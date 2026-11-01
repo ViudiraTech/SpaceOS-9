@@ -34,6 +34,10 @@ fn main() -> ExitCode {
         "files" => apps::files::run(arguments.get(2).map(String::as_str)),
         "edit" => apps::edit::run(arguments.get(2).map(String::as_str)),
         "settings" => apps::settings::run(),
+        "calc" | "calculator" => apps::calc::run(),
+        "monitor" | "taskmgr" => apps::monitor::run(),
+        "view" | "image" => apps::view::run(arguments.get(2).map(String::as_str)),
+        "help" => apps::help::run(),
         "login" => apps::login::run(),
         "notify" => apps::notify::run(
             arguments.get(2).map(String::as_str).unwrap_or("通知"),

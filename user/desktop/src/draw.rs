@@ -972,4 +972,144 @@ impl Canvas {
             }
         }
     }
+
+    /// Fill a rectangle with a vertical linear color/alpha gradient.
+    pub fn fill_gradient_v(
+        &mut self,
+        rect: Rect,
+        top_color: u32,
+        bottom_color: u32,
+        top_alpha: f32,
+        bottom_alpha: f32,
+    ) {
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() || rect.h <= 0 {
+            return;
+        }
+        self.mark_dirty(clip);
+        let stride = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        let inv_h = 1.0 / (rect.h as f32).max(1.0);
+        for py in clip.y..clip.bottom() {
+            let t = ((py - rect.y) as f32 * inv_h).clamp(0.0, 1.0);
+            let row_color = mix(top_color, bottom_color, t);
+            let alpha = (lerp_f32(top_alpha, bottom_alpha, t).clamp(0.0, 1.0) * 255.0) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            let row = &mut pixels[py as usize * stride..py as usize * stride + stride];
+            for px in clip.x..clip.right() {
+                let slot = &mut row[px as usize];
+                *slot = blend_u8(*slot, row_color, alpha);
+            }
+        }
+    }
+
+    /// Draw a smooth sparkline chart with optional vertical gradient area fill.
+    pub fn draw_sparkline(
+        &mut self,
+        rect: Rect,
+        values: &[f32],
+        stroke_color: u32,
+        fill_color: Option<u32>,
+    ) {
+        if values.len() < 2 || rect.w <= 4 || rect.h <= 4 {
+            return;
+        }
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() {
+            return;
+        }
+        let n = values.len();
+        let step_x = (rect.w as f32 - 1.0) / (n - 1) as f32;
+        let base_y = rect.bottom() as f32 - 1.0;
+        let scale_y = (rect.h as f32 - 2.0).max(1.0);
+
+        let mut pts: Vec<(f32, f32)> = Vec::with_capacity(n);
+        for (i, &v) in values.iter().enumerate() {
+            let clamped = v.clamp(0.0, 1.0);
+            let px = rect.x as f32 + i as f32 * step_x;
+            let py = base_y - clamped * scale_y;
+            pts.push((px, py));
+        }
+
+        // Draw vertical area fill under the curve if requested
+        if let Some(fill) = fill_color {
+            let stride = self.width;
+            let pixels = self.buffer.as_mut_slice();
+            for i in 0..n - 1 {
+                let x0 = pts[i].0.round() as i32;
+                let x1 = pts[i + 1].0.round() as i32;
+                let seg_clip_x0 = x0.max(clip.x);
+                let seg_clip_x1 = x1.min(clip.right());
+                if seg_clip_x0 >= seg_clip_x1 {
+                    continue;
+                }
+                let dx = (pts[i + 1].0 - pts[i].0).max(0.001);
+                for x in seg_clip_x0..seg_clip_x1 {
+                    let t = ((x as f32 - pts[i].0) / dx).clamp(0.0, 1.0);
+                    let top_y = (pts[i].1 + t * (pts[i + 1].1 - pts[i].1)).round() as i32;
+                    let y_start = top_y.max(clip.y);
+                    let y_end = (rect.bottom() - 1).min(clip.bottom());
+                    for y in y_start..=y_end {
+                        let rel_y = (y - top_y) as f32 / (rect.h as f32).max(1.0);
+                        let alpha = ((1.0 - rel_y * 0.75).clamp(0.05, 0.40) * 255.0) as u8;
+                        let slot = &mut pixels[y as usize * stride + x as usize];
+                        *slot = blend_u8(*slot, fill, alpha);
+                    }
+                }
+            }
+            self.mark_dirty(clip);
+        }
+
+        // Draw stroke line segments
+        for i in 0..n - 1 {
+            self.line(
+                pts[i].0.round() as i32,
+                pts[i].1.round() as i32,
+                pts[i + 1].0.round() as i32,
+                pts[i + 1].1.round() as i32,
+                stroke_color,
+                1.0,
+            );
+        }
+    }
+}
+
+/// Linear interpolation between `a` and `b` by factor `t` (0.0 ..= 1.0).
+#[inline(always)]
+pub fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Standard cubic ease-out easing function.
+#[inline(always)]
+pub fn ease_out_cubic(t: f32) -> f32 {
+    let p = (1.0 - t).clamp(0.0, 1.0);
+    1.0 - p * p * p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lerp_and_easing() {
+        assert_eq!(lerp_f32(10.0, 20.0, 0.0), 10.0);
+        assert_eq!(lerp_f32(10.0, 20.0, 0.5), 15.0);
+        assert_eq!(lerp_f32(10.0, 20.0, 1.0), 20.0);
+
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert!(ease_out_cubic(0.5) > 0.5); // Ease-out curve rises faster early on
+    }
+
+    #[test]
+    fn test_sparkline_draw() {
+        let mut canvas = Canvas::new(100, 50, 0x000000);
+        let vals = [0.1, 0.5, 0.8, 0.2, 0.9];
+        canvas.draw_sparkline(Rect::new(10, 10, 80, 30), &vals, 0x3b82f6, Some(0x3b82f6));
+        // Verify buffer is modified without crashing or out-of-bounds
+        assert!(canvas.buffer.as_slice().iter().any(|&p| p != 0x000000));
+    }
 }

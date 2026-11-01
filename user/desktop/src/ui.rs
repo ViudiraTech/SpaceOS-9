@@ -268,38 +268,62 @@ pub fn button(
     }
 }
 
-/// Pill-shaped boolean toggle switch (`38 × 20` recommended).
-pub fn toggle_switch(canvas: &mut Canvas, theme: &Theme, rect: Rect, checked: bool, hover: bool) {
+/// Pill-shaped boolean toggle switch (`38 × 20` recommended) with continuous animation progress `0.0..=1.0`.
+pub fn toggle_switch_anim(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    progress: f32,
+    hover: bool,
+) {
     let radius = (rect.h / 2).max(1);
-    let base = if checked {
-        theme.accent
-    } else if theme.is_dark() {
-        0x36363e
-    } else {
-        0xd4d4dc
-    };
-    let track_bg = if hover {
-        if theme.is_dark() {
+    let p = progress.clamp(0.0, 1.0);
+    let off_color = if theme.is_dark() { 0x36363e } else { 0xd4d4dc };
+    let mut base = mix(off_color, theme.accent, p);
+    if hover {
+        base = if theme.is_dark() {
             mix(base, 0xffffff, 0.10)
         } else {
             mix(base, 0x000000, 0.08)
-        }
-    } else {
-        base
-    };
-    canvas.rounded_rect(rect, radius, track_bg, 1.0);
-    if !checked {
-        canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
+        };
+    }
+    canvas.rounded_rect(rect, radius, base, 1.0);
+    if p < 0.95 {
+        let border_alpha = (1.0 - p).clamp(0.0, 1.0);
+        canvas.rounded_border(rect, radius, theme.window_border, border_alpha, 1);
     }
     let pad = 2;
     let knob_d = (rect.h - pad * 2).max(6);
-    let knob_x = if checked {
-        rect.right() - knob_d - pad
-    } else {
-        rect.x + pad
-    };
+    let start_x = rect.x + pad;
+    let end_x = rect.right() - knob_d - pad;
+    let knob_x = (start_x as f32 + (end_x - start_x) as f32 * p).round() as i32;
     let knob_rect = Rect::new(knob_x, rect.y + pad, knob_d, knob_d);
     canvas.rounded_rect(knob_rect, knob_d / 2, 0xffffff, 1.0);
+}
+
+/// Pill-shaped boolean toggle switch (`38 × 20` recommended).
+pub fn toggle_switch(canvas: &mut Canvas, theme: &Theme, rect: Rect, checked: bool, hover: bool) {
+    toggle_switch_anim(canvas, theme, rect, if checked { 1.0 } else { 0.0 }, hover);
+}
+
+/// Linear horizontal progress bar with rounded caps.
+pub fn progress_bar(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    progress: f32,
+    color: Option<u32>,
+) {
+    let radius = (rect.h / 2).max(1);
+    canvas.rounded_rect(rect, radius, theme.window_alt, 1.0);
+    canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
+    let p = progress.clamp(0.0, 1.0);
+    let fill_w = ((rect.w as f32) * p).round() as i32;
+    if fill_w > 0 {
+        let fg = color.unwrap_or(theme.accent);
+        let fill_rect = Rect::new(rect.x, rect.y, fill_w.min(rect.w), rect.h);
+        canvas.rounded_rect(fill_rect, radius, fg, 1.0);
+    }
 }
 
 /// Compute the hit rectangle of `index` inside a `count`-option `segmented_control`.
@@ -317,25 +341,27 @@ pub fn segmented_item_rect(rect: Rect, count: usize, index: usize) -> Rect {
     Rect::new(x0, inner.y, (x1 - x0).max(1), inner.h.max(1))
 }
 
-/// Multi-option segmented selector control.
-pub fn segmented_control(
+/// Multi-option segmented selector control with animated indicator slider.
+pub fn segmented_control_anim(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
     theme: &Theme,
     rect: Rect,
     labels: &[&str],
+    indicator_rect: Rect,
     selected: usize,
     hover_idx: Option<usize>,
 ) {
     canvas.rounded_rect(rect, RADIUS_CONTROL + 1, theme.window_alt, 1.0);
     canvas.rounded_border(rect, RADIUS_CONTROL + 1, theme.window_border, 1.0, 1);
+    if !indicator_rect.is_empty() {
+        canvas.rounded_rect(indicator_rect, RADIUS_CONTROL, theme.accent, 1.0);
+    }
     let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.3;
     for (i, label) in labels.iter().enumerate() {
         let seg = segmented_item_rect(rect, labels.len(), i);
         let is_sel = i == selected;
-        if is_sel {
-            canvas.rounded_rect(seg, RADIUS_CONTROL, theme.accent, 1.0);
-        } else if hover_idx == Some(i) {
+        if hover_idx == Some(i) && !is_sel {
             canvas.rounded_rect(seg, RADIUS_CONTROL, theme.panel_hover, 1.0);
         }
         let fg = if is_sel { 0xffffff } else { theme.text_dim };
@@ -350,6 +376,20 @@ pub fn segmented_control(
             face,
         );
     }
+}
+
+/// Multi-option segmented selector control.
+pub fn segmented_control(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    rect: Rect,
+    labels: &[&str],
+    selected: usize,
+    hover_idx: Option<usize>,
+) {
+    let seg = segmented_item_rect(rect, labels.len(), selected);
+    segmented_control_anim(canvas, text, theme, rect, labels, seg, selected, hover_idx);
 }
 
 /// Circular color swatch with active ring indicator.

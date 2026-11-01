@@ -65,6 +65,11 @@ PACKAGES = [
     "font-noto-cjk",
     "breeze-cursors",
     "tzdata",
+    "file",
+    "htop",
+    "nano",
+    "tree",
+    "fastfetch",
 ]
 WALLPAPERS = (
     ("alpine-peaks.jpg", "https://picsum.photos/id/29/1920/1200.jpg"),
@@ -77,6 +82,10 @@ BREEZE_ICONS = {
     "files": "usr/share/icons/breeze/apps/48/system-file-manager.svg",
     "editor": "usr/share/icons/breeze/apps/48/accessories-text-editor.svg",
     "settings": "usr/share/icons/breeze/apps/48/preferences-system.svg",
+    "calculator": "usr/share/icons/breeze/apps/48/accessories-calculator.svg",
+    "monitor": "usr/share/icons/breeze/apps/48/utilities-system-monitor.svg",
+    "image-viewer": "usr/share/icons/breeze/apps/48/gwenview.svg",
+    "help": "usr/share/icons/breeze/apps/48/help-browser.svg",
     "login": "usr/share/icons/breeze/preferences/32/preferences-system-login.svg",
     "notify": "usr/share/icons/breeze/preferences/32/preferences-desktop-notification-bell.svg",
     "appearance": "usr/share/icons/breeze/preferences/32/preferences-desktop-theme-global.svg",

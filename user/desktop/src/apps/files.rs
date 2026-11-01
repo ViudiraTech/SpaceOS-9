@@ -200,6 +200,16 @@ impl BrowserState {
             self.navigate_to(entry.path, true);
             return;
         }
+        if is_image_file(&entry.path) {
+            match std::env::current_exe() {
+                Ok(exe) => match Command::new(exe).arg("view").arg(&entry.path).spawn() {
+                    Ok(_) => self.status = format!("已在看图工具中打开 {}", entry.name),
+                    Err(e) => self.status = format!("启动看图工具失败: {e}"),
+                },
+                Err(e) => self.status = format!("定位程序失败: {e}"),
+            }
+            return;
+        }
         if is_editable_text(&entry.path, entry.size) {
             match std::env::current_exe() {
                 Ok(exe) => match Command::new(exe).arg("edit").arg(&entry.path).spawn() {
@@ -804,6 +814,16 @@ fn classify_kind(path: &Path, is_dir: bool) -> &'static str {
         None => "系统文件",
         _ => "文件",
     }
+}
+
+fn is_image_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "bmp" | "webp" | "gif" | "pnm" | "tga")
+    )
 }
 
 fn is_editable_text(path: &Path, size: u64) -> bool {

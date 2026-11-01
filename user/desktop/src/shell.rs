@@ -35,8 +35,8 @@ extern "C" {
     fn tzset();
 }
 
-const MENU_WIDTH: i32 = 360;
-const MENU_HEIGHT: i32 = 424;
+const MENU_WIDTH: i32 = 380;
+const MENU_HEIGHT: i32 = 530;
 const CTX_WIDTH: i32 = 192;
 const CTX_HEIGHT: i32 = 148;
 const TOAST_WIDTH: i32 = 324;
@@ -50,7 +50,7 @@ struct AppEntry {
     mode: &'static str,
 }
 
-const APPS: [AppEntry; 4] = [
+const APPS: [AppEntry; 8] = [
     AppEntry {
         name: "文件管理器",
         subtitle: "浏览目录与系统文件",
@@ -66,6 +66,13 @@ const APPS: [AppEntry; 4] = [
         mode: "term",
     },
     AppEntry {
+        name: "系统监视器",
+        subtitle: "CPU、内存、进程性能监控与管理",
+        keywords: "monitor taskmgr top htop task manager 监视器 性能 进程 任务管理器",
+        icon: Icon::Monitor,
+        mode: "monitor",
+    },
+    AppEntry {
         name: "文本编辑器",
         subtitle: "查看与编辑文本文档",
         keywords: "edit editor text notepad kwrite 文本 编辑器",
@@ -73,11 +80,32 @@ const APPS: [AppEntry; 4] = [
         mode: "edit",
     },
     AppEntry {
+        name: "计算器",
+        subtitle: "标准四则运算与即时数值计算",
+        keywords: "calc calculator math 计算器 计算 数学",
+        icon: Icon::Calculator,
+        mode: "calc",
+    },
+    AppEntry {
+        name: "看图工具",
+        subtitle: "图像浏览、缩放与壁纸设定",
+        keywords: "view image viewer photo picture 看图 图片 图像 相册",
+        icon: Icon::ImageViewer,
+        mode: "view",
+    },
+    AppEntry {
         name: "系统设置",
         subtitle: "外观、桌面、输入设备与系统偏好",
         keywords: "settings display wallpaper theme 外观 壁纸 分辨率 设置",
         icon: Icon::Settings,
         mode: "settings",
+    },
+    AppEntry {
+        name: "帮助手册",
+        subtitle: "SpaceOS-9 桌面使用与快捷键指南",
+        keywords: "help manual guide doc 帮助 手册 快捷键 文档 指南",
+        icon: Icon::Help,
+        mode: "help",
     },
 ];
 
@@ -206,7 +234,7 @@ fn apply_display_mode(mode_arg: &str) {
 }
 
 fn menu_row_rect(index: usize) -> Rect {
-    Rect::new(12, 62 + index as i32 * 54, MENU_WIDTH - 24, 50)
+    Rect::new(12, 58 + index as i32 * 52, MENU_WIDTH - 24, 48)
 }
 
 fn ctx_row_rect(index: usize) -> Rect {
@@ -220,14 +248,23 @@ fn ctx_row_rect(index: usize) -> Rect {
 }
 
 fn infer_window_icon(title: &str) -> Icon {
-    if title.contains("终端") || title.to_ascii_lowercase().contains("term") {
+    let lower = title.to_ascii_lowercase();
+    if title.contains("终端") || lower.contains("term") {
         Icon::Terminal
-    } else if title.contains("文件") {
+    } else if title.contains("文件") || lower.contains("file") {
         Icon::Files
-    } else if title.contains("编辑") {
+    } else if title.contains("编辑") || lower.contains("edit") {
         Icon::Editor
-    } else if title.contains("设置") {
+    } else if title.contains("监视器") || lower.contains("monitor") || title.contains("任务") {
+        Icon::Monitor
+    } else if title.contains("计算器") || lower.contains("calc") {
+        Icon::Calculator
+    } else if title.contains("看图") || lower.contains("view") || lower.contains("image") {
+        Icon::ImageViewer
+    } else if title.contains("设置") || lower.contains("setting") {
         Icon::Settings
+    } else if title.contains("帮助") || lower.contains("help") || title.contains("手册") {
+        Icon::Help
     } else if title.contains("登录") || title.contains("账户") {
         Icon::Login
     } else {
@@ -485,9 +522,23 @@ impl Shell {
         } else {
             14
         };
-        let cell_w = (icon_sz + 44).max(80);
+        let bottom_limit = if self.config.panel_position == PanelPosition::Bottom {
+            i32::from(self.x.height) - self.panel_height() - 14
+        } else {
+            i32::from(self.x.height) - 14
+        };
+        let cell_w = (icon_sz + 44).max(84);
         let cell_h = icon_sz + 42;
-        Rect::new(14, top_base + index as i32 * (cell_h + 6), cell_w, cell_h)
+        let spacing = 6;
+        let per_col = ((bottom_limit - top_base) / (cell_h + spacing)).max(1) as usize;
+        let col = index / per_col;
+        let row = index % per_col;
+        Rect::new(
+            14 + col as i32 * (cell_w + 10),
+            top_base + row as i32 * (cell_h + spacing),
+            cell_w,
+            cell_h,
+        )
     }
 
     fn start_button_rect(&self) -> Rect {
@@ -1340,7 +1391,7 @@ impl Shell {
         let ph = self.panel_height();
         let bh = (ph - 12).clamp(26, 40);
         let start_x = if self.config.panel_show_pinned {
-            264
+            102 + (APPS.len() as i32) * 38 + 10
         } else {
             106
         };
@@ -1650,7 +1701,7 @@ impl Shell {
         let h = self.panel_height();
         let start = self.start_button_rect();
         let show_pinned = self.config.panel_show_pinned;
-        let pinned_rects: [Rect; 4] = std::array::from_fn(|i| self.pinned_rect(i));
+        let pinned_rects: [Rect; 8] = std::array::from_fn(|i| self.pinned_rect(i));
         let win_count = self.windows.len().min(6);
         let win_rects: Vec<Rect> = (0..win_count).map(|i| self.window_button_rect(i)).collect();
         let bell = self.bell_rect();
@@ -1910,12 +1961,12 @@ impl Shell {
                 if hovered {
                     canvas.rounded_rect(row, RADIUS_CONTROL, self.theme.panel_hover, 1.0);
                 }
-                icons::draw(canvas, app.icon, row.x + 10, row.y + 9, 32, None);
+                icons::draw(canvas, app.icon, row.x + 10, row.y + 8, 32, None);
                 self.text.draw(
                     canvas,
                     app.name,
                     (row.x + 52) as f32,
-                    (row.y + 22) as f32,
+                    (row.y + 20) as f32,
                     13.0,
                     self.theme.text,
                     Face::Bold,
@@ -1924,7 +1975,7 @@ impl Shell {
                     canvas,
                     app.subtitle,
                     (row.x + 52) as f32,
-                    (row.y + 39) as f32,
+                    (row.y + 37) as f32,
                     11.0,
                     self.theme.text_muted,
                     Face::Ui,
