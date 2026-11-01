@@ -277,7 +277,7 @@ pub fn authenticate(
         Some(shadow) => shadow,
         None => return Err(AuthFailure::denied()),
     };
-    if shadow.hash.is_empty() || shadow.hash.starts_with('!') || shadow.hash.starts_with('*') {
+    if shadow.hash.starts_with('!') || shadow.hash.starts_with('*') {
         return Err(AuthFailure::denied());
     }
     if !verify_password(password, &shadow.hash) {
@@ -319,8 +319,11 @@ pub fn dummy_verify(password: &[u8], hash: &str) {
 }
 
 pub fn verify_password(password: &[u8], hash: &str) -> bool {
-    if password.is_empty() || hash.is_empty() || hash.starts_with('!') {
+    if hash.starts_with('!') || hash.starts_with('*') {
         return false;
+    }
+    if hash.is_empty() {
+        return password.is_empty();
     }
     let Ok(password) = CString::new(password) else {
         return false;
@@ -343,9 +346,6 @@ fn verify_against_shadow(username: &str, password: &[u8]) -> bool {
 }
 
 pub fn hash_password(password: &[u8]) -> Result<String, String> {
-    if password.is_empty() {
-        return Err("密码不能为空".to_string());
-    }
     let salt = random_salt();
     let salt_c = CString::new(format!("$6${salt}$")).map_err(|_| "salt NUL".to_string())?;
     let password_c = CString::new(password).map_err(|_| "密码包含 NUL 字符".to_string())?;
@@ -595,6 +595,15 @@ mod tests {
         assert!(!verify_password(b"anything", "!$6$salt$hash"));
         assert!(!verify_password(b"anything", "*"));
         assert!(!verify_password(b"anything", ""));
+    }
+
+    #[test]
+    fn empty_password_round_trip() {
+        let hash = hash_password(b"").expect("hash empty password");
+        assert!(hash.starts_with("$6$"));
+        assert!(verify_password(b"", &hash));
+        assert!(!verify_password(b"not empty", &hash));
+        assert!(verify_password(b"", ""));
     }
 
     #[test]

@@ -545,9 +545,7 @@ impl Oobe {
         if self.password != self.confirm {
             return Err("两次输入的密码不一致".to_string());
         }
-        validate_password(&self.password, &self.username, &self.full_name)
-            .map(|_| ())
-            .map_err(ToString::to_string)
+        Ok(())
     }
 
     fn validate_system(&self) -> std::result::Result<(), String> {
@@ -1006,10 +1004,13 @@ impl Oobe {
             None,
         );
 
-        let strength = validate_password(&self.password, &self.username, &self.full_name);
-        let (score, label) = match strength {
-            Ok(score) => (score, password_strength_label(score)),
-            Err(reason) => (0, reason),
+        let (score, label) = if self.password.is_empty() {
+            (0, "未设置（允许空密码）")
+        } else {
+            match validate_password(&self.password, &self.username, &self.full_name) {
+                Ok(score) => (score, password_strength_label(score)),
+                Err(_) => (1, "简单密码（允许使用）"),
+            }
         };
         let bar = Rect::new(layout.content_x, layout.card.y + 438, layout.content_w, 5);
         ui::progress_bar(

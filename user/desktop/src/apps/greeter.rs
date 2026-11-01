@@ -422,12 +422,6 @@ impl Greeter {
             self.screen.needs_redraw = true;
             return;
         }
-        if self.password.is_empty() {
-            self.error = "请输入密码".to_string();
-            self.focus = Focus::Password;
-            self.screen.needs_redraw = true;
-            return;
-        }
         self.error.clear();
         self.waiting = true;
         self.screen.needs_redraw = true;

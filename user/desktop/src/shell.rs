@@ -779,7 +779,14 @@ impl Shell {
             }
             if raw.is_empty() {
                 let ux_fd = self.watch.as_ref().map(UxConfWatch::as_raw_fd);
-                let timeout = if self.config.clock_seconds { 200 } else { 500 };
+                let anim_active = ui::has_active_animations();
+                let timeout = if anim_active {
+                    16
+                } else if self.config.clock_seconds {
+                    200
+                } else {
+                    500
+                };
                 let (_, ux_ready, _) = self.x.wait_fds(ux_fd, None, timeout);
                 if ux_ready {
                     self.poll_uxconf()?;
@@ -807,7 +814,8 @@ impl Shell {
                 self.handle(event)?;
             }
 
-            if self.update_clock() {
+            let anim_active = ui::has_active_animations();
+            if self.update_clock() || anim_active {
                 self.draw_taskbar();
                 self.present_taskbar()?;
             }
@@ -1731,7 +1739,8 @@ impl Shell {
 
         // Start button using official SpaceOS9.png logo.
         let start_active = self.menu_open || self.hover == Hit::Start;
-        if start_active {
+        let start_t = ui::animate_bool(start, start_active, ui::MOTION_HOVER);
+        if start_t > 0.001 {
             canvas.rounded_rect(
                 start,
                 RADIUS_CONTROL,
@@ -1740,7 +1749,7 @@ impl Shell {
                 } else {
                     self.theme.panel_hover
                 },
-                1.0,
+                start_t,
             );
             canvas.rounded_border(
                 start,
@@ -1750,7 +1759,7 @@ impl Shell {
                 } else {
                     self.theme.panel_border
                 },
-                1.0,
+                start_t,
                 1,
             );
         }
@@ -1780,8 +1789,9 @@ impl Shell {
         if show_pinned {
             for (i, app) in APPS.iter().enumerate() {
                 let rect = pinned_rects[i];
-                if self.hover == Hit::Pinned(i) {
-                    canvas.rounded_rect(rect, RADIUS_CONTROL, self.theme.panel_hover, 1.0);
+                let hov_t = ui::animate_bool(rect, self.hover == Hit::Pinned(i), ui::MOTION_HOVER);
+                if hov_t > 0.001 {
+                    canvas.rounded_rect(rect, RADIUS_CONTROL, self.theme.panel_hover, hov_t);
                 }
                 icons::draw(
                     canvas,
@@ -1800,16 +1810,18 @@ impl Shell {
             let managed = &self.windows[index];
             let is_active = !managed.minimized && self.active == Some(managed.window);
             let is_hover = self.hover == Hit::Window(index);
+            let hov_t = ui::animate_bool(rect, is_hover, ui::MOTION_HOVER);
             let bg = if is_active {
                 self.theme.panel_high
-            } else if is_hover {
-                self.theme.panel_hover
+            } else if hov_t > 0.001 {
+                crate::draw::mix(self.theme.panel, self.theme.panel_hover, hov_t)
             } else {
                 self.theme.panel
             };
             canvas.rounded_rect(rect, RADIUS_CONTROL, bg, 1.0);
-            if is_active || is_hover {
-                canvas.rounded_border(rect, RADIUS_CONTROL, self.theme.panel_border, 1.0, 1);
+            if is_active || hov_t > 0.001 {
+                let border_alpha = if is_active { 1.0 } else { hov_t };
+                canvas.rounded_border(rect, RADIUS_CONTROL, self.theme.panel_border, border_alpha, 1);
             }
             if is_active {
                 canvas.rounded_rect(
@@ -1855,8 +1867,9 @@ impl Shell {
         }
 
         // Right tray: notification bell & configurable clock.
-        if self.hover == Hit::Bell {
-            canvas.rounded_rect(bell, RADIUS_CONTROL, self.theme.panel_hover, 1.0);
+        let bell_hov = ui::animate_bool(bell, self.hover == Hit::Bell, ui::MOTION_HOVER);
+        if bell_hov > 0.001 {
+            canvas.rounded_rect(bell, RADIUS_CONTROL, self.theme.panel_hover, bell_hov);
         }
         icons::draw(
             canvas,

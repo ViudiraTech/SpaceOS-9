@@ -17,6 +17,7 @@ use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
 use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
+use crate::ui;
 use crate::x11::{Key, Result};
 use std::time::Instant;
 
@@ -454,28 +455,38 @@ fn draw_calc(
                 btn_r.h = (btn_r.h - 2).max(1);
             }
 
+            let hover_t = ui::animate_bool(
+                (row as u64) << 16 | (col as u64),
+                is_hover,
+                ui::MOTION_HOVER,
+            );
+
             let bg = if is_accent {
                 if is_pressed {
                     theme.accent
-                } else if is_hover {
-                    crate::draw::mix(theme.accent, 0xffffff, 0.12)
+                } else if hover_t > 0.001 {
+                    crate::draw::mix(theme.accent, 0xffffff, 0.12 * hover_t)
                 } else {
                     theme.accent
                 }
             } else if is_func {
+                let base = theme.window_high;
                 if is_pressed {
                     theme.window_alt
-                } else if is_hover {
-                    theme.panel_hover
+                } else if hover_t > 0.001 {
+                    crate::draw::mix(base, theme.panel_hover, hover_t)
                 } else {
-                    theme.window_high
+                    base
                 }
-            } else if is_pressed {
-                theme.window_alt
-            } else if is_hover {
-                theme.panel_hover
             } else {
-                theme.panel
+                let base = theme.panel;
+                if is_pressed {
+                    theme.window_alt
+                } else if hover_t > 0.001 {
+                    crate::draw::mix(base, theme.panel_hover, hover_t)
+                } else {
+                    base
+                }
             };
 
             canvas.rounded_rect(btn_r, RADIUS_CONTROL, bg, 1.0);

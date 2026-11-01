@@ -334,12 +334,15 @@ pub fn titlebar(
     let title_color = if active { theme.text } else { theme.text_muted };
     text.draw(canvas, &shown, title_x, 22.0, 12.5, title_color, Face::Ui);
 
-    // Minimize button: crisp 10px horizontal bar.
+    // Minimize button: crisp 10px horizontal bar with animated hover fade.
     let min_rect = caption_button_rect(width, CaptionHit::Minimize, buttons_left);
-    if hover == CaptionHit::Minimize {
-        canvas.fill(
+    let min_hov = animate_bool(min_rect, hover == CaptionHit::Minimize, MOTION_HOVER);
+    if min_hov > 0.001 {
+        canvas.rounded_rect(
             Rect::new(min_rect.x, 1, min_rect.w, TITLEBAR_HEIGHT - 2),
+            0,
             theme.panel_hover,
+            min_hov,
         );
     }
     let glyph_fg = if active {
@@ -357,12 +360,15 @@ pub fn titlebar(
         glyph_fg,
     );
 
-    // Maximize / Restore button: crisp 10x10 square or overlapping 8x8 squares.
+    // Maximize / Restore button: crisp 10x10 square with animated hover fade.
     let max_rect = caption_button_rect(width, CaptionHit::Maximize, buttons_left);
-    if hover == CaptionHit::Maximize {
-        canvas.fill(
+    let max_hov = animate_bool(max_rect, hover == CaptionHit::Maximize, MOTION_HOVER);
+    if max_hov > 0.001 {
+        canvas.rounded_rect(
             Rect::new(max_rect.x, 1, max_rect.w, TITLEBAR_HEIGHT - 2),
+            0,
             theme.panel_hover,
+            max_hov,
         );
     }
     if maximized {
@@ -383,14 +389,19 @@ pub fn titlebar(
         canvas.border_1px(sq, glyph_fg);
     }
 
-    // Close button: red hover background with crisp 10x10 'X'.
+    // Close button: red hover background with crisp 10x10 'X' and animated hover fade.
     let close_rect = caption_button_rect(width, CaptionHit::Close, buttons_left);
-    let close_fg = if hover == CaptionHit::Close {
-        canvas.fill(
+    let close_hov = animate_bool(close_rect, hover == CaptionHit::Close, MOTION_HOVER);
+    if close_hov > 0.001 {
+        canvas.rounded_rect(
             Rect::new(close_rect.x, 0, close_rect.w, TITLEBAR_HEIGHT - 1),
+            0,
             theme.danger,
+            close_hov,
         );
-        0xffffff
+    }
+    let close_fg = if close_hov > 0.001 {
+        mix(glyph_fg, 0xffffff, close_hov)
     } else {
         glyph_fg
     };
@@ -505,6 +516,7 @@ pub fn button(
     primary: bool,
     hover: bool,
 ) {
+    let hover_t = animate_bool(rect, hover, MOTION_HOVER);
     button_anim(
         canvas,
         text,
@@ -513,8 +525,35 @@ pub fn button(
         label,
         leading_icon,
         primary,
-        if hover { 1.0 } else { 0.0 },
+        hover_t,
         false,
+    );
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn button_with_id(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    id: impl IntoWidgetId,
+    rect: Rect,
+    label: &str,
+    leading_icon: Option<Icon>,
+    primary: bool,
+    hover: bool,
+    pressed: bool,
+) {
+    let hover_t = animate_bool(id, hover, MOTION_HOVER);
+    button_anim(
+        canvas,
+        text,
+        theme,
+        rect,
+        label,
+        leading_icon,
+        primary,
+        hover_t,
+        pressed,
     );
 }
 
@@ -579,7 +618,7 @@ pub fn toggle_switch_with_id(
     toggle_switch_anim(canvas, theme, rect, p, hover);
 }
 
-/// Linear horizontal progress bar with rounded caps.
+/// Linear horizontal progress bar with rounded caps and automatic smooth animation.
 pub fn progress_bar(
     canvas: &mut Canvas,
     theme: &Theme,
@@ -587,10 +626,11 @@ pub fn progress_bar(
     progress: f32,
     color: Option<u32>,
 ) {
+    let p_target = progress.clamp(0.0, 1.0);
+    let p = animate_float(rect, p_target, 0.22);
     let radius = (rect.h / 2).max(1);
     canvas.rounded_rect(rect, radius, theme.window_alt, 1.0);
     canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
-    let p = progress.clamp(0.0, 1.0);
     let fill_w = ((rect.w as f32) * p).round() as i32;
     if fill_w > 0 {
         let fg = color.unwrap_or(theme.accent);
@@ -599,7 +639,29 @@ pub fn progress_bar(
     }
 }
 
-/// Smooth horizontal slider with filled track and elevated expandable thumb.
+#[allow(dead_code)]
+pub fn progress_bar_with_id(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    id: impl IntoWidgetId,
+    rect: Rect,
+    progress: f32,
+    color: Option<u32>,
+) {
+    let p_target = progress.clamp(0.0, 1.0);
+    let p = animate_float(id, p_target, 0.22);
+    let radius = (rect.h / 2).max(1);
+    canvas.rounded_rect(rect, radius, theme.window_alt, 1.0);
+    canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
+    let fill_w = ((rect.w as f32) * p).round() as i32;
+    if fill_w > 0 {
+        let fg = color.unwrap_or(theme.accent);
+        let fill_rect = Rect::new(rect.x, rect.y, fill_w.min(rect.w), rect.h);
+        canvas.rounded_rect(fill_rect, radius, fg, 1.0);
+    }
+}
+
+/// Smooth horizontal slider with filled track, animated expandable thumb and glow.
 #[allow(dead_code)]
 pub fn slider(
     canvas: &mut Canvas,
@@ -610,6 +672,7 @@ pub fn slider(
     dragging: bool,
 ) {
     let p = progress.clamp(0.0, 1.0);
+    let hover_t = animate_bool(rect, hover || dragging, 0.12);
     let track_h = 4;
     let track_y = rect.y + (rect.h - track_h) / 2;
     let track_rect = Rect::new(rect.x, track_y, rect.w, track_h);
@@ -622,21 +685,15 @@ pub fn slider(
         canvas.rounded_rect(active_r, 2, theme.accent, 1.0);
     }
 
-    let thumb_d = if dragging {
-        18
-    } else if hover {
-        16
-    } else {
-        14
-    };
+    let thumb_d = (14.0 + if dragging { 4.0 } else { 2.0 * hover_t }).round() as i32;
     let thumb_x = (rect.x as f32 + (rect.w as f32) * p).round() as i32 - thumb_d / 2;
     let thumb_y = rect.y + (rect.h - thumb_d) / 2;
     let thumb_r = Rect::new(thumb_x, thumb_y, thumb_d, thumb_d);
     // Drop shadow
     canvas.rounded_rect(thumb_r.offset(0, 1), thumb_d / 2, 0x000000, 0.25);
     canvas.rounded_rect(thumb_r, thumb_d / 2, 0xffffff, 1.0);
-    if dragging || hover {
-        canvas.rounded_border(thumb_r, thumb_d / 2, theme.accent, 0.60, 2);
+    if hover_t > 0.001 {
+        canvas.rounded_border(thumb_r, thumb_d / 2, theme.accent, 0.60 * hover_t, 2);
     }
 }
 
@@ -725,7 +782,7 @@ pub fn segmented_control_with_id(
     segmented_control_anim(canvas, text, theme, rect, labels, ind_rect, selected, hover_idx);
 }
 
-/// Circular color swatch with active ring indicator.
+/// Circular color swatch with animated active ring indicator.
 pub fn color_swatch(
     canvas: &mut Canvas,
     theme: &Theme,
@@ -734,16 +791,18 @@ pub fn color_swatch(
     selected: bool,
     hover: bool,
 ) {
+    let sel_t = animate_bool(rect, selected, 0.18);
+    let hov_t = animate_bool(rect.offset(1, 1), hover, 0.12);
     let cx = rect.x as f32 + rect.w as f32 * 0.5;
     let cy = rect.y as f32 + rect.h as f32 * 0.5;
     let radius = (rect.w.min(rect.h) as f32 * 0.5 - 3.0).max(4.0);
     canvas.circle(cx, cy, radius, color, 1.0);
     canvas.ring(cx, cy, radius, 1.0, 0x000000, 0.18);
-    if selected {
-        canvas.ring(cx, cy, radius + 2.2, 1.8, theme.text, 0.92);
-        canvas.circle(cx, cy, 3.2, 0xffffff, 0.98);
-    } else if hover {
-        canvas.ring(cx, cy, radius + 1.8, 1.4, theme.text_muted, 0.75);
+    if sel_t > 0.001 {
+        canvas.ring(cx, cy, radius + 2.2 * sel_t, 1.8 * sel_t, theme.text, 0.92 * sel_t);
+        canvas.circle(cx, cy, 3.2 * sel_t, 0xffffff, 0.98 * sel_t);
+    } else if hov_t > 0.001 {
+        canvas.ring(cx, cy, radius + 1.8 * hov_t, 1.4 * hov_t, theme.text_muted, 0.75 * hov_t);
     }
 }
 
@@ -755,11 +814,16 @@ pub fn icon_button(
     enabled: bool,
     hover: bool,
 ) {
-    if hover && enabled {
-        canvas.rounded_rect(rect, RADIUS_CONTROL, theme.panel_hover, 1.0);
+    let hover_t = animate_bool(rect, hover && enabled, MOTION_HOVER);
+    if hover_t > 0.001 {
+        canvas.rounded_rect(rect, RADIUS_CONTROL, theme.panel_hover, hover_t);
     }
     let tint = if enabled {
-        theme.text_dim
+        if hover_t > 0.001 {
+            mix(theme.text_dim, theme.text, hover_t)
+        } else {
+            theme.text_dim
+        }
     } else {
         theme.text_muted
     };
@@ -784,15 +848,22 @@ pub fn text_input(
     focused: bool,
     leading_icon: Option<Icon>,
 ) {
+    let focus_t = animate_bool(rect, focused, 0.15);
     canvas.rounded_rect(rect, RADIUS_CONTROL, theme.input_bg, 1.0);
-    let border = if focused {
-        theme.accent
+    let border = if focus_t > 0.001 {
+        mix(theme.panel_border, theme.accent, focus_t)
     } else {
         theme.panel_border
     };
     canvas.rounded_border(rect, RADIUS_CONTROL, border, 1.0, 1);
-    if focused {
-        canvas.rounded_border(rect.inset(-2), RADIUS_CONTROL + 2, theme.accent, 0.28, 2);
+    if focus_t > 0.001 {
+        canvas.rounded_border(
+            rect.inset(-2),
+            RADIUS_CONTROL + 2,
+            theme.accent,
+            0.28 * focus_t,
+            2,
+        );
     }
 
     let mut text_x = rect.x + 10;

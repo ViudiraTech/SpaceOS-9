@@ -1218,10 +1218,6 @@ impl Daemon {
                 return;
             }
         };
-        if let Err(error) = auth::validate_password(password, username, full_name) {
-            let _ = self.send_error(ErrorCode::FieldInvalid, error, 0);
-            return;
-        }
         let settings = SystemSettings {
             hostname,
             timezone,
