@@ -1,32 +1,39 @@
 /*
  *
  *       user/desktop/src/shell.rs
- *       SPUI 4.0 desktop shell: WM, wallpaper, shortcuts, full-width taskbar & start menu
+ *       SPUI 4.0 desktop shell: WM, backdrop, shortcuts, configurable panel & start menu
  *
  *       2026/10/30 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
  *
  */
 
-//! The shell acts as the X11 window manager and renders the desktop wallpaper,
-//! shortcut icons, right-click context menu, 46px full-width bottom taskbar,
-//! XShape-clipped Start Menu (with live search) and notification toasts.
+//! The shell acts as the X11 window manager and renders the desktop backdrop
+//! (cover / contain / stretch / solid), shortcut icons, right-click context
+//! menu, top- or bottom-docked panel, XShape-clipped Start Menu (with live
+//! search) and notification toasts, synchronized live with `uxconfd`.
 
 use crate::draw::{Canvas, Rect, Sprite};
 use crate::icons::{self, Icon};
-use crate::settings_store::SpuiSettings;
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, RADIUS_CONTROL, RADIUS_POPUP, TASKBAR_HEIGHT};
+use crate::theme::{Theme, RADIUS_CONTROL, RADIUS_POPUP};
 use crate::ui;
 use crate::x11::{CursorKind, Key, Result, X};
+use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use uxconf::client::{UxConfClient, UxConfWatch};
+use uxconf::{BackdropStyle, DesktopConfig, FocusMode, PanelPosition, WindowPlacement};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux,
     ConnectionExt, EventMask, PropMode, Window,
 };
 use x11rb::protocol::Event;
+
+extern "C" {
+    fn tzset();
+}
 
 const MENU_WIDTH: i32 = 360;
 const MENU_HEIGHT: i32 = 424;
@@ -53,21 +60,21 @@ const APPS: [AppEntry; 4] = [
     },
     AppEntry {
         name: "终端",
-        subtitle: "交互式 PTY 命令行会话",
+        subtitle: "交互式命令行会话",
         keywords: "term terminal shell sh bash console 终端 命令行",
         icon: Icon::Terminal,
         mode: "term",
     },
     AppEntry {
         name: "文本编辑器",
-        subtitle: "查看与编辑 UTF-8 文本",
+        subtitle: "查看与编辑文本文档",
         keywords: "edit editor text notepad kwrite 文本 编辑器",
         icon: Icon::Editor,
         mode: "edit",
     },
     AppEntry {
         name: "系统设置",
-        subtitle: "壁纸、主题外观、分辨率与硬件信息",
+        subtitle: "外观、桌面、输入设备与系统偏好",
         keywords: "settings display wallpaper theme 外观 壁纸 分辨率 设置",
         icon: Icon::Settings,
         mode: "settings",
@@ -107,7 +114,8 @@ struct Toast {
 pub struct Shell {
     x: X,
     text: TextRenderer,
-    settings: SpuiSettings,
+    config: DesktopConfig,
+    watch: Option<UxConfWatch>,
     theme: Theme,
     wallpaper_raw: Option<Sprite>,
     wallpaper_scaled: Vec<u32>,
@@ -133,12 +141,13 @@ pub struct Shell {
     windows: Vec<Managed>,
     active: Option<Window>,
     hover: Hit,
-    minute: u32,
+    clock_tick: (i32, i32, i32),
     last_launch: Option<(&'static str, Instant)>,
     running: bool,
 }
 
 fn now_local() -> (i32, i32, i32, i32, i32, i32, i32) {
+    // SAFETY: `localtime_r` writes into stack-owned zeroed `libc::tm` with no shared state.
     unsafe {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -157,12 +166,43 @@ fn now_local() -> (i32, i32, i32, i32, i32, i32, i32) {
     }
 }
 
-fn desktop_icon_rect(index: usize) -> Rect {
-    Rect::new(14, 14 + index as i32 * 88, 84, 82)
+fn apply_timezone(tz: &str) {
+    if tz.is_empty() || tz.contains("..") || tz.starts_with('/') {
+        return;
+    }
+    let zone_path = format!("/usr/share/zoneinfo/{tz}");
+    if Path::new(&zone_path).exists() {
+        let _ = fs::remove_file("/etc/localtime");
+        let _ = std::os::unix::fs::symlink(&zone_path, "/etc/localtime");
+    }
+    let posix_tz = uxconf::posix_tz_for_zone(tz);
+    let _ = fs::write("/etc/TZ", format!("{posix_tz}\n"));
+    std::env::set_var("TZ", &posix_tz);
+    // SAFETY: `tzset` refreshes libc's timezone state from `TZ` / `/etc/localtime` in this single-threaded process.
+    unsafe {
+        tzset();
+    }
 }
 
-fn pinned_rect(index: usize) -> Rect {
-    Rect::new(102 + index as i32 * 38, 5, 34, 36)
+fn apply_display_mode(mode_arg: &str) {
+    if !Path::new("/usr/bin/xrandr").exists() {
+        return;
+    }
+    let ok = Command::new("/usr/bin/xrandr")
+        .args(["--output", "Virtual-1", "--mode", mode_arg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        let _ = Command::new("/usr/bin/xrandr")
+            .args(["-s", mode_arg])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 fn menu_row_rect(index: usize) -> Rect {
@@ -188,7 +228,7 @@ fn infer_window_icon(title: &str) -> Icon {
         Icon::Editor
     } else if title.contains("设置") {
         Icon::Settings
-    } else if title.contains("登录") {
+    } else if title.contains("登录") || title.contains("账户") {
         Icon::Login
     } else {
         Icon::SpaceLogo
@@ -201,18 +241,27 @@ impl Shell {
         eprintln!("spui: shell start");
         // Map the CJK fonts before Xorg grabs DRM/VT; the kernel currently
         // deadlocks when a large file-backed mapping races Xorg startup.
-        let text = TextRenderer::load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let mut text =
+            TextRenderer::load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         eprintln!("spui: fonts mapped at {} ms", startup.elapsed().as_millis());
-        let _ = std::fs::write("/tmp/spui-loaded", b"1");
+        let _ = fs::write("/tmp/spui-loaded", b"1");
         let x = X::connect()?;
         eprintln!(
             "spui: X connected {}x{} depth={} shm={} shape={}",
             x.width, x.height, x.depth, x.has_shm, x.has_shape
         );
-        let settings = SpuiSettings::load();
-        let theme = Theme::from_settings(&settings);
+
+        let mut ux_client = UxConfClient::connect().ok();
+        let config = ux_client
+            .as_mut()
+            .map(UxConfClient::load_desktop_config)
+            .unwrap_or_default();
+        let watch = UxConfWatch::subscribe(None).ok();
+        let theme = Theme::from_config(&config);
+        text.set_ui_scale(theme.ui_scale());
+        apply_timezone(&config.timezone);
+
         x.set_cursor(x.root, CursorKind::Default)?;
-        x.publish_settings(&settings)?;
 
         let root_mask = EventMask::SUBSTRUCTURE_REDIRECT
             | EventMask::SUBSTRUCTURE_NOTIFY
@@ -244,7 +293,12 @@ impl Shell {
         x.map(desktop)?;
         x.lower(desktop)?;
 
-        let taskbar_y = i32::from(x.height) - TASKBAR_HEIGHT;
+        let panel_h = config.panel_size.clamp(34, 60);
+        let taskbar_y = if config.panel_position == PanelPosition::Top {
+            0
+        } else {
+            i32::from(x.height) - panel_h
+        };
         let taskbar = x.generate_id()?;
         x.create_window(
             taskbar,
@@ -252,7 +306,7 @@ impl Shell {
             0,
             taskbar_y as i16,
             x.width,
-            TASKBAR_HEIGHT as u16,
+            panel_h as u16,
             true,
             EventMask::EXPOSURE
                 | EventMask::BUTTON_PRESS
@@ -265,12 +319,17 @@ impl Shell {
         x.set_wm_type(taskbar, x.atoms.net_wm_type_dock)?;
         x.map(taskbar)?;
 
+        let menu_y = if config.panel_position == PanelPosition::Top {
+            panel_h + 6
+        } else {
+            (taskbar_y - MENU_HEIGHT - 6).max(8)
+        };
         let menu = x.generate_id()?;
         x.create_window(
             menu,
             x.root,
             6,
-            (taskbar_y - MENU_HEIGHT - 6).max(8) as i16,
+            menu_y as i16,
             MENU_WIDTH as u16,
             MENU_HEIGHT as u16,
             true,
@@ -304,12 +363,17 @@ impl Shell {
         x.set_wm_type(ctx_menu, x.atoms.net_wm_type_dialog)?;
         x.set_rounded_shape(ctx_menu, CTX_WIDTH as u16, CTX_HEIGHT as u16, RADIUS_POPUP)?;
 
+        let toast_y = if config.panel_position == PanelPosition::Top {
+            panel_h + 12
+        } else {
+            12
+        };
         let toast_window = x.generate_id()?;
         x.create_window(
             toast_window,
             x.root,
             (i32::from(x.width) - TOAST_WIDTH - 12) as i16,
-            12,
+            toast_y as i16,
             TOAST_WIDTH as u16,
             TOAST_HEIGHT as u16,
             true,
@@ -325,8 +389,7 @@ impl Shell {
         )?;
 
         let desktop_canvas = x.create_canvas(x.width as usize, x.height as usize, theme.bg_top);
-        let taskbar_canvas =
-            x.create_canvas(x.width as usize, TASKBAR_HEIGHT as usize, theme.panel);
+        let taskbar_canvas = x.create_canvas(x.width as usize, panel_h as usize, theme.panel);
         let menu_canvas = x.create_canvas(MENU_WIDTH as usize, MENU_HEIGHT as usize, theme.panel);
         let ctx_canvas = x.create_canvas(CTX_WIDTH as usize, CTX_HEIGHT as usize, theme.panel);
         let toast_canvas =
@@ -335,7 +398,8 @@ impl Shell {
         let mut shell = Self {
             x,
             text,
-            settings,
+            config,
+            watch,
             theme,
             wallpaper_raw: None,
             wallpaper_scaled: Vec::new(),
@@ -359,11 +423,12 @@ impl Shell {
             windows: Vec::new(),
             active: None,
             hover: Hit::None,
-            minute: u32::MAX,
+            clock_tick: (-1, -1, -1),
             last_launch: None,
             running: true,
         };
         shell.claim_wm()?;
+        shell.apply_x11_settings(None);
         shell.reload_wallpaper(true);
         shell.draw_desktop();
         shell.present_desktop()?;
@@ -377,15 +442,193 @@ impl Shell {
         shell.event_loop()
     }
 
-    fn reload_wallpaper(&mut self, force: bool) {
-        if force || self.wallpaper_file != self.settings.wallpaper {
-            self.wallpaper_file = self.settings.wallpaper.clone();
-            let path = self.settings.wallpaper_path();
+    fn panel_height(&self) -> i32 {
+        self.config.panel_size.clamp(34, 60)
+    }
+
+    fn taskbar_y(&self) -> i32 {
+        if self.config.panel_position == PanelPosition::Top {
+            0
+        } else {
+            i32::from(self.x.height) - self.panel_height()
+        }
+    }
+
+    fn menu_y(&self) -> i32 {
+        if self.config.panel_position == PanelPosition::Top {
+            self.panel_height() + 6
+        } else {
+            (self.taskbar_y() - MENU_HEIGHT - 6).max(8)
+        }
+    }
+
+    fn toast_y(&self) -> i32 {
+        if self.config.panel_position == PanelPosition::Top {
+            self.panel_height() + 12
+        } else {
+            12
+        }
+    }
+
+    fn tray_width(&self) -> i32 {
+        if self.config.clock_seconds || !self.config.clock_24h {
+            136
+        } else {
+            108
+        }
+    }
+
+    fn desktop_icon_rect(&self, index: usize) -> Rect {
+        let icon_sz = self.config.desktop_icon_size.clamp(32, 48);
+        let top_base = if self.config.panel_position == PanelPosition::Top {
+            self.panel_height() + 12
+        } else {
+            14
+        };
+        let cell_w = (icon_sz + 44).max(80);
+        let cell_h = icon_sz + 42;
+        Rect::new(14, top_base + index as i32 * (cell_h + 6), cell_w, cell_h)
+    }
+
+    fn start_button_rect(&self) -> Rect {
+        let ph = self.panel_height();
+        let bh = (ph - 10).clamp(28, 42);
+        Rect::new(6, (ph - bh) / 2, 86, bh)
+    }
+
+    fn pinned_rect(&self, index: usize) -> Rect {
+        let ph = self.panel_height();
+        let bh = (ph - 10).clamp(28, 42);
+        Rect::new(102 + index as i32 * 38, (ph - bh) / 2, 34, bh)
+    }
+
+    fn apply_x11_settings(&self, prev: Option<&DesktopConfig>) {
+        if prev.is_none_or(|p| p.mouse_left_handed != self.config.mouse_left_handed) {
+            self.x.apply_pointer_mapping(self.config.mouse_left_handed);
+        }
+        if prev.is_none_or(|p| p.mouse_speed != self.config.mouse_speed) {
+            self.x.apply_pointer_speed(self.config.mouse_speed);
+        }
+        if prev.is_none_or(|p| {
+            p.key_repeat_enabled != self.config.key_repeat_enabled
+                || p.key_repeat_delay_ms != self.config.key_repeat_delay_ms
+                || p.key_repeat_rate_hz != self.config.key_repeat_rate_hz
+        }) {
+            self.x.apply_keyboard_repeat(
+                self.config.key_repeat_enabled,
+                self.config.key_repeat_delay_ms,
+                self.config.key_repeat_rate_hz,
+            );
+        }
+        if prev.is_none_or(|p| p.display_blank_timeout_sec != self.config.display_blank_timeout_sec)
+        {
+            self.x
+                .apply_screensaver_timeout(self.config.display_blank_timeout_sec);
+        }
+        let current_mode = format!("{}x{}", self.x.width, self.x.height);
+        let res_changed = match prev {
+            Some(p) => p.display_resolution != self.config.display_resolution,
+            None => self.config.display_resolution != current_mode,
+        };
+        if res_changed {
+            apply_display_mode(&self.config.display_resolution);
+        }
+    }
+
+    fn apply_live_config_diff(&mut self, prev: DesktopConfig) -> Result<()> {
+        self.theme = Theme::from_config(&self.config);
+        self.text.set_ui_scale(self.theme.ui_scale());
+
+        if prev.timezone != self.config.timezone {
+            apply_timezone(&self.config.timezone);
+            self.clock_tick = (-1, -1, -1);
+        }
+
+        self.apply_x11_settings(Some(&prev));
+
+        let panel_geom_changed = prev.panel_position != self.config.panel_position
+            || prev.panel_size != self.config.panel_size;
+        if panel_geom_changed {
+            let ph = self.panel_height();
+            self.x.move_resize(
+                self.taskbar,
+                0,
+                self.taskbar_y() as i16,
+                self.x.width,
+                ph as u16,
+            )?;
+            self.x.move_resize(
+                self.menu,
+                6,
+                self.menu_y() as i16,
+                MENU_WIDTH as u16,
+                MENU_HEIGHT as u16,
+            )?;
+            self.x.move_resize(
+                self.toast_window,
+                (i32::from(self.x.width) - TOAST_WIDTH - 12) as i16,
+                self.toast_y() as i16,
+                TOAST_WIDTH as u16,
+                TOAST_HEIGHT as u16,
+            )?;
+            if self.taskbar_canvas.height != ph as usize {
+                self.x.release_canvas(&self.taskbar_canvas);
+                self.taskbar_canvas =
+                    self.x
+                        .create_canvas(self.x.width as usize, ph as usize, self.theme.panel);
+            }
+        }
+
+        let wp_file_changed = prev.wallpaper != self.config.wallpaper;
+        let backdrop_changed = wp_file_changed
+            || prev.backdrop_style != self.config.backdrop_style
+            || prev.solid_color != self.config.solid_color;
+        if backdrop_changed {
+            self.reload_wallpaper(wp_file_changed);
+        }
+
+        self.draw_desktop();
+        self.present_desktop()?;
+        self.draw_taskbar();
+        self.present_taskbar()?;
+        if self.menu_open {
+            self.draw_menu();
+            self.present_menu()?;
+        }
+        if self.ctx_open {
+            self.draw_ctx();
+            self.present_ctx()?;
+        }
+        if self.toast.is_some() {
+            self.draw_toast();
+            self.present_toast()?;
+        }
+        self.x.raise(self.taskbar)?;
+        Ok(())
+    }
+
+    fn reload_wallpaper(&mut self, force_decode: bool) {
+        if self.config.backdrop_style == BackdropStyle::Solid {
+            self.wallpaper_scaled.clear();
+            return;
+        }
+        if force_decode
+            || self.wallpaper_raw.is_none()
+            || self.wallpaper_file != self.config.wallpaper
+        {
+            self.wallpaper_file = self.config.wallpaper.clone();
+            let path = self.config.wallpaper_path();
             self.wallpaper_raw = icons::decode_jpeg(Path::new(&path));
         }
+        let w = self.x.width as usize;
+        let h = self.x.height as usize;
         if let Some(raw) = &self.wallpaper_raw {
-            self.wallpaper_scaled =
-                raw.scale_cover_opaque(self.x.width as usize, self.x.height as usize);
+            self.wallpaper_scaled = match self.config.backdrop_style {
+                BackdropStyle::Cover => raw.scale_cover_opaque(w, h),
+                BackdropStyle::Contain => raw.scale_contain_opaque(w, h, self.config.solid_color),
+                BackdropStyle::Stretch => raw.scale_stretch_opaque(w, h),
+                BackdropStyle::Solid => Vec::new(),
+            };
         } else {
             self.wallpaper_scaled.clear();
         }
@@ -437,23 +680,47 @@ impl Shell {
     }
 
     fn update_clock(&mut self) -> bool {
-        let (_, _, _, _, minute, _, _) = now_local();
-        if minute as u32 != self.minute {
-            self.minute = minute as u32;
+        let (_, _, _, hour, minute, sec, _) = now_local();
+        let stamp = (
+            hour,
+            minute,
+            if self.config.clock_seconds { sec } else { -1 },
+        );
+        if stamp != self.clock_tick {
+            self.clock_tick = stamp;
             true
         } else {
             false
         }
     }
 
+    fn poll_uxconf(&mut self) -> Result<()> {
+        let prev = self.config.clone();
+        let changed = self
+            .watch
+            .as_mut()
+            .is_some_and(|w| w.poll_into(&mut self.config).0);
+        if changed {
+            self.apply_live_config_diff(prev)?;
+        }
+        Ok(())
+    }
+
     fn event_loop(&mut self) -> Result<()> {
         while self.running {
+            self.poll_uxconf()?;
+
             let mut raw = Vec::new();
             while let Some(event) = self.x.poll()? {
                 raw.push(event);
             }
             if raw.is_empty() {
-                self.x.wait_readable(None, 250);
+                let ux_fd = self.watch.as_ref().map(UxConfWatch::as_raw_fd);
+                let timeout = if self.config.clock_seconds { 200 } else { 500 };
+                let (_, ux_ready, _) = self.x.wait_fds(ux_fd, None, timeout);
+                if ux_ready {
+                    self.poll_uxconf()?;
+                }
                 while let Some(event) = self.x.poll()? {
                     raw.push(event);
                 }
@@ -497,27 +764,22 @@ impl Shell {
         }
         self.x.width = new_w;
         self.x.height = new_h;
-        let taskbar_y = i32::from(new_h) - TASKBAR_HEIGHT;
+        let ph = self.panel_height();
 
         self.x.move_resize(self.desktop, 0, 0, new_w, new_h)?;
-        self.x.move_resize(
-            self.taskbar,
-            0,
-            taskbar_y as i16,
-            new_w,
-            TASKBAR_HEIGHT as u16,
-        )?;
+        self.x
+            .move_resize(self.taskbar, 0, self.taskbar_y() as i16, new_w, ph as u16)?;
         self.x.move_resize(
             self.menu,
             6,
-            (taskbar_y - MENU_HEIGHT - 6).max(8) as i16,
+            self.menu_y() as i16,
             MENU_WIDTH as u16,
             MENU_HEIGHT as u16,
         )?;
         self.x.move_resize(
             self.toast_window,
             (i32::from(new_w) - TOAST_WIDTH - 12) as i16,
-            12,
+            self.toast_y() as i16,
             TOAST_WIDTH as u16,
             TOAST_HEIGHT as u16,
         )?;
@@ -531,9 +793,9 @@ impl Shell {
         self.desktop_canvas =
             self.x
                 .create_canvas(new_w as usize, new_h as usize, self.theme.bg_top);
-        self.taskbar_canvas =
-            self.x
-                .create_canvas(new_w as usize, TASKBAR_HEIGHT as usize, self.theme.panel);
+        self.taskbar_canvas = self
+            .x
+            .create_canvas(new_w as usize, ph as usize, self.theme.panel);
 
         self.reload_wallpaper(false);
         self.draw_desktop();
@@ -603,8 +865,30 @@ impl Shell {
                         );
                     }
                 }
-                // No manual repaint: the server sends Expose for exactly the
-                // desktop area a move uncovers, and the moved window covers the rest.
+            }
+            Event::EnterNotify(e) => {
+                if self.config.wm_focus_mode == FocusMode::Sloppy
+                    && !self.menu_open
+                    && !self.ctx_open
+                    && self.active != Some(e.event)
+                    && self
+                        .windows
+                        .iter()
+                        .any(|w| w.window == e.event && !w.minimized)
+                {
+                    if self.config.wm_auto_raise {
+                        self.x.raise(e.event)?;
+                        self.x.raise(self.taskbar)?;
+                        if self.toast.is_some() {
+                            let _ = self.x.raise(self.toast_window);
+                        }
+                    }
+                    self.x.focus(e.event)?;
+                    self.active = Some(e.event);
+                    self.publish_active()?;
+                    self.draw_taskbar();
+                    self.present_taskbar()?;
+                }
             }
             Event::UnmapNotify(e) => {
                 let is_minimized = self
@@ -624,36 +908,10 @@ impl Shell {
                 }
             }
             Event::PropertyNotify(e) => {
-                if e.window == self.x.root && e.atom == self.x.atoms.spui_settings {
-                    if let Some(next) = self.x.read_settings() {
-                        let wp_changed = next.wallpaper != self.settings.wallpaper;
-                        self.settings = next;
-                        self.theme = Theme::from_settings(&self.settings);
-                        self.reload_wallpaper(wp_changed);
-                        self.draw_desktop();
-                        self.present_desktop()?;
-                        self.draw_taskbar();
-                        self.present_taskbar()?;
-                        if self.menu_open {
-                            self.draw_menu();
-                            self.present_menu()?;
-                        }
-                        if self.ctx_open {
-                            self.draw_ctx();
-                            self.present_ctx()?;
-                        }
-                        if self.toast.is_some() {
-                            self.draw_toast();
-                            self.present_toast()?;
-                        }
-                    }
-                } else if e.window == self.x.root && e.atom == self.x.atoms.net_active_window {
+                if e.window == self.x.root && e.atom == self.x.atoms.net_active_window {
                     let active = self.x.get_active_window();
                     if active != self.active {
                         self.active = active;
-                        // A client announced itself as active (title-bar click):
-                        // make the WM the single owner of raise + input focus so
-                        // keyboard focus, stacking and taskbar highlight agree.
                         let target = active.filter(|window| {
                             !self.menu_open
                                 && self
@@ -685,9 +943,6 @@ impl Shell {
                     }
                 }
             }
-            // Every Expose rectangle must be handled, not only the last of a
-            // batch: moving a window exposes an L-shaped region as several
-            // events and dropping the earlier ones leaves stale pixels.
             Event::Expose(e) => {
                 let area = Rect::new(
                     i32::from(e.x),
@@ -696,9 +951,6 @@ impl Shell {
                     i32::from(e.height),
                 );
                 if e.window == self.desktop {
-                    // The server repaints the desktop from its background
-                    // pixmap before sending Expose; only fall back to an
-                    // upload while that pixmap does not exist yet.
                     if self.desktop_bg == 0 {
                         self.desktop_canvas.mark_dirty(area);
                         self.present_desktop()?;
@@ -898,22 +1150,48 @@ impl Shell {
         let title = self.window_title(window);
         let icon = infer_window_icon(&title);
         let geometry = self.x.conn.get_geometry(window)?.reply()?;
-        // Listen for title changes on managed client window.
+        // Listen for title changes and pointer entry (for focus-follows-mouse) on managed client.
         let _ = self.x.conn.change_window_attributes(
             window,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            &ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::ENTER_WINDOW),
         );
 
-        let index = self.windows.len() as i32;
-        let usable_h = i32::from(self.x.height) - TASKBAR_HEIGHT;
-        let mut wx =
-            (i32::from(self.x.width) - i32::from(geometry.width)) / 2 - 24 + (index % 5) * 28;
-        let mut wy = (usable_h - i32::from(geometry.height)) / 2 - 16 + (index % 5) * 26;
+        let ph = self.panel_height();
+        let top_y = if self.config.panel_position == PanelPosition::Top {
+            ph
+        } else {
+            0
+        };
+        let usable_h = (i32::from(self.x.height) - ph).max(200);
+        let min_x = if self.config.desktop_icons_visible {
+            84
+        } else {
+            16
+        };
+
+        let (mut wx, mut wy) = match self.config.wm_placement {
+            WindowPlacement::Center => (
+                (i32::from(self.x.width) - i32::from(geometry.width)) / 2,
+                top_y + (usable_h - i32::from(geometry.height)) / 2,
+            ),
+            WindowPlacement::Cascade => {
+                let index = self.windows.len() as i32;
+                (
+                    (i32::from(self.x.width) - i32::from(geometry.width)) / 2 - 24
+                        + (index % 5) * 28,
+                    top_y + (usable_h - i32::from(geometry.height)) / 2 - 16 + (index % 5) * 26,
+                )
+            }
+        };
         wx = wx.clamp(
-            84,
+            min_x,
             (i32::from(self.x.width) - i32::from(geometry.width) - 12).max(12),
         );
-        wy = wy.clamp(12, (usable_h - i32::from(geometry.height) - 12).max(12));
+        wy = wy.clamp(
+            top_y + 10,
+            (top_y + usable_h - i32::from(geometry.height) - 10).max(top_y + 4),
+        );
 
         self.x.move_resize(
             window,
@@ -950,7 +1228,7 @@ impl Shell {
         };
         if managed.minimized {
             return Ok(());
-        }
+        };
         managed.minimized = true;
         self.x.unmap(window)?;
         if self.active == Some(window) {
@@ -1047,8 +1325,11 @@ impl Shell {
     }
 
     fn desktop_hit(&self, x: i32, y: i32) -> Hit {
+        if !self.config.desktop_icons_visible {
+            return Hit::None;
+        }
         for idx in 0..APPS.len() {
-            if desktop_icon_rect(idx).contains(x, y) {
+            if self.desktop_icon_rect(idx).contains(x, y) {
                 return Hit::DesktopIcon(idx);
             }
         }
@@ -1056,21 +1337,41 @@ impl Shell {
     }
 
     fn window_button_rect(&self, index: usize) -> Rect {
-        let start_x = 264;
-        let right_reserve = 176;
+        let ph = self.panel_height();
+        let bh = (ph - 12).clamp(26, 40);
+        let start_x = if self.config.panel_show_pinned {
+            264
+        } else {
+            106
+        };
+        let right_reserve = self.tray_width() + 56;
         let available = (i32::from(self.x.width) - start_x - right_reserve).max(120);
         let count = self.windows.len().clamp(1, 6) as i32;
-        let btn_w = ((available - (count - 1) * 4) / count).clamp(80, 156);
-        Rect::new(start_x + index as i32 * (btn_w + 4), 6, btn_w, 34)
+        let btn_w = ((available - (count - 1) * 4) / count).clamp(80, 160);
+        Rect::new(
+            start_x + index as i32 * (btn_w + 4),
+            (ph - bh) / 2,
+            btn_w,
+            bh,
+        )
+    }
+
+    fn bell_rect(&self) -> Rect {
+        let w = i32::from(self.x.width);
+        let ph = self.panel_height();
+        let bh = (ph - 12).clamp(26, 38);
+        Rect::new(w - self.tray_width() - 40, (ph - bh) / 2, 34, bh)
     }
 
     fn taskbar_hit(&self, x: i32, y: i32) -> Hit {
-        if Rect::new(6, 5, 86, 36).contains(x, y) {
+        if self.start_button_rect().contains(x, y) {
             return Hit::Start;
         }
-        for i in 0..APPS.len() {
-            if pinned_rect(i).contains(x, y) {
-                return Hit::Pinned(i);
+        if self.config.panel_show_pinned {
+            for i in 0..APPS.len() {
+                if self.pinned_rect(i).contains(x, y) {
+                    return Hit::Pinned(i);
+                }
             }
         }
         for index in 0..self.windows.len().min(6) {
@@ -1078,8 +1379,7 @@ impl Shell {
                 return Hit::Window(index);
             }
         }
-        let w = i32::from(self.x.width);
-        if Rect::new(w - 148, 6, 34, 34).contains(x, y) {
+        if self.bell_rect().contains(x, y) {
             return Hit::Bell;
         }
         Hit::None
@@ -1149,10 +1449,20 @@ impl Shell {
     }
 
     fn open_ctx(&mut self, root_x: i32, root_y: i32) -> Result<()> {
+        let ph = self.panel_height();
+        let min_y = if self.config.panel_position == PanelPosition::Top {
+            ph + 4
+        } else {
+            4
+        };
+        let max_y = if self.config.panel_position == PanelPosition::Top {
+            (i32::from(self.x.height) - CTX_HEIGHT - 4).max(min_y)
+        } else {
+            (i32::from(self.x.height) - ph - CTX_HEIGHT - 4).max(min_y)
+        };
         let max_x = (i32::from(self.x.width) - CTX_WIDTH - 4).max(4);
-        let max_y = (i32::from(self.x.height) - TASKBAR_HEIGHT - CTX_HEIGHT - 4).max(4);
         let cx = root_x.clamp(4, max_x) as i16;
-        let cy = root_y.clamp(4, max_y) as i16;
+        let cy = root_y.clamp(min_y, max_y) as i16;
         self.ctx_open = true;
         self.hover = Hit::None;
         self.x
@@ -1268,7 +1578,9 @@ impl Shell {
     fn draw_desktop(&mut self) {
         let w = self.desktop_canvas.width as i32;
         let h = self.desktop_canvas.height as i32;
-        if self.wallpaper_scaled.len() == (w * h) as usize {
+        if self.config.backdrop_style == BackdropStyle::Solid {
+            self.desktop_canvas.clear(self.config.solid_color);
+        } else if self.wallpaper_scaled.len() == (w * h) as usize {
             self.desktop_canvas.copy_background(&self.wallpaper_scaled);
         } else {
             self.desktop_canvas.vertical_gradient(
@@ -1278,9 +1590,13 @@ impl Shell {
             );
         }
 
-        // Top-left desktop shortcut icons with crisp translucent hover/selection frame.
+        if !self.config.desktop_icons_visible {
+            return;
+        }
+
+        let icon_sz = self.config.desktop_icon_size.clamp(32, 48) as u32;
         for (idx, app) in APPS.iter().enumerate() {
-            let cell = desktop_icon_rect(idx);
+            let cell = self.desktop_icon_rect(idx);
             let hovered = self.hover == Hit::DesktopIcon(idx);
             let selected = self.selected_desktop_icon == Some(idx);
             if selected || hovered {
@@ -1301,14 +1617,13 @@ impl Shell {
             icons::draw(
                 &mut self.desktop_canvas,
                 app.icon,
-                cell.x + (cell.w - 40) / 2,
+                cell.x + (cell.w - icon_sz as i32) / 2,
                 cell.y + 8,
-                40,
+                icon_sz,
                 None,
             );
             let cx = cell.x as f32 + cell.w as f32 * 0.5;
-            let by = (cell.y + 68) as f32;
-            // Subtle 1px drop shadow so icon labels remain legible over light sky wallpapers.
+            let by = (cell.y + icon_sz as i32 + 28) as f32;
             self.text.draw_centered(
                 &mut self.desktop_canvas,
                 app.name,
@@ -1332,15 +1647,25 @@ impl Shell {
 
     fn draw_taskbar(&mut self) {
         let w = self.taskbar_canvas.width as i32;
-        let h = TASKBAR_HEIGHT;
+        let h = self.panel_height();
+        let start = self.start_button_rect();
+        let show_pinned = self.config.panel_show_pinned;
+        let pinned_rects: [Rect; 4] = std::array::from_fn(|i| self.pinned_rect(i));
         let win_count = self.windows.len().min(6);
         let win_rects: Vec<Rect> = (0..win_count).map(|i| self.window_button_rect(i)).collect();
+        let bell = self.bell_rect();
+        let tray_w = self.tray_width();
+        let border_y = if self.config.panel_position == PanelPosition::Top {
+            h - 1
+        } else {
+            0
+        };
+
         let canvas = &mut self.taskbar_canvas;
         canvas.fill(Rect::new(0, 0, w, h), self.theme.panel);
-        canvas.fill(Rect::new(0, 0, w, 1), self.theme.panel_border);
+        canvas.fill(Rect::new(0, border_y, w, 1), self.theme.panel_border);
 
         // Start button using official SpaceOS9.png logo.
-        let start = Rect::new(6, 5, 86, 36);
         let start_active = self.menu_open || self.hover == Hit::Start;
         if start_active {
             canvas.rounded_rect(
@@ -1365,29 +1690,46 @@ impl Shell {
                 1,
             );
         }
-        icons::draw(canvas, Icon::SpaceLogo, start.x + 9, start.y + 7, 22, None);
+        icons::draw(
+            canvas,
+            Icon::SpaceLogo,
+            start.x + 9,
+            start.y + (start.h - 22) / 2,
+            22,
+            None,
+        );
         self.text.draw(
             canvas,
             "开始",
             (start.x + 38) as f32,
-            (start.y + 23) as f32,
+            start.y as f32 + start.h as f32 * 0.5 + 4.8,
             13.0,
             self.theme.text,
             Face::Bold,
         );
 
-        canvas.fill(Rect::new(97, 11, 1, 24), self.theme.panel_border);
+        let sep_h = (h - 20).clamp(16, 26);
+        let sep_y = (h - sep_h) / 2;
+        canvas.fill(Rect::new(97, sep_y, 1, sep_h), self.theme.panel_border);
 
-        // Quick-launch pinned icons.
-        for (i, app) in APPS.iter().enumerate() {
-            let rect = pinned_rect(i);
-            if self.hover == Hit::Pinned(i) {
-                canvas.rounded_rect(rect, RADIUS_CONTROL, self.theme.panel_hover, 1.0);
+        // Quick-launch pinned icons (optional).
+        if show_pinned {
+            for (i, app) in APPS.iter().enumerate() {
+                let rect = pinned_rects[i];
+                if self.hover == Hit::Pinned(i) {
+                    canvas.rounded_rect(rect, RADIUS_CONTROL, self.theme.panel_hover, 1.0);
+                }
+                icons::draw(
+                    canvas,
+                    app.icon,
+                    rect.x + 6,
+                    rect.y + (rect.h - 22) / 2,
+                    22,
+                    None,
+                );
             }
-            icons::draw(canvas, app.icon, rect.x + 6, rect.y + 7, 22, None);
+            canvas.fill(Rect::new(257, sep_y, 1, sep_h), self.theme.panel_border);
         }
-
-        canvas.fill(Rect::new(257, 11, 1, 24), self.theme.panel_border);
 
         // Running window buttons.
         for (index, &rect) in win_rects.iter().enumerate() {
@@ -1420,7 +1762,14 @@ impl Shell {
                     1.0,
                 );
             }
-            icons::draw(canvas, managed.icon, rect.x + 9, rect.y + 9, 16, None);
+            icons::draw(
+                canvas,
+                managed.icon,
+                rect.x + 9,
+                rect.y + (rect.h - 16) / 2,
+                16,
+                None,
+            );
             let max_w = (rect.w - 36).max(24) as f32;
             let label = self.text.truncate(&managed.title, max_w, 12.0, Face::Ui);
             let fg = if is_active {
@@ -1434,15 +1783,14 @@ impl Shell {
                 canvas,
                 &label,
                 (rect.x + 30) as f32,
-                (rect.y + 22) as f32,
+                rect.y as f32 + rect.h as f32 * 0.5 + 4.5,
                 12.0,
                 fg,
                 Face::Ui,
             );
         }
 
-        // Right tray: notification bell & two-line clock.
-        let bell = Rect::new(w - 148, 6, 34, 34);
+        // Right tray: notification bell & configurable clock.
         if self.hover == Hit::Bell {
             canvas.rounded_rect(bell, RADIUS_CONTROL, self.theme.panel_hover, 1.0);
         }
@@ -1453,8 +1801,8 @@ impl Shell {
             } else {
                 Icon::Bell
             },
-            bell.x + 9,
-            bell.y + 9,
+            bell.x + (bell.w - 16) / 2,
+            bell.y + (bell.h - 16) / 2,
             16,
             Some(if self.toast.is_some() {
                 self.theme.accent
@@ -1462,31 +1810,67 @@ impl Shell {
                 self.theme.text_dim
             }),
         );
-        canvas.fill(Rect::new(w - 108, 11, 1, 24), self.theme.panel_border);
+        canvas.fill(
+            Rect::new(w - tray_w, sep_y, 1, sep_h),
+            self.theme.panel_border,
+        );
 
-        let (year, month, day, hour, minute, _, weekday) = now_local();
-        let weeks = ["日", "一", "二", "三", "四", "五", "六"];
-        self.text.draw_right(
-            canvas,
-            &format!("{hour:02}:{minute:02}"),
-            (w - 14) as f32,
-            21.0,
-            13.0,
-            self.theme.text,
-            Face::Bold,
-        );
-        self.text.draw_right(
-            canvas,
-            &format!(
-                "{year}/{month:02}/{day:02} 周{}",
-                weeks[(weekday.max(0) as usize).min(6)]
-            ),
-            (w - 14) as f32,
-            36.0,
-            10.0,
-            self.theme.text_muted,
-            Face::Ui,
-        );
+        let (year, month, day, hour, minute, sec, weekday) = now_local();
+        let time_str = if self.config.clock_24h {
+            if self.config.clock_seconds {
+                format!("{hour:02}:{minute:02}:{sec:02}")
+            } else {
+                format!("{hour:02}:{minute:02}")
+            }
+        } else {
+            let period = if hour < 12 { "上午" } else { "下午" };
+            let h12 = match hour % 12 {
+                0 => 12,
+                v => v,
+            };
+            if self.config.clock_seconds {
+                format!("{period} {h12}:{minute:02}:{sec:02}")
+            } else {
+                format!("{period} {h12}:{minute:02}")
+            }
+        };
+
+        let right_x = (w - 14) as f32;
+        if self.config.clock_show_date {
+            let weeks = ["日", "一", "二", "三", "四", "五", "六"];
+            let mid = h as f32 * 0.5;
+            self.text.draw_right(
+                canvas,
+                &time_str,
+                right_x,
+                mid - 2.0,
+                12.5,
+                self.theme.text,
+                Face::Bold,
+            );
+            self.text.draw_right(
+                canvas,
+                &format!(
+                    "{year}/{month:02}/{day:02} 周{}",
+                    weeks[(weekday.max(0) as usize).min(6)]
+                ),
+                right_x,
+                mid + 13.0,
+                10.0,
+                self.theme.text_muted,
+                Face::Ui,
+            );
+        } else {
+            self.text.draw_right(
+                canvas,
+                &time_str,
+                right_x,
+                h as f32 * 0.5 + 4.8,
+                13.0,
+                self.theme.text,
+                Face::Bold,
+            );
+        }
     }
 
     fn draw_menu(&mut self) {
@@ -1496,7 +1880,6 @@ impl Shell {
         canvas.clear(self.theme.panel);
         ui::popup_surface(canvas, &self.theme, Rect::new(0, 0, w, h), RADIUS_POPUP);
 
-        // Interactive search input at the top.
         ui::text_input(
             canvas,
             &mut self.text,
@@ -1590,7 +1973,7 @@ impl Shell {
             ("在此打开终端", Icon::Terminal),
             ("打开文件管理器", Icon::Files),
             ("刷新桌面", Icon::Refresh),
-            ("外观与壁纸设置", Icon::Wallpaper),
+            ("桌面与外观设置", Icon::Settings),
         ];
         canvas.fill(
             Rect::new(10, 104, CTX_WIDTH - 20, 1),
@@ -1684,8 +2067,6 @@ impl Shell {
         };
         self.x
             .put_canvas(self.desktop_bg, &self.desktop_canvas, upload)?;
-        // Re-set the attribute so the server picks up the updated pixmap, then
-        // repaint just the changed rectangle from it (a server-side copy).
         self.x.conn.change_window_attributes(
             self.desktop,
             &ChangeWindowAttributesAux::new().background_pixmap(self.desktop_bg),

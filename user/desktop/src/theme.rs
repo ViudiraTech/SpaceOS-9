@@ -13,9 +13,10 @@
 //! neon tint) paired with a clean light mode and restrained native metrics.
 
 use crate::draw::mix;
-use crate::settings_store::{SpuiSettings, ThemeMode};
+use uxconf::{DesktopConfig, ThemeMode};
 
 pub const TITLEBAR_HEIGHT: i32 = 34;
+#[allow(dead_code)]
 pub const TASKBAR_HEIGHT: i32 = 46;
 #[allow(dead_code)]
 pub const RADIUS_WINDOW: i32 = 6;
@@ -26,6 +27,7 @@ pub const RADIUS_CONTROL: i32 = 5;
 pub struct Theme {
     pub mode: ThemeMode,
     pub accent: u32,
+    pub font_scale: i32,
     pub accent_soft: u32,
     pub bg_top: u32,
     pub bg_bottom: u32,
@@ -52,11 +54,17 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn from_settings(settings: &SpuiSettings) -> Self {
-        match settings.mode {
-            ThemeMode::Dark => Self::dark_with_accent(settings.accent),
-            ThemeMode::Light => Self::light_with_accent(settings.accent),
-        }
+    pub fn from_config(config: &DesktopConfig) -> Self {
+        let mut theme = match config.mode {
+            ThemeMode::Dark => Self::dark_with_accent(config.accent),
+            ThemeMode::Light => Self::light_with_accent(config.accent),
+        };
+        theme.font_scale = config.font_scale;
+        theme
+    }
+
+    pub fn ui_scale(&self) -> f32 {
+        (self.font_scale.clamp(85, 125) as f32) / 100.0
     }
 
     #[allow(dead_code)]
@@ -69,6 +77,7 @@ impl Theme {
         Self {
             mode: ThemeMode::Dark,
             accent,
+            font_scale: 100,
             accent_soft: mix(base_panel, accent, 0.24),
             bg_top: 0x18181b,
             bg_bottom: 0x202024,
@@ -100,6 +109,7 @@ impl Theme {
         Self {
             mode: ThemeMode::Light,
             accent,
+            font_scale: 100,
             accent_soft: mix(base_panel, accent, 0.16),
             bg_top: 0xe4e4e7,
             bg_bottom: 0xd4d4d8,

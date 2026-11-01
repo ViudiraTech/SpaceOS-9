@@ -1,0 +1,8 @@
+[Unit]
+Description=SpaceOS configuration daemon (uxconfd)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/uxconfd
+Restart=always
+RestartSec=1

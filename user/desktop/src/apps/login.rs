@@ -89,7 +89,7 @@ pub fn run() -> Result<()> {
             let w = app.width as i32;
             match event {
                 UiEvent::Close => app.request_close(),
-                UiEvent::Expose | UiEvent::Configure { .. } | UiEvent::ThemeChanged => {
+                UiEvent::Expose | UiEvent::Configure { .. } | UiEvent::ConfigChanged => {
                     app.needs_redraw = true;
                 }
                 UiEvent::Motion { x, y, .. } => {

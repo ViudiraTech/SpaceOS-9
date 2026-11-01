@@ -1,8 +1,8 @@
 #
 #       user/desktop/Cargo.toml
-#       SPUI 4.0 desktop environment package and dependencies
+#       SPUI 4.0 desktop environment and uxconf configuration subsystem
 #
-#       2026/10/30 By JiTianYu391
+#       2026/11/01 By JiTianYu391
 #       Copyright (C) 2026 ViudiraTech.
 #
 
@@ -10,8 +10,25 @@
 name = "spui"
 version = "4.0.0"
 edition = "2021"
-description = "SpaceOS-9 SPUI desktop environment"
+default-run = "spui"
+description = "SpaceOS-9 SPUI desktop environment and uxconfd daemon"
 license = "LicenseRef-Proprietary"
+
+[lib]
+name = "uxconf"
+path = "src/uxconf/mod.rs"
+
+[[bin]]
+name = "spui"
+path = "src/main.rs"
+
+[[bin]]
+name = "uxconfd"
+path = "src/bin/uxconfd.rs"
+
+[[bin]]
+name = "uxconf-query"
+path = "src/bin/uxconf_query.rs"
 
 [dependencies]
 x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "render", "shape", "randr"] }

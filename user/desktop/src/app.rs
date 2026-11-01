@@ -1,7 +1,7 @@
 /*
  *
  *       user/desktop/src/app.rs
- *       Application window lifecycle, 8-edge resize, SHM present and live theme sync
+ *       Application window lifecycle, 8-edge resize, SHM present and uxconfd live sync
  *
  *       2026/10/30 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
@@ -10,17 +10,20 @@
 
 //! Every SPUI application owns one top-level window with 34px client-side
 //! decorations. `App` manages `MIT-SHM` canvas resizing, Minimize / Maximize /
-//! Close buttons, titlebar double-click maximize, 4-edge + 4-corner resizing
-//! with Breeze resize cursors, and live `_SPUI_SETTINGS` theme updates.
+//! Close buttons (left- or right-aligned), configurable titlebar double-click
+//! action, 4-edge + 4-corner resizing with Breeze resize cursors, and live
+//! `uxconfd` configuration subscriptions.
 
 use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
-use crate::settings_store::SpuiSettings;
 use crate::text::TextRenderer;
-use crate::theme::{Theme, TASKBAR_HEIGHT, TITLEBAR_HEIGHT};
+use crate::theme::{Theme, TITLEBAR_HEIGHT};
 use crate::ui::{self, CaptionHit};
 use crate::x11::{CursorKind, Key, Result, X};
 use std::time::{Duration, Instant};
+use uxconf::client::{UxConfClient, UxConfWatch};
+use uxconf::schema::channel_defaults;
+use uxconf::{ButtonLayout, DesktopConfig, DoubleClickAction, PanelPosition, Value};
 use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt, EventMask, Window};
 use x11rb::protocol::Event;
 
@@ -94,7 +97,7 @@ pub enum UiEvent {
         y: i32,
         state: u16,
     },
-    ThemeChanged,
+    ConfigChanged,
     Close,
 }
 
@@ -112,7 +115,9 @@ pub struct App {
     /// never receive a redraw storm just because a window moved above them.
     backing: u32,
     pub text: TextRenderer,
-    pub settings: SpuiSettings,
+    pub config: DesktopConfig,
+    pub uxconf: Option<UxConfClient>,
+    watch: Option<UxConfWatch>,
     pub theme: Theme,
     pub title: String,
     pub active: bool,
@@ -131,10 +136,15 @@ pub struct App {
 impl App {
     pub fn new(title: &str, icon: Icon, width: u16, height: u16) -> Result<Self> {
         let x = X::connect()?;
-        let settings = x.read_settings().unwrap_or_else(SpuiSettings::load);
-        let theme = Theme::from_settings(&settings);
+        let mut uxconf = UxConfClient::connect().ok();
+        let config = uxconf
+            .as_mut()
+            .map(UxConfClient::load_desktop_config)
+            .unwrap_or_default();
+        let watch = UxConfWatch::subscribe(None).ok();
+        let theme = Theme::from_config(&config);
 
-        // Listen for `_SPUI_SETTINGS` and `_NET_ACTIVE_WINDOW` changes on the root window.
+        // Listen for `_NET_ACTIVE_WINDOW` changes on the root window.
         let _ = x.conn.change_window_attributes(
             x.root,
             &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
@@ -159,7 +169,9 @@ impl App {
         x.map(win)?;
         x.flush()?;
 
-        let text = TextRenderer::load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let mut text =
+            TextRenderer::load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        text.set_ui_scale(theme.ui_scale());
         let canvas = x.create_canvas(width as usize, height as usize, theme.window);
         // Keep a server-side copy so Xorg can repaint exposed areas itself
         // while another window is dragged across this one.
@@ -178,7 +190,9 @@ impl App {
             canvas,
             backing,
             text,
-            settings,
+            config,
+            uxconf,
+            watch,
             theme,
             title: title.to_string(),
             active: true,
@@ -193,6 +207,67 @@ impl App {
             content_cursor: CursorKind::Default,
             last_title_click: None,
         })
+    }
+
+    pub fn buttons_left(&self) -> bool {
+        self.config.wm_button_layout == ButtonLayout::Left
+    }
+
+    /// Write `(channel, property, value)` to `uxconfd` and apply immediately in-process.
+    pub fn set_config_property(&mut self, channel: &str, property: &str, value: Value) {
+        if self.uxconf.is_none() {
+            self.uxconf = UxConfClient::connect().ok();
+        }
+        if let Some(client) = self.uxconf.as_mut() {
+            let _ = client.set(channel, property, value.clone());
+        }
+        if self.config.apply_property(channel, property, &value) {
+            self.sync_config_visuals();
+        }
+    }
+
+    /// Reset an entire `channel` back to its schema defaults in `uxconfd`.
+    pub fn reset_config_channel(&mut self, channel: &str) {
+        if self.uxconf.is_none() {
+            self.uxconf = UxConfClient::connect().ok();
+        }
+        if let Some(client) = self.uxconf.as_mut() {
+            let _ = client.reset(channel, "/", true);
+            if let Ok(entries) = client.get_all(channel, "/") {
+                for (prop, val) in entries {
+                    self.config.apply_property(channel, &prop, &val);
+                }
+                self.sync_config_visuals();
+                return;
+            }
+        }
+        for (prop, val) in channel_defaults(channel) {
+            self.config.apply_property(channel, prop, &val);
+        }
+        self.sync_config_visuals();
+    }
+
+    fn sync_config_visuals(&mut self) {
+        self.theme = Theme::from_config(&self.config);
+        self.text.set_ui_scale(self.theme.ui_scale());
+        if self.maximized {
+            if let Ok(cookie) = self.x.conn.get_geometry(self.x.root) {
+                if let Ok(root_geom) = cookie.reply() {
+                    let panel_h = self.config.panel_size.clamp(34, 60) as u16;
+                    let max_y = if self.config.panel_position == PanelPosition::Top {
+                        panel_h as i16
+                    } else {
+                        0
+                    };
+                    let max_h = root_geom.height.saturating_sub(panel_h).max(200);
+                    let _ = self
+                        .x
+                        .move_resize(self.win, 0, max_y, root_geom.width, max_h);
+                    let _ = self.x.flush();
+                }
+            }
+        }
+        self.needs_redraw = true;
     }
 
     pub fn content(&self) -> Rect {
@@ -259,11 +334,15 @@ impl App {
             let root_geom = self.x.conn.get_geometry(self.x.root)?.reply()?;
             self.saved_geom = Some((geom.x, geom.y, self.width, self.height));
             self.maximized = true;
-            let max_h = root_geom
-                .height
-                .saturating_sub(TASKBAR_HEIGHT as u16)
-                .max(200);
-            self.x.move_resize(self.win, 0, 0, root_geom.width, max_h)?;
+            let panel_h = self.config.panel_size.clamp(34, 60) as u16;
+            let max_y = if self.config.panel_position == PanelPosition::Top {
+                panel_h as i16
+            } else {
+                0
+            };
+            let max_h = root_geom.height.saturating_sub(panel_h).max(200);
+            self.x
+                .move_resize(self.win, 0, max_y, root_geom.width, max_h)?;
         }
         self.needs_redraw = true;
         self.x.flush()?;
@@ -275,7 +354,7 @@ impl App {
         Ok(events)
     }
 
-    /// Block via `poll(2)` up to `timeout_ms` for X11 or `extra_fd` activity,
+    /// Block via `poll(2)` up to `timeout_ms` for X11, `uxconfd`, or `extra_fd` activity,
     /// coalescing burst pointer motion events so redraws never fall behind input.
     pub fn pump_with_fd(
         &mut self,
@@ -286,16 +365,42 @@ impl App {
         while let Some(ev) = self.x.poll()? {
             raw.push(ev);
         }
+
+        let mut cfg_changed = false;
+        if let Some(watch) = self.watch.as_mut() {
+            let (changed, _) = watch.poll_into(&mut self.config);
+            if changed {
+                cfg_changed = true;
+            }
+        }
+
+        let ux_fd = self.watch.as_ref().map(UxConfWatch::as_raw_fd);
         let mut extra_ready = false;
-        if raw.is_empty() {
-            let (_, ext) = self.x.wait_readable(extra_fd, timeout_ms);
+        if raw.is_empty() && !cfg_changed {
+            let (_, ux_ready, ext) = self.x.wait_fds(ux_fd, extra_fd, timeout_ms);
             extra_ready = ext;
+            if ux_ready {
+                if let Some(watch) = self.watch.as_mut() {
+                    let (changed, _) = watch.poll_into(&mut self.config);
+                    if changed {
+                        cfg_changed = true;
+                    }
+                }
+            }
             while let Some(ev) = self.x.poll()? {
                 raw.push(ev);
             }
-        } else if let Some(fd) = extra_fd {
-            let (_, ext) = self.x.wait_readable(Some(fd), 0);
+        } else if extra_fd.is_some() || ux_fd.is_some() {
+            let (_, ux_ready, ext) = self.x.wait_fds(ux_fd, extra_fd, 0);
             extra_ready = ext;
+            if ux_ready {
+                if let Some(watch) = self.watch.as_mut() {
+                    let (changed, _) = watch.poll_into(&mut self.config);
+                    if changed {
+                        cfg_changed = true;
+                    }
+                }
+            }
         }
 
         // Coalesce consecutive MotionNotify events on our window.
@@ -311,6 +416,10 @@ impl App {
         }
 
         let mut events = Vec::new();
+        if cfg_changed {
+            self.sync_config_visuals();
+            events.push(UiEvent::ConfigChanged);
+        }
         for ev in coalesced {
             self.translate(ev, &mut events)?;
         }
@@ -388,16 +497,7 @@ impl App {
                 }
             }
             Event::PropertyNotify(e) if e.window == self.x.root => {
-                if e.atom == self.x.atoms.spui_settings {
-                    if let Some(new_settings) = self.x.read_settings() {
-                        if new_settings != self.settings {
-                            self.settings = new_settings;
-                            self.theme = Theme::from_settings(&self.settings);
-                            self.needs_redraw = true;
-                            events.push(UiEvent::ThemeChanged);
-                        }
-                    }
-                } else if e.atom == self.x.atoms.net_active_window {
+                if e.atom == self.x.atoms.net_active_window {
                     let is_active = self.x.get_active_window() == Some(self.win);
                     if is_active != self.active {
                         self.active = is_active;
@@ -415,12 +515,15 @@ impl App {
             }
             Event::ButtonPress(e) if e.event == self.win => {
                 let (x, y) = (e.event_x as i32, e.event_y as i32);
-                // Mouse wheel events (buttons 4 / 5).
-                if e.detail == 4 {
-                    events.push(UiEvent::Wheel { x, y, delta: -3 });
-                    return Ok(());
-                } else if e.detail == 5 {
-                    events.push(UiEvent::Wheel { x, y, delta: 3 });
+                // Mouse wheel events (buttons 4 / 5), respecting natural scroll preference.
+                if e.detail == 4 || e.detail == 5 {
+                    let raw_delta = if e.detail == 4 { -3 } else { 3 };
+                    let delta = if self.config.mouse_natural_scroll {
+                        -raw_delta
+                    } else {
+                        raw_delta
+                    };
+                    events.push(UiEvent::Wheel { x, y, delta });
                     return Ok(());
                 }
 
@@ -428,7 +531,7 @@ impl App {
                 let _ = self.x.set_active_window(self.win);
 
                 if e.detail == 1 {
-                    let cap = ui::hit_caption(self.width as i32, x, y);
+                    let cap = ui::hit_caption(self.width as i32, x, y, self.buttons_left());
                     if cap != CaptionHit::None {
                         match cap {
                             CaptionHit::Close => events.push(UiEvent::Close),
@@ -459,19 +562,36 @@ impl App {
                     }
                     if y < TITLEBAR_HEIGHT {
                         let now = Instant::now();
-                        if self.last_title_click.is_some_and(|prev| {
-                            now.duration_since(prev) <= Duration::from_millis(380)
-                        }) {
+                        let dc_limit = Duration::from_millis(self.config.mouse_double_click_ms);
+                        if self.config.wm_double_click != DoubleClickAction::None
+                            && self
+                                .last_title_click
+                                .is_some_and(|prev| now.duration_since(prev) <= dc_limit)
+                        {
                             self.last_title_click = None;
-                            self.toggle_maximize()?;
+                            match self.config.wm_double_click {
+                                DoubleClickAction::Maximize => {
+                                    self.toggle_maximize()?;
+                                }
+                                DoubleClickAction::Minimize => {
+                                    let _ = self.x.send_window_cmd(self.win, 1);
+                                    let _ = self.x.flush();
+                                }
+                                DoubleClickAction::None => {}
+                            }
                             return Ok(());
                         }
                         self.last_title_click = Some(now);
                         if !self.maximized {
                             let geom = self.x.conn.get_geometry(self.win)?.reply()?;
+                            let min_y = if self.config.panel_position == PanelPosition::Top {
+                                self.config.panel_size.clamp(34, 60) as i16
+                            } else {
+                                0
+                            };
                             self.drag = Some(DragState::Move {
                                 orig_x: geom.x,
-                                orig_y: geom.y,
+                                orig_y: geom.y.max(min_y),
                                 press_rx: e.root_x,
                                 press_ry: e.root_y,
                             });
@@ -505,6 +625,11 @@ impl App {
                 let btn1_held = u16::from(e.state) & (1 << 8) != 0;
                 if let Some(drag) = self.drag {
                     if btn1_held {
+                        let min_y = if self.config.panel_position == PanelPosition::Top {
+                            self.config.panel_size.clamp(34, 60)
+                        } else {
+                            0
+                        };
                         match drag {
                             DragState::Move {
                                 orig_x,
@@ -515,7 +640,7 @@ impl App {
                                 let nx = orig_x.saturating_add(e.root_x.saturating_sub(press_rx));
                                 let ny = orig_y
                                     .saturating_add(e.root_y.saturating_sub(press_ry))
-                                    .max(0);
+                                    .max(min_y as i16);
                                 self.x.move_window(self.win, nx, ny)?;
                                 self.x.flush()?;
                             }
@@ -543,7 +668,7 @@ impl App {
                                     }
                                     ResizeDir::Top => {
                                         nh = (orig_h - dy).max(min_h);
-                                        ny = (orig_y + (orig_h - nh)).max(0);
+                                        ny = (orig_y + (orig_h - nh)).max(min_y);
                                     }
                                     ResizeDir::BottomRight => {
                                         nw = (orig_w + dx).max(min_w);
@@ -557,13 +682,13 @@ impl App {
                                     ResizeDir::TopRight => {
                                         nw = (orig_w + dx).max(min_w);
                                         nh = (orig_h - dy).max(min_h);
-                                        ny = (orig_y + (orig_h - nh)).max(0);
+                                        ny = (orig_y + (orig_h - nh)).max(min_y);
                                     }
                                     ResizeDir::TopLeft => {
                                         nw = (orig_w - dx).max(min_w);
                                         nx = orig_x + (orig_w - nw);
                                         nh = (orig_h - dy).max(min_h);
-                                        ny = (orig_y + (orig_h - nh)).max(0);
+                                        ny = (orig_y + (orig_h - nh)).max(min_y);
                                     }
                                 }
                                 self.x.move_resize(
@@ -578,7 +703,7 @@ impl App {
                     }
                 }
 
-                let cap = ui::hit_caption(self.width as i32, x, y);
+                let cap = ui::hit_caption(self.width as i32, x, y, self.buttons_left());
                 if cap != self.caption_hover {
                     self.caption_hover = cap;
                     self.needs_redraw = true;
@@ -618,6 +743,7 @@ impl App {
     }
 
     pub fn draw_chrome(&mut self) {
+        let buttons_left = self.buttons_left();
         ui::titlebar(
             &mut self.canvas,
             &mut self.text,
@@ -627,6 +753,7 @@ impl App {
             &self.title,
             self.active,
             self.maximized,
+            buttons_left,
             self.caption_hover,
         );
         ui::window_border(&mut self.canvas, &self.theme, self.active, self.maximized);

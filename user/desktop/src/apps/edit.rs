@@ -1,16 +1,16 @@
 /*
  *
  *       user/desktop/src/apps/edit.rs
- *       SPUI 4.0 UTF-8 text editor with 2D cursor, scrolling and Save toolbar
+ *       SPUI 4.0 UTF-8 text editor with 2D cursor, scrolling and live uxconfd preferences
  *
  *       2026/10/30 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
  *
  */
 
-//! Clean native UTF-8 text editor with monospace line-number gutter, uniform
-//! body text color, 2D keyboard & mouse cursor positioning, wheel scrolling
-//! and toolbar / `Ctrl+S` saving.
+//! Clean native UTF-8 text editor with toggleable monospace line-number gutter,
+//! configurable font size, active-line highlight and tab width, 2D keyboard &
+//! mouse cursor positioning, wheel scrolling and toolbar / `Ctrl+S` saving.
 
 use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect};
@@ -21,15 +21,44 @@ use crate::ui;
 use crate::x11::{CursorKind, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use uxconf::DesktopConfig;
 
 const TOOLBAR_H: i32 = 38;
 const STATUS_H: i32 = 25;
-const GUTTER_W: i32 = 52;
-const LINE_H: i32 = 21;
-const FONT_PX: f32 = 13.5;
+const DEFAULT_GUTTER_W: i32 = 52;
 const TEXT_PAD_X: i32 = 12;
 const TEXT_PAD_Y: i32 = 6;
 const SCROLLBAR_W: i32 = 8;
+
+#[derive(Clone, Copy)]
+struct EditorPrefs {
+    font_px: f32,
+    line_h: i32,
+    baseline_off: f32,
+    gutter_w: i32,
+    highlight_active: bool,
+    tab_width: usize,
+}
+
+impl EditorPrefs {
+    fn from_config(cfg: &DesktopConfig) -> Self {
+        let font_px = (cfg.editor_font_size.clamp(11, 20) as f32) - 0.5;
+        let line_h = ((font_px * 1.55).round() as i32).max(17);
+        let baseline_off = (line_h as f32 * 0.72).round();
+        Self {
+            font_px,
+            line_h,
+            baseline_off,
+            gutter_w: if cfg.editor_show_line_numbers {
+                DEFAULT_GUTTER_W
+            } else {
+                0
+            },
+            highlight_active: cfg.editor_highlight_active_line,
+            tab_width: cfg.editor_tab_width.clamp(2, 8),
+        }
+    }
+}
 
 struct Editor {
     path: PathBuf,
@@ -44,10 +73,11 @@ struct Editor {
 }
 
 impl Editor {
-    fn open(path: PathBuf) -> Self {
+    fn open(path: PathBuf, tab_width: usize) -> Self {
+        let tab_spaces = " ".repeat(tab_width.clamp(2, 8));
         let (raw, status) = match fs::read_to_string(&path) {
             Ok(data) => {
-                let normalized = data.replace("\r\n", "\n").replace('\t', "    ");
+                let normalized = data.replace("\r\n", "\n").replace('\t', &tab_spaces);
                 let msg = format!("已打开 {}", path.display());
                 (normalized, msg)
             }
@@ -224,14 +254,15 @@ fn editor_body_rect(win_w: i32, win_h: i32) -> Rect {
     Rect::new(0, top, win_w, bottom - top)
 }
 
-fn visible_line_count(win_h: i32) -> usize {
-    let h = (win_h - TITLEBAR_HEIGHT - TOOLBAR_H - STATUS_H - TEXT_PAD_Y * 2).max(LINE_H);
-    (h / LINE_H).max(1) as usize
+fn visible_line_count(win_h: i32, line_h: i32) -> usize {
+    let h = (win_h - TITLEBAR_HEIGHT - TOOLBAR_H - STATUS_H - TEXT_PAD_Y * 2).max(line_h);
+    (h / line_h).max(1) as usize
 }
 
 fn hit_text_cursor(
     editor: &Editor,
     text: &mut TextRenderer,
+    prefs: EditorPrefs,
     win_h: i32,
     mx: i32,
     my: i32,
@@ -242,16 +273,17 @@ fn hit_text_cursor(
         return None;
     }
     let rel_y = (my - body_top - TEXT_PAD_Y).max(0);
-    let line_idx = (editor.scroll_top + (rel_y / LINE_H) as usize).min(editor.lines.len() - 1);
+    let line_idx =
+        (editor.scroll_top + (rel_y / prefs.line_h) as usize).min(editor.lines.len() - 1);
     let line = &editor.lines[line_idx];
-    let rel_x = (mx - (GUTTER_W + TEXT_PAD_X)) as f32;
+    let rel_x = (mx - (prefs.gutter_w + TEXT_PAD_X)) as f32;
     if rel_x <= 0.0 {
         return Some((line_idx, 0));
     }
     let mut acc = 0.0f32;
     let mut col = 0usize;
     for ch in line.chars() {
-        let adv = text.glyph(Face::Mono, ch, FONT_PX).advance;
+        let adv = text.glyph(Face::Mono, ch, prefs.font_px).advance;
         if rel_x < acc + adv * 0.5 {
             break;
         }
@@ -265,13 +297,16 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     let path = argument
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/root/untitled.txt"));
-    let mut editor = Editor::open(path);
-    let init_title = editor.window_title();
 
-    let mut app = App::new(&init_title, Icon::Editor, 840, 580)?;
+    let mut app = App::new("文本编辑器", Icon::Editor, 840, 580)?;
     app.min_width = 480;
     app.min_height = 300;
     app.set_content_cursor(CursorKind::Text);
+
+    let mut prefs = EditorPrefs::from_config(&app.config);
+    let mut editor = Editor::open(path, prefs.tab_width);
+    app.title = editor.window_title();
+    let _ = app.x.set_title(app.win, &app.title);
 
     loop {
         if app.close {
@@ -280,10 +315,17 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         let prev_saved = editor.saved;
 
         for event in app.pump()? {
-            let vis = visible_line_count(app.height as i32);
+            let vis = visible_line_count(app.height as i32, prefs.line_h);
             match event {
                 UiEvent::Close => app.request_close(),
-                UiEvent::Expose | UiEvent::ThemeChanged => app.needs_redraw = true,
+                UiEvent::Expose => app.needs_redraw = true,
+                UiEvent::ConfigChanged => {
+                    prefs = EditorPrefs::from_config(&app.config);
+                    let new_vis = visible_line_count(app.height as i32, prefs.line_h);
+                    let max_scroll = editor.lines.len().saturating_sub(new_vis);
+                    editor.scroll_top = editor.scroll_top.min(max_scroll);
+                    app.needs_redraw = true;
+                }
                 UiEvent::Configure { .. } => {
                     let max_scroll = editor.lines.len().saturating_sub(vis);
                     editor.scroll_top = editor.scroll_top.min(max_scroll);
@@ -296,7 +338,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         app.needs_redraw = true;
                     }
                     let body = editor_body_rect(app.width as i32, app.height as i32);
-                    app.set_content_cursor(if body.contains(x, y) && x >= GUTTER_W {
+                    app.set_content_cursor(if body.contains(x, y) && x >= prefs.gutter_w {
                         CursorKind::Text
                     } else {
                         CursorKind::Default
@@ -325,7 +367,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         editor.save();
                         app.needs_redraw = true;
                     } else if let Some((line, col)) =
-                        hit_text_cursor(&editor, &mut app.text, app.height as i32, x, y)
+                        hit_text_cursor(&editor, &mut app.text, prefs, app.height as i32, x, y)
                     {
                         editor.cur_line = line;
                         editor.cur_col = col;
@@ -356,7 +398,8 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         editor.ensure_cursor_visible(vis);
                         app.needs_redraw = true;
                     } else if key.is_tab() {
-                        editor.insert_str("    ");
+                        let spaces = " ".repeat(prefs.tab_width);
+                        editor.insert_str(&spaces);
                         editor.ensure_cursor_visible(vis);
                         app.needs_redraw = true;
                     } else if key.is_backspace() {
@@ -415,6 +458,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 &mut app.text,
                 &app.theme,
                 &editor,
+                prefs,
                 app.active,
             );
             app.draw_chrome();
@@ -429,10 +473,14 @@ fn draw_editor(
     text: &mut TextRenderer,
     theme: &Theme,
     editor: &Editor,
+    prefs: EditorPrefs,
     window_active: bool,
 ) {
     let w = canvas.width as i32;
     let h = canvas.height as i32;
+    let gutter_w = prefs.gutter_w;
+    let line_h = prefs.line_h;
+    let font_px = prefs.font_px;
     canvas.clear(theme.window);
 
     // Top toolbar
@@ -487,34 +535,39 @@ fn draw_editor(
         Face::Ui,
     );
 
-    // Editor body: gutter + uniform-color monospace text canvas
+    // Editor body: optional gutter + uniform-color monospace text canvas
     let body = editor_body_rect(w, h);
-    canvas.fill(Rect::new(0, body.y, GUTTER_W, body.h), theme.window_alt);
-    canvas.fill(
-        Rect::new(GUTTER_W - 1, body.y, 1, body.h),
-        theme.window_border,
-    );
+    if gutter_w > 0 {
+        canvas.fill(Rect::new(0, body.y, gutter_w, body.h), theme.window_alt);
+        canvas.fill(
+            Rect::new(gutter_w - 1, body.y, 1, body.h),
+            theme.window_border,
+        );
+    }
 
-    let vis = visible_line_count(h);
-    let text_x = (GUTTER_W + TEXT_PAD_X) as f32;
+    let vis = visible_line_count(h, line_h);
+    let text_x = (gutter_w + TEXT_PAD_X) as f32;
     let text_clip = Rect::new(
-        GUTTER_W,
+        gutter_w,
         body.y,
-        (w - GUTTER_W - SCROLLBAR_W - 2).max(1),
+        (w - gutter_w - SCROLLBAR_W - 2).max(1),
         body.h,
     );
 
     // Subtle active-line highlight
-    if editor.cur_line >= editor.scroll_top && editor.cur_line < editor.scroll_top + vis + 1 {
-        let ay = body.y + TEXT_PAD_Y + (editor.cur_line - editor.scroll_top) as i32 * LINE_H;
+    if prefs.highlight_active
+        && editor.cur_line >= editor.scroll_top
+        && editor.cur_line < editor.scroll_top + vis + 1
+    {
+        let ay = body.y + TEXT_PAD_Y + (editor.cur_line - editor.scroll_top) as i32 * line_h;
         if ay < body.bottom() {
             let hl = crate::draw::mix(theme.window, theme.panel_hover, 0.45);
             canvas.fill(
                 Rect::new(
-                    GUTTER_W,
+                    gutter_w,
                     ay,
-                    (w - GUTTER_W - SCROLLBAR_W - 2).max(0),
-                    LINE_H,
+                    (w - gutter_w - SCROLLBAR_W - 2).max(0),
+                    line_h,
                 ),
                 hl,
             );
@@ -522,32 +575,34 @@ fn draw_editor(
     }
 
     // Gutter line numbers
-    for (slot, (line_idx, _)) in editor
-        .lines
-        .iter()
-        .enumerate()
-        .skip(editor.scroll_top)
-        .take(vis + 1)
-        .enumerate()
-    {
-        let ly = body.y + TEXT_PAD_Y + slot as i32 * LINE_H;
-        if ly >= body.bottom() {
-            break;
+    if gutter_w > 0 {
+        for (slot, (line_idx, _)) in editor
+            .lines
+            .iter()
+            .enumerate()
+            .skip(editor.scroll_top)
+            .take(vis + 1)
+            .enumerate()
+        {
+            let ly = body.y + TEXT_PAD_Y + slot as i32 * line_h;
+            if ly >= body.bottom() {
+                break;
+            }
+            let num_fg = if line_idx == editor.cur_line {
+                theme.text
+            } else {
+                theme.text_muted
+            };
+            text.draw_right(
+                canvas,
+                &(line_idx + 1).to_string(),
+                (gutter_w - 10) as f32,
+                ly as f32 + prefs.baseline_off,
+                11.5,
+                num_fg,
+                Face::Mono,
+            );
         }
-        let num_fg = if line_idx == editor.cur_line {
-            theme.text
-        } else {
-            theme.text_muted
-        };
-        text.draw_right(
-            canvas,
-            &(line_idx + 1).to_string(),
-            (GUTTER_W - 10) as f32,
-            (ly + 15) as f32,
-            11.5,
-            num_fg,
-            Face::Mono,
-        );
     }
 
     // Text lines + caret
@@ -560,19 +615,19 @@ fn draw_editor(
             .take(vis + 1)
             .enumerate()
         {
-            let ly = body.y + TEXT_PAD_Y + slot as i32 * LINE_H;
+            let ly = body.y + TEXT_PAD_Y + slot as i32 * line_h;
             if ly >= body.bottom() {
                 break;
             }
-            let baseline = (ly + 15) as f32;
+            let baseline = ly as f32 + prefs.baseline_off;
             if !line.is_empty() {
-                text.draw(c, line, text_x, baseline, FONT_PX, theme.text, Face::Mono);
+                text.draw(c, line, text_x, baseline, font_px, theme.text, Face::Mono);
             }
             if line_idx == editor.cur_line && window_active {
                 let byte_idx = Editor::char_to_byte(line, editor.cur_col);
-                let caret_x = text_x + text.measure(&line[..byte_idx], FONT_PX, Face::Mono);
+                let caret_x = text_x + text.measure(&line[..byte_idx], font_px, Face::Mono);
                 c.fill(
-                    Rect::new(caret_x.round() as i32, ly + 2, 2, LINE_H - 4),
+                    Rect::new(caret_x.round() as i32, ly + 2, 2, line_h - 4),
                     theme.accent,
                 );
             }
@@ -600,10 +655,11 @@ fn draw_editor(
     canvas.fill(Rect::new(0, status_y, w, 1), theme.window_border);
 
     let pos_info = format!(
-        "行 {}, 列 {}  |  共 {} 行  |  UTF-8",
+        "行 {}, 列 {}  |  共 {} 行  |  缩进 {} 空格  |  UTF-8",
         editor.cur_line + 1,
         editor.cur_col + 1,
-        editor.lines.len()
+        editor.lines.len(),
+        prefs.tab_width
     );
     let pos_w = text.measure(&pos_info, 11.5, Face::Ui);
     text.draw_right(

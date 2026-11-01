@@ -24,13 +24,11 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
+use uxconf::CursorStyle;
 
-const FONT_PX: f32 = 13.5;
-const CELL_H: i32 = 20;
 const PAD_X: i32 = 10;
 const PAD_Y: i32 = 8;
 const SCROLLBAR_W: i32 = 8;
-const MAX_SCROLLBACK: usize = 1000;
 
 const TIOCSWINSZ_REQ: u64 = 0x5414;
 const TIOCSCTTY_REQ: u64 = 0x540e;
@@ -207,6 +205,7 @@ struct VtTerm {
     screen: Vec<Vec<Cell>>,
     alt_saved: Option<(Vec<Vec<Cell>>, usize, usize)>,
     scrollback: VecDeque<Vec<Cell>>,
+    max_scrollback: usize,
     scroll_offset: usize,
     cur_row: usize,
     cur_col: usize,
@@ -231,7 +230,7 @@ struct VtTerm {
 }
 
 impl VtTerm {
-    fn new(cols: usize, rows: usize) -> Self {
+    fn new(cols: usize, rows: usize, max_scrollback: usize) -> Self {
         let cols = cols.max(4);
         let rows = rows.max(2);
         Self {
@@ -240,6 +239,7 @@ impl VtTerm {
             screen: vec![vec![Cell::default(); cols]; rows],
             alt_saved: None,
             scrollback: VecDeque::with_capacity(256),
+            max_scrollback: max_scrollback.clamp(100, 10_000),
             scroll_offset: 0,
             cur_row: 0,
             cur_col: 0,
@@ -313,8 +313,16 @@ impl VtTerm {
         self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
     }
 
+    fn set_max_scrollback(&mut self, limit: usize) {
+        self.max_scrollback = limit.clamp(100, 10_000);
+        while self.scrollback.len() > self.max_scrollback {
+            self.scrollback.pop_front();
+        }
+        self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+    }
+
     fn push_scrollback(&mut self, row: Vec<Cell>) {
-        if self.scrollback.len() >= MAX_SCROLLBACK {
+        if self.scrollback.len() >= self.max_scrollback {
             self.scrollback.pop_front();
         }
         self.scrollback.push_back(row);
@@ -1208,11 +1216,32 @@ fn key_to_pty_bytes(key: &Key, app_cursor: bool) -> Option<Vec<u8>> {
     None
 }
 
-fn calc_grid(content: Rect, cell_w: i32) -> (usize, usize) {
+#[derive(Clone, Copy)]
+struct TermMetrics {
+    font_px: f32,
+    cell_w: i32,
+    cell_h: i32,
+    baseline_off: f32,
+}
+
+fn compute_metrics(text: &mut TextRenderer, font_size: i32) -> TermMetrics {
+    let font_px = (font_size.clamp(11, 20) as f32) - 0.5;
+    let cell_h = ((font_px * 1.48).round() as i32).max(16);
+    let baseline_off = (cell_h as f32 * 0.75).round();
+    let cell_w = text.mono_advance(font_px).round().max(7.0) as i32;
+    TermMetrics {
+        font_px,
+        cell_w,
+        cell_h,
+        baseline_off,
+    }
+}
+
+fn calc_grid(content: Rect, cell_w: i32, cell_h: i32) -> (usize, usize) {
     let usable_w = (content.w - PAD_X * 2 - SCROLLBAR_W).max(cell_w * 10);
-    let usable_h = (content.h - PAD_Y * 2).max(CELL_H * 3);
+    let usable_h = (content.h - PAD_Y * 2).max(cell_h * 3);
     let cols = (usable_w / cell_w).max(10) as usize;
-    let rows = (usable_h / CELL_H).max(3) as usize;
+    let rows = (usable_h / cell_h).max(3) as usize;
     (cols, rows)
 }
 
@@ -1222,9 +1251,9 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     app.min_height = 240;
     app.set_content_cursor(CursorKind::Text);
 
-    let cell_w = app.text.mono_advance(FONT_PX).round().max(7.0) as i32;
-    let (init_cols, init_rows) = calc_grid(app.content(), cell_w);
-    let mut vt = VtTerm::new(init_cols, init_rows);
+    let mut metrics = compute_metrics(&mut app.text, app.config.term_font_size);
+    let (init_cols, init_rows) = calc_grid(app.content(), metrics.cell_w, metrics.cell_h);
+    let mut vt = VtTerm::new(init_cols, init_rows, app.config.term_scrollback_lines);
 
     let workdir = argument
         .map(PathBuf::from)
@@ -1236,8 +1265,8 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         &workdir,
         init_rows as u16,
         init_cols as u16,
-        (init_cols as i32 * cell_w) as u16,
-        (init_rows as i32 * CELL_H) as u16,
+        (init_cols as i32 * metrics.cell_w) as u16,
+        (init_rows as i32 * metrics.cell_h) as u16,
     ) {
         Ok(pty) => Some(pty),
         Err(err) => {
@@ -1295,17 +1324,34 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         for event in events {
             match event {
                 UiEvent::Close => app.request_close(),
-                UiEvent::Expose | UiEvent::ThemeChanged => app.needs_redraw = true,
-                UiEvent::Configure { .. } => {
-                    let (cols, rows) = calc_grid(app.content(), cell_w);
+                UiEvent::Expose => app.needs_redraw = true,
+                UiEvent::ConfigChanged => {
+                    metrics = compute_metrics(&mut app.text, app.config.term_font_size);
+                    vt.set_max_scrollback(app.config.term_scrollback_lines);
+                    let (cols, rows) = calc_grid(app.content(), metrics.cell_w, metrics.cell_h);
                     if cols != vt.cols || rows != vt.rows {
                         vt.resize(cols, rows);
                         if let Some(p) = &pty {
                             p.resize(
                                 rows as u16,
                                 cols as u16,
-                                (cols as i32 * cell_w) as u16,
-                                (rows as i32 * CELL_H) as u16,
+                                (cols as i32 * metrics.cell_w) as u16,
+                                (rows as i32 * metrics.cell_h) as u16,
+                            );
+                        }
+                    }
+                    app.needs_redraw = true;
+                }
+                UiEvent::Configure { .. } => {
+                    let (cols, rows) = calc_grid(app.content(), metrics.cell_w, metrics.cell_h);
+                    if cols != vt.cols || rows != vt.rows {
+                        vt.resize(cols, rows);
+                        if let Some(p) = &pty {
+                            p.resize(
+                                rows as u16,
+                                cols as u16,
+                                (cols as i32 * metrics.cell_w) as u16,
+                                (rows as i32 * metrics.cell_h) as u16,
                             );
                         }
                     }
@@ -1353,7 +1399,8 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 &mut app.text,
                 &app.theme,
                 &vt,
-                cell_w,
+                metrics,
+                app.config.term_cursor_style,
                 app.active,
             );
             app.draw_chrome();
@@ -1368,9 +1415,13 @@ fn draw_terminal(
     text: &mut TextRenderer,
     theme: &Theme,
     vt: &VtTerm,
-    cell_w: i32,
+    metrics: TermMetrics,
+    cursor_style: CursorStyle,
     window_active: bool,
 ) {
+    let cell_w = metrics.cell_w;
+    let cell_h = metrics.cell_h;
+    let font_px = metrics.font_px;
     let default_bg = ColorSpec::DefaultBg.resolve(theme, false);
     let body = Rect::new(
         0,
@@ -1385,7 +1436,7 @@ fn draw_terminal(
 
     for row_idx in 0..vt.rows {
         let line = vt.view_row(row_idx);
-        let row_y = origin_y + row_idx as i32 * CELL_H;
+        let row_y = origin_y + row_idx as i32 * cell_h;
         if row_y >= canvas.height as i32 - 1 {
             break;
         }
@@ -1419,7 +1470,7 @@ fn draw_terminal(
                         origin_x + start as i32 * cell_w,
                         row_y,
                         (col - start) as i32 * cell_w,
-                        CELL_H,
+                        cell_h,
                     ),
                     cell_bg,
                 );
@@ -1429,7 +1480,7 @@ fn draw_terminal(
         }
 
         // Draw foreground glyphs.
-        let baseline = row_y as f32 + 15.0;
+        let baseline = row_y as f32 + metrics.baseline_off;
         let mut buf = [0u8; 4];
         for (c_idx, cell) in line.iter().take(vt.cols).enumerate() {
             if cell.wide_cont || cell.ch == ' ' {
@@ -1450,7 +1501,7 @@ fn draw_terminal(
                 s,
                 (origin_x + c_idx as i32 * cell_w) as f32,
                 baseline,
-                FONT_PX,
+                font_px,
                 fg,
                 face,
             );
@@ -1466,26 +1517,41 @@ fn draw_terminal(
             cell_w
         };
         let cx = origin_x + vt.cur_col as i32 * cell_w;
-        let cy = origin_y + vt.cur_row as i32 * CELL_H;
-        let cursor_rect = Rect::new(cx, cy + 1, cur_w, CELL_H - 2);
+        let cy = origin_y + vt.cur_row as i32 * cell_h;
         let cursor_color = theme.accent;
-        if window_active {
-            canvas.fill(cursor_rect, cursor_color);
-            if cur_cell.ch != ' ' && !cur_cell.wide_cont {
-                let mut buf = [0u8; 4];
-                let s = cur_cell.ch.encode_utf8(&mut buf);
-                text.draw(
-                    canvas,
-                    s,
-                    cx as f32,
-                    cy as f32 + 15.0,
-                    FONT_PX,
-                    0xffffff,
-                    Face::Mono,
+        match cursor_style {
+            CursorStyle::Beam => {
+                let thickness = if window_active { 2 } else { 1 };
+                canvas.fill(Rect::new(cx, cy + 2, thickness, cell_h - 4), cursor_color);
+            }
+            CursorStyle::Underline => {
+                let thickness = if window_active { 2 } else { 1 };
+                canvas.fill(
+                    Rect::new(cx, cy + cell_h - 3, cur_w, thickness),
+                    cursor_color,
                 );
             }
-        } else {
-            canvas.border_1px(cursor_rect, cursor_color);
+            CursorStyle::Block => {
+                let cursor_rect = Rect::new(cx, cy + 1, cur_w, cell_h - 2);
+                if window_active {
+                    canvas.fill(cursor_rect, cursor_color);
+                    if cur_cell.ch != ' ' && !cur_cell.wide_cont {
+                        let mut buf = [0u8; 4];
+                        let s = cur_cell.ch.encode_utf8(&mut buf);
+                        text.draw(
+                            canvas,
+                            s,
+                            cx as f32,
+                            cy as f32 + metrics.baseline_off,
+                            font_px,
+                            0xffffff,
+                            Face::Mono,
+                        );
+                    }
+                } else {
+                    canvas.border_1px(cursor_rect, cursor_color);
+                }
+            }
         }
     }
 
@@ -1508,7 +1574,7 @@ mod tests {
 
     #[test]
     fn vt_ansi_colors_cursor_and_split_utf8() {
-        let mut vt = VtTerm::new(40, 10);
+        let mut vt = VtTerm::new(40, 10, 1000);
         // Feed split UTF-8 ("中文") and SGR colors + cursor motion.
         let payload = "\x1b[1;32mroot@spaceos\x1b[0m:~$ echo 中文\r\nOK";
         for chunk in payload.as_bytes().chunks(3) {

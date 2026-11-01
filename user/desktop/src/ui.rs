@@ -1,7 +1,7 @@
 /*
  *
  *       user/desktop/src/ui.rs
- *       Native SPUI 4.0 chrome, buttons, text fields and scrollbar widgets
+ *       Native SPUI 4.0 chrome, buttons, switches, segmented controls and scrollbars
  *
  *       2026/10/30 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
@@ -9,8 +9,9 @@
  */
 
 //! Compact native desktop controls: 34px single-line window titlebar with
-//! Minimize / Maximize-Restore / Close rectangular buttons, flat 1px-bordered
-//! popup surfaces, buttons, text inputs and scrollbars.
+//! left- or right-aligned Minimize / Maximize-Restore / Close buttons, flat
+//! 1px-bordered surfaces, buttons, switches, segmented controls, color swatches,
+//! text inputs and scrollbars.
 
 use crate::draw::{mix, Canvas, Rect};
 use crate::icons::{self, Icon};
@@ -27,31 +28,40 @@ pub enum CaptionHit {
     Close,
 }
 
-pub fn caption_button_rect(window_width: i32, kind: CaptionHit) -> Rect {
-    match kind {
-        CaptionHit::Close => Rect::new(
-            window_width - CAPTION_BTN_W,
-            0,
-            CAPTION_BTN_W,
-            TITLEBAR_HEIGHT,
-        ),
-        CaptionHit::Maximize => Rect::new(
-            window_width - CAPTION_BTN_W * 2,
-            0,
-            CAPTION_BTN_W,
-            TITLEBAR_HEIGHT,
-        ),
-        CaptionHit::Minimize => Rect::new(
-            window_width - CAPTION_BTN_W * 3,
-            0,
-            CAPTION_BTN_W,
-            TITLEBAR_HEIGHT,
-        ),
-        CaptionHit::None => Rect::default(),
+pub fn caption_button_rect(window_width: i32, kind: CaptionHit, buttons_left: bool) -> Rect {
+    if buttons_left {
+        match kind {
+            CaptionHit::Close => Rect::new(0, 0, CAPTION_BTN_W, TITLEBAR_HEIGHT),
+            CaptionHit::Minimize => Rect::new(CAPTION_BTN_W, 0, CAPTION_BTN_W, TITLEBAR_HEIGHT),
+            CaptionHit::Maximize => Rect::new(CAPTION_BTN_W * 2, 0, CAPTION_BTN_W, TITLEBAR_HEIGHT),
+            CaptionHit::None => Rect::default(),
+        }
+    } else {
+        match kind {
+            CaptionHit::Close => Rect::new(
+                window_width - CAPTION_BTN_W,
+                0,
+                CAPTION_BTN_W,
+                TITLEBAR_HEIGHT,
+            ),
+            CaptionHit::Maximize => Rect::new(
+                window_width - CAPTION_BTN_W * 2,
+                0,
+                CAPTION_BTN_W,
+                TITLEBAR_HEIGHT,
+            ),
+            CaptionHit::Minimize => Rect::new(
+                window_width - CAPTION_BTN_W * 3,
+                0,
+                CAPTION_BTN_W,
+                TITLEBAR_HEIGHT,
+            ),
+            CaptionHit::None => Rect::default(),
+        }
     }
 }
 
-pub fn hit_caption(window_width: i32, x: i32, y: i32) -> CaptionHit {
+pub fn hit_caption(window_width: i32, x: i32, y: i32, buttons_left: bool) -> CaptionHit {
     if y < 0 || y >= TITLEBAR_HEIGHT {
         return CaptionHit::None;
     }
@@ -60,13 +70,14 @@ pub fn hit_caption(window_width: i32, x: i32, y: i32) -> CaptionHit {
         CaptionHit::Maximize,
         CaptionHit::Minimize,
     ] {
-        if caption_button_rect(window_width, kind).contains(x, y) {
+        if caption_button_rect(window_width, kind, buttons_left).contains(x, y) {
             return kind;
         }
     }
     CaptionHit::None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn titlebar(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
@@ -76,6 +87,7 @@ pub fn titlebar(
     title: &str,
     active: bool,
     maximized: bool,
+    buttons_left: bool,
     hover: CaptionHit,
 ) {
     let bg = if active {
@@ -89,15 +101,27 @@ pub fn titlebar(
         theme.window_border,
     );
 
-    icons::draw(canvas, app_icon, 11, (TITLEBAR_HEIGHT - 16) / 2, 16, None);
+    let (icon_x, title_x) = if buttons_left {
+        (CAPTION_BTN_W * 3 + 10, (CAPTION_BTN_W * 3 + 33) as f32)
+    } else {
+        (11, 34.0)
+    };
+    icons::draw(
+        canvas,
+        app_icon,
+        icon_x,
+        (TITLEBAR_HEIGHT - 16) / 2,
+        16,
+        None,
+    );
 
     let max_title_w = (width - CAPTION_BTN_W * 3 - 48).max(40) as f32;
     let shown = text.truncate(title, max_title_w, 12.5, Face::Ui);
     let title_color = if active { theme.text } else { theme.text_muted };
-    text.draw(canvas, &shown, 34.0, 22.0, 12.5, title_color, Face::Ui);
+    text.draw(canvas, &shown, title_x, 22.0, 12.5, title_color, Face::Ui);
 
     // Minimize button: crisp 10px horizontal bar.
-    let min_rect = caption_button_rect(width, CaptionHit::Minimize);
+    let min_rect = caption_button_rect(width, CaptionHit::Minimize, buttons_left);
     if hover == CaptionHit::Minimize {
         canvas.fill(
             Rect::new(min_rect.x, 1, min_rect.w, TITLEBAR_HEIGHT - 2),
@@ -120,7 +144,7 @@ pub fn titlebar(
     );
 
     // Maximize / Restore button: crisp 10x10 square or overlapping 8x8 squares.
-    let max_rect = caption_button_rect(width, CaptionHit::Maximize);
+    let max_rect = caption_button_rect(width, CaptionHit::Maximize, buttons_left);
     if hover == CaptionHit::Maximize {
         canvas.fill(
             Rect::new(max_rect.x, 1, max_rect.w, TITLEBAR_HEIGHT - 2),
@@ -130,12 +154,10 @@ pub fn titlebar(
     if maximized {
         let bx = max_rect.x + (CAPTION_BTN_W - 10) / 2;
         let by = (TITLEBAR_HEIGHT - 10) / 2;
-        // Back square (top-right)
         canvas.fill(Rect::new(bx + 2, by, 8, 1), glyph_fg);
         canvas.fill(Rect::new(bx + 9, by, 1, 8), glyph_fg);
         canvas.fill(Rect::new(bx + 2, by, 1, 2), glyph_fg);
         canvas.fill(Rect::new(bx + 8, by + 7, 2, 1), glyph_fg);
-        // Front square (bottom-left)
         canvas.border_1px(Rect::new(bx, by + 2, 8, 8), glyph_fg);
     } else {
         let sq = Rect::new(
@@ -148,7 +170,7 @@ pub fn titlebar(
     }
 
     // Close button: red hover background with crisp 10x10 'X'.
-    let close_rect = caption_button_rect(width, CaptionHit::Close);
+    let close_rect = caption_button_rect(width, CaptionHit::Close, buttons_left);
     let close_fg = if hover == CaptionHit::Close {
         canvas.fill(
             Rect::new(close_rect.x, 0, close_rect.w, TITLEBAR_HEIGHT - 1),
@@ -187,6 +209,7 @@ pub fn card(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
     canvas.rounded_border(rect, 6, theme.window_border, 1.0, 1);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn button(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
@@ -245,6 +268,112 @@ pub fn button(
     }
 }
 
+/// Pill-shaped boolean toggle switch (`38 × 20` recommended).
+pub fn toggle_switch(canvas: &mut Canvas, theme: &Theme, rect: Rect, checked: bool, hover: bool) {
+    let radius = (rect.h / 2).max(1);
+    let base = if checked {
+        theme.accent
+    } else if theme.is_dark() {
+        0x36363e
+    } else {
+        0xd4d4dc
+    };
+    let track_bg = if hover {
+        if theme.is_dark() {
+            mix(base, 0xffffff, 0.10)
+        } else {
+            mix(base, 0x000000, 0.08)
+        }
+    } else {
+        base
+    };
+    canvas.rounded_rect(rect, radius, track_bg, 1.0);
+    if !checked {
+        canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
+    }
+    let pad = 2;
+    let knob_d = (rect.h - pad * 2).max(6);
+    let knob_x = if checked {
+        rect.right() - knob_d - pad
+    } else {
+        rect.x + pad
+    };
+    let knob_rect = Rect::new(knob_x, rect.y + pad, knob_d, knob_d);
+    canvas.rounded_rect(knob_rect, knob_d / 2, 0xffffff, 1.0);
+}
+
+/// Compute the hit rectangle of `index` inside a `count`-option `segmented_control`.
+pub fn segmented_item_rect(rect: Rect, count: usize, index: usize) -> Rect {
+    if count == 0 || index >= count {
+        return Rect::default();
+    }
+    let inner = rect.inset(2);
+    let x0 = inner.x + ((inner.w * index as i32) / count as i32);
+    let x1 = if index + 1 == count {
+        inner.right()
+    } else {
+        inner.x + ((inner.w * (index + 1) as i32) / count as i32)
+    };
+    Rect::new(x0, inner.y, (x1 - x0).max(1), inner.h.max(1))
+}
+
+/// Multi-option segmented selector control.
+pub fn segmented_control(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    rect: Rect,
+    labels: &[&str],
+    selected: usize,
+    hover_idx: Option<usize>,
+) {
+    canvas.rounded_rect(rect, RADIUS_CONTROL + 1, theme.window_alt, 1.0);
+    canvas.rounded_border(rect, RADIUS_CONTROL + 1, theme.window_border, 1.0, 1);
+    let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.3;
+    for (i, label) in labels.iter().enumerate() {
+        let seg = segmented_item_rect(rect, labels.len(), i);
+        let is_sel = i == selected;
+        if is_sel {
+            canvas.rounded_rect(seg, RADIUS_CONTROL, theme.accent, 1.0);
+        } else if hover_idx == Some(i) {
+            canvas.rounded_rect(seg, RADIUS_CONTROL, theme.panel_hover, 1.0);
+        }
+        let fg = if is_sel { 0xffffff } else { theme.text_dim };
+        let face = if is_sel { Face::Bold } else { Face::Ui };
+        text.draw_centered(
+            canvas,
+            label,
+            seg.x as f32 + seg.w as f32 * 0.5,
+            baseline,
+            12.0,
+            fg,
+            face,
+        );
+    }
+}
+
+/// Circular color swatch with active ring indicator.
+pub fn color_swatch(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    color: u32,
+    selected: bool,
+    hover: bool,
+) {
+    let cx = rect.x as f32 + rect.w as f32 * 0.5;
+    let cy = rect.y as f32 + rect.h as f32 * 0.5;
+    let radius = (rect.w.min(rect.h) as f32 * 0.5 - 3.0).max(4.0);
+    canvas.circle(cx, cy, radius, color, 1.0);
+    canvas.ring(cx, cy, radius, 1.0, 0x000000, 0.18);
+    if selected {
+        canvas.ring(cx, cy, radius + 2.2, 1.8, theme.text, 0.92);
+        canvas.circle(cx, cy, 3.2, 0xffffff, 0.98);
+    } else if hover {
+        canvas.ring(cx, cy, radius + 1.8, 1.4, theme.text_muted, 0.75);
+    }
+}
+
 pub fn icon_button(
     canvas: &mut Canvas,
     theme: &Theme,
@@ -271,6 +400,7 @@ pub fn icon_button(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn text_input(
     canvas: &mut Canvas,
     text: &mut TextRenderer,

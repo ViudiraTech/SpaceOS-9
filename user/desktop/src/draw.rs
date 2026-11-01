@@ -244,6 +244,77 @@ impl Sprite {
         out
     }
 
+    /// Bilinear stretch scaling of the entire sprite into an opaque `0x00RRGGBB` buffer.
+    pub fn scale_stretch_opaque(&self, dst_w: usize, dst_h: usize) -> Vec<u32> {
+        if dst_w == 0 || dst_h == 0 || self.width == 0 || self.height == 0 {
+            return vec![0; dst_w * dst_h];
+        }
+        let sw = self.width as usize;
+        let sh = self.height as usize;
+        let mut out = vec![0u32; dst_w * dst_h];
+        for dy in 0..dst_h {
+            let sy_fp = ((dy * sh * 256) / dst_h).min((sh - 1) * 256);
+            let sy0 = sy_fp >> 8;
+            let sy1 = (sy0 + 1).min(sh - 1);
+            let fy = (sy_fp & 0xff) as u32;
+            let row0 = &self.pixels[sy0 * sw..(sy0 + 1) * sw];
+            let row1 = &self.pixels[sy1 * sw..(sy1 + 1) * sw];
+            let out_row = &mut out[dy * dst_w..(dy + 1) * dst_w];
+
+            for (dx, slot) in out_row.iter_mut().enumerate() {
+                let sx_fp = ((dx * sw * 256) / dst_w).min((sw - 1) * 256);
+                let sx0 = sx_fp >> 8;
+                let sx1 = (sx0 + 1).min(sw - 1);
+                let fx = (sx_fp & 0xff) as u32;
+
+                let p00 = row0[sx0] & 0x00ff_ffff;
+                let p10 = row0[sx1] & 0x00ff_ffff;
+                let p01 = row1[sx0] & 0x00ff_ffff;
+                let p11 = row1[sx1] & 0x00ff_ffff;
+
+                let top_rb = (((p00 & 0x00ff_00ff) * (256 - fx) + (p10 & 0x00ff_00ff) * fx) >> 8)
+                    & 0x00ff_00ff;
+                let bot_rb = (((p01 & 0x00ff_00ff) * (256 - fx) + (p11 & 0x00ff_00ff) * fx) >> 8)
+                    & 0x00ff_00ff;
+                let rb = ((top_rb * (256 - fy) + bot_rb * fy) >> 8) & 0x00ff_00ff;
+
+                let top_g = (((p00 & 0x0000_ff00) * (256 - fx) + (p10 & 0x0000_ff00) * fx) >> 8)
+                    & 0x0000_ff00;
+                let bot_g = (((p01 & 0x0000_ff00) * (256 - fx) + (p11 & 0x0000_ff00) * fx) >> 8)
+                    & 0x0000_ff00;
+                let g = ((top_g * (256 - fy) + bot_g * fy) >> 8) & 0x0000_ff00;
+
+                *slot = rb | g;
+            }
+        }
+        out
+    }
+
+    /// Aspect-preserving letterboxed scaling into an opaque `0x00RRGGBB` buffer filled with `bg`.
+    pub fn scale_contain_opaque(&self, dst_w: usize, dst_h: usize, bg: u32) -> Vec<u32> {
+        let fill = bg & 0x00ff_ffff;
+        let mut out = vec![fill; dst_w * dst_h];
+        if dst_w == 0 || dst_h == 0 || self.width == 0 || self.height == 0 {
+            return out;
+        }
+        let sw = self.width as usize;
+        let sh = self.height as usize;
+        let (fit_w, fit_h) = if sw * dst_h > sh * dst_w {
+            (dst_w, (dst_w * sh / sw).max(1).min(dst_h))
+        } else {
+            ((dst_h * sw / sh).max(1).min(dst_w), dst_h)
+        };
+        let off_x = (dst_w - fit_w) / 2;
+        let off_y = (dst_h - fit_h) / 2;
+        let scaled = self.scale_stretch_opaque(fit_w, fit_h);
+        for ry in 0..fit_h {
+            let src_row = &scaled[ry * fit_w..(ry + 1) * fit_w];
+            let dst_start = (off_y + ry) * dst_w + off_x;
+            out[dst_start..dst_start + fit_w].copy_from_slice(src_row);
+        }
+        out
+    }
+
     /// Bilinear scale into a `dst_w × dst_h` premultiplied `Sprite` (e.g. PNG logo).
     pub fn scale_bilinear(&self, dst_w: u32, dst_h: u32) -> Self {
         let (dw, dh) = (dst_w.max(1) as usize, dst_h.max(1) as usize);

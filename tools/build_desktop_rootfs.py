@@ -81,7 +81,12 @@ BREEZE_ICONS = {
     "notify": "usr/share/icons/breeze/preferences/32/preferences-desktop-notification-bell.svg",
     "appearance": "usr/share/icons/breeze/preferences/32/preferences-desktop-theme-global.svg",
     "wallpaper": "usr/share/icons/breeze/preferences/32/preferences-desktop-wallpaper.svg",
+    "panel": "usr/share/icons/breeze/preferences/32/preferences-desktop-plasma.svg",
+    "windows": "usr/share/icons/breeze/preferences/32/preferences-system-windows.svg",
     "display": "usr/share/icons/breeze/preferences/32/preferences-desktop-display.svg",
+    "peripherals": "usr/share/icons/breeze/preferences/32/preferences-desktop-peripherals.svg",
+    "applications": "usr/share/icons/breeze/preferences/32/preferences-desktop-default-applications.svg",
+    "datetime": "usr/share/icons/breeze/preferences/32/preferences-system-time.svg",
     "about": "usr/share/icons/breeze/actions/32/help-about.svg",
     "folder": "usr/share/icons/breeze/places/32/folder.svg",
     "folder-large": "usr/share/icons/breeze/places/64/folder.svg",
@@ -413,16 +418,90 @@ def configure() -> None:
     for directory in (
         "dev", "proc", "sys", "tmp", "run", "root", "home/user", "etc/X11/xorg.conf.d",
         "var/log", "var/lib/xkb", "etc/systemg", "usr/share/spui", "etc/spui",
-        "var/cache/fontconfig",
+        "etc/uxconf/channels", "var/lib/uxconf/channels", "var/cache/fontconfig",
     ):
         (STAGE / directory).mkdir(parents=True, exist_ok=True)
     os.chmod(STAGE / "tmp", 0o1777)
     busybox_links()
 
-    for stale_probe in ("usr/bin/drmprobe", "usr/bin/drm-probe"):
+    for stale_probe in ("usr/bin/drmprobe", "usr/bin/drm-probe", "etc/spui/settings.conf"):
         probe_path = STAGE / stale_probe
         if probe_path.exists() or probe_path.is_symlink():
             probe_path.unlink()
+
+    uxconf_defaults = {
+        "appearance": (
+            '# uxconf channel: appearance\n'
+            '/font/scale = int:100\n'
+            '/theme/accent = string:"#3b82f6"\n'
+            '/theme/mode = string:"dark"\n'
+        ),
+        "desktop": (
+            '# uxconf channel: desktop\n'
+            '/backdrop/solid-color = string:"#1e293b"\n'
+            '/backdrop/style = string:"cover"\n'
+            '/backdrop/wallpaper = string:"alpine-peaks.jpg"\n'
+            '/icons/size = int:40\n'
+            '/icons/visible = bool:true\n'
+        ),
+        "panel": (
+            '# uxconf channel: panel\n'
+            '/position = string:"bottom"\n'
+            '/show-pinned = bool:true\n'
+            '/size = int:46\n'
+        ),
+        "wm": (
+            '# uxconf channel: wm\n'
+            '/auto-raise = bool:false\n'
+            '/button-layout = string:"right"\n'
+            '/double-click-action = string:"maximize"\n'
+            '/focus-mode = string:"click"\n'
+            '/placement = string:"cascade"\n'
+        ),
+        "display": (
+            '# uxconf channel: display\n'
+            '/blank-timeout-sec = int:0\n'
+            '/resolution = string:"1280x800"\n'
+        ),
+        "input": (
+            '# uxconf channel: input\n'
+            '/keyboard/repeat-delay-ms = int:400\n'
+            '/keyboard/repeat-enabled = bool:true\n'
+            '/keyboard/repeat-rate-hz = int:30\n'
+            '/mouse/double-click-ms = int:380\n'
+            '/mouse/left-handed = bool:false\n'
+            '/mouse/natural-scroll = bool:false\n'
+            '/mouse/speed = int:3\n'
+        ),
+        "terminal": (
+            '# uxconf channel: terminal\n'
+            '/cursor-style = string:"block"\n'
+            '/font-size = int:14\n'
+            '/scrollback-lines = int:1000\n'
+        ),
+        "files": (
+            '# uxconf channel: files\n'
+            '/folders-first = bool:true\n'
+            '/show-hidden = bool:false\n'
+            '/single-click-open = bool:false\n'
+        ),
+        "editor": (
+            '# uxconf channel: editor\n'
+            '/font-size = int:14\n'
+            '/highlight-active-line = bool:true\n'
+            '/show-line-numbers = bool:true\n'
+            '/tab-width = int:4\n'
+        ),
+        "datetime": (
+            '# uxconf channel: datetime\n'
+            '/clock-24h = bool:true\n'
+            '/clock-seconds = bool:false\n'
+            '/clock-show-date = bool:true\n'
+            '/timezone = string:"UTC"\n'
+        ),
+    }
+    for channel_name, channel_body in uxconf_defaults.items():
+        write(f"/etc/uxconf/channels/{channel_name}.conf", channel_body)
 
     write("/etc/hostname", "spaceos\n")
     write("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:SpaceOS User:/home/user:/bin/sh\n")
@@ -525,7 +604,7 @@ EndSection
     spui = ROOT / "target" / "x86_64-unknown-linux-musl" / os.environ.get("SPUI_PROFILE", "release")
     if spui.is_dir():
         for path in sorted(spui.iterdir()):
-            if path.is_file() and os.access(path, os.X_OK) and path.name.startswith("sp"):
+            if path.is_file() and os.access(path, os.X_OK) and path.name in ("spui", "uxconfd", "uxconf-query"):
                 install_binary(path, f"/usr/bin/{path.name}")
     assets = ROOT / "user" / "desktop" / "assets"
     if assets.is_dir():

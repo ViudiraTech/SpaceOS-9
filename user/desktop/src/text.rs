@@ -201,6 +201,7 @@ pub struct TextRenderer {
     ui: Font,
     bold: Font,
     mono: Font,
+    ui_scale: f32,
     cache: HashMap<(Face, char, u16), Arc<Glyph>>,
 }
 
@@ -305,8 +306,13 @@ impl TextRenderer {
             ui,
             bold,
             mono,
+            ui_scale: 1.0,
             cache: HashMap::with_capacity(512),
         })
+    }
+
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        self.ui_scale = scale.clamp(0.75, 1.5);
     }
 
     fn font(&self, face: Face) -> &Font {
@@ -318,12 +324,17 @@ impl TextRenderer {
     }
 
     pub fn glyph(&mut self, face: Face, ch: char, px: f32) -> Arc<Glyph> {
-        let key = (face, ch, (px * 10.0).round() as u16);
+        let eff_px = if matches!(face, Face::Ui | Face::Bold) {
+            px * self.ui_scale
+        } else {
+            px
+        };
+        let key = (face, ch, (eff_px * 10.0).round() as u16);
         if let Some(glyph) = self.cache.get(&key) {
             return glyph.clone();
         }
         let font = self.font(face);
-        let glyph = Arc::new(font.rasterize(ch, px));
+        let glyph = Arc::new(font.rasterize(ch, eff_px));
         self.cache.insert(key, glyph.clone());
         glyph
     }

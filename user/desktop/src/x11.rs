@@ -10,20 +10,22 @@
 
 //! Synchronous X11 client layer on top of `x11rb`. Supports zero-copy `MIT-SHM`
 //! canvas buffers, 32-bit ARGB KDE Breeze XRender cursors, `SHAPE` rounded-rect
-//! window masks, `_SPUI_SETTINGS` live broadcasts and `poll(2)` multiplexing.
+//! window masks, X11 pointer/keyboard/screensaver controls and `poll(2)` multiplexing.
 
 use crate::draw::{Canvas, Rect};
-use crate::settings_store::SpuiSettings;
 use std::fs;
 use std::os::fd::AsRawFd;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{ConnectionExt as RenderExt, PictType, Pictformat};
 use x11rb::protocol::shape::{self, ConnectionExt as ShapeExt};
 use x11rb::protocol::shm::ConnectionExt as ShmExt;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
-    ConnectionExt, CreateGCAux, CreateWindowAux, Cursor, EventMask, Gcontext, ImageFormat,
-    InputFocus, PropMode, Rectangle, StackMode, Window, WindowClass,
+    Atom, AtomEnum, AutoRepeatMode, Blanking, ChangeKeyboardControlAux, ChangeWindowAttributesAux,
+    ClientMessageEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux, CreateWindowAux, Cursor,
+    EventMask, Exposures, Gcontext, ImageFormat, InputFocus, PropMode, Rectangle, StackMode,
+    Window, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -102,7 +104,6 @@ pub struct Atoms {
     pub net_supported: Atom,
     pub net_wm_pid: Atom,
     pub wm_class: Atom,
-    pub spui_settings: Atom,
     pub spui_window_cmd: Atom,
 }
 
@@ -562,38 +563,79 @@ impl X {
         Ok(())
     }
 
-    pub fn publish_settings(&self, settings: &SpuiSettings) -> Result<()> {
-        let raw = settings.encode();
-        self.conn.change_property(
-            PropMode::REPLACE,
-            self.root,
-            self.atoms.spui_settings,
-            self.atoms.utf8,
-            8,
-            raw.len() as u32,
-            raw.as_bytes(),
-        )?;
-        self.flush()
+    /// Apply left-handed (`[3, 2, 1, ...]`) or standard (`[1, 2, 3, ...]`) X11 pointer button order.
+    pub fn apply_pointer_mapping(&self, left_handed: bool) {
+        let Ok(cookie) = self.conn.get_pointer_mapping() else {
+            return;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return;
+        };
+        let mut map = reply.map;
+        if map.len() >= 3 {
+            for (idx, slot) in map.iter_mut().enumerate() {
+                *slot = (idx + 1) as u8;
+            }
+            if left_handed {
+                map[0] = 3;
+                map[1] = 2;
+                map[2] = 1;
+            }
+            if let Ok(set_cookie) = self.conn.set_pointer_mapping(&map) {
+                let _ = set_cookie.reply();
+            }
+        }
     }
 
-    pub fn read_settings(&self) -> Option<SpuiSettings> {
-        let reply = self
+    /// Apply X11 pointer acceleration profile (`speed_level` in `1..=5`).
+    pub fn apply_pointer_speed(&self, speed_level: i32) {
+        let (num, denom, threshold) = match speed_level.clamp(1, 5) {
+            1 => (1i16, 2i16, 4i16),
+            2 => (3, 4, 4),
+            3 => (1, 1, 4),
+            4 => (3, 2, 2),
+            _ => (2, 1, 1),
+        };
+        let _ = self
             .conn
-            .get_property(
-                false,
-                self.root,
-                self.atoms.spui_settings,
-                self.atoms.utf8,
-                0,
-                1024,
-            )
-            .ok()?
-            .reply()
-            .ok()?;
-        if reply.value.is_empty() {
-            None
+            .change_pointer_control(num, denom, threshold, true, true);
+        let _ = self.flush();
+    }
+
+    /// Configure X11 idle screen blanking timeout (`0` disables screen blanking).
+    pub fn apply_screensaver_timeout(&self, seconds: i32) {
+        let timeout = if seconds <= 0 {
+            0i16
         } else {
-            Some(SpuiSettings::decode(&String::from_utf8_lossy(&reply.value)))
+            seconds.clamp(60, 7200) as i16
+        };
+        let _ = self
+            .conn
+            .set_screen_saver(timeout, 0, Blanking::PREFERRED, Exposures::ALLOWED);
+        let _ = self.flush();
+    }
+
+    /// Configure X11 keyboard auto-repeat toggle and XKB repeat delay/rate via `xset`.
+    pub fn apply_keyboard_repeat(&self, enabled: bool, delay_ms: i32, rate_hz: i32) {
+        let mode = if enabled {
+            AutoRepeatMode::ON
+        } else {
+            AutoRepeatMode::OFF
+        };
+        let _ = self
+            .conn
+            .change_keyboard_control(&ChangeKeyboardControlAux::new().auto_repeat_mode(mode));
+        let _ = self.flush();
+
+        if enabled && Path::new("/usr/bin/xset").exists() {
+            let delay = delay_ms.clamp(150, 1000).to_string();
+            let rate = rate_hz.clamp(10, 60).to_string();
+            let _ = Command::new("/usr/bin/xset")
+                .args(["r", "rate", &delay, &rate])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         }
     }
 
@@ -736,30 +778,62 @@ impl X {
         Ok(self.conn.poll_for_event()?)
     }
 
-    /// Block using `poll(2)` until the X11 socket (or `extra_fd`, e.g. PTY master) is readable.
-    pub fn wait_readable(&self, extra_fd: Option<i32>, timeout_ms: i32) -> (bool, bool) {
+    /// Block using `poll(2)` until X11, `uxconf_fd`, or `extra_fd` becomes readable.
+    pub fn wait_fds(
+        &self,
+        uxconf_fd: Option<i32>,
+        extra_fd: Option<i32>,
+        timeout_ms: i32,
+    ) -> (bool, bool, bool) {
         let x_fd = self.conn.stream().as_raw_fd();
-        let mut fds = [
-            libc::pollfd {
-                fd: x_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: extra_fd.unwrap_or(-1),
+        let mut fds = [libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        }; 3];
+        fds[0] = libc::pollfd {
+            fd: x_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut nfds = 1usize;
+        let ux_idx = uxconf_fd.map(|fd| {
+            let idx = nfds;
+            fds[idx] = libc::pollfd {
+                fd,
                 events: libc::POLLIN | libc::POLLHUP,
                 revents: 0,
-            },
-        ];
-        let nfds = if extra_fd.is_some() { 2 } else { 1 };
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
+            };
+            nfds += 1;
+            idx
+        });
+        let ext_idx = extra_fd.map(|fd| {
+            let idx = nfds;
+            fds[idx] = libc::pollfd {
+                fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            };
+            nfds += 1;
+            idx
+        });
+        // SAFETY: `fds[..nfds]` is a valid contiguous stack slice of open descriptors.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout_ms) };
         if rc <= 0 {
-            return (false, false);
+            return (false, false, false);
         }
-        let x_ready = fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
-        let extra_ready =
-            nfds == 2 && (fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0);
-        (x_ready, extra_ready)
+        let mask = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
+        let x_ready = fds[0].revents & mask != 0;
+        let ux_ready = ux_idx.is_some_and(|i| fds[i].revents & mask != 0);
+        let ext_ready = ext_idx.is_some_and(|i| fds[i].revents & mask != 0);
+        (x_ready, ux_ready, ext_ready)
+    }
+
+    /// Block using `poll(2)` until the X11 socket (or `extra_fd`, e.g. PTY master) is readable.
+    #[allow(dead_code)]
+    pub fn wait_readable(&self, extra_fd: Option<i32>, timeout_ms: i32) -> (bool, bool) {
+        let (x_ready, _, ext_ready) = self.wait_fds(None, extra_fd, timeout_ms);
+        (x_ready, ext_ready)
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -824,7 +898,6 @@ impl Atoms {
             net_supported: get("_NET_SUPPORTED")?,
             net_wm_pid: get("_NET_WM_PID")?,
             wm_class: get("WM_CLASS")?,
-            spui_settings: get("_SPUI_SETTINGS")?,
             spui_window_cmd: get("_SPUI_WINDOW_CMD")?,
         })
     }

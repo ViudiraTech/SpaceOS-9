@@ -1,5 +1,7 @@
 [Unit]
 Description=SpaceOS desktop session (Xorg and SPUI)
+After=uxconfd.service
+Requires=uxconfd.service
 
 [Service]
 Type=simple

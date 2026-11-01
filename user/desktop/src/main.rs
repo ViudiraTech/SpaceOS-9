@@ -16,7 +16,6 @@ mod app;
 mod apps;
 mod draw;
 mod icons;
-mod settings_store;
 mod shell;
 mod text;
 mod theme;

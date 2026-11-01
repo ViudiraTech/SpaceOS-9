@@ -71,10 +71,12 @@ struct BrowserState {
     hover: HoverTarget,
     status: String,
     last_row_click: Option<(usize, Instant)>,
+    show_hidden: bool,
+    folders_first: bool,
 }
 
 impl BrowserState {
-    fn new(initial: PathBuf, home: PathBuf) -> Self {
+    fn new(initial: PathBuf, home: PathBuf, show_hidden: bool, folders_first: bool) -> Self {
         let places = vec![
             Place {
                 label: "主目录",
@@ -102,7 +104,7 @@ impl BrowserState {
                 icon: Icon::FolderTemp,
             },
         ];
-        let entries = scan(&initial);
+        let entries = scan(&initial, show_hidden, folders_first);
         let status = summarize_entries(&entries);
         Self {
             home,
@@ -115,6 +117,8 @@ impl BrowserState {
             hover: HoverTarget::None,
             status,
             last_row_click: None,
+            show_hidden,
+            folders_first,
         }
     }
 
@@ -127,7 +131,7 @@ impl BrowserState {
             self.history.push(self.current.clone());
         }
         self.current = target;
-        self.entries = scan(&self.current);
+        self.entries = scan(&self.current, self.show_hidden, self.folders_first);
         self.selected = None;
         self.scroll = 0;
         self.last_row_click = None;
@@ -149,7 +153,7 @@ impl BrowserState {
     }
 
     fn refresh(&mut self, visible_rows: usize) {
-        self.entries = scan(&self.current);
+        self.entries = scan(&self.current, self.show_hidden, self.folders_first);
         if let Some(sel) = self.selected {
             if sel >= self.entries.len() {
                 self.selected = self.entries.len().checked_sub(1);
@@ -158,6 +162,22 @@ impl BrowserState {
         let max_scroll = self.entries.len().saturating_sub(visible_rows.max(1));
         self.scroll = self.scroll.min(max_scroll);
         self.status = format!("已刷新 · {}", summarize_entries(&self.entries));
+    }
+
+    fn apply_prefs(&mut self, show_hidden: bool, folders_first: bool, visible_rows: usize) {
+        if self.show_hidden != show_hidden || self.folders_first != folders_first {
+            self.show_hidden = show_hidden;
+            self.folders_first = folders_first;
+            self.entries = scan(&self.current, self.show_hidden, self.folders_first);
+            if let Some(sel) = self.selected {
+                if sel >= self.entries.len() {
+                    self.selected = self.entries.len().checked_sub(1);
+                }
+            }
+            let max_scroll = self.entries.len().saturating_sub(visible_rows.max(1));
+            self.scroll = self.scroll.min(max_scroll);
+            self.status = summarize_entries(&self.entries);
+        }
     }
 
     fn ensure_selected_visible(&mut self, visible_rows: usize) {
@@ -302,7 +322,12 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     app.min_width = 560;
     app.min_height = 340;
 
-    let mut state = BrowserState::new(initial, home);
+    let mut state = BrowserState::new(
+        initial,
+        home,
+        app.config.files_show_hidden,
+        app.config.files_folders_first,
+    );
 
     loop {
         if app.close {
@@ -312,7 +337,15 @@ pub fn run(argument: Option<&str>) -> Result<()> {
             let vis = visible_row_count(app.height as i32);
             match event {
                 UiEvent::Close => app.request_close(),
-                UiEvent::Expose | UiEvent::ThemeChanged => app.needs_redraw = true,
+                UiEvent::Expose => app.needs_redraw = true,
+                UiEvent::ConfigChanged => {
+                    state.apply_prefs(
+                        app.config.files_show_hidden,
+                        app.config.files_folders_first,
+                        vis,
+                    );
+                    app.needs_redraw = true;
+                }
                 UiEvent::Configure { .. } => {
                     let max_scroll = state.entries.len().saturating_sub(vis);
                     state.scroll = state.scroll.min(max_scroll);
@@ -373,13 +406,15 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         }
                         HoverTarget::Row(idx) => {
                             let now = Instant::now();
+                            let dc_ms = app.config.mouse_double_click_ms;
                             let is_double =
                                 state.last_row_click.is_some_and(|(prev_idx, prev_t)| {
                                     prev_idx == idx
-                                        && now.duration_since(prev_t) <= Duration::from_millis(450)
+                                        && now.duration_since(prev_t)
+                                            <= Duration::from_millis(dc_ms)
                                 });
                             state.selected = Some(idx);
-                            if is_double {
+                            if app.config.files_single_click || is_double {
                                 state.last_row_click = None;
                                 state.activate_entry(idx);
                             } else {
@@ -817,18 +852,21 @@ fn is_editable_text(path: &Path, size: u64) -> bool {
     !sample[..n].contains(&0)
 }
 
-fn scan(path: &Path) -> Vec<Entry> {
+fn scan(path: &Path, show_hidden: bool, folders_first: bool) -> Vec<Entry> {
     let Ok(read) = fs::read_dir(path) else {
         return Vec::new();
     };
     let mut result = read
         .filter_map(|item| {
             let item = item.ok()?;
+            let name = item.file_name().to_string_lossy().into_owned();
+            if !show_hidden && name.starts_with('.') {
+                return None;
+            }
             let entry_path = item.path();
             let metadata = fs::metadata(&entry_path)
                 .or_else(|_| item.metadata())
                 .ok()?;
-            let name = item.file_name().to_string_lossy().into_owned();
             let directory = metadata.is_dir();
             Some(Entry {
                 icon: Icon::for_file(&entry_path, directory),
@@ -841,9 +879,13 @@ fn scan(path: &Path) -> Vec<Entry> {
         })
         .collect::<Vec<_>>();
     result.sort_by(|a, b| {
-        b.directory
-            .cmp(&a.directory)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        if folders_first {
+            b.directory
+                .cmp(&a.directory)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        } else {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        }
     });
     result
 }
