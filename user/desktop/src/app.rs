@@ -243,12 +243,12 @@ impl App {
         entry.target = target;
         let factor = 1.0 - (-speed * dt).exp();
         entry.value += (entry.target - entry.value) * factor;
-        if (entry.value - entry.target).abs() > 0.002 {
-            self.anim_active = true;
-        } else {
+        if (entry.value - entry.target).abs() <= 0.002 {
             entry.value = entry.target;
         }
-        entry.value
+        let out = entry.value;
+        self.anim_active = self.anims.values().any(|a| (a.value - a.target).abs() > 0.002);
+        out
     }
 
     #[allow(dead_code)]
@@ -408,8 +408,22 @@ impl App {
         extra_fd: Option<i32>,
         timeout_ms: i32,
     ) -> Result<(Vec<UiEvent>, bool)> {
-        self.update_frame_time();
-        let effective_timeout = if self.anim_active { 16 } else { timeout_ms };
+        let anim_active = ui::has_active_animations() || self.anim_active;
+        let effective_timeout = if anim_active {
+            // Adaptive deadline-based frame pacing: target ~60 FPS (16.6ms intervals).
+            let target_frame = Duration::from_millis(16);
+            let target_deadline = self.last_frame + target_frame;
+            let now = Instant::now();
+            if target_deadline > now {
+                let rem = (target_deadline - now).as_millis() as i32;
+                rem.clamp(1, 16)
+            } else {
+                0
+            }
+        } else {
+            timeout_ms
+        };
+
         let mut raw = Vec::new();
         while let Some(ev) = self.x.poll()? {
             raw.push(ev);
@@ -452,6 +466,9 @@ impl App {
             }
         }
 
+        // Measure true wall-clock dt after waiting, for the next frame render.
+        self.update_frame_time();
+
         // Coalesce consecutive MotionNotify events on our window.
         let mut coalesced: Vec<Event> = Vec::with_capacity(raw.len());
         for ev in raw {
@@ -472,7 +489,8 @@ impl App {
         for ev in coalesced {
             self.translate(ev, &mut events)?;
         }
-        if self.anim_active {
+        let now_animating = ui::has_active_animations() || self.anim_active;
+        if now_animating {
             self.needs_redraw = true;
         }
         Ok((events, extra_ready))
@@ -832,6 +850,7 @@ impl App {
         self.x.flush()?;
         self.drawn = true;
         self.needs_redraw = false;
+        self.last_frame = Instant::now();
         Ok(())
     }
 

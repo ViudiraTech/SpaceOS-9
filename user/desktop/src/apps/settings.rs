@@ -19,8 +19,6 @@ use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
 use crate::ui;
 use crate::x11::Result;
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
 use std::path::Path;
@@ -158,189 +156,6 @@ enum HitTarget {
     ClockShowDate,
     Timezone(usize),
     FactoryReset,
-}
-
-#[derive(Clone, Copy)]
-struct FloatTween {
-    from: f32,
-    to: f32,
-    start: std::time::Instant,
-    duration: f32,
-}
-
-impl FloatTween {
-    fn new(value: f32) -> Self {
-        let now = std::time::Instant::now();
-        Self {
-            from: value,
-            to: value,
-            start: now,
-            duration: 0.0,
-        }
-    }
-
-    fn set_target(&mut self, target: f32, now: std::time::Instant, duration: f32) {
-        if (target - self.to).abs() <= f32::EPSILON {
-            return;
-        }
-        self.from = self.value(now);
-        self.to = target;
-        self.start = now;
-        self.duration = duration;
-    }
-
-    fn value(&self, now: std::time::Instant) -> f32 {
-        if self.duration <= 0.0 {
-            return self.to;
-        }
-        let t = (now.saturating_duration_since(self.start).as_secs_f32() / self.duration)
-            .clamp(0.0, 1.0);
-        self.from + (self.to - self.from) * ease_out_cubic(t)
-    }
-
-    fn active(&self, now: std::time::Instant) -> bool {
-        self.duration > 0.0
-            && now.saturating_duration_since(self.start).as_secs_f32() < self.duration
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RectTween {
-    from: [f32; 4],
-    to: [f32; 4],
-    start: std::time::Instant,
-    duration: f32,
-}
-
-impl RectTween {
-    fn new(rect: Rect) -> Self {
-        let now = std::time::Instant::now();
-        let value = [rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32];
-        Self {
-            from: value,
-            to: value,
-            start: now,
-            duration: 0.0,
-        }
-    }
-
-    fn set_target(&mut self, rect: Rect, now: std::time::Instant, duration: f32) {
-        let target = [rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32];
-        if self.to == target {
-            return;
-        }
-        let current = self.value(now);
-        self.from = [
-            current.x as f32,
-            current.y as f32,
-            current.w as f32,
-            current.h as f32,
-        ];
-        self.to = target;
-        self.start = now;
-        self.duration = duration;
-    }
-
-    fn value(&self, now: std::time::Instant) -> Rect {
-        if self.duration <= 0.0 {
-            return rect_from_values(self.to);
-        }
-        let t = (now.saturating_duration_since(self.start).as_secs_f32() / self.duration)
-            .clamp(0.0, 1.0);
-        let eased = ease_out_cubic(t);
-        let mut value = [0.0; 4];
-        for index in 0..4 {
-            value[index] = self.from[index] + (self.to[index] - self.from[index]) * eased;
-        }
-        rect_from_values(value)
-    }
-
-    fn active(&self, now: std::time::Instant) -> bool {
-        self.duration > 0.0
-            && now.saturating_duration_since(self.start).as_secs_f32() < self.duration
-    }
-}
-
-fn rect_from_values(value: [f32; 4]) -> Rect {
-    Rect::new(
-        value[0].round() as i32,
-        value[1].round() as i32,
-        value[2].round() as i32,
-        value[3].round() as i32,
-    )
-}
-
-/// Material/Qt-style decelerating curve: fast response, gentle settle.
-fn ease_out_cubic(t: f32) -> f32 {
-    let inv = 1.0 - t.clamp(0.0, 1.0);
-    1.0 - inv * inv * inv
-}
-
-// Desktop UI motion: Material 3 "effects" default is 200ms and its spatial
-// default is 350–500ms; NN/G recommends 100–400ms. Controls use 200ms and
-// moving indicators 250ms, both with an ease-out curve.
-const MOTION_CONTROL: f32 = 0.20;
-const MOTION_INDICATOR: f32 = 0.25;
-
-#[derive(Default)]
-struct SettingsAnimStore {
-    toggles: HashMap<HitTarget, FloatTween>,
-    segments: HashMap<String, RectTween>,
-    nav_y: Option<FloatTween>,
-    active: bool,
-    now: Option<std::time::Instant>,
-}
-
-impl SettingsAnimStore {
-    fn set_dt(&mut self, _dt: f32) {
-        self.now = Some(std::time::Instant::now());
-        self.active = false;
-    }
-
-    fn now(&self) -> std::time::Instant {
-        self.now.unwrap_or_else(std::time::Instant::now)
-    }
-
-    fn anim_toggle(&mut self, target: HitTarget, checked: bool) -> f32 {
-        let desired = if checked { 1.0 } else { 0.0 };
-        let now = self.now();
-        let tween = self
-            .toggles
-            .entry(target)
-            .or_insert_with(|| FloatTween::new(desired));
-        tween.set_target(desired, now, MOTION_CONTROL);
-        if tween.active(now) {
-            self.active = true;
-        }
-        tween.value(now)
-    }
-
-    fn anim_segmented(&mut self, key: &str, target_item: Rect) -> Rect {
-        let now = self.now();
-        let tween = self
-            .segments
-            .entry(key.to_string())
-            .or_insert_with(|| RectTween::new(target_item));
-        tween.set_target(target_item, now, MOTION_INDICATOR);
-        if tween.active(now) {
-            self.active = true;
-        }
-        tween.value(now)
-    }
-
-    fn anim_nav(&mut self, target_y: f32) -> f32 {
-        let now = self.now();
-        let tween = self.nav_y.get_or_insert_with(|| FloatTween::new(target_y));
-        tween.set_target(target_y, now, MOTION_INDICATOR);
-        if tween.active(now) {
-            self.active = true;
-        }
-        tween.value(now)
-    }
-}
-
-thread_local! {
-    static ANIMS: RefCell<SettingsAnimStore> = RefCell::new(SettingsAnimStore::default());
 }
 
 static FACTORY_RESET_ARMED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -653,13 +468,8 @@ pub fn run() -> Result<()> {
     let mut last_clock_preview = String::new();
     let thumbnails = load_wallpaper_thumbnails();
     let sys_info = SystemInfo::gather();
-    let mut last_frame = std::time::Instant::now();
 
     loop {
-        let dt = last_frame.elapsed().as_secs_f32().clamp(0.001, 0.100);
-        last_frame = std::time::Instant::now();
-        ANIMS.with(|a| a.borrow_mut().set_dt(dt));
-
         if page == Page::DateTime {
             let (now_str, _) = format_datetime_preview(&app.config);
             if now_str != last_clock_preview {
@@ -668,7 +478,6 @@ pub fn run() -> Result<()> {
             }
         }
 
-        let mut frame_animating = false;
         if app.needs_redraw {
             let vp = scroll_viewport(app.width as i32, app.height as i32);
             hits.clear();
@@ -705,23 +514,15 @@ pub fn run() -> Result<()> {
                     &mut hits,
                 );
             }
-            frame_animating = ANIMS.with(|a| a.borrow().active);
             app.draw_chrome();
             app.present()?;
-            // present() clears needs_redraw; re-arm after it so the next
-            // animation tick is not lost.
-            if frame_animating {
-                app.needs_redraw = true;
-            }
         }
 
         if app.close {
             break;
         }
 
-        let timeout_ms = if frame_animating {
-            16
-        } else if page == Page::DateTime && app.config.clock_seconds {
+        let timeout_ms = if page == Page::DateTime && app.config.clock_seconds {
             250
         } else {
             500
@@ -1173,8 +974,7 @@ fn draw_toggle_row(
     let sw_rect = Rect::new(card_x + card_w - 16 - 42, y + (ROW_H - 22) / 2, 42, 22);
     let label_max_w = sw_rect.x - (card_x + 16) - 16;
     draw_row_labels(canvas, text, theme, card_x, y, label_max_w, title, subtitle);
-    let p = ANIMS.with(|a| a.borrow_mut().anim_toggle(target, checked));
-    ui::toggle_switch_anim(canvas, theme, sw_rect, p, hover == Some(target));
+    ui::toggle_switch_with_id(canvas, theme, target, sw_rect, checked, hover == Some(target));
     push_clipped_hit(hits, viewport, sw_rect, target);
 }
 
@@ -1216,10 +1016,8 @@ fn draw_segmented_row<F>(
         let item_rect = ui::segmented_item_rect(seg_rect, labels.len(), i);
         push_clipped_hit(hits, viewport, item_rect, item_target);
     }
-    let target_item = ui::segmented_item_rect(seg_rect, labels.len(), selected);
-    let ind_rect = ANIMS.with(|a| a.borrow_mut().anim_segmented(title, target_item));
-    ui::segmented_control_anim(
-        canvas, text, theme, seg_rect, labels, ind_rect, selected, hover_idx,
+    ui::segmented_control_with_id(
+        canvas, text, theme, title, seg_rect, labels, selected, hover_idx,
     );
 }
 
@@ -1264,7 +1062,7 @@ fn draw_settings(
 
     let active_idx = NAV.iter().position(|(id, _, _)| *id == page).unwrap_or(0);
     let target_nav_y = (TITLEBAR_HEIGHT + 36 + active_idx as i32 * 38) as f32;
-    let nav_y = ANIMS.with(|a| a.borrow_mut().anim_nav(target_nav_y));
+    let nav_y = ui::animate_float("settings_nav", target_nav_y, ui::MOTION_INDICATOR);
     let active_pill = Rect::new(10, nav_y.round() as i32, SIDEBAR_W - 20, 34);
     canvas.rounded_rect(active_pill, RADIUS_CONTROL, theme.accent_soft, 1.0);
     canvas.fill(

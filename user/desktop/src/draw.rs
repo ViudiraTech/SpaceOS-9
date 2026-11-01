@@ -15,7 +15,7 @@
 
 #![allow(dead_code)]
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,

@@ -17,6 +17,220 @@ use crate::draw::{mix, Canvas, Rect};
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::time::Instant;
+
+pub const MOTION_TOGGLE: f32 = 0.18;
+pub const MOTION_INDICATOR: f32 = 0.22;
+#[allow(dead_code)]
+pub const MOTION_HOVER: f32 = 0.12;
+
+/// Material/iOS-style decelerating curve: fast response, gentle settle.
+#[inline]
+pub fn ease_out_cubic(t: f32) -> f32 {
+    let inv = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - inv * inv * inv
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WidgetId(pub u64);
+
+impl WidgetId {
+    pub fn new<T: Hash>(val: T) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        val.hash(&mut hasher);
+        Self(hasher.finish())
+    }
+}
+
+pub trait IntoWidgetId {
+    fn into_widget_id(self) -> WidgetId;
+}
+
+impl<T: Hash> IntoWidgetId for T {
+    fn into_widget_id(self) -> WidgetId {
+        WidgetId::new(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FloatTween {
+    from: f32,
+    to: f32,
+    start: Instant,
+    duration: f32,
+}
+
+impl FloatTween {
+    pub fn new(value: f32) -> Self {
+        Self {
+            from: value,
+            to: value,
+            start: Instant::now(),
+            duration: 0.0,
+        }
+    }
+
+    pub fn set_target(&mut self, target: f32, now: Instant, duration: f32) {
+        if (target - self.to).abs() <= f32::EPSILON {
+            return;
+        }
+        self.from = self.value(now);
+        self.to = target;
+        self.start = now;
+        self.duration = duration;
+    }
+
+    pub fn value(&self, now: Instant) -> f32 {
+        if self.duration <= 0.0 {
+            return self.to;
+        }
+        let t = (now.saturating_duration_since(self.start).as_secs_f32() / self.duration)
+            .clamp(0.0, 1.0);
+        self.from + (self.to - self.from) * ease_out_cubic(t)
+    }
+
+    pub fn active(&self, now: Instant) -> bool {
+        self.duration > 0.0
+            && now.saturating_duration_since(self.start).as_secs_f32() < self.duration
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RectTween {
+    from: [f32; 4],
+    to: [f32; 4],
+    start: Instant,
+    duration: f32,
+}
+
+impl RectTween {
+    pub fn new(rect: Rect) -> Self {
+        let value = [rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32];
+        Self {
+            from: value,
+            to: value,
+            start: Instant::now(),
+            duration: 0.0,
+        }
+    }
+
+    pub fn set_target(&mut self, rect: Rect, now: Instant, duration: f32) {
+        let target = [rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32];
+        if self.to == target {
+            return;
+        }
+        let current = self.value(now);
+        self.from = [
+            current.x as f32,
+            current.y as f32,
+            current.w as f32,
+            current.h as f32,
+        ];
+        self.to = target;
+        self.start = now;
+        self.duration = duration;
+    }
+
+    pub fn value(&self, now: Instant) -> Rect {
+        if self.duration <= 0.0 {
+            return rect_from_values(self.to);
+        }
+        let t = (now.saturating_duration_since(self.start).as_secs_f32() / self.duration)
+            .clamp(0.0, 1.0);
+        let eased = ease_out_cubic(t);
+        let mut value = [0.0; 4];
+        for index in 0..4 {
+            value[index] = self.from[index] + (self.to[index] - self.from[index]) * eased;
+        }
+        rect_from_values(value)
+    }
+
+    pub fn active(&self, now: Instant) -> bool {
+        self.duration > 0.0
+            && now.saturating_duration_since(self.start).as_secs_f32() < self.duration
+    }
+}
+
+fn rect_from_values(value: [f32; 4]) -> Rect {
+    Rect::new(
+        value[0].round() as i32,
+        value[1].round() as i32,
+        value[2].round() as i32,
+        value[3].round() as i32,
+    )
+}
+
+#[derive(Default)]
+pub struct AnimationManager {
+    toggles: HashMap<WidgetId, FloatTween>,
+    rects: HashMap<WidgetId, RectTween>,
+    floats: HashMap<WidgetId, FloatTween>,
+}
+
+impl AnimationManager {
+    pub fn animate_bool(&mut self, id: WidgetId, target: bool, duration: f32) -> f32 {
+        let desired = if target { 1.0 } else { 0.0 };
+        let now = Instant::now();
+        let tween = self
+            .toggles
+            .entry(id)
+            .or_insert_with(|| FloatTween::new(desired));
+        tween.set_target(desired, now, duration);
+        tween.value(now)
+    }
+
+    pub fn animate_rect(&mut self, id: WidgetId, target: Rect, duration: f32) -> Rect {
+        let now = Instant::now();
+        let tween = self
+            .rects
+            .entry(id)
+            .or_insert_with(|| RectTween::new(target));
+        tween.set_target(target, now, duration);
+        tween.value(now)
+    }
+
+    pub fn animate_float(&mut self, id: WidgetId, target: f32, duration: f32) -> f32 {
+        let now = Instant::now();
+        let tween = self
+            .floats
+            .entry(id)
+            .or_insert_with(|| FloatTween::new(target));
+        tween.set_target(target, now, duration);
+        tween.value(now)
+    }
+
+    pub fn has_active(&self) -> bool {
+        let now = Instant::now();
+        self.toggles.values().any(|t| t.active(now))
+            || self.rects.values().any(|t| t.active(now))
+            || self.floats.values().any(|t| t.active(now))
+    }
+}
+
+thread_local! {
+    static ANIM_MGR: std::cell::RefCell<AnimationManager> = std::cell::RefCell::new(AnimationManager::default());
+}
+
+pub fn animate_bool(id: impl IntoWidgetId, target: bool, duration: f32) -> f32 {
+    let wid = id.into_widget_id();
+    ANIM_MGR.with(|m| m.borrow_mut().animate_bool(wid, target, duration))
+}
+
+pub fn animate_rect(id: impl IntoWidgetId, target: Rect, duration: f32) -> Rect {
+    let wid = id.into_widget_id();
+    ANIM_MGR.with(|m| m.borrow_mut().animate_rect(wid, target, duration))
+}
+
+pub fn animate_float(id: impl IntoWidgetId, target: f32, duration: f32) -> f32 {
+    let wid = id.into_widget_id();
+    ANIM_MGR.with(|m| m.borrow_mut().animate_float(wid, target, duration))
+}
+
+pub fn has_active_animations() -> bool {
+    ANIM_MGR.with(|m| m.borrow().has_active())
+}
 
 pub const CAPTION_BTN_W: i32 = 42;
 
@@ -346,10 +560,23 @@ pub fn toggle_switch_anim(
     canvas.rounded_rect(knob_rect, knob_d / 2, 0xffffff, 1.0);
 }
 
-/// Pill-shaped boolean toggle switch (`38 × 20` recommended).
-#[allow(dead_code)]
+/// Pill-shaped boolean toggle switch (`38 × 20` recommended) with automatic smooth animation.
 pub fn toggle_switch(canvas: &mut Canvas, theme: &Theme, rect: Rect, checked: bool, hover: bool) {
-    toggle_switch_anim(canvas, theme, rect, if checked { 1.0 } else { 0.0 }, hover);
+    let p = animate_bool(rect, checked, MOTION_TOGGLE);
+    toggle_switch_anim(canvas, theme, rect, p, hover);
+}
+
+/// Pill-shaped boolean toggle switch with explicit widget ID and automatic smooth animation.
+pub fn toggle_switch_with_id(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    id: impl IntoWidgetId,
+    rect: Rect,
+    checked: bool,
+    hover: bool,
+) {
+    let p = animate_bool(id, checked, MOTION_TOGGLE);
+    toggle_switch_anim(canvas, theme, rect, p, hover);
 }
 
 /// Linear horizontal progress bar with rounded caps.
@@ -467,7 +694,7 @@ pub fn segmented_control_anim(
     }
 }
 
-/// Multi-option segmented selector control.
+/// Multi-option segmented selector control with automatic smooth animation.
 pub fn segmented_control(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
@@ -478,7 +705,24 @@ pub fn segmented_control(
     hover_idx: Option<usize>,
 ) {
     let seg = segmented_item_rect(rect, labels.len(), selected);
-    segmented_control_anim(canvas, text, theme, rect, labels, seg, selected, hover_idx);
+    let ind_rect = animate_rect(rect, seg, MOTION_INDICATOR);
+    segmented_control_anim(canvas, text, theme, rect, labels, ind_rect, selected, hover_idx);
+}
+
+/// Multi-option segmented selector control with explicit widget ID and automatic smooth animation.
+pub fn segmented_control_with_id(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    id: impl IntoWidgetId,
+    rect: Rect,
+    labels: &[&str],
+    selected: usize,
+    hover_idx: Option<usize>,
+) {
+    let seg = segmented_item_rect(rect, labels.len(), selected);
+    let ind_rect = animate_rect(id, seg, MOTION_INDICATOR);
+    segmented_control_anim(canvas, text, theme, rect, labels, ind_rect, selected, hover_idx);
 }
 
 /// Circular color swatch with active ring indicator.
@@ -633,4 +877,52 @@ pub fn scrollbar_v(
     let thumb_y = track.y + ((offset.min(max_offset) * travel as usize) / max_offset) as i32;
     let thumb = Rect::new(track.x + 1, thumb_y, (track.w - 2).max(2), thumb_h);
     canvas.rounded_rect(thumb, 3, theme.scrollbar_thumb, 1.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ease_out_cubic() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        let mid = ease_out_cubic(0.5);
+        assert!(mid > 0.5, "Ease-out cubic should accelerate early: mid={}", mid);
+        assert!((mid - 0.875).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_widget_id() {
+        let id1 = "test_toggle".into_widget_id();
+        let id2 = "test_toggle".into_widget_id();
+        let id3 = "other_toggle".into_widget_id();
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+
+        let r_id1 = Rect::new(10, 20, 30, 40).into_widget_id();
+        let r_id2 = Rect::new(10, 20, 30, 40).into_widget_id();
+        assert_eq!(r_id1, r_id2);
+    }
+
+    #[test]
+    fn test_animate_bool() {
+        let p0 = animate_bool("unit_test_toggle", false, 0.2);
+        assert_eq!(p0, 0.0);
+        let p1 = animate_bool("unit_test_toggle", true, 0.2);
+        assert!(p1 >= 0.0 && p1 <= 1.0);
+        assert!(has_active_animations());
+    }
+
+    #[test]
+    fn test_animate_rect() {
+        let r0 = Rect::new(0, 0, 100, 30);
+        let r1 = Rect::new(50, 0, 100, 30);
+        let out0 = animate_rect("unit_test_rect", r0, 0.2);
+        assert_eq!(out0, r0);
+        let out1 = animate_rect("unit_test_rect", r1, 0.2);
+        assert_eq!(out1.y, 0);
+        assert_eq!(out1.w, 100);
+        assert_eq!(out1.h, 30);
+    }
 }

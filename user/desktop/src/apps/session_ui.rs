@@ -470,8 +470,13 @@ impl Screen {
         self.needs_redraw = true;
     }
 
-    pub fn wait(&self, backend_fd: RawFd, timeout_ms: i32) -> (bool, bool) {
-        let (x_ready, _, backend_ready) = self.x.wait_fds(None, Some(backend_fd), timeout_ms);
+    pub fn wait(&mut self, backend_fd: RawFd, timeout_ms: i32) -> (bool, bool) {
+        let anim_active = crate::ui::has_active_animations();
+        let timeout = if anim_active { 16 } else { timeout_ms };
+        let (x_ready, _, backend_ready) = self.x.wait_fds(None, Some(backend_fd), timeout);
+        if crate::ui::has_active_animations() {
+            self.needs_redraw = true;
+        }
         (x_ready, backend_ready)
     }
 }
