@@ -178,7 +178,6 @@ pub extern "C" fn kmain() -> ! {
     sched::init(boot::cpu_count());
     smp::start();
     kinfo!("Scheduler: per-CPU EEVDF ready");
-    ipc::start_poll_timer();
     vfs::start_services();
     match boot::init_path() {
         Some(path) => match vfs::read_file(&path) {

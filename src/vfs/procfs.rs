@@ -62,6 +62,13 @@ impl Node {
                 let stats = task.stats();
                 let files = task.files();
                 let space = task.address_space();
+                // Filesystem metadata may sleep, so collect it before locking.
+                let map_entries = match space.as_ref() {
+                    Some(space) if name == "maps" => {
+                        crate::user::UserAddressSpace::map_entries(space)
+                    }
+                    _ => alloc::vec::Vec::new(),
+                };
                 let space = space.as_ref().map(|s| s.lock());
                 let image = space.as_ref().and_then(|s| s.image.as_ref());
                 let comm_len = stats
@@ -135,7 +142,7 @@ impl Node {
                             let brk_end =
                                 crate::user::address_space::align_up(s.brk).unwrap_or(s.brk);
                             let exe_name = s.image.as_ref().map(|i| i.executable.as_str());
-                            for (start, end, p, shared, rdev, ino) in s.map_entries() {
+                            for (start, end, p, shared, rdev, ino) in map_entries {
                                 let label = if s.brk > s.brk_base
                                     && start >= s.brk_base
                                     && end <= brk_end

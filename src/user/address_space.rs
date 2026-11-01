@@ -17,6 +17,7 @@ use crate::vfs::{Inode, VfsError};
 use crate::{
     arch,
     mm::{pmm, vmm},
+    sync::SpinLock,
 };
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
@@ -637,9 +638,23 @@ impl UserAddressSpace {
 
     /// Activate this address space on the current CPU.
     pub fn activate(&self) {
+        Self::activate_root(self.root_phys);
+    }
+
+    /// Activate `space` without taking its lock. The context switch path must
+    /// not wait for a lock whose holder may need this CPU to make progress, and
+    /// the root table never changes after the space is created.
+    pub fn activate_shared(space: &SpinLock<Self>) {
+        // SAFETY: `root_phys` is immutable after construction, the pointer comes
+        // from a live lock, and no reference to the protected value is formed.
+        let root = unsafe { core::ptr::addr_of!((*space.as_ptr()).root_phys).read() };
+        Self::activate_root(root);
+    }
+
+    fn activate_root(root: u64) {
         #[cfg(target_arch = "x86_64")]
         {
-            arch::set_page_root(self.root_phys);
+            arch::set_page_root(root);
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -660,14 +675,14 @@ impl UserAddressSpace {
                     "dsb ish",
                     "isb",
                     tcr = in(reg) tcr,
-                    root = in(reg) self.root_phys,
+                    root = in(reg) root,
                     options(nostack)
                 );
             }
         }
         #[cfg(target_arch = "riscv64")]
         {
-            arch::set_page_root(self.root_phys);
+            arch::set_page_root(root);
         }
     }
 
@@ -1147,40 +1162,46 @@ impl UserAddressSpace {
         result
     }
 
-    pub fn map_entries(&self) -> Vec<(u64, u64, u32, bool, u64, u64)> {
-        let mut result: Vec<(u64, u64, u32, bool, u64, u64)> = Vec::new();
+    /// `(start, end, prot, shared, rdev, ino)` for every mapping, as shown in
+    /// `/proc/<pid>/maps`. Takes the lock itself because a filesystem's `metadata`
+    /// may sleep and so has to run after it is released.
+    pub fn map_entries(space: &SpinLock<Self>) -> Vec<(u64, u64, u32, bool, u64, u64)> {
+        let raw = space.lock().raw_map_entries();
+        let mut result: Vec<(u64, u64, u32, bool, u64, u64)> = Vec::with_capacity(raw.len());
+        for (start, end, prot, shared, file) in raw {
+            let (rdev, ino) = file
+                .and_then(|inode| inode.metadata().ok())
+                .map_or((0, 0), |stat| (stat.rdev, stat.ino));
+            result.push((start, end, prot, shared, rdev, ino));
+        }
+        result
+    }
+
+    fn raw_map_entries(&self) -> Vec<(u64, u64, u32, bool, Option<Arc<dyn Inode>>)> {
+        let mut result: Vec<(u64, u64, u32, bool, Option<Arc<dyn Inode>>)> = Vec::new();
         for (&start, region) in &self.lazy {
-            let (rdev, ino) = region
-                .file
-                .as_ref()
-                .and_then(|i| i.metadata().ok())
-                .map(|s| (s.rdev, s.ino))
-                .unwrap_or((0, 0));
-            result.push((start, region.end, region.prot, region.shared, rdev, ino));
+            result.push((start, region.end, region.prot, region.shared, region.file.clone()));
         }
         for (&page, m) in &self.mapped_frames {
             if self.lazy_region(page).is_some() {
                 continue;
             }
             let shared = !m.owned;
-            let (rdev, ino) = m
-                .owner
-                .as_ref()
-                .and_then(|i| i.metadata().ok())
-                .map(|s| (s.rdev, s.ino))
-                .unwrap_or((0, 0));
-            if let Some(last) = result.last_mut() {
-                if last.1 == page
-                    && last.2 == m.prot
-                    && last.3 == shared
-                    && last.4 == rdev
-                    && last.5 == ino
-                {
-                    last.1 += PAGE_SIZE;
-                    continue;
-                }
+            let same_owner = |other: &Option<Arc<dyn Inode>>| match (other, &m.owner) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if let Some(last) = result.last_mut()
+                && last.1 == page
+                && last.2 == m.prot
+                && last.3 == shared
+                && same_owner(&last.4)
+            {
+                last.1 += PAGE_SIZE;
+                continue;
             }
-            result.push((page, page + PAGE_SIZE, m.prot, shared, rdev, ino));
+            result.push((page, page + PAGE_SIZE, m.prot, shared, m.owner.clone()));
         }
         result.sort_unstable_by_key(|entry| entry.0);
         result
@@ -1214,6 +1235,8 @@ impl UserAddressSpace {
 
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
+        // Exec and fatal signals leave without shmdt, as does a plain exit.
+        crate::ipc::shm::release_address_space(self.root_phys);
         // Drop one reference from privately owned frames; COW pages may
         // still be mapped by another address space.
         for m in self.mapped_frames.values() {

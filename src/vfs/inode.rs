@@ -204,6 +204,13 @@ pub trait Inode: Send + Sync + core::any::Any {
         1 | 4
     }
 
+    /// Declare how a blocked task learns that `poll` may have changed. The
+    /// default rechecks every millisecond; inodes that announce their changes
+    /// override this. Must not sleep: it runs under spin locks.
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        sources.tick();
+    }
+
     /// Sequence of new readable activity for edge-triggered poll consumers.
     fn poll_read_generation(&self) -> u64 {
         0

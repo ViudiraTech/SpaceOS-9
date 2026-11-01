@@ -40,7 +40,7 @@ fn main() -> ExitCode {
             arguments.get(2).map(String::as_str).unwrap_or("通知"),
             arguments.get(3).map(String::as_str).unwrap_or(""),
         ),
-        "xprobe" => xprobe::run(),
+        "xprobe" => xprobe::run(arguments.get(2..).unwrap_or(&[])),
         "version" => {
             println!("SPUI 4.0 (SpaceOS-9)");
             Ok(())

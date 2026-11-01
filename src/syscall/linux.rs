@@ -1011,7 +1011,23 @@ fn select_core(
             });
         }
     }
+    let mut wait = crate::ipc::pollwait::PollWait::new();
     loop {
+        if wait.registered() {
+            let mut sources = crate::ipc::pollwait::PollSources::new();
+            if let Some(deadline) = deadline {
+                sources.expire_at(deadline);
+            }
+            let table = vfs::current_fd_table();
+            let table = table.lock();
+            for slot in &slots {
+                if let Some(entry) = table.get(slot.fd as usize) {
+                    entry.file.inode.poll_sources(&mut sources);
+                }
+            }
+            drop(table);
+            wait.arm(&sources);
+        }
         let mut out_read = vec![0u8; bytes];
         let mut out_write = vec![0u8; bytes];
         let mut out_except = vec![0u8; bytes];
@@ -1059,7 +1075,7 @@ fn select_core(
         if crate::signal::pending_for_current() {
             return Err(VfsError::Interrupted);
         }
-        crate::ipc::wait_pollers(deadline.map(|deadline| deadline - now));
+        wait.sleep();
     }
 }
 

@@ -243,6 +243,7 @@ fn enqueue(queue: &mut Vec<Signal>, signal: Signal) {
         return;
     }
     queue.push(signal);
+    crate::ipc::poll_kick();
 }
 
 /// Lowest-numbered standard signal first; real-time signals stay FIFO.
@@ -618,8 +619,13 @@ mod x86_64 {
     pub const UCONTEXT_SIGMASK: usize = 296;
     pub const UCONTEXT_SIZE: usize = 304;
     pub const FRAME_SIGINFO: usize = FRAME_UCONTEXT + UCONTEXT_SIZE;
-    pub const FRAME_FPSTATE: usize = 448;
+    /// With the frame placed at 64n - 8, this offset keeps the FPU image on a
+    /// 64-byte boundary as XSAVE requires.
+    pub const FRAME_FPSTATE: usize = 456;
     pub const FRAME_BASE: usize = FRAME_FPSTATE + 512;
+    /// System V x86-64: leaf functions may use 128 bytes below RSP without
+    /// moving it, and that memory must survive an asynchronous signal.
+    pub const RED_ZONE: u64 = 128;
     pub const SIGCONTEXT_SIZE: usize = 256;
 
     const SC_R8: usize = 0;
@@ -818,7 +824,7 @@ mod x86_64 {
         let base_sp = if use_altstack {
             stack_pointer.saturating_add(stack_size)
         } else {
-            regs.rsp
+            regs.rsp.saturating_sub(RED_ZONE)
         };
 
         let mut fpu = [0u8; 4096];
@@ -827,7 +833,9 @@ mod x86_64 {
         if base_sp <= (frame_size as u64 + 4096) {
             return Err(VfsError::Fault);
         }
-        let frame_address = (base_sp - frame_size as u64) & !63;
+        // The handler is entered as if called: RSP points at the return address
+        // (`pretcode`), so RSP + 8 must be 16-byte aligned.
+        let frame_address = ((base_sp - frame_size as u64) & !63) - 8;
         let mut frame = alloc::vec![0u8; frame_size];
 
         put_u64(&mut frame, FRAME_PRETCODE, action.restorer);

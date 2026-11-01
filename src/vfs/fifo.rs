@@ -103,6 +103,10 @@ impl Inode for FifoEndInode {
         pipe_write(&self.shared, self.nonblock.load(Ordering::Acquire), buf)
     }
 
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        sources.object(Arc::as_ptr(&self.shared));
+    }
+
     fn poll(&self) -> u32 {
         let pipe = self.shared.lock();
         let mut events = 0;
@@ -139,5 +143,6 @@ impl Drop for FifoEndInode {
         if self.can_write {
             pipe.writers = pipe.writers.saturating_sub(1);
         }
+        crate::ipc::poll_kick();
     }
 }

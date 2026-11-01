@@ -1201,6 +1201,8 @@ pub fn service(gpu: &Gpu) {
                 if queue.len() < 256 {
                     queue.push_back(event);
                 }
+                drop(queue);
+                crate::ipc::wake_object(Arc::as_ptr(&job.events));
             }
         }
     }

@@ -46,6 +46,12 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// Raw pointer to the value, for fields documented as immutable after
+    /// construction. Dereferencing anything else needs the lock.
+    pub const fn as_ptr(&self) -> *mut T {
+        self.value.get()
+    }
+
     pub fn lock(&self) -> Guard<'_, T> {
         let flags = loop {
             let flags = arch::irq_save();

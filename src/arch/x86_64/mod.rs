@@ -23,7 +23,7 @@ pub mod syscall;
 
 pub use context::{Context, context_init, switch};
 pub use cpu::{
-    counter, disable_interrupts, enable_interrupts, halt, irq_restore, irq_save, system_reset,
+    counter, disable_interrupts, enable_interrupts, halt, irq_restore, irq_save, irqs_enabled, system_reset,
 };
 pub use interrupts::{init_bsp as init_exceptions, load_cpu as load_exceptions};
 pub use paging::setup_memory_protection;

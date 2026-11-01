@@ -97,6 +97,11 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
     }
     space.lock().activate();
     drop(old);
+    // enter_user_mode never returns, so anything still owned by this frame would
+    // never be dropped; a leaked space would keep every page of this image alive.
+    drop(space);
+    drop(path);
+    drop(task);
     unsafe {
         crate::user::process::install_tls(tls_tp);
         let _ = crate::fpu::enable_user();
@@ -116,7 +121,26 @@ pub fn poll(pointer: u64, count: u64, timeout_ms: i64) -> i64 {
         } else {
             crate::time::uptime_micros().saturating_add((timeout_ms as u64).saturating_mul(1000))
         };
+        let mut wait = crate::ipc::pollwait::PollWait::new();
         loop {
+            if wait.registered() {
+                let mut sources = crate::ipc::pollwait::PollSources::new();
+                if deadline != u64::MAX {
+                    sources.expire_at(deadline);
+                }
+                let table = vfs::current_fd_table();
+                let table = table.lock();
+                for item in bytes.chunks_exact(8) {
+                    let fd = i32::from_le_bytes(item[..4].try_into().unwrap());
+                    if fd >= 0
+                        && let Some(entry) = table.get(fd as usize)
+                    {
+                        entry.file.inode.poll_sources(&mut sources);
+                    }
+                }
+                drop(table);
+                wait.arm(&sources);
+            }
             let mut ready = 0;
             for item in bytes.chunks_exact_mut(8) {
                 let fd = i32::from_le_bytes(item[..4].try_into().unwrap());
@@ -140,7 +164,7 @@ pub fn poll(pointer: u64, count: u64, timeout_ms: i64) -> i64 {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::wait_pollers(None);
+            wait.sleep();
         }
     })();
     match result {

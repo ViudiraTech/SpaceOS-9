@@ -68,6 +68,19 @@ pub fn mmap(hint: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64)
             offset
                 .checked_add(length)
                 .ok_or(VfsError::InvalidArgument)?;
+            // A filesystem may sleep here, so ask before taking the space lock.
+            if !shared {
+                // Device nodes without file contents have nothing to copy.
+                let meta = f.inode.metadata()?;
+                if !matches!(
+                    meta.kind,
+                    crate::vfs::InodeKind::Regular
+                        | crate::vfs::InodeKind::CharDevice
+                        | crate::vfs::InodeKind::BlockDevice
+                ) {
+                    return Err(VfsError::NoDevice);
+                }
+            }
             Some(f)
         } else {
             None
@@ -108,16 +121,6 @@ pub fn mmap(hint: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64)
                     space.restrict_permissions(address, length, 5)?;
                 }
             } else {
-                // Device nodes without file contents have nothing to copy.
-                let meta = file.inode.metadata()?;
-                if !matches!(
-                    meta.kind,
-                    crate::vfs::InodeKind::Regular
-                        | crate::vfs::InodeKind::CharDevice
-                        | crate::vfs::InodeKind::BlockDevice
-                ) {
-                    return Err(VfsError::NoDevice);
-                }
                 space.map_lazy(
                     address,
                     length,

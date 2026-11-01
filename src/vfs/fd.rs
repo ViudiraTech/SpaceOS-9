@@ -15,7 +15,7 @@ use super::{
     inode::{DirEntry, Inode, InodeKind, Stat, VfsError},
 };
 use crate::{
-    sync::SpinLock,
+    sync::{Mutex, SpinLock},
     tty::{self, ReadError, TtyDevice},
 };
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
@@ -205,6 +205,8 @@ pub(crate) fn pipe_read(
             for slot in &mut buf[..count] {
                 *slot = pipe.queue.pop_front().unwrap();
             }
+            drop(pipe);
+            crate::ipc::wake_object(shared as *const SpinLock<PipeBuffer>);
             return Ok(count);
         }
         if pipe.writers == 0 {
@@ -246,6 +248,8 @@ pub(crate) fn pipe_write(
             for &byte in &buf[..count] {
                 pipe.queue.push_back(byte);
             }
+            drop(pipe);
+            crate::ipc::wake_object(shared as *const SpinLock<PipeBuffer>);
             return Ok(count);
         }
         drop(pipe);
@@ -286,6 +290,10 @@ impl Inode for PipeEndInode {
         pipe_write(&self.shared, self.nonblock.load(Ordering::Acquire), buf)
     }
 
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        sources.object(Arc::as_ptr(&self.shared));
+    }
+
     fn poll(&self) -> u32 {
         let pipe = self.shared.lock();
         if self.is_writer {
@@ -322,6 +330,7 @@ impl Drop for PipeEndInode {
         } else {
             pipe.readers = pipe.readers.saturating_sub(1);
         }
+        crate::ipc::poll_kick();
     }
 }
 
@@ -369,7 +378,8 @@ pub struct OpenFile {
     pub inode: Arc<dyn Inode>,
     pub abs_path: String,
     flags: SpinLock<u32>,
-    offset: SpinLock<u64>,
+    /// Held across file I/O, which may sleep, to serialize the file position.
+    offset: Mutex<u64>,
     dir_cursor: SpinLock<usize>,
     /// `flock` key held by this description, released when it is destroyed.
     flock_key: SpinLock<Option<(u64, u64)>>,
@@ -396,7 +406,7 @@ impl OpenFile {
             inode,
             abs_path,
             flags: SpinLock::new(flags),
-            offset: SpinLock::new(0),
+            offset: Mutex::new(0),
             dir_cursor: SpinLock::new(0),
             flock_key: SpinLock::new(None),
         }
@@ -465,7 +475,7 @@ impl OpenFile {
             *off = off.saturating_add(n as u64);
             return Ok(n);
         }
-        // Blocking socket/pipe writes must not run under the offset spin lock.
+        // Blocking socket/pipe writes must not hold up other users of the position.
         self.inode.write_at(0, buf)
     }
 

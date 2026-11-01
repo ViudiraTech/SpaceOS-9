@@ -599,6 +599,10 @@ impl Inode for PtyMaster {
         Ok(())
     }
 
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        sources.object(Arc::as_ptr(&self.core));
+    }
+
     fn poll(&self) -> u32 {
         let state = self.core.state.lock();
         let mut events = 0;
@@ -618,7 +622,9 @@ impl Inode for PtyMaster {
         if buffer.is_empty() {
             return Ok(0);
         }
+        let mut wait = crate::ipc::pollwait::PollWait::new();
         loop {
+            wait.arm_object(Arc::as_ptr(&self.core));
             {
                 let mut state = self.core.state.lock();
                 if !state.output.is_empty() {
@@ -626,6 +632,8 @@ impl Inode for PtyMaster {
                     for slot in buffer[..count].iter_mut() {
                         *slot = state.output.pop_front().unwrap();
                     }
+                    drop(state);
+                    crate::ipc::wake_object(Arc::as_ptr(&self.core));
                     return Ok(count);
                 }
                 // Linux reports EIO once every slave handle is gone.
@@ -639,7 +647,7 @@ impl Inode for PtyMaster {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::wait_pollers(None);
+            wait.sleep();
         }
     }
 
@@ -649,7 +657,7 @@ impl Inode for PtyMaster {
             PtyCore::input_byte(&mut state, byte);
         }
         drop(state);
-        crate::ipc::wake_pollers();
+        crate::ipc::wake_object(Arc::as_ptr(&self.core));
         Ok(buffer.len())
     }
 
@@ -755,6 +763,10 @@ impl Inode for PtySlave {
         Ok(stat)
     }
 
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        sources.object(Arc::as_ptr(&self.core));
+    }
+
     fn poll(&self) -> u32 {
         let state = self.core.state.lock();
         let mut events = 0;
@@ -777,7 +789,9 @@ impl Inode for PtySlave {
             return Ok(0);
         }
         self.job_control_check(true)?;
+        let mut wait = crate::ipc::pollwait::PollWait::new();
         loop {
+            wait.arm_object(Arc::as_ptr(&self.core));
             {
                 let mut state = self.core.state.lock();
                 let canonical = state.termios.lflag & ICANON != 0;
@@ -795,6 +809,8 @@ impl Inode for PtySlave {
                     }
                     let minimum = usize::from(state.termios.cc[VMIN]);
                     if canonical || count >= minimum.min(buffer.len()) || minimum == 0 {
+                        drop(state);
+                        crate::ipc::wake_object(Arc::as_ptr(&self.core));
                         return Ok(count);
                     }
                     for &byte in buffer[..count].iter().rev() {
@@ -812,7 +828,7 @@ impl Inode for PtySlave {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::wait_pollers(None);
+            wait.sleep();
         }
     }
 
@@ -824,7 +840,7 @@ impl Inode for PtySlave {
         }
         PtyCore::output_bytes(&mut state, buffer);
         drop(state);
-        crate::ipc::wake_pollers();
+        crate::ipc::wake_object(Arc::as_ptr(&self.core));
         Ok(buffer.len())
     }
 

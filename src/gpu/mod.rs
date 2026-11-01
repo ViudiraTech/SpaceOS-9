@@ -1392,6 +1392,8 @@ impl Session {
             return Err(VfsError::NoSpace);
         }
         queue.push_back(bytes);
+        drop(queue);
+        crate::ipc::wake_object(Arc::as_ptr(&self.events));
         Ok(())
     }
 }
@@ -1480,6 +1482,13 @@ impl Inode for Session {
             written += event.len();
         }
         Ok(written)
+    }
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        sources.object(Arc::as_ptr(&self.events));
+        // Fence completion only becomes an event when poll collects it.
+        if !self.pending_events.lock().is_empty() {
+            sources.tick();
+        }
     }
     fn poll(&self) -> u32 {
         self.complete_events();

@@ -104,6 +104,10 @@ impl Inode for SignalFd {
         Err(VfsError::InvalidArgument)
     }
 
+    fn poll_sources(&self, _sources: &mut crate::ipc::pollwait::PollSources) {
+        // Queueing a signal kicks every waiter.
+    }
+
     fn poll(&self) -> u32 {
         if signal::pending_masked(self.mask()) {
             crate::ipc::unix::POLLIN

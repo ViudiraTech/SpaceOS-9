@@ -157,7 +157,10 @@ impl QueuePair {
                 break;
             }
             spins += 1;
-            if spins > 2000 && crate::sched::current().is_some() {
+            // Interrupts off means a spin lock is held somewhere up the stack;
+            // whoever needs that lock could then stop this CPU from ever
+            // scheduling the task back.
+            if spins > 2000 && crate::sched::current().is_some() && crate::arch::irqs_enabled() {
                 crate::sched::yield_now();
             } else {
                 core::hint::spin_loop();
@@ -181,6 +184,17 @@ impl QueuePair {
 
         let status_code = cqe.status >> 1;
         if status_code != 0 || cqe.cid != cid {
+            kwarn!(
+                "NVMe: q{} command {:#x} failed: status={:#x} cid={} expected={} sq_head={} cdw10={:#x} cdw12={:#x}",
+                self.qid,
+                cmd.cdw0 & 0xFF,
+                status_code,
+                cqe.cid,
+                cid,
+                cqe.sq_head,
+                cmd.cdw10,
+                cmd.cdw12
+            );
             return Err(BlockError::IoError);
         }
 

@@ -90,6 +90,9 @@ impl Inode for DeviceNode {
         self.check()?;
         self.session.ioctl(c, a)
     }
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        self.session.poll_sources(sources);
+    }
     fn poll(&self) -> u32 {
         if self.check().is_err() {
             8 | 16

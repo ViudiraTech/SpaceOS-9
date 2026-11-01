@@ -198,6 +198,10 @@ impl Inode for NetlinkSocket {
         Ok(Stat::simple(self.ino, InodeKind::Socket, 0o777, 0))
     }
 
+    fn poll_sources(&self, _sources: &mut crate::ipc::pollwait::PollSources) {
+        // Delivery announces itself through wake_pollers.
+    }
+
     fn poll(&self) -> u32 {
         let state = self.state.lock();
         // POLLOUT is always possible: multicast never blocks.

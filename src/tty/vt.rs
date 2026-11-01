@@ -282,7 +282,7 @@ pub fn ioctl(vt: usize, command: u64, arg: u64) -> Option<Result<u64, VfsError>>
                     if crate::signal::pending_for_current() {
                         break Err(VfsError::Interrupted);
                     }
-                    crate::ipc::wait_pollers(None);
+                    crate::ipc::block_briefly();
                 }
             }
         }

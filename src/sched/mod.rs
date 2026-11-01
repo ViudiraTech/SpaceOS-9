@@ -580,7 +580,7 @@ pub(crate) fn finish_switch() {
     if let Some(current_task) = current() {
         let task = current_task.lock();
         if let Some(space) = &task.address_space {
-            space.lock().activate();
+            crate::user::UserAddressSpace::activate_shared(space);
             if let Some(stack_top) = task.kernel_stack_top() {
                 arch::set_kernel_stack(cpu, stack_top as u64);
             }
@@ -754,6 +754,9 @@ pub fn tick() {
             break;
         };
         wake_entity(entity);
+    }
+    if cpu == 0 {
+        crate::ipc::pollwait::timer_tick(now);
     }
 }
 

@@ -185,6 +185,12 @@ impl Inode for TimerFd {
         Err(VfsError::InvalidArgument)
     }
 
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        if let Some(deadline) = self.state.lock().deadline {
+            sources.expire_at(deadline);
+        }
+    }
+
     fn poll(&self) -> u32 {
         if self.readable() {
             crate::ipc::unix::POLLIN

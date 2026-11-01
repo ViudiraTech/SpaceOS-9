@@ -91,6 +91,46 @@ pub fn resolve_fault(
     }
 }
 
+/// Log who died and what the address space looked like around the fault, so a
+/// crash in a stripped userland binary can be mapped back to a module offset.
+pub fn report_fatal_fault(address: u64, ip: u64, sp: u64) {
+    let Some(task) = sched::current() else {
+        return;
+    };
+    let stats = task.stats();
+    let comm = task.comm();
+    let length = comm.iter().position(|&byte| byte == 0).unwrap_or(comm.len());
+    crate::kwarn!(
+        "fatal fault: comm={} tid={} tgid={} ip={:#x} sp={:#x} address={:#x}",
+        core::str::from_utf8(&comm[..length]).unwrap_or("?"),
+        stats.ltid,
+        stats.tgid,
+        ip,
+        sp,
+        address
+    );
+    let Some(space) = task.address_space() else {
+        return;
+    };
+    let entries = UserAddressSpace::map_entries(&space);
+    let nearest = entries.partition_point(|entry| entry.1 <= address);
+    let around = nearest.saturating_sub(3)..(nearest + 3).min(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let holds_ip = (entry.0..entry.1).contains(&ip);
+        if around.contains(&index) || holds_ip {
+            crate::kwarn!(
+                "  {:#x}-{:#x} prot={} shared={} ino={}{}",
+                entry.0,
+                entry.1,
+                entry.2,
+                entry.3,
+                entry.5,
+                if holds_ip { " <- ip" } else { "" }
+            );
+        }
+    }
+}
+
 pub fn current_space() -> Result<alloc::sync::Arc<crate::sync::SpinLock<UserAddressSpace>>, VfsError>
 {
     sched::current()

@@ -15,7 +15,10 @@ pub mod memfd;
 pub mod netlink;
 pub mod shm;
 pub mod signalfd;
+pub mod pollwait;
 pub mod timerfd;
+
+pub use pollwait::{block_briefly, poll_kick, wake_object, wake_pollers};
 pub mod unix;
 
 use crate::{
@@ -60,6 +63,7 @@ impl Inode for EventFd {
                     value
                 };
                 drop(counter);
+                wake_object(self as *const Self);
                 buf[..8].copy_from_slice(&value.to_le_bytes());
                 return Ok(8);
             }
@@ -89,6 +93,8 @@ impl Inode for EventFd {
                 .is_some_and(|next| next <= MAX_COUNTER)
             {
                 *counter += value;
+                drop(counter);
+                wake_object(self as *const Self);
                 return Ok(8);
             }
             drop(counter);
@@ -100,6 +106,10 @@ impl Inode for EventFd {
             }
             sched::sleep_micros(1000);
         }
+    }
+
+    fn poll_sources(&self, sources: &mut pollwait::PollSources) {
+        sources.object(self as *const Self);
     }
 
     fn poll(&self) -> u32 {
@@ -1323,53 +1333,6 @@ pub fn inotify_rm_watch(fd: u64, wd: i32) -> i64 {
     }
 }
 
-// ---- readiness wakeups -----------------------------------------------------
-
-static POLL_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static POLLERS: SpinLock<Option<crate::sched::WaitQueue>> = SpinLock::new(None);
-
-fn poll_queue() -> Option<crate::sched::WaitQueue> {
-    POLLERS.lock().clone()
-}
-
-/// Wake every task blocked in poll, select or epoll so it re-checks readiness.
-///
-/// Callable from IRQ context. Readiness is recomputed from each inode's `poll`,
-/// so spurious wakeups are harmless and no per-object wait lists are needed.
-pub fn wake_pollers() {
-    POLL_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    if let Some(queue) = poll_queue()
-        && !queue.is_empty()
-    {
-        queue.wake_all();
-    }
-}
-
-/// Block until the next `wake_pollers` or the coarse timer tick below.
-pub fn wait_pollers(_timeout_micros: Option<u64>) {
-    let Some(queue) = poll_queue() else {
-        crate::sched::sleep_micros(1000);
-        return;
-    };
-    let seen = POLL_EPOCH.load(core::sync::atomic::Ordering::Acquire);
-    queue.wait_until(|| POLL_EPOCH.load(core::sync::atomic::Ordering::Acquire) != seen);
-}
-
-/// Start the 1 ms tick that serves deadlines and time-based readiness such as
-/// timerfd, which no event source announces.
-pub fn start_poll_timer() {
-    *POLLERS.lock() = Some(crate::sched::WaitQueue::new());
-    let _ = crate::sched::spawn(
-        || {
-            loop {
-                crate::sched::sleep_micros(1000);
-                wake_pollers();
-            }
-        },
-        0,
-    );
-}
-
 pub fn signalfd4(fd: i64, mask: u64, sigsetsize: u64, flags: u32) -> i64 {
     if sigsetsize != 8 {
         return -abi::EINVAL;
@@ -1440,6 +1403,8 @@ pub fn timerfd_settime(fd: u64, flags: u32, new_value: u64, old_value: u64) -> i
         Ok(old) => old,
         Err(error) => return error.to_errno(),
     };
+    // A task sleeping on this timer computed its wakeup from the old deadline.
+    wake_pollers();
     if old_value != 0
         && let Err(error) = uaccess::write_value(old_value, &old)
     {

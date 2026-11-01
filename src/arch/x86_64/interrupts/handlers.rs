@@ -212,6 +212,11 @@ pub(super) extern "x86-interrupt" fn page_fault(
             code,
             frame.instruction_pointer
         );
+        crate::user::uaccess::report_fatal_fault(
+            address,
+            frame.instruction_pointer.as_u64(),
+            frame.stack_pointer.as_u64(),
+        );
         crate::syscall::set_last_user_exit_code(128 + crate::signal::SIGSEGV as i32);
         crate::signal::force_fatal(crate::signal::SIGSEGV, true);
     }

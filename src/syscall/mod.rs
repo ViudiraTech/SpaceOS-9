@@ -123,27 +123,18 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
     CURRENT_NR[slot].store(num, core::sync::atomic::Ordering::Relaxed);
     let result = dispatch_inner(num, arg0, arg1, arg2, arg3, arg4, arg5);
     CURRENT_NR[slot].store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
-    // These calls can make another task's descriptor readable or writable.
+    // Data transfer announces itself per object. These rarer calls change
+    // connection state or signals for tasks this path cannot identify.
     if matches!(
         num,
-        SYS_WRITE
-            | SYS_WRITEV
-            | SYS_PWRITE64
-            | SYS_SENDTO
-            | SYS_SENDMSG
-            | SYS_CLOSE
+        SYS_CLOSE
             | SYS_SHUTDOWN
             | SYS_CONNECT
             | SYS_ACCEPT
             | SYS_ACCEPT4
-            | SYS_READ
-            | SYS_READV
-            | SYS_RECVFROM
-            | SYS_RECVMSG
             | SYS_KILL
             | SYS_TKILL
             | SYS_TGKILL
-            | SYS_IOCTL
     ) {
         crate::ipc::wake_pollers();
     }
@@ -1705,11 +1696,6 @@ fn sys_exit(code: i32, group: bool) -> i64 {
         let stats = task.stats();
         if group || stats.ltid == stats.tgid {
             crate::tty::vt::release_owner(stats.tgid);
-        }
-        if let Some(space) = task.address_space()
-            && sched::tasks_in_group(stats.tgid).len() <= 1
-        {
-            crate::ipc::shm::release_address_space(space.lock().root_physical());
         }
     }
     let leader = sched::current()

@@ -22,6 +22,14 @@ pub fn enable_interrupts() {
 }
 
 #[inline]
+pub fn irqs_enabled() -> bool {
+    let flags: u64;
+    // SAFETY: reading RFLAGS has no side effects.
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) }
+    flags & (1 << 9) != 0
+}
+
+#[inline]
 pub fn irq_save() -> u64 {
     let flags: u64;
     // SAFETY: flags are captured and interrupts disabled on the same CPU.

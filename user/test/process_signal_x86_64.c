@@ -120,6 +120,52 @@ static void test_sigreturn_registers(i64 pid) {
     }
 }
 
+static volatile u64 handler_frame;
+
+static void frame_handler(int sig, void *info, void *context) {
+    (void)sig;
+    (void)info;
+    (void)context;
+    handler_frame = (u64)__builtin_frame_address(0);
+}
+
+/* A signal may interrupt a leaf function that keeps locals in the 128 bytes
+ * below RSP, and it must enter its handler with the call-time stack alignment. */
+static void test_signal_stack_layout(i64 pid) {
+    install_handler(SIGUSR1, frame_handler);
+    u64 damaged;
+    i64 result;
+    register u64 cursor __asm__("r8");
+    __asm__ volatile("lea -128(%%rsp), %%r8\n"
+                     "1: mov %%r8, (%%r8)\n"
+                     "add $8, %%r8\n"
+                     "cmp %%rsp, %%r8\n"
+                     "jb 1b\n"
+                     "syscall\n"
+                     "mov %%rax, %%rdi\n"
+                     "xor %%edx, %%edx\n"
+                     "lea -128(%%rsp), %%r8\n"
+                     "2: cmp %%r8, (%%r8)\n"
+                     "je 3f\n"
+                     "inc %%rdx\n"
+                     "3: add $8, %%r8\n"
+                     "cmp %%rsp, %%r8\n"
+                     "jb 2b\n"
+                     : "=D"(result), "=d"(damaged), "=r"(cursor)
+                     : "a"(SYS_KILL), "D"(pid), "S"(SIGUSR1)
+                     : "rcx", "r11", "memory", "cc");
+    if (result != 0 || handler_frame == 0) {
+        fail("E:signal-layout-run\n");
+    }
+    if (damaged != 0) {
+        fail("E:red-zone\n");
+    }
+    /* A correctly aligned entry leaves RBP on a 16-byte boundary after push. */
+    if (handler_frame % 16 != 0) {
+        fail("E:handler-alignment\n");
+    }
+}
+
 int main(void) {
     i64 me = sys_getpid();
     if (me <= 0 || sys_gettid() != me) {
@@ -130,6 +176,7 @@ int main(void) {
     }
 
     test_sigreturn_registers(me);
+    test_signal_stack_layout(me);
     install_handler(SIGUSR1, handler);
     install_handler(SIGUSR2, handler);
     install_handler(SIGTERM, terminate_handler);

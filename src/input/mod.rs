@@ -403,9 +403,10 @@ impl InputDevice {
                 });
             }
             state.queue.push_back(event);
+            drop(state);
+            crate::ipc::wake_object(Arc::as_ptr(client));
         }
         drop(clients);
-        crate::ipc::wake_pollers();
     }
 }
 
@@ -625,6 +626,10 @@ impl Inode for EvdevFile {
         Ok(())
     }
 
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        sources.object(Arc::as_ptr(&self.client));
+    }
+
     fn poll(&self) -> u32 {
         let state = self.client.state.lock();
         if state.revoked {
@@ -665,7 +670,7 @@ impl Inode for EvdevFile {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::wait_pollers(None);
+            crate::ipc::block_briefly();
         }
     }
 

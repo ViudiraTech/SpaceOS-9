@@ -254,6 +254,10 @@ impl Inode for Inotify {
         }
     }
 
+    fn poll_sources(&self, _sources: &mut crate::ipc::pollwait::PollSources) {
+        // Delivery announces itself through wake_pollers.
+    }
+
     fn poll(&self) -> u32 {
         u32::from(!self.state.lock().queue.is_empty())
     }

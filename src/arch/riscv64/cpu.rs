@@ -20,6 +20,13 @@ pub fn enable_interrupts() {
     unsafe { asm!("csrsi sstatus, 2", options(nomem, nostack)) }
 }
 
+pub fn irqs_enabled() -> bool {
+    let flags: u64;
+    // SAFETY: reading sstatus has no side effects.
+    unsafe { asm!("csrr {}, sstatus", out(reg) flags, options(nomem, nostack)) }
+    flags & 2 != 0
+}
+
 pub fn irq_save() -> u64 {
     let flags: u64;
     // SAFETY: atomic CSR exchange saves the previous SIE bit.

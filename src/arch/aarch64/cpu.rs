@@ -20,6 +20,13 @@ pub fn enable_interrupts() {
     unsafe { asm!("msr daifclr, #0x2", options(nomem, nostack)) }
 }
 
+pub fn irqs_enabled() -> bool {
+    let flags: u64;
+    // SAFETY: reading DAIF has no side effects.
+    unsafe { asm!("mrs {}, daif", out(reg) flags, options(nomem, nostack)) }
+    flags & (1 << 7) == 0
+}
+
 pub fn irq_save() -> u64 {
     let flags: u64;
     // SAFETY: capture and mask interrupts on the same processing element.

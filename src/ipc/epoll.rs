@@ -91,6 +91,12 @@ impl EpollInstance {
     }
 
     pub fn control(&self, op: u32, fd: i32, event: u64) -> Result<(), VfsError> {
+        let result = self.apply_control(op, fd, event);
+        crate::ipc::wake_object(self as *const Self);
+        result
+    }
+
+    fn apply_control(&self, op: u32, fd: i32, event: u64) -> Result<(), VfsError> {
         let file = self.file_of(fd)?;
         match op {
             EPOLL_CTL_ADD => {
@@ -175,8 +181,17 @@ impl EpollInstance {
         } else {
             crate::time::uptime_micros().saturating_add((timeout_ms as u64).saturating_mul(1000))
         };
+        let mut wait = crate::ipc::pollwait::PollWait::new();
         loop {
             self.prune();
+            if wait.registered() {
+                let mut sources = crate::ipc::pollwait::PollSources::new();
+                if deadline != u64::MAX {
+                    sources.expire_at(deadline);
+                }
+                self.gather_sources(&mut sources);
+                wait.arm(&sources);
+            }
             let mut output = Vec::new();
             let limit = (maxevents as usize).min(MAX_WAIT_EVENTS);
             {
@@ -229,7 +244,17 @@ impl EpollInstance {
             if crate::signal::pending_for_current() {
                 return -crate::vfs::abi::EINTR;
             }
-            crate::ipc::wait_pollers(None);
+            wait.sleep();
+        }
+    }
+
+    fn gather_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        // EPOLL_CTL from another thread announces itself through this object.
+        sources.object(self as *const Self);
+        for interest in self.interests.lock().iter() {
+            if interest.enabled {
+                interest.file.inode.poll_sources(sources);
+            }
         }
     }
 
@@ -286,6 +311,10 @@ impl Inode for EpollInstance {
 
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, VfsError> {
         Err(VfsError::InvalidArgument)
+    }
+
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        self.gather_sources(sources);
     }
 
     fn poll(&self) -> u32 {
