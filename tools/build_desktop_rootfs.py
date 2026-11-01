@@ -605,10 +605,15 @@ EndSection
         source = USERLAND / name
         if source.exists():
             install_binary(source, f"/sbin/{name}")
-    for name in ("hello",):
+    for name in ("hello", "systemctl"):
         source = USERLAND / name
         if source.exists():
-            install_binary(source, f"/usr/bin/{name}")
+            install_binary(source, f"/bin/{name}")
+            for p in (f"/usr/bin/{name}", f"/sbin/{name}"):
+                dest = STAGE / p.lstrip("/")
+                if dest.is_symlink() or dest.exists():
+                    dest.unlink()
+                dest.symlink_to(f"/bin/{name}")
 
     spui = ROOT / "target" / "x86_64-unknown-linux-musl" / os.environ.get("SPUI_PROFILE", "release")
     if spui.is_dir():

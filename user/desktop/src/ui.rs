@@ -210,7 +210,7 @@ pub fn card(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn button(
+pub fn button_anim(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
     theme: &Theme,
@@ -218,37 +218,49 @@ pub fn button(
     label: &str,
     leading_icon: Option<Icon>,
     primary: bool,
-    hover: bool,
+    hover_t: f32,
+    pressed: bool,
 ) {
     let base = if primary {
         theme.accent
     } else {
         theme.panel_high
     };
-    let bg = if hover {
+    let hover_factor = hover_t.clamp(0.0, 1.0);
+    let mut bg = if hover_factor > 0.001 {
         if theme.is_dark() {
-            mix(base, 0xffffff, 0.10)
+            mix(base, 0xffffff, 0.12 * hover_factor)
         } else {
-            mix(base, 0x000000, 0.06)
+            mix(base, 0x000000, 0.08 * hover_factor)
         }
     } else {
         base
     };
-    canvas.rounded_rect(rect, RADIUS_CONTROL, bg, 1.0);
+    if pressed {
+        bg = mix(bg, 0x000000, 0.15);
+    }
+
+    let draw_r = if pressed {
+        Rect::new(rect.x, rect.y + 1, rect.w, rect.h)
+    } else {
+        rect
+    };
+
+    canvas.rounded_rect(draw_r, RADIUS_CONTROL, bg, 1.0);
     if !primary {
-        canvas.rounded_border(rect, RADIUS_CONTROL, theme.window_border, 1.0, 1);
+        canvas.rounded_border(draw_r, RADIUS_CONTROL, theme.window_border, 1.0, 1);
     }
     let fg = if primary { 0xffffff } else { theme.text };
-    let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.5;
+    let baseline = draw_r.y as f32 + draw_r.h as f32 * 0.5 + 4.5;
     if let Some(ic) = leading_icon {
         let label_w = text.measure(label, 12.5, Face::Ui);
         let total_w = 16.0 + if label.is_empty() { 0.0 } else { 6.0 + label_w };
-        let start_x = rect.x as f32 + (rect.w as f32 - total_w) * 0.5;
+        let start_x = draw_r.x as f32 + (draw_r.w as f32 - total_w) * 0.5;
         icons::draw(
             canvas,
             ic,
             start_x.round() as i32,
-            rect.y + (rect.h - 16) / 2,
+            draw_r.y + (draw_r.h - 16) / 2,
             16,
             Some(fg),
         );
@@ -259,7 +271,7 @@ pub fn button(
         text.draw_centered(
             canvas,
             label,
-            rect.x as f32 + rect.w as f32 * 0.5,
+            draw_r.x as f32 + draw_r.w as f32 * 0.5,
             baseline,
             12.5,
             fg,
@@ -268,7 +280,31 @@ pub fn button(
     }
 }
 
-/// Pill-shaped boolean toggle switch (`38 × 20` recommended) with continuous animation progress `0.0..=1.0`.
+#[allow(clippy::too_many_arguments)]
+pub fn button(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    rect: Rect,
+    label: &str,
+    leading_icon: Option<Icon>,
+    primary: bool,
+    hover: bool,
+) {
+    button_anim(
+        canvas,
+        text,
+        theme,
+        rect,
+        label,
+        leading_icon,
+        primary,
+        if hover { 1.0 } else { 0.0 },
+        false,
+    );
+}
+
+/// Pill-shaped boolean toggle switch (`38 × 20` to `42 × 22` recommended) with continuous animation progress `0.0..=1.0`.
 pub fn toggle_switch_anim(
     canvas: &mut Canvas,
     theme: &Theme,
@@ -294,14 +330,24 @@ pub fn toggle_switch_anim(
     }
     let pad = 2;
     let knob_d = (rect.h - pad * 2).max(6);
+    // Tactile squish/stretch during motion
+    let stretch = ((0.5 - (p - 0.5).abs()) * 2.0).clamp(0.0, 1.0);
+    let knob_w = knob_d + (stretch * 3.0).round() as i32;
+
     let start_x = rect.x + pad;
-    let end_x = rect.right() - knob_d - pad;
+    let end_x = rect.right() - knob_w - pad;
     let knob_x = (start_x as f32 + (end_x - start_x) as f32 * p).round() as i32;
-    let knob_rect = Rect::new(knob_x, rect.y + pad, knob_d, knob_d);
+
+    // Soft drop shadow under the knob
+    let shadow_rect = Rect::new(knob_x, rect.y + pad + 1, knob_w, knob_d);
+    canvas.rounded_rect(shadow_rect, knob_d / 2, 0x000000, 0.24);
+
+    let knob_rect = Rect::new(knob_x, rect.y + pad, knob_w, knob_d);
     canvas.rounded_rect(knob_rect, knob_d / 2, 0xffffff, 1.0);
 }
 
 /// Pill-shaped boolean toggle switch (`38 × 20` recommended).
+#[allow(dead_code)]
 pub fn toggle_switch(canvas: &mut Canvas, theme: &Theme, rect: Rect, checked: bool, hover: bool) {
     toggle_switch_anim(canvas, theme, rect, if checked { 1.0 } else { 0.0 }, hover);
 }
@@ -323,6 +369,47 @@ pub fn progress_bar(
         let fg = color.unwrap_or(theme.accent);
         let fill_rect = Rect::new(rect.x, rect.y, fill_w.min(rect.w), rect.h);
         canvas.rounded_rect(fill_rect, radius, fg, 1.0);
+    }
+}
+
+/// Smooth horizontal slider with filled track and elevated expandable thumb.
+#[allow(dead_code)]
+pub fn slider(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    progress: f32,
+    hover: bool,
+    dragging: bool,
+) {
+    let p = progress.clamp(0.0, 1.0);
+    let track_h = 4;
+    let track_y = rect.y + (rect.h - track_h) / 2;
+    let track_rect = Rect::new(rect.x, track_y, rect.w, track_h);
+    canvas.rounded_rect(track_rect, 2, theme.window_alt, 1.0);
+    canvas.rounded_border(track_rect, 2, theme.window_border, 1.0, 1);
+
+    let active_w = ((rect.w as f32) * p).round() as i32;
+    if active_w > 0 {
+        let active_r = Rect::new(rect.x, track_y, active_w, track_h);
+        canvas.rounded_rect(active_r, 2, theme.accent, 1.0);
+    }
+
+    let thumb_d = if dragging {
+        18
+    } else if hover {
+        16
+    } else {
+        14
+    };
+    let thumb_x = (rect.x as f32 + (rect.w as f32) * p).round() as i32 - thumb_d / 2;
+    let thumb_y = rect.y + (rect.h - thumb_d) / 2;
+    let thumb_r = Rect::new(thumb_x, thumb_y, thumb_d, thumb_d);
+    // Drop shadow
+    canvas.rounded_rect(thumb_r.offset(0, 1), thumb_d / 2, 0x000000, 0.25);
+    canvas.rounded_rect(thumb_r, thumb_d / 2, 0xffffff, 1.0);
+    if dragging || hover {
+        canvas.rounded_border(thumb_r, thumb_d / 2, theme.accent, 0.60, 2);
     }
 }
 
@@ -355,6 +442,8 @@ pub fn segmented_control_anim(
     canvas.rounded_rect(rect, RADIUS_CONTROL + 1, theme.window_alt, 1.0);
     canvas.rounded_border(rect, RADIUS_CONTROL + 1, theme.window_border, 1.0, 1);
     if !indicator_rect.is_empty() {
+        // Drop shadow for the sliding pill
+        canvas.rounded_rect(indicator_rect.offset(0, 1), RADIUS_CONTROL, 0x000000, 0.22);
         canvas.rounded_rect(indicator_rect, RADIUS_CONTROL, theme.accent, 1.0);
     }
     let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.3;
@@ -458,6 +547,9 @@ pub fn text_input(
         theme.panel_border
     };
     canvas.rounded_border(rect, RADIUS_CONTROL, border, 1.0, 1);
+    if focused {
+        canvas.rounded_border(rect.inset(-2), RADIUS_CONTROL + 2, theme.accent, 0.28, 2);
+    }
 
     let mut text_x = rect.x + 10;
     if let Some(ic) = leading_icon {

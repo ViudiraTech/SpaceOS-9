@@ -1,14 +1,18 @@
 /*
+ *
  *       user/systemg/systemg.c
- *       Minimal systemd-subset service manager running as PID 1
+ *       Minimal systemd-compatible service manager running as PID 1
+ *
  *       2026/10/25 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
+ *
  */
 
 #include "splibc.h"
 
-#define MAX_UNITS 16
+#define MAX_UNITS 32
 #define MAX_DEPS 8
+#define SOCK_PATH "/run/systemg.sock"
 
 enum unit_type { TYPE_SIMPLE, TYPE_EXEC, TYPE_ONESHOT };
 enum restart_policy { RESTART_NO, RESTART_ON_FAILURE, RESTART_ALWAYS };
@@ -32,6 +36,8 @@ struct unit {
     int pending_restart;
     int restarts;
     int ever_started;
+    time_t started_at;
+    int exit_status;
 };
 
 static struct unit units[MAX_UNITS];
@@ -41,6 +47,14 @@ static volatile int child_changed;
 static void child_handler(int signal_number) {
     (void)signal_number;
     child_changed = 1;
+}
+
+static time_t get_uptime_seconds(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return ts.tv_sec;
+    }
+    return 0;
 }
 
 static const char *unit_ident(const struct unit *unit) {
@@ -157,10 +171,31 @@ static void add_dependency(char list[MAX_DEPS][64], int *count, const char *valu
     }
 }
 
-static int load_unit(const char *path, const char *name) {
-    if (unit_count >= MAX_UNITS) {
-        return -1;
+static int unit_index(const char *name) {
+    for (int index = 0; index < unit_count; index++) {
+        if (strcmp(units[index].name, name) == 0) {
+            return index;
+        }
     }
+    return -1;
+}
+
+static int load_unit(const char *path, const char *name) {
+    int existing = unit_index(name);
+    struct unit *unit;
+    if (existing >= 0) {
+        unit = &units[existing];
+    } else {
+        if (unit_count >= MAX_UNITS) {
+            return -1;
+        }
+        unit = &units[unit_count];
+        memset(unit, 0, sizeof(*unit));
+        copy_name(unit->name, sizeof(unit->name), name);
+        unit->restart = RESTART_NO;
+        unit->restart_sec = 1;
+    }
+
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         return -1;
@@ -172,11 +207,7 @@ static int load_unit(const char *path, const char *name) {
         return -1;
     }
     content[count] = 0;
-    struct unit *unit = &units[unit_count];
-    memset(unit, 0, sizeof(*unit));
-    copy_name(unit->name, sizeof(unit->name), name);
-    unit->restart = RESTART_NO;
-    unit->restart_sec = 1;
+
     int section = 0;
     char *line = content;
     while (line != NULL && *line != 0) {
@@ -240,8 +271,34 @@ static int load_unit(const char *path, const char *name) {
     if (unit->exec[0] == 0) {
         return -1;
     }
-    unit_count++;
+    if (existing < 0) {
+        unit_count++;
+    }
     return 0;
+}
+
+static void reload_all_units(void) {
+    DIR *directory = opendir("/etc/systemg");
+    if (directory == NULL) {
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        size_t length = strlen(entry->d_name);
+        if (length < 9 || strcmp(entry->d_name + length - 8, ".service") != 0) {
+            continue;
+        }
+        char path[256];
+        snprintf(path, sizeof(path), "/etc/systemg/%s", entry->d_name);
+        char name[64];
+        copy_name(name, sizeof(name), entry->d_name);
+        name[length - 8] = 0;
+        load_unit(path, name);
+    }
+    closedir(directory);
 }
 
 static int split_arguments(char *command, char *arguments[], int maximum) {
@@ -278,15 +335,6 @@ static int split_arguments(char *command, char *arguments[], int maximum) {
     return count;
 }
 
-static int unit_index(const char *name) {
-    for (int index = 0; index < unit_count; index++) {
-        if (strcmp(units[index].name, name) == 0) {
-            return index;
-        }
-    }
-    return -1;
-}
-
 static int dependencies_ready(const struct unit *unit) {
     for (int index = 0; index < unit->after_count; index++) {
         int other = unit_index(unit->after[index]);
@@ -318,6 +366,9 @@ static pid_t start_unit(struct unit *unit) {
     printf("         Starting %s...\n", unit_ident(unit));
     pid_t pid = fork();
     if (pid == 0) {
+        for (int fd = 3; fd < 256; fd++) {
+            close(fd);
+        }
         setpgid(0, 0);
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
@@ -339,6 +390,7 @@ static pid_t start_unit(struct unit *unit) {
     unit->ever_started = 1;
     unit->failed = 0;
     unit->pending_restart = 0;
+    unit->started_at = get_uptime_seconds();
     setpgid(pid, pid);
     if (unit->type != TYPE_ONESHOT) {
         printf("[  OK  ] Started %s.\n", unit_ident(unit));
@@ -350,6 +402,7 @@ static pid_t start_unit(struct unit *unit) {
         int status = 0;
         if (waitpid(pid, &status, 0) == pid) {
             unit->pid = 0;
+            unit->exit_status = status;
             unit->failed = !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
             log_process_exit(unit, "Control process", status);
         } else {
@@ -364,6 +417,31 @@ static pid_t start_unit(struct unit *unit) {
         }
     }
     return pid;
+}
+
+static int stop_unit(struct unit *unit) {
+    unit->pending_restart = 0;
+    unit->started = 0;
+    if (unit->pid > 0) {
+        kill(unit->pid, SIGTERM);
+        printf("systemg[1]: Stopping %s (PID %d)...\n", unit->name, (int)unit->pid);
+        return 0;
+    }
+    return 0;
+}
+
+static int restart_unit(struct unit *unit) {
+    if (unit->pid > 0) {
+        unit->pending_restart = 1;
+        unit->started = 1;
+        printf("systemg[1]: Restarting %s (PID %d)...\n", unit->name, (int)unit->pid);
+        kill(unit->pid, SIGTERM);
+        return 0;
+    } else {
+        unit->pending_restart = 0;
+        unit->restarts++;
+        return start_unit(unit);
+    }
 }
 
 static void start_ready_units(void) {
@@ -421,6 +499,140 @@ static int should_restart(const struct unit *unit) {
     return 0;
 }
 
+/* Handle systemctl IPC client command */
+static void handle_ipc_client(int client_fd) {
+    char req[512];
+    ssize_t n = read(client_fd, req, sizeof(req) - 1);
+    if (n <= 0) {
+        return;
+    }
+    req[n] = 0;
+    char *cmd = trim(req);
+
+    char *arg = strchr(cmd, ' ');
+    if (arg != NULL) {
+        *arg = 0;
+        arg = trim(arg + 1);
+        char *dot = strstr(arg, ".service");
+        if (dot != NULL) {
+            *dot = 0;
+        }
+    }
+
+    char resp[4096];
+    resp[0] = 0;
+
+    if (strcmp(cmd, "LIST") == 0) {
+        int offset = snprintf(resp, sizeof(resp), "COUNT:%d\n", unit_count);
+        for (int i = 0; i < unit_count && offset < (int)sizeof(resp) - 128; i++) {
+            struct unit *u = &units[i];
+            const char *state = (u->pid > 0 || (u->type == TYPE_ONESHOT && u->started && !u->failed))
+                                    ? "active"
+                                    : (u->failed ? "failed" : "inactive");
+            const char *sub = (u->pid > 0) ? "running"
+                                           : ((u->type == TYPE_ONESHOT && !u->failed && u->ever_started) ? "exited" : "dead");
+            offset += snprintf(resp + offset, sizeof(resp) - offset,
+                               "%s.service|loaded|%s|%s|%d|%s\n",
+                               u->name, state, sub, (int)u->pid, u->description);
+        }
+    } else if (strcmp(cmd, "STATUS") == 0) {
+        if (arg == NULL || *arg == 0) {
+            snprintf(resp, sizeof(resp), "ERR:unit name required\n");
+        } else {
+            int idx = unit_index(arg);
+            if (idx < 0) {
+                snprintf(resp, sizeof(resp), "ERR:unit not found\n");
+            } else {
+                struct unit *u = &units[idx];
+                const char *state = (u->pid > 0 || (u->type == TYPE_ONESHOT && u->started && !u->failed))
+                                        ? "active (running)"
+                                        : (u->failed ? "failed (result 'exit-code')" : "inactive (dead)");
+                time_t now = get_uptime_seconds();
+                time_t uptime = (u->started_at > 0 && now >= u->started_at) ? (now - u->started_at) : 0;
+                snprintf(resp, sizeof(resp),
+                         "NAME:%s.service\n"
+                         "DESC:%s\n"
+                         "LOADED:loaded (/etc/systemg/%s.service; enabled)\n"
+                         "STATE:%s\n"
+                         "PID:%d\n"
+                         "EXEC:%s\n"
+                         "UPTIME:%ld\n"
+                         "RESTARTS:%d\n"
+                         "EXIT_CODE:%d\n",
+                         u->name, u->description, u->name, state, (int)u->pid, u->exec,
+                         (long)uptime, u->restarts, u->exit_status);
+            }
+        }
+    } else if (strcmp(cmd, "START") == 0) {
+        if (arg == NULL || *arg == 0) {
+            snprintf(resp, sizeof(resp), "ERR:unit name required\n");
+        } else {
+            int idx = unit_index(arg);
+            if (idx < 0) {
+                snprintf(resp, sizeof(resp), "ERR:unit not found\n");
+            } else {
+                start_unit(&units[idx]);
+                snprintf(resp, sizeof(resp), "OK\n");
+            }
+        }
+    } else if (strcmp(cmd, "STOP") == 0) {
+        if (arg == NULL || *arg == 0) {
+            snprintf(resp, sizeof(resp), "ERR:unit name required\n");
+        } else {
+            int idx = unit_index(arg);
+            if (idx < 0) {
+                snprintf(resp, sizeof(resp), "ERR:unit not found\n");
+            } else {
+                stop_unit(&units[idx]);
+                snprintf(resp, sizeof(resp), "OK\n");
+            }
+        }
+    } else if (strcmp(cmd, "RESTART") == 0) {
+        if (arg == NULL || *arg == 0) {
+            snprintf(resp, sizeof(resp), "ERR:unit name required\n");
+        } else {
+            int idx = unit_index(arg);
+            if (idx < 0) {
+                snprintf(resp, sizeof(resp), "ERR:unit not found\n");
+            } else {
+                restart_unit(&units[idx]);
+                snprintf(resp, sizeof(resp), "OK\n");
+            }
+        }
+    } else if (strcmp(cmd, "IS_ACTIVE") == 0) {
+        if (arg == NULL || *arg == 0) {
+            snprintf(resp, sizeof(resp), "inactive\n");
+        } else {
+            int idx = unit_index(arg);
+            if (idx >= 0 && (units[idx].pid > 0 || (units[idx].type == TYPE_ONESHOT && units[idx].started && !units[idx].failed))) {
+                snprintf(resp, sizeof(resp), "active\n");
+            } else if (idx >= 0 && units[idx].failed) {
+                snprintf(resp, sizeof(resp), "failed\n");
+            } else {
+                snprintf(resp, sizeof(resp), "inactive\n");
+            }
+        }
+    } else if (strcmp(cmd, "IS_FAILED") == 0) {
+        if (arg == NULL || *arg == 0) {
+            snprintf(resp, sizeof(resp), "unknown\n");
+        } else {
+            int idx = unit_index(arg);
+            if (idx >= 0 && units[idx].failed) {
+                snprintf(resp, sizeof(resp), "failed\n");
+            } else {
+                snprintf(resp, sizeof(resp), "active\n");
+            }
+        }
+    } else if (strcmp(cmd, "RELOAD") == 0) {
+        reload_all_units();
+        snprintf(resp, sizeof(resp), "OK\n");
+    } else {
+        snprintf(resp, sizeof(resp), "ERR:unknown command\n");
+    }
+
+    write(client_fd, resp, strlen(resp));
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc;
     (void)argv;
@@ -434,7 +646,7 @@ int main(int argc, char **argv, char **envp) {
             close(console);
         }
     }
-    setenv("PATH", "/bin:/sbin", 1);
+    setenv("PATH", "/bin:/sbin:/usr/bin", 1);
     setenv("HOME", "/root", 1);
     signal(SIGCHLD, child_handler);
     signal(SIGINT, SIG_IGN);
@@ -445,28 +657,24 @@ int main(int argc, char **argv, char **envp) {
     signal(SIGTTOU, SIG_IGN);
     printf("SYSTEMG_OK pid=%d\n", getpid());
 
-    DIR *directory = opendir("/etc/systemg");
-    if (directory != NULL) {
-        struct dirent *entry;
-        while ((entry = readdir(directory)) != NULL) {
-            if (entry->d_name[0] == '.') {
-                continue;
-            }
-            size_t length = strlen(entry->d_name);
-            if (length < 9 || strcmp(entry->d_name + length - 8, ".service") != 0) {
-                continue;
-            }
-            char path[256];
-            snprintf(path, sizeof(path), "/etc/systemg/%s", entry->d_name);
-            char name[64];
-            copy_name(name, sizeof(name), entry->d_name);
-            name[length - 8] = 0;
-            load_unit(path, name);
+    /* Initialize control socket */
+    mkdir("/run", 0755);
+    unlink(SOCK_PATH);
+    int server_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (server_fd >= 0) {
+        struct sockaddr_un sun;
+        memset(&sun, 0, sizeof(sun));
+        sun.sun_family = AF_UNIX;
+        copy_name(sun.sun_path, sizeof(sun.sun_path), SOCK_PATH);
+        if (bind(server_fd, &sun, sizeof(sun)) == 0) {
+            listen(server_fd, 8);
+        } else {
+            close(server_fd);
+            server_fd = -1;
         }
-        closedir(directory);
-    } else {
-        printf("systemg: no /etc/systemg directory\n");
     }
+
+    reload_all_units();
     start_ready_units();
 
     for (;;) {
@@ -482,6 +690,7 @@ int main(int argc, char **argv, char **envp) {
             struct unit *unit = unit_for_pid(pid);
             if (unit != NULL) {
                 unit->pid = 0;
+                unit->exit_status = status;
                 unit->failed = !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
                 log_process_exit(unit, "Main process", status);
                 if (unit->failed) {
@@ -506,7 +715,24 @@ int main(int argc, char **argv, char **envp) {
                 start_unit(unit);
             }
         }
+
+        /* Poll IPC server socket with 100ms timeout */
+        if (server_fd >= 0) {
+            struct pollfd pfd;
+            pfd.fd = server_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            int r = poll(&pfd, 1, 100);
+            if (r > 0 && (pfd.revents & POLLIN)) {
+                int client_fd = accept(server_fd, NULL, NULL);
+                if (client_fd >= 0) {
+                    handle_ipc_client(client_fd);
+                    close(client_fd);
+                }
+            }
+        } else {
+            usleep(100000);
+        }
         child_changed = 0;
-        usleep(100000);
     }
 }

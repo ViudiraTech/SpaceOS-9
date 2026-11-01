@@ -20,6 +20,7 @@ use crate::text::TextRenderer;
 use crate::theme::{Theme, TITLEBAR_HEIGHT};
 use crate::ui::{self, CaptionHit};
 use crate::x11::{CursorKind, Key, Result, X};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use uxconf::client::{UxConfClient, UxConfWatch};
 use uxconf::schema::channel_defaults;
@@ -101,6 +102,13 @@ pub enum UiEvent {
     Close,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct AnimFloat {
+    pub value: f32,
+    pub target: f32,
+}
+
 pub struct App {
     pub x: X,
     pub win: Window,
@@ -131,6 +139,11 @@ pub struct App {
     current_cursor: CursorKind,
     content_cursor: CursorKind,
     last_title_click: Option<Instant>,
+    pub anim_active: bool,
+    last_frame: Instant,
+    last_dt: f32,
+    #[allow(dead_code)]
+    anims: HashMap<u64, AnimFloat>,
 }
 
 impl App {
@@ -206,7 +219,41 @@ impl App {
             current_cursor: CursorKind::Default,
             content_cursor: CursorKind::Default,
             last_title_click: None,
+            anim_active: false,
+            last_frame: Instant::now(),
+            last_dt: 0.016,
+            anims: HashMap::new(),
         })
+    }
+
+    pub fn update_frame_time(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32();
+        self.last_frame = now;
+        self.last_dt = dt.clamp(0.001, 0.100);
+    }
+
+    #[allow(dead_code)]
+    pub fn anim(&mut self, id: u64, target: f32, speed: f32) -> f32 {
+        let dt = self.last_dt;
+        let entry = self.anims.entry(id).or_insert(AnimFloat {
+            value: target,
+            target,
+        });
+        entry.target = target;
+        let factor = 1.0 - (-speed * dt).exp();
+        entry.value += (entry.target - entry.value) * factor;
+        if (entry.value - entry.target).abs() > 0.002 {
+            self.anim_active = true;
+        } else {
+            entry.value = entry.target;
+        }
+        entry.value
+    }
+
+    #[allow(dead_code)]
+    pub fn anim_bool(&mut self, id: u64, target: bool, speed: f32) -> f32 {
+        self.anim(id, if target { 1.0 } else { 0.0 }, speed)
     }
 
     pub fn buttons_left(&self) -> bool {
@@ -361,6 +408,8 @@ impl App {
         extra_fd: Option<i32>,
         timeout_ms: i32,
     ) -> Result<(Vec<UiEvent>, bool)> {
+        self.update_frame_time();
+        let effective_timeout = if self.anim_active { 16 } else { timeout_ms };
         let mut raw = Vec::new();
         while let Some(ev) = self.x.poll()? {
             raw.push(ev);
@@ -377,7 +426,7 @@ impl App {
         let ux_fd = self.watch.as_ref().map(UxConfWatch::as_raw_fd);
         let mut extra_ready = false;
         if raw.is_empty() && !cfg_changed {
-            let (_, ux_ready, ext) = self.x.wait_fds(ux_fd, extra_fd, timeout_ms);
+            let (_, ux_ready, ext) = self.x.wait_fds(ux_fd, extra_fd, effective_timeout);
             extra_ready = ext;
             if ux_ready {
                 if let Some(watch) = self.watch.as_mut() {
@@ -422,6 +471,9 @@ impl App {
         }
         for ev in coalesced {
             self.translate(ev, &mut events)?;
+        }
+        if self.anim_active {
+            self.needs_redraw = true;
         }
         Ok((events, extra_ready))
     }

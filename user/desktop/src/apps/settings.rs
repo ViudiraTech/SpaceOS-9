@@ -19,6 +19,8 @@ use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
 use crate::ui;
 use crate::x11::Result;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
 use std::path::Path;
@@ -111,7 +113,7 @@ const NAV: [(Page, &str, Icon); 8] = [
     (Page::About, "关于", Icon::About),
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum HitTarget {
     Nav(usize),
     ResetPage,
@@ -154,6 +156,77 @@ enum HitTarget {
     ClockSeconds,
     ClockShowDate,
     Timezone(usize),
+}
+
+#[derive(Default)]
+struct SettingsAnimStore {
+    toggles: HashMap<HitTarget, f32>,
+    segments: HashMap<HitTarget, (f32, f32)>,
+    nav_y: Option<f32>,
+    active: bool,
+    dt: f32,
+}
+
+impl SettingsAnimStore {
+    fn set_dt(&mut self, dt: f32) {
+        self.dt = dt.clamp(0.001, 0.100);
+    }
+
+    fn anim_toggle(&mut self, target: HitTarget, checked: bool, speed: f32) -> f32 {
+        let desired = if checked { 1.0 } else { 0.0 };
+        let dt = self.dt;
+        let current = self.toggles.entry(target).or_insert(desired);
+        let factor = 1.0 - (-speed * dt).exp();
+        *current += (desired - *current) * factor;
+        if (*current - desired).abs() > 0.002 {
+            self.active = true;
+        } else {
+            *current = desired;
+        }
+        *current
+    }
+
+    fn anim_segmented(&mut self, target: HitTarget, target_item: Rect, speed: f32) -> Rect {
+        let dt = self.dt;
+        let (cur_x, cur_w) = self
+            .segments
+            .entry(target)
+            .or_insert((target_item.x as f32, target_item.w as f32));
+        let factor = 1.0 - (-speed * dt).exp();
+        *cur_x += (target_item.x as f32 - *cur_x) * factor;
+        *cur_w += (target_item.w as f32 - *cur_w) * factor;
+        if (*cur_x - target_item.x as f32).abs() > 0.5
+            || (*cur_w - target_item.w as f32).abs() > 0.5
+        {
+            self.active = true;
+        } else {
+            *cur_x = target_item.x as f32;
+            *cur_w = target_item.w as f32;
+        }
+        Rect::new(
+            cur_x.round() as i32,
+            target_item.y,
+            cur_w.round() as i32,
+            target_item.h,
+        )
+    }
+
+    fn anim_nav(&mut self, target_y: f32, speed: f32) -> f32 {
+        let dt = self.dt;
+        let cur = self.nav_y.get_or_insert(target_y);
+        let factor = 1.0 - (-speed * dt).exp();
+        *cur += (target_y - *cur) * factor;
+        if (*cur - target_y).abs() > 0.5 {
+            self.active = true;
+        } else {
+            *cur = target_y;
+        }
+        *cur
+    }
+}
+
+thread_local! {
+    static ANIMS: RefCell<SettingsAnimStore> = RefCell::new(SettingsAnimStore::default());
 }
 
 struct HitBox {
@@ -464,8 +537,13 @@ pub fn run() -> Result<()> {
     let mut last_clock_preview = String::new();
     let thumbnails = load_wallpaper_thumbnails();
     let sys_info = SystemInfo::gather();
+    let mut last_frame = std::time::Instant::now();
 
     loop {
+        let dt = last_frame.elapsed().as_secs_f32().clamp(0.001, 0.100);
+        last_frame = std::time::Instant::now();
+        ANIMS.with(|a| a.borrow_mut().set_dt(dt));
+
         if page == Page::DateTime {
             let (now_str, _) = format_datetime_preview(&app.config);
             if now_str != last_clock_preview {
@@ -510,6 +588,15 @@ pub fn run() -> Result<()> {
                     &mut hits,
                 );
             }
+            let is_animating = ANIMS.with(|a| {
+                let mut store = a.borrow_mut();
+                let was_active = store.active;
+                store.active = false;
+                was_active
+            });
+            if is_animating {
+                app.needs_redraw = true;
+            }
             app.draw_chrome();
             app.present()?;
         }
@@ -518,7 +605,10 @@ pub fn run() -> Result<()> {
             break;
         }
 
-        let timeout_ms = if page == Page::DateTime && app.config.clock_seconds {
+        let is_animating = ANIMS.with(|a| a.borrow().active);
+        let timeout_ms = if is_animating {
+            16
+        } else if page == Page::DateTime && app.config.clock_seconds {
             250
         } else {
             500
@@ -941,10 +1031,11 @@ fn draw_toggle_row(
     target: HitTarget,
     hover: Option<HitTarget>,
 ) {
-    let sw_rect = Rect::new(card_x + card_w - 16 - 38, y + (ROW_H - 20) / 2, 38, 20);
+    let sw_rect = Rect::new(card_x + card_w - 16 - 42, y + (ROW_H - 22) / 2, 42, 22);
     let label_max_w = sw_rect.x - (card_x + 16) - 16;
     draw_row_labels(canvas, text, theme, card_x, y, label_max_w, title, subtitle);
-    ui::toggle_switch(canvas, theme, sw_rect, checked, hover == Some(target));
+    let p = ANIMS.with(|a| a.borrow_mut().anim_toggle(target, checked, 20.0));
+    ui::toggle_switch_anim(canvas, theme, sw_rect, p, hover == Some(target));
     push_clipped_hit(hits, viewport, sw_rect, target);
 }
 
@@ -986,7 +1077,14 @@ fn draw_segmented_row<F>(
         let item_rect = ui::segmented_item_rect(seg_rect, labels.len(), i);
         push_clipped_hit(hits, viewport, item_rect, item_target);
     }
-    ui::segmented_control(canvas, text, theme, seg_rect, labels, selected, hover_idx);
+    let target_item = ui::segmented_item_rect(seg_rect, labels.len(), selected);
+    let ind_rect = ANIMS.with(|a| {
+        a.borrow_mut()
+            .anim_segmented(make_target(0), target_item, 24.0)
+    });
+    ui::segmented_control_anim(
+        canvas, text, theme, seg_rect, labels, ind_rect, selected, hover_idx,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1028,14 +1126,21 @@ fn draw_settings(
         Face::Bold,
     );
 
+    let active_idx = NAV.iter().position(|(id, _, _)| *id == page).unwrap_or(0);
+    let target_nav_y = (TITLEBAR_HEIGHT + 36 + active_idx as i32 * 38) as f32;
+    let nav_y = ANIMS.with(|a| a.borrow_mut().anim_nav(target_nav_y, 22.0));
+    let active_pill = Rect::new(10, nav_y.round() as i32, SIDEBAR_W - 20, 34);
+    canvas.rounded_rect(active_pill, RADIUS_CONTROL, theme.accent_soft, 1.0);
+    canvas.fill(
+        Rect::new(active_pill.x, active_pill.y + 7, 3, active_pill.h - 14),
+        theme.accent,
+    );
+
     for (i, (id, label, icon)) in NAV.iter().enumerate() {
         let r = Rect::new(10, TITLEBAR_HEIGHT + 36 + i as i32 * 38, SIDEBAR_W - 20, 34);
         let active = page == *id;
         let target = HitTarget::Nav(i);
-        if active {
-            canvas.rounded_rect(r, RADIUS_CONTROL, theme.accent_soft, 1.0);
-            canvas.fill(Rect::new(r.x, r.y + 7, 3, r.h - 14), theme.accent);
-        } else if hover == Some(target) {
+        if hover == Some(target) && !active {
             canvas.rounded_rect(r, RADIUS_CONTROL, theme.panel_hover, 1.0);
         }
         icons::draw(canvas, *icon, r.x + 10, r.y + (r.h - 18) / 2, 18, None);

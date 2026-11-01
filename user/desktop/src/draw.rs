@@ -28,6 +28,10 @@ impl Rect {
         Self { x, y, w, h }
     }
 
+    pub const fn offset(&self, dx: i32, dy: i32) -> Rect {
+        Rect::new(self.x + dx, self.y + dy, self.w, self.h)
+    }
+
     pub const fn right(&self) -> i32 {
         self.x + self.w
     }

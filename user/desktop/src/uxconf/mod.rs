@@ -376,7 +376,7 @@ pub struct ChangeEvent {
     pub value: Option<Value>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ThemeMode {
     Dark,
     Light,
