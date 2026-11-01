@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -373,6 +373,7 @@ impl Server {
                 }
                 Err(err) => format_err(&err),
             },
+            Request::FactoryReset => self.request_factory_reset(client_idx),
             Request::Subscribe { filter } => {
                 self.clients[client_idx].subscription = Some(match filter {
                     Some(ch) => Subscription::Channel(ch),
@@ -382,6 +383,92 @@ impl Server {
             }
         }
     }
+    fn request_factory_reset(&self, client_idx: usize) -> String {
+        let fd = self.clients[client_idx].stream.as_raw_fd();
+        let uid = match socket_peer_uid(fd) {
+            Ok(uid) => uid,
+            Err(error) => {
+                return format_err(&ConfError::Io(format!(
+                    "cannot read peer credentials: {error}"
+                )))
+            }
+        };
+        if uid != 0 && !wheel_member(uid) {
+            return format_err(&ConfError::Io(
+                "factory reset requires a wheel administrator".to_string(),
+            ));
+        }
+        let directory = Path::new("/var/lib/spaceos");
+        if let Err(error) = fs::create_dir_all(directory) {
+            return format_err(&ConfError::Io(error.to_string()));
+        }
+        let path = directory.join("factory-reset");
+        let body = format!(
+            "requested_uid={uid}\nrequested_at={}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs())
+        );
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true).mode(0o600);
+        match options.open(&path).and_then(|mut file| {
+            file.write_all(body.as_bytes())?;
+            file.sync_all()
+        }) {
+            Ok(()) => "OK\n".to_string(),
+            Err(error) => format_err(&ConfError::Io(format!(
+                "cannot record factory reset request: {error}"
+            ))),
+        }
+    }
+}
+
+fn socket_peer_uid(fd: std::os::fd::RawFd) -> io::Result<u32> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut _ as *mut libc::c_void,
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(credentials.uid)
+}
+
+fn wheel_member(uid: u32) -> bool {
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let Some((name, gid)) = passwd.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 4 && fields[2].parse::<u32>().ok() == Some(uid) {
+            fields[3]
+                .parse::<u32>()
+                .ok()
+                .map(|gid| (fields[0].to_string(), gid))
+        } else {
+            None
+        }
+    }) else {
+        return false;
+    };
+    let group = fs::read_to_string("/etc/group").unwrap_or_default();
+    for line in group.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 4 || fields[0] != "wheel" {
+            continue;
+        }
+        if fields[2].parse::<u32>().ok() == Some(gid)
+            || fields[3].split(',').any(|member| member == name)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl Drop for Server {

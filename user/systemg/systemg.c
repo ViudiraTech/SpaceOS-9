@@ -369,7 +369,12 @@ static pid_t start_unit(struct unit *unit) {
         for (int fd = 3; fd < 256; fd++) {
             close(fd);
         }
-        setpgid(0, 0);
+        /* getty/login creates its own session; a process-group leader cannot
+         * call setsid(2).  Other services still get a private process group so
+         * systemg can terminate their whole tree. */
+        if (strcmp(unit->name, "console") != 0) {
+            setpgid(0, 0);
+        }
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
@@ -391,12 +396,11 @@ static pid_t start_unit(struct unit *unit) {
     unit->failed = 0;
     unit->pending_restart = 0;
     unit->started_at = get_uptime_seconds();
-    setpgid(pid, pid);
+    if (strcmp(unit->name, "console") != 0) {
+        setpgid(pid, pid);
+    }
     if (unit->type != TYPE_ONESHOT) {
         printf("[  OK  ] Started %s.\n", unit_ident(unit));
-    }
-    if (strcmp(unit->name, "console") == 0) {
-        tcsetpgrp(0, pid);
     }
     if (unit->type == TYPE_ONESHOT) {
         int status = 0;

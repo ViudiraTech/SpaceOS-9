@@ -75,6 +75,7 @@ pub enum Request {
         property: String,
         recursive: bool,
     },
+    FactoryReset,
     Subscribe {
         filter: Option<String>,
     },
@@ -100,6 +101,7 @@ impl Request {
                 "RESET {channel} {property} {}\n",
                 if *recursive { 1 } else { 0 }
             ),
+            Self::FactoryReset => "FACTORY_RESET\n".to_string(),
             Self::Subscribe { filter } => match filter {
                 Some(ch) => format!("SUBSCRIBE {ch}\n"),
                 None => "SUBSCRIBE *\n".to_string(),
@@ -181,6 +183,7 @@ impl Request {
                     })
                 }
             }
+            "FACTORY_RESET" => Ok(Self::FactoryReset),
             other => Err(ConfError::Protocol(format!("unknown command {other:?}"))),
         }
     }

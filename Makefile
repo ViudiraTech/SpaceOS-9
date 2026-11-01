@@ -93,7 +93,7 @@ ROOTFS_SELFTEST ?= 0
 ROOTFS_IMG := build/rootfs/fat32.img
 ROOTFS_MODULE := $(if $(filter 1,$(WITH_ROOTFS)),module_path: boot():/rootfs.img,)
 
-.PHONY: desktop desktop-iso desktop-spui desktop-rootfs desktop-run all kernel iso rootfs-image busybox run debug test test-single test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
+.PHONY: desktop desktop-iso desktop-spui desktop-rootfs desktop-run release-try all kernel iso rootfs-image busybox run debug test test-single test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
 all: iso
 
 defconfig:
@@ -174,6 +174,17 @@ desktop: desktop-iso desktop-rootfs
 desktop-run: desktop
 	qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -m 4096 -smp $(CPUS) -serial stdio -monitor none -no-reboot -vga none -display gtk,zoom-to-fit=off -device virtio-gpu-pci,xres=1280,yres=800 -device virtio-tablet-pci -device virtio-keyboard-pci -drive file=$(DESKTOP_IMAGE),if=none,id=root,format=raw -device nvme,serial=SPROOT,drive=root -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
 
+# Reproducible release candidate requested by the release checklist.  The ISO
+# boots the release kernel; the matching desktop rootfs is build/rootfs/ext4.img.
+RELEASE_TRY := build/spacekernel-release-try.iso
+
+release-try:
+	$(MAKE) desktop PROFILE=release ARCH=x86_64
+	cp build/x86_64/release/SpaceKernel-x86_64.iso $(RELEASE_TRY)
+	cp build/rootfs/ext4.img build/spacekernel-release-try-rootfs.img
+	@printf 'Release image ready: %s\n' '$(RELEASE_TRY)'
+	@printf 'Release rootfs ready: build/spacekernel-release-try-rootfs.img\n'
+
 DISK_DIR := build/disks
 QEMU_STORAGE_FLAGS := -drive file=$(DISK_DIR)/nvme.img,if=none,id=nvme0,format=raw -device nvme,serial=SKNVME01,drive=nvme0 -device ich9-ahci,id=ahci0 -drive file=$(DISK_DIR)/sata.img,if=none,id=sata0,format=raw -device ide-hd,drive=sata0,bus=ahci0.0 $(if $(filter x86_64,$(ARCH)),-device piix3-ide,id=ide0 -drive file=$(DISK_DIR)/ide.img,if=none,id=pata0,format=raw -device ide-hd,drive=pata0,bus=ide0.0,)
 
@@ -240,4 +251,5 @@ help:
 	  'make debug       Start QEMU paused with GDB port 1234' \
 	  'make test        Host model checks + x86_64/aarch64/riscv64 boot matrix' \
 	  'make test ARCH=  Single-architecture boot smoke test' \
-	  'make check       Format and check all target architectures'
+	  'make check       Format and check all target architectures' \
+	  'make release-try Build release desktop ISO at build/spacekernel-release-try.iso'

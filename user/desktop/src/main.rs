@@ -14,6 +14,7 @@
 
 mod app;
 mod apps;
+mod ddm;
 mod draw;
 mod icons;
 mod shell;
@@ -39,6 +40,12 @@ fn main() -> ExitCode {
         "view" | "image" => apps::view::run(arguments.get(2).map(String::as_str)),
         "help" => apps::help::run(),
         "login" => apps::login::run(),
+        "greeter" => apps::greeter::run(arguments.get(2..).unwrap_or(&[])),
+        "oobe" => apps::oobe::run(arguments.get(2..).unwrap_or(&[])),
+        "ddm" => ddm::run(arguments.get(2..).unwrap_or(&[])).map_err(|error| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, error))
+                as Box<dyn std::error::Error>
+        }),
         "notify" => apps::notify::run(
             arguments.get(2).map(String::as_str).unwrap_or("通知"),
             arguments.get(3).map(String::as_str).unwrap_or(""),

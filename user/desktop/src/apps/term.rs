@@ -983,24 +983,41 @@ impl Pty {
         let dir_str = if workdir.is_dir() {
             workdir.to_string_lossy().into_owned()
         } else {
-            "/root".to_string()
+            std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
         };
-        let workdir_c = CString::new(dir_str).unwrap_or_else(|_| CString::new("/root").unwrap());
+        let workdir_c = CString::new(dir_str).unwrap_or_else(|_| CString::new("/").unwrap());
         let sh_path = CString::new("/bin/sh").unwrap();
         let sh_arg0 = CString::new("-sh").unwrap();
 
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-        let env_strings = [
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+        let logname = std::env::var("LOGNAME").unwrap_or_else(|_| user.clone());
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let lang = std::env::var("LANG").unwrap_or_else(|_| "zh_CN.UTF-8".to_string());
+        let mut env_strings = vec![
             CString::new("PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin").unwrap(),
-            CString::new("HOME=/root").unwrap(),
-            CString::new("USER=root").unwrap(),
-            CString::new("LOGNAME=root").unwrap(),
-            CString::new("SHELL=/bin/sh").unwrap(),
+            CString::new(format!("HOME={home}"))
+                .unwrap_or_else(|_| CString::new("HOME=/").unwrap()),
+            CString::new(format!("USER={user}"))
+                .unwrap_or_else(|_| CString::new("USER=user").unwrap()),
+            CString::new(format!("LOGNAME={logname}"))
+                .unwrap_or_else(|_| CString::new("LOGNAME=user").unwrap()),
+            CString::new(format!("SHELL={shell}"))
+                .unwrap_or_else(|_| CString::new("SHELL=/bin/sh").unwrap()),
             CString::new("TERM=xterm-256color").unwrap(),
             CString::new("COLORTERM=truecolor").unwrap(),
-            CString::new("LANG=zh_CN.UTF-8").unwrap(),
+            CString::new(format!("LANG={lang}"))
+                .unwrap_or_else(|_| CString::new("LANG=C").unwrap()),
             CString::new(format!("DISPLAY={display}")).unwrap(),
         ];
+        for key in ["XAUTHORITY", "TZ", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE"] {
+            if let Ok(value) = std::env::var(key) {
+                if let Ok(entry) = CString::new(format!("{key}={value}")) {
+                    env_strings.push(entry);
+                }
+            }
+        }
         let mut env_ptrs: Vec<*const libc::c_char> =
             env_strings.iter().map(|s| s.as_ptr()).collect();
         env_ptrs.push(std::ptr::null());
@@ -1259,7 +1276,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/root"));
+        .unwrap_or_else(|| PathBuf::from("/"));
 
     let mut pty = match Pty::spawn(
         &workdir,

@@ -54,8 +54,8 @@ fn topic_content(topic: Topic) -> (&'static str, &'static [Section]) {
                 Section {
                     title: "关于 SpaceOS 9",
                     paragraphs: &[
-                        "SpaceOS 9 是由 ViudiraTech 研发的高性能自主操作系统，搭载 SpaceKernel 内核与自研原生 SPUI 4.0 图形桌面环境。",
-                        "系统深度融合现代微内核设计理念与完备的 Linux ABI 兼容层，具备纳秒级 IPC、高吞吐内存文件系统与原生的 X11 桌面交互体验。",
+                        "SpaceOS 9 是由 ViudiraTech 研发的高性能自主操作系统，搭载 SpaceKernel 宏内核与自研原生 SPUI 4.0 图形桌面环境。",
+                        "系统采用宏内核（monolithic kernel）架构，在单一内核地址空间中统一提供虚拟内存、EEVDF 调度、VFS 与文件系统、设备模型、TTY、图形子系统以及 Linux ABI 系统调用；用户态通过系统调用直接使用这些内核服务，而不是依赖微内核式的用户态服务转发。",
                     ],
                     bullets: &[
                         "轻量原生：纯 Rust 构建桌面与窗口管理器，零重度框架包袱，内存占用极低。",
@@ -174,15 +174,16 @@ fn topic_content(topic: Topic) -> (&'static str, &'static [Section]) {
             "SpaceKernel 架构与内核概览",
             &[
                 Section {
-                    title: "微内核与高性能子系统",
+                    title: "宏内核与高性能子系统",
                     paragraphs: &[
-                        "SpaceKernel 采用现代微内核思想设计，内核核心专注于提供极限速度的虚拟内存管理、per-CPU EEVDF 任务调度与轻量级进程间通信 (IPC)。",
-                        "图形渲染架构采用纯软件 SWAR 并行混合引擎 + MIT-SHM 共享内存零拷贝传递，实现极低开销的高帧率桌面交互，不依赖庞大笨重的外部驱动栈。",
+                        "SpaceKernel 采用宏内核设计：调度器、虚拟内存、VFS、设备驱动、网络与图形核心运行在同一个内核地址空间中，通过稳定编号的 Linux ABI 系统调用向用户态提供服务。文件系统和驱动不需要经过额外的用户态服务进程转发。",
+                        "这种架构以较低的系统调用开销和完整的 Linux ABI 兼容性为目标；代价是内核故障域更大。项目通过 Rust 内存安全、资源所有权约束、失败路径审计和可重复的 QEMU 测试矩阵来控制这一风险。",
+                        "图形渲染架构采用纯软件 SWAR 并行混合引擎 + MIT-SHM 共享内存零拷贝传递，实现低开销的桌面交互，不依赖庞大笨重的外部驱动栈。",
                     ],
                     bullets: &[
-                        "多架构原生支持：一套代码库无缝适配 x86_64、AArch64 与 RISC-V 64 三大主流 CPU 指令集架构。",
-                        "高可靠持久化：内置 ext4 与 JBD2 日志文件系统驱动，确保在断电或异常关机下磁盘数据依然严密安全。",
-                        "现代化系统管理：由 systemg 作为 PID 1 统一编排系统服务，支持依赖解析、并行启动与崩溃自动拉起。",
+                        "多架构原生支持：一套代码库适配 x86_64、AArch64 与 RISC-V 64 三大 CPU 指令集架构。",
+                        "高可靠持久化：内置 ext4 与 JBD2 日志文件系统驱动，降低异常断电导致的数据损坏风险。",
+                        "现代化系统管理：由 systemg 作为 PID 1 统一编排系统服务，支持依赖解析、顺序启动与崩溃自动拉起。",
                     ],
                     code_snippet: None,
                 },

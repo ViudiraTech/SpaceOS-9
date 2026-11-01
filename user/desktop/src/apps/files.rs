@@ -322,7 +322,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
-        .unwrap_or_else(|| PathBuf::from("/root"));
+        .unwrap_or_else(|| PathBuf::from("/"));
     let initial = argument
         .map(PathBuf::from)
         .filter(|p| p.is_dir())

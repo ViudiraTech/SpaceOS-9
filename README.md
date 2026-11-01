@@ -49,6 +49,8 @@ make check                 # rustfmt + 三架构 cargo check
 make test                  # 主机侧模型测试 + 三架构 QEMU 启动矩阵
 make test ARCH=x86_64      # 单架构启动测试
 make debug                 # QEMU 暂停在启动处，GDB 端口 1234
+make desktop PROFILE=release  # 构建 SPUI 桌面与 rootfs
+make release-try           # 生成 build/spacekernel-release-try.iso 与 rootfs
 ```
 
 `make test` 的 x86_64 项使用 VirtIO GPU/Venus 设备；如果宿主机没有 `/dev/dri/renderD128`，可用 `tools/qemu_test.py --gpu 2d` 运行无 3D 的显示链路测试。
@@ -66,6 +68,7 @@ SpaceOS、SpaceOS-9、SpaceKernel、SPK 名称与 Logo 归 ViudiraTech 所有。
 ## 文档
 
 - [子系统设计与验收契约](docs/SPACEOS9_SUBSYSTEM_DESIGN.md)
+- [DDM 显示管理器与 OOBE 首次启动](docs/DDM_OOBE.md)
 - [SMP 与调度器](docs/SCHEDULER.md)
 - [CPU 与扩展状态](docs/CPU_STATE.md)
 - [源码约定](docs/CODING_STYLE.md)

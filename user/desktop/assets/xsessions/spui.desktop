@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=SpaceOS 桌面
+Name[zh_CN]=SpaceOS 桌面
+Comment=SPUI 4.0 desktop session
+Exec=/bin/sh /usr/share/spui/session.sh
+TryExec=/usr/bin/spui
+DesktopNames=SPUI

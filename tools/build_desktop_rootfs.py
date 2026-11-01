@@ -47,11 +47,14 @@ PACKAGES = [
     "alpine-baselayout-data",
     "musl",
     "busybox",
+    "busybox-suid",
+    "doas",
     "xorg-server",
     "xf86-input-libinput",
     "xf86-input-evdev",
     "xkeyboard-config",
     "xkbcomp",
+    "setxkbmap",
     "font-misc-misc",
     "font-cursor-misc",
     "libudev-zero",
@@ -308,7 +311,7 @@ def busybox_links() -> None:
         return
     os.chmod(binary, 0o755)
     host_list = subprocess.run(
-        ["strings", str(binary)], check=True, capture_output=True, text=True
+        ["strings", "-n", "2", str(binary)], check=True, capture_output=True, text=True
     ).stdout
     # Applet names are stored in a NUL separated table beginning at "[".
     known = (
@@ -316,15 +319,22 @@ def busybox_links() -> None:
         "sort uniq cut tr tee find xargs ps kill sleep usleep uname id whoami date env true false "
         "clear reset stty tty hostname df du free mount umount dmesg top ping mknod chmod "
         "chown basename dirname readlink realpath which test expr seq sync vi more less "
-        "gzip gunzip tar poweroff reboot halt base64 cmp dd md5sum sha256sum strings nproc diff"
+        "gzip gunzip tar poweroff reboot halt base64 cmp dd md5sum sha256sum strings nproc diff "
+        "login getty nologin su passwd vlock adduser addgroup chpasswd"
     ).split()
+    suid = {"su", "passwd"}
+    bbsuid = STAGE / "bin" / "bbsuid"
     for name in known:
         if name not in host_list and name not in ("sh", "ash"):
             continue
-        directory = "bin"
-        link = STAGE / directory / name
-        if not link.exists() and not link.is_symlink():
-            os.symlink("/bin/busybox", link)
+        link = STAGE / "bin" / name
+        if link.exists() or link.is_symlink():
+            continue
+        if name in suid and bbsuid.exists():
+            os.chmod(bbsuid, 0o4755)
+            link.symlink_to("/bin/bbsuid")
+        else:
+            link.symlink_to("/bin/busybox")
 
 
 def ensure_cached_package(pkg_name: str) -> pathlib.Path:
@@ -425,17 +435,41 @@ def generate_misc_font_index() -> None:
 
 def configure() -> None:
     for directory in (
-        "dev", "proc", "sys", "tmp", "run", "root", "home/user", "etc/X11/xorg.conf.d",
-        "var/log", "var/lib/xkb", "etc/systemg", "usr/share/spui", "etc/spui",
+        "dev", "proc", "sys", "tmp", "run", "root", "home", "etc/X11/xorg.conf.d",
+        "var/log", "var/log/ddm", "var/lib/xkb", "var/lib/ddm", "var/lib/spaceos",
+        "etc/systemg", "etc/ddm", "usr/share/spui", "usr/share/xsessions", "etc/spui",
         "etc/uxconf/channels", "var/lib/uxconf/channels", "var/cache/fontconfig",
+        "var/mail", "run/ddm", "run/user",
     ):
         (STAGE / directory).mkdir(parents=True, exist_ok=True)
     os.chmod(STAGE / "tmp", 0o1777)
+    os.chmod(STAGE / "run" / "ddm", 0o711)
+    os.chmod(STAGE / "run" / "user", 0o755)
+    os.chmod(STAGE / "var" / "lib" / "ddm", 0o700)
+    os.chmod(STAGE / "var" / "log" / "ddm", 0o755)
+    os.chmod(STAGE / "home", 0o755)
+    (STAGE / "var" / "db" / "doas").mkdir(parents=True, exist_ok=True)
+    os.chmod(STAGE / "var" / "db" / "doas", 0o700)
+    (STAGE / "etc" / "skel").mkdir(parents=True, exist_ok=True)
+    if not (STAGE / "var" / "run").exists() and not (STAGE / "var" / "run").is_symlink():
+        os.symlink("../run", STAGE / "var" / "run")
+    write("/var/log/wtmp", "", 0o664)
+    write("/var/log/btmp", "", 0o600)
+    write("/var/log/lastlog", "", 0o644)
     busybox_links()
 
-    for stale_probe in ("usr/bin/drmprobe", "usr/bin/drm-probe", "etc/spui/settings.conf"):
+    for stale_probe in (
+        "usr/bin/drmprobe",
+        "usr/bin/drm-probe",
+        "etc/spui/settings.conf",
+        "etc/systemg/desktop.service",
+        "home/user",
+        "etc/systemg/oobe.service",
+    ):
         probe_path = STAGE / stale_probe
-        if probe_path.exists() or probe_path.is_symlink():
+        if probe_path.is_dir() and not probe_path.is_symlink():
+            shutil.rmtree(probe_path)
+        elif probe_path.exists() or probe_path.is_symlink():
             probe_path.unlink()
 
     uxconf_defaults = {
@@ -513,13 +547,52 @@ def configure() -> None:
         write(f"/etc/uxconf/channels/{channel_name}.conf", channel_body)
 
     write("/etc/hostname", "spaceos\n")
-    write("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:SpaceOS User:/home/user:/bin/sh\n")
-    write("/etc/group", "root:x:0:\ninput:x:97:user\nvideo:x:27:user\nuser:x:1000:\n")
-    write("/etc/shadow", "root::0:0:99999:7:::\nuser::0:0:99999:7:::\n", 0o640)
+    write(
+        "/etc/passwd",
+        "root:x:0:0:root:/root:/bin/sh\n"
+        "ddm:x:990:990:SpaceOS Display Manager:/var/lib/ddm:/bin/nologin\n",
+    )
+    write(
+        "/etc/group",
+        "root:x:0:\n"
+        "wheel:x:10:\n"
+        "video:x:27:\n"
+        "input:x:97:\n"
+        "ddm:x:990:\n",
+    )
+    write(
+        "/etc/shadow",
+        "root:!:0:0:99999:7:::\n"
+        "ddm:!:0:0:99999:7:::\n",
+        0o600,
+    )
+    write(
+        "/etc/gshadow",
+        "root:*::\nwheel:*::\nddm:!::\n",
+        0o600,
+    )
     write("/etc/profile", "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\nexport TERM=${TERM:-xterm-256color}\nexport COLORTERM=truecolor\nexport LANG=zh_CN.UTF-8\nexport PS1='\\u@\\h:\\w\\$ '\n")
     write("/etc/os-release", 'NAME="SpaceOS"\nVERSION="9"\nID=spaceos9\nID_LIKE=alpine\nVERSION_ID="9"\nPRETTY_NAME="SpaceOS 9"\nHOME_URL="https://github.com/ViudiraTech/SpaceOS-9"\n')
     write("/etc/fstab", "/dev/nvme0n1 / ext4 defaults 0 1\nproc /proc proc defaults 0 0\nsysfs /sys sysfs defaults 0 0\ndevtmpfs /dev devtmpfs defaults 0 0\ntmpfs /tmp tmpfs defaults 0 0\n")
-    write("/etc/motd", "SpaceOS 9 desktop root (Alpine userland, ext4 + jbd2)\n")
+    write("/etc/motd", "SpaceOS 9 desktop (Alpine userland, ext4 + jbd2)\nGraphical login is provided by DDM; root graphical login is disabled.\n")
+    write("/etc/locale.conf", "LANG=zh_CN.UTF-8\n")
+    write("/etc/TZ", "UTC0\n")
+    write("/etc/timezone", "UTC\n")
+    localtime = STAGE / "etc" / "localtime"
+    if localtime.exists() or localtime.is_symlink():
+        localtime.unlink()
+    os.symlink("/usr/share/zoneinfo/UTC", localtime)
+
+    ddm_dir = ROOT / "user" / "desktop" / "assets" / "ddm"
+    if (ddm_dir / "ddm.conf").is_file():
+        install_binary(ddm_dir / "ddm.conf", "/etc/ddm/ddm.conf", 0o644)
+    if (ddm_dir / "doas.conf").is_file():
+        install_binary(ddm_dir / "doas.conf", "/etc/doas.conf", 0o640)
+    xsessions = ROOT / "user" / "desktop" / "assets" / "xsessions"
+    if xsessions.is_dir():
+        for path in sorted(xsessions.iterdir()):
+            if path.is_file():
+                install_binary(path, f"/usr/share/xsessions/{path.name}", 0o644)
 
     # Glamor pulls in Mesa and LLVM. Keep them on disk for a later GL stage, but
     # never load them: this is the Pixman path chosen for the first release.
@@ -625,6 +698,9 @@ EndSection
         for path in assets.rglob("*"):
             if path.is_file():
                 install_binary(path, f"/usr/share/spui/{path.relative_to(assets)}", 0o644)
+    session_script = STAGE / "usr" / "share" / "spui" / "session.sh"
+    if session_script.is_file():
+        os.chmod(session_script, 0o755)
 
     install_spui_assets()
     generate_misc_font_index()

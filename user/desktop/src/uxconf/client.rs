@@ -259,6 +259,15 @@ impl UxConfClient {
         }
     }
 
+    pub fn factory_reset(&mut self) -> Result<(), ConfError> {
+        let line = self.send_and_read_header(&Request::FactoryReset)?;
+        if line.starts_with("OK") {
+            Ok(())
+        } else {
+            Err(parse_err_line(&line))
+        }
+    }
+
     /// Fetch all built-in desktop channels into a strongly-typed `DesktopConfig`.
     pub fn load_desktop_config(&mut self) -> DesktopConfig {
         let mut cfg = DesktopConfig::default();

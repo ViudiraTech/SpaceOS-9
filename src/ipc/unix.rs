@@ -191,13 +191,21 @@ impl Credentials {
 }
 
 pub fn current_credentials() -> Credentials {
-    Credentials {
-        pid: sched::current()
-            .map(|task| task.stats().tgid as u32)
-            .unwrap_or(0),
-        uid: 0,
-        gid: 0,
-    }
+    sched::current().map_or(
+        Credentials {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        },
+        |task| {
+            let credentials = task.credentials();
+            Credentials {
+                pid: task.stats().tgid as u32,
+                uid: credentials.euid,
+                gid: credentials.egid,
+            }
+        },
+    )
 }
 
 struct Barrier {

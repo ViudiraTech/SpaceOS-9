@@ -1,8 +1,8 @@
 [Unit]
-Description=Serial and framebuffer console shell
+Description=Serial login console
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -l
+ExecStart=/bin/getty -L 115200 ttyS0 vt100
 Restart=always
-RestartSec=1
+RestartSec=2

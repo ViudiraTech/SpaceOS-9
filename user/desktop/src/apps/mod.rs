@@ -13,10 +13,13 @@
 pub mod calc;
 pub mod edit;
 pub mod files;
+pub mod greeter;
 pub mod help;
 pub mod login;
 pub mod monitor;
 pub mod notify;
+pub mod oobe;
+pub mod session_ui;
 pub mod settings;
 pub mod term;
 pub mod view;

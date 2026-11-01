@@ -25,6 +25,7 @@ use std::ffi::CStr;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use uxconf::{
     format_hex_rgb, BackdropStyle, ButtonLayout, CursorStyle, DesktopConfig, DoubleClickAction,
     FocusMode, PanelPosition, ThemeMode, Value, WindowPlacement, ACCENT_PRESETS, RESOLUTIONS,
@@ -156,6 +157,7 @@ enum HitTarget {
     ClockSeconds,
     ClockShowDate,
     Timezone(usize),
+    FactoryReset,
 }
 
 #[derive(Default)]
@@ -228,6 +230,8 @@ impl SettingsAnimStore {
 thread_local! {
     static ANIMS: RefCell<SettingsAnimStore> = RefCell::new(SettingsAnimStore::default());
 }
+
+static FACTORY_RESET_ARMED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 struct HitBox {
     rect: Rect,
@@ -949,6 +953,32 @@ fn handle_click(
             apply_local_timezone(tz_id);
             app.set_config_property("datetime", "/timezone", Value::String(tz_id.to_string()));
         }
+        HitTarget::FactoryReset => {
+            let now = std::time::Instant::now();
+            let confirmed = {
+                let mut armed = FACTORY_RESET_ARMED.lock().unwrap();
+                let confirm = armed
+                    .is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(15));
+                *armed = if confirm { None } else { Some(now) };
+                confirm
+            };
+            if !confirmed {
+                *status = "再次点击「重置…」确认恢复出厂设置（15 秒内有效）".to_string();
+            } else {
+                match app.uxconf.as_mut().map(|client| client.factory_reset()) {
+                    Some(Ok(())) => {
+                        *status =
+                            "恢复出厂设置已登记；重启后清除本地账户并进入首次设置向导".to_string();
+                    }
+                    Some(Err(error)) => {
+                        *status = format!("无法登记恢复出厂设置：{error}");
+                    }
+                    None => {
+                        *status = "配置服务不可用，无法登记恢复出厂设置".to_string();
+                    }
+                }
+            }
+        }
     }
     app.needs_redraw = true;
 }
@@ -1194,6 +1224,18 @@ fn draw_settings(
                 Face::Ui,
             );
         }
+    } else if !status.is_empty() {
+        let shown = text.truncate(status, (w - CONTENT_X - 48) as f32, 11.5, Face::Ui);
+        let st_w = text.measure(&shown, 11.5, Face::Ui);
+        text.draw(
+            canvas,
+            &shown,
+            (w - 24) as f32 - st_w,
+            (TITLEBAR_HEIGHT + 31) as f32,
+            11.5,
+            theme.accent,
+            Face::Ui,
+        );
     }
     if scroll_y > 0 {
         canvas.fill(
@@ -2357,6 +2399,50 @@ fn draw_settings(
                     );
                 }
                 y += c_sw.h + 18;
+
+                y = draw_section_heading(canvas, text, theme, CONTENT_X, y, "系统维护");
+                let c_reset = Rect::new(CONTENT_X, y, card_w, 92);
+                ui::card(canvas, theme, c_reset);
+                text.draw(
+                    canvas,
+                    "恢复出厂设置",
+                    (CONTENT_X + 16) as f32,
+                    (c_reset.y + 30) as f32,
+                    13.0,
+                    theme.danger,
+                    Face::Bold,
+                );
+                text.draw(
+                    canvas,
+                    "删除本地账户、主目录和个性化配置；重启后进入首次设置向导。",
+                    (CONTENT_X + 16) as f32,
+                    (c_reset.y + 52) as f32,
+                    10.5,
+                    theme.text_muted,
+                    Face::Ui,
+                );
+                text.draw(
+                    canvas,
+                    "需要 wheel 管理员确认；不会影响内核、系统文件或已安装软件。",
+                    (CONTENT_X + 16) as f32,
+                    (c_reset.y + 70) as f32,
+                    9.5,
+                    theme.text_muted,
+                    Face::Ui,
+                );
+                let reset_btn = Rect::new(c_reset.right() - 132, c_reset.y + 30, 112, 34);
+                ui::button(
+                    canvas,
+                    text,
+                    theme,
+                    reset_btn,
+                    "重置…",
+                    None,
+                    false,
+                    hover == Some(HitTarget::FactoryReset),
+                );
+                push_clipped_hit(hits, viewport, reset_btn, HitTarget::FactoryReset);
+                y += c_reset.h + 18;
             }
         }
         end_y = y;

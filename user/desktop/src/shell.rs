@@ -174,6 +174,18 @@ pub struct Shell {
     running: bool,
 }
 
+fn session_identity() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".to_string());
+    let host = fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "spaceos".to_string());
+    format!("{user}@{host}")
+}
+
 fn now_local() -> (i32, i32, i32, i32, i32, i32, i32) {
     // SAFETY: `localtime_r` writes into stack-owned zeroed `libc::tm` with no shared state.
     unsafe {
@@ -1492,8 +1504,9 @@ impl Shell {
             }
             Hit::Logout => {
                 self.close_menu()?;
-                self.launch("login");
-                Ok(())
+                // DDM owns the session.  Exiting the shell makes the daemon
+                // tear down the whole process group and show the greeter again.
+                std::process::exit(0);
             }
             _ => Ok(()),
         }
@@ -1987,9 +2000,10 @@ impl Shell {
         canvas.fill(Rect::new(1, h - 54, w - 2, 53), self.theme.window_alt);
         canvas.fill(Rect::new(1, h - 54, w - 2, 1), self.theme.panel_border);
         icons::draw(canvas, Icon::SpaceLogo, 16, h - 38, 22, None);
+        let identity = session_identity();
         self.text.draw(
             canvas,
-            "root@spaceos",
+            &identity,
             46.0,
             (h - 22) as f32,
             12.5,
@@ -2003,7 +2017,7 @@ impl Shell {
             &mut self.text,
             &self.theme,
             logout,
-            "会话",
+            "注销",
             Some(Icon::Logout),
             false,
             self.hover == Hit::Logout,

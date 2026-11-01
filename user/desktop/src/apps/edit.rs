@@ -294,9 +294,12 @@ fn hit_text_cursor(
 }
 
 pub fn run(argument: Option<&str>) -> Result<()> {
-    let path = argument
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root/untitled.txt"));
+    let path = argument.map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("untitled.txt")
+    });
 
     let mut app = App::new("文本编辑器", Icon::Editor, 840, 580)?;
     app.min_width = 480;
