@@ -38,15 +38,31 @@ struct unit {
     int ever_started;
     time_t started_at;
     int exit_status;
+    u64 queue_ts;
+    u64 start_ts;
+    u64 active_ts;
+    u64 duration_us;
 };
 
 static struct unit units[MAX_UNITS];
 static int unit_count;
 static volatile int child_changed;
+static u64 kernel_finish_usec;
+static u64 userspace_start_usec;
+static u64 userspace_finish_usec;
+static const char *g_sock_path = SOCK_PATH;
 
 static void child_handler(int signal_number) {
     (void)signal_number;
     child_changed = 1;
+}
+
+static u64 get_monotonic_usec(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (u64)ts.tv_sec * 1000000ULL + (u64)(ts.tv_nsec / 1000);
+    }
+    return 0;
 }
 
 static time_t get_uptime_seconds(void) {
@@ -57,8 +73,14 @@ static time_t get_uptime_seconds(void) {
     return 0;
 }
 
-static const char *unit_ident(const struct unit *unit) {
-    return unit->description[0] != 0 ? unit->description : unit->name;
+static void print_unit_status(const char *tag, const char *action, const struct unit *unit, const char *suffix) {
+    if (unit->description[0] != 0) {
+        printf("%s %s %s.service \033[90m- %s\033[0m%s\n",
+               tag, action, unit->name, unit->description, suffix ? suffix : ".");
+    } else {
+        printf("%s %s %s.service%s\n",
+               tag, action, unit->name, suffix ? suffix : ".");
+    }
 }
 
 static const char *exit_status_name(int status) {
@@ -194,6 +216,7 @@ static int load_unit(const char *path, const char *name) {
         copy_name(unit->name, sizeof(unit->name), name);
         unit->restart = RESTART_NO;
         unit->restart_sec = 1;
+        unit->queue_ts = get_monotonic_usec();
     }
 
     int fd = open(path, O_RDONLY);
@@ -278,7 +301,11 @@ static int load_unit(const char *path, const char *name) {
 }
 
 static void reload_all_units(void) {
-    DIR *directory = opendir("/etc/systemg");
+    const char *dir_path = getenv("SPACEOS_SERVICES");
+    if (dir_path == NULL || *dir_path == 0) {
+        dir_path = "/etc/systemg";
+    }
+    DIR *directory = opendir(dir_path);
     if (directory == NULL) {
         return;
     }
@@ -292,7 +319,7 @@ static void reload_all_units(void) {
             continue;
         }
         char path[256];
-        snprintf(path, sizeof(path), "/etc/systemg/%s", entry->d_name);
+        snprintf(path, sizeof(path), "%s/%s", dir_path, entry->d_name);
         char name[64];
         copy_name(name, sizeof(name), entry->d_name);
         name[length - 8] = 0;
@@ -355,6 +382,7 @@ static pid_t start_unit(struct unit *unit) {
     if (unit->pid > 0) {
         return unit->pid;
     }
+    unit->start_ts = get_monotonic_usec();
     char command[256];
     copy_name(command, sizeof(command), unit->exec);
     char *arguments[16];
@@ -363,7 +391,7 @@ static pid_t start_unit(struct unit *unit) {
         unit->failed = 1;
         return -1;
     }
-    printf("         Starting %s...\n", unit_ident(unit));
+    print_unit_status("        ", "Starting", unit, "...");
     pid_t pid = fork();
     if (pid == 0) {
         for (int fd = 3; fd < 256; fd++) {
@@ -400,7 +428,14 @@ static pid_t start_unit(struct unit *unit) {
         setpgid(pid, pid);
     }
     if (unit->type != TYPE_ONESHOT) {
-        printf("[  OK  ] Started %s.\n", unit_ident(unit));
+        unit->active_ts = get_monotonic_usec();
+        if (unit->active_ts >= unit->start_ts) {
+            unit->duration_us = unit->active_ts - unit->start_ts;
+        }
+        if (unit->duration_us == 0) {
+            unit->duration_us = 1;
+        }
+        print_unit_status("[  \033[1;32mOK\033[0m  ]", "Started", unit, ".");
     }
     if (unit->type == TYPE_ONESHOT) {
         int status = 0;
@@ -413,11 +448,18 @@ static pid_t start_unit(struct unit *unit) {
             unit->pid = 0;
             unit->failed = 1;
         }
+        unit->active_ts = get_monotonic_usec();
+        if (unit->active_ts >= unit->start_ts) {
+            unit->duration_us = unit->active_ts - unit->start_ts;
+        }
+        if (unit->duration_us == 0) {
+            unit->duration_us = 1;
+        }
         if (unit->failed) {
-            printf("[FAILED] Failed to start %s.\n", unit_ident(unit));
+            print_unit_status("[\033[1;31mFAILED\033[0m]", "Failed to start", unit, ".");
             printf("systemg[1]: %s: Failed with result 'exit-code'.\n", unit->name);
         } else {
-            printf("[  OK  ] Started %s.\n", unit_ident(unit));
+            print_unit_status("[  \033[1;32mOK\033[0m  ]", "Started", unit, ".");
         }
     }
     return pid;
@@ -472,12 +514,22 @@ static void start_ready_units(void) {
         for (int dependency = 0; dependency < unit->requires_count; dependency++) {
             int other = unit_index(unit->requires[dependency]);
             if (other >= 0 && (!units[other].started || units[other].failed)) {
-                printf("[DEPEND] Dependency failed for %s.\n", unit_ident(unit));
+                print_unit_status("[\033[1;33mDEPEND\033[0m]", "Dependency failed for", unit, ".");
                 unit->failed = 1;
                 unit->started = 1;
                 break;
             }
         }
+    }
+    int has_ddm = 0;
+    int ddm_idx = unit_index("ddm");
+    if (ddm_idx >= 0 && units[ddm_idx].started && !units[ddm_idx].failed) {
+        has_ddm = 1;
+    }
+    if (has_ddm) {
+        printf("[  \033[1;32mOK\033[0m  ] Reached target \033[1mGraphical Interface\033[0m \033[90m- graphical.target\033[0m.\n");
+    } else {
+        printf("[  \033[1;32mOK\033[0m  ] Reached target \033[1mMulti-User System\033[0m \033[90m- multi-user.target\033[0m.\n");
     }
 }
 
@@ -517,10 +569,145 @@ static void handle_ipc_client(int client_fd) {
     if (arg != NULL) {
         *arg = 0;
         arg = trim(arg + 1);
-        char *dot = strstr(arg, ".service");
-        if (dot != NULL) {
-            *dot = 0;
+        size_t arg_len = strlen(arg);
+        if (arg_len > 8 && strcmp(arg + arg_len - 8, ".service") == 0) {
+            arg[arg_len - 8] = 0;
         }
+    }
+
+    if (strcmp(cmd, "TIMES") == 0 || strcmp(cmd, "TIMINGS") == 0) {
+        u64 u_fin = (userspace_finish_usec > 0) ? userspace_finish_usec : get_monotonic_usec();
+        dprintf(client_fd, "KERNEL_USEC:%llu\n", (unsigned long long)kernel_finish_usec);
+        dprintf(client_fd, "USERSPACE_START_USEC:%llu\n", (unsigned long long)userspace_start_usec);
+        dprintf(client_fd, "USERSPACE_FINISH_USEC:%llu\n", (unsigned long long)u_fin);
+        dprintf(client_fd, "COUNT:%d\n", unit_count);
+        for (int i = 0; i < unit_count; i++) {
+            struct unit *u = &units[i];
+            const char *state = (u->pid > 0 || (u->type == TYPE_ONESHOT && u->started && !u->failed))
+                                    ? "active"
+                                    : (u->failed ? "failed" : "inactive");
+            const char *sub = (u->pid > 0) ? "running"
+                                           : ((u->type == TYPE_ONESHOT && !u->failed && u->ever_started) ? "exited" : "dead");
+            const char *type_str = (u->type == TYPE_ONESHOT) ? "oneshot"
+                                 : ((u->type == TYPE_EXEC) ? "exec" : "simple");
+
+            char after_buf[256];
+            after_buf[0] = 0;
+            for (int d = 0; d < u->after_count; d++) {
+                if (d > 0) strcat(after_buf, ",");
+                strcat(after_buf, u->after[d]);
+            }
+
+            char req_buf[256];
+            req_buf[0] = 0;
+            for (int d = 0; d < u->requires_count; d++) {
+                if (d > 0) strcat(req_buf, ",");
+                strcat(req_buf, u->requires[d]);
+            }
+
+            char wants_buf[256];
+            wants_buf[0] = 0;
+            for (int d = 0; d < u->wants_count; d++) {
+                if (d > 0) strcat(wants_buf, ",");
+                strcat(wants_buf, u->wants[d]);
+            }
+
+            dprintf(client_fd, "UNIT:%s|%s|%s|%s|%d|%llu|%llu|%llu|%llu|%s|%s|%s|%s\n",
+                    u->name, type_str, state, sub, (int)u->pid,
+                    (unsigned long long)u->queue_ts,
+                    (unsigned long long)u->start_ts,
+                    (unsigned long long)u->active_ts,
+                    (unsigned long long)u->duration_us,
+                    after_buf, req_buf, wants_buf,
+                    u->description);
+        }
+        return;
+    }
+
+    if (strcmp(cmd, "DUMP") == 0) {
+        time_t now = get_uptime_seconds();
+        u64 u_fin = (userspace_finish_usec > 0) ? userspace_finish_usec : get_monotonic_usec();
+        u64 k_ms = kernel_finish_usec / 1000;
+        u64 u_ms = (u_fin > userspace_start_usec)
+                       ? ((u_fin - userspace_start_usec) / 1000)
+                       : 0;
+        u64 tot_ms = k_ms + u_ms;
+        dprintf(client_fd, "--- Manager State ---\n");
+        dprintf(client_fd, "PID: 1\n");
+        dprintf(client_fd, "Socket: %s\n", g_sock_path);
+        dprintf(client_fd, "Kernel startup: %llu.%03llus\n", (unsigned long long)(k_ms / 1000), (unsigned long long)(k_ms % 1000));
+        dprintf(client_fd, "Userspace startup: %llu.%03llus\n", (unsigned long long)(u_ms / 1000), (unsigned long long)(u_ms % 1000));
+        dprintf(client_fd, "Total startup: %llu.%03llus\n", (unsigned long long)(tot_ms / 1000), (unsigned long long)(tot_ms % 1000));
+        dprintf(client_fd, "Uptime: %lds\n", (long)now);
+        dprintf(client_fd, "Units loaded: %d\n\n", unit_count);
+
+        for (int i = 0; i < unit_count; i++) {
+            struct unit *u = &units[i];
+            if (arg != NULL && *arg != 0) {
+                if (strstr(u->name, arg) == NULL && strstr(u->description, arg) == NULL) {
+                    continue;
+                }
+            }
+            const char *state = (u->pid > 0 || (u->type == TYPE_ONESHOT && u->started && !u->failed))
+                                    ? "active (running)"
+                                    : (u->failed ? "failed (result 'exit-code')" : "inactive (dead)");
+            const char *type_str = (u->type == TYPE_ONESHOT) ? "oneshot"
+                                 : ((u->type == TYPE_EXEC) ? "exec" : "simple");
+            const char *rst_str = (u->restart == RESTART_ALWAYS) ? "always"
+                                : ((u->restart == RESTART_ON_FAILURE) ? "on-failure" : "no");
+
+            dprintf(client_fd, "--- Unit %s.service ---\n", u->name);
+            dprintf(client_fd, "  Description: %s\n", u->description);
+            dprintf(client_fd, "  Loaded: /etc/systemg/%s.service\n", u->name);
+            dprintf(client_fd, "  Type: %s\n", type_str);
+            dprintf(client_fd, "  State: %s\n", state);
+            dprintf(client_fd, "  Main PID: %d\n", (int)u->pid);
+            dprintf(client_fd, "  Exit status: %s (%d)\n", exit_status_name(u->exit_status), u->exit_status);
+            dprintf(client_fd, "  Restart policy: %s (delay %ds)\n", rst_str, u->restart_sec);
+            dprintf(client_fd, "  Restarts: %d\n", u->restarts);
+            dprintf(client_fd, "  ExecStart: %s\n", u->exec);
+
+            u64 q_ms = u->queue_ts / 1000;
+            u64 s_ms = u->start_ts / 1000;
+            u64 a_ms = u->active_ts / 1000;
+            u64 d_ms = u->duration_us / 1000;
+            dprintf(client_fd, "  Timeline: queued at %llu.%03llus, started at %llu.%03llus, active at %llu.%03llus (+%llums)\n",
+                    (unsigned long long)(q_ms / 1000), (unsigned long long)(q_ms % 1000),
+                    (unsigned long long)(s_ms / 1000), (unsigned long long)(s_ms % 1000),
+                    (unsigned long long)(a_ms / 1000), (unsigned long long)(a_ms % 1000),
+                    (unsigned long long)d_ms);
+
+            dprintf(client_fd, "  After:");
+            if (u->after_count == 0) {
+                dprintf(client_fd, " (none)");
+            } else {
+                for (int d = 0; d < u->after_count; d++) {
+                    dprintf(client_fd, " %s.service", u->after[d]);
+                }
+            }
+            dprintf(client_fd, "\n");
+
+            dprintf(client_fd, "  Requires:");
+            if (u->requires_count == 0) {
+                dprintf(client_fd, " (none)");
+            } else {
+                for (int d = 0; d < u->requires_count; d++) {
+                    dprintf(client_fd, " %s.service", u->requires[d]);
+                }
+            }
+            dprintf(client_fd, "\n");
+
+            dprintf(client_fd, "  Wants:");
+            if (u->wants_count == 0) {
+                dprintf(client_fd, " (none)");
+            } else {
+                for (int d = 0; d < u->wants_count; d++) {
+                    dprintf(client_fd, " %s.service", u->wants[d]);
+                }
+            }
+            dprintf(client_fd, "\n\n");
+        }
+        return;
     }
 
     char resp[4096];
@@ -641,6 +828,8 @@ int main(int argc, char **argv, char **envp) {
     (void)argc;
     (void)argv;
     (void)envp;
+    kernel_finish_usec = get_monotonic_usec();
+    userspace_start_usec = kernel_finish_usec;
     int console = open("/dev/console", O_RDWR);
     if (console >= 0) {
         dup2(console, 0);
@@ -662,14 +851,19 @@ int main(int argc, char **argv, char **envp) {
     printf("SYSTEMG_OK pid=%d\n", getpid());
 
     /* Initialize control socket */
-    mkdir("/run", 0755);
-    unlink(SOCK_PATH);
+    const char *env_sock = getenv("SYSTEMG_SOCK");
+    if (env_sock != NULL && *env_sock != 0) {
+        g_sock_path = env_sock;
+    } else {
+        mkdir("/run", 0755);
+    }
+    unlink(g_sock_path);
     int server_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (server_fd >= 0) {
         struct sockaddr_un sun;
         memset(&sun, 0, sizeof(sun));
         sun.sun_family = AF_UNIX;
-        copy_name(sun.sun_path, sizeof(sun.sun_path), SOCK_PATH);
+        copy_name(sun.sun_path, sizeof(sun.sun_path), g_sock_path);
         if (bind(server_fd, &sun, sizeof(sun)) == 0) {
             listen(server_fd, 8);
         } else {
@@ -680,6 +874,7 @@ int main(int argc, char **argv, char **envp) {
 
     reload_all_units();
     start_ready_units();
+    userspace_finish_usec = get_monotonic_usec();
 
     for (;;) {
         int status = 0;
@@ -703,7 +898,7 @@ int main(int argc, char **argv, char **envp) {
                 } else {
                     printf("systemg[1]: %s: Deactivated successfully.\n", unit->name);
                 }
-                printf("[  OK  ] Stopped %s.\n", unit_ident(unit));
+                print_unit_status("[  \033[1;32mOK\033[0m  ]", "Stopped", unit, ".");
                 if (should_restart(unit)) {
                     unit->pending_restart = 1;
                 }

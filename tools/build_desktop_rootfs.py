@@ -678,7 +678,7 @@ EndSection
         source = USERLAND / name
         if source.exists():
             install_binary(source, f"/sbin/{name}")
-    for name in ("hello", "systemctl"):
+    for name in ("hello", "systemctl", "systemg-analyze"):
         source = USERLAND / name
         if source.exists():
             install_binary(source, f"/bin/{name}")
@@ -687,6 +687,12 @@ EndSection
                 if dest.is_symlink() or dest.exists():
                     dest.unlink()
                 dest.symlink_to(f"/bin/{name}")
+
+    for p in ("/bin/systemd-analyze", "/usr/bin/systemd-analyze"):
+        dest = STAGE / p.lstrip("/")
+        if dest.is_symlink() or dest.exists():
+            dest.unlink()
+        dest.symlink_to("/bin/systemg-analyze")
 
     spui = ROOT / "target" / "x86_64-unknown-linux-musl" / os.environ.get("SPUI_PROFILE", "release")
     if spui.is_dir():

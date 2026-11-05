@@ -77,7 +77,7 @@ def main() -> int:
                       "/dev", "/proc", "/sys", "/run", "/root"):
         run("mmd", "-i", str(IMAGE), f"::{directory}")
 
-    for name in ("hello", "cat", "echo", "sh", "fastfetch"):
+    for name in ("hello", "cat", "echo", "sh", "fastfetch", "systemctl", "systemg-analyze"):
         source = USERLAND / name
         if source.exists():
             run("mcopy", "-i", str(IMAGE), str(source), f"::/bin/{name}")
