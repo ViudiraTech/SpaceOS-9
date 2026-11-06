@@ -59,10 +59,16 @@
 #define SYS_OPENAT 257
 #define SYS_GETCWD 79
 #define SYS_CHDIR 80
+#define SYS_RENAME 82
 #define SYS_MKDIR 83
 #define SYS_RMDIR 84
 #define SYS_UNLINK 87
+#define SYS_SYMLINK 88
 #define SYS_READLINK 89
+#define SYS_GETUID 102
+#define SYS_GETGID 104
+#define SYS_GETEUID 107
+#define SYS_GETEGID 108
 #define SYS_GETPPID 110
 #define SYS_SETPGID 109
 #define SYS_SETSID 112

@@ -678,7 +678,7 @@ EndSection
         source = USERLAND / name
         if source.exists():
             install_binary(source, f"/sbin/{name}")
-    for name in ("hello", "systemctl", "systemg-analyze"):
+    for name in ("hello", "systemctl", "systemg-analyze", "journald", "journalctl", "dmesg"):
         source = USERLAND / name
         if source.exists():
             install_binary(source, f"/bin/{name}")
@@ -687,6 +687,12 @@ EndSection
                 if dest.is_symlink() or dest.exists():
                     dest.unlink()
                 dest.symlink_to(f"/bin/{name}")
+
+    for p in ("/bin/systemd-journald", "/usr/bin/systemd-journald"):
+        dest = STAGE / p.lstrip("/")
+        if dest.is_symlink() or dest.exists():
+            dest.unlink()
+        dest.symlink_to("/bin/journald")
 
     module_dir = ROOT / "build" / "modules" / "x86_64"
     if module_dir.is_dir():

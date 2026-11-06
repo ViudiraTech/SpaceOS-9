@@ -89,3 +89,27 @@ char *getcwd(char *buf, size_t size) {
     long result = __sc2(SYS_GETCWD, (long)buf, (long)size);
     return result < 0 ? NULL : buf;
 }
+
+int rename(const char *oldpath, const char *newpath) {
+    return __sc2(SYS_RENAME, (long)oldpath, (long)newpath);
+}
+
+int symlink(const char *target, const char *linkpath) {
+    return __sc2(SYS_SYMLINK, (long)target, (long)linkpath);
+}
+
+uid_t getuid(void) {
+    return (uid_t)__sc0(SYS_GETUID);
+}
+
+gid_t getgid(void) {
+    return (gid_t)__sc0(SYS_GETGID);
+}
+
+uid_t geteuid(void) {
+    return (uid_t)__sc0(SYS_GETEUID);
+}
+
+gid_t getegid(void) {
+    return (gid_t)__sc0(SYS_GETEGID);
+}

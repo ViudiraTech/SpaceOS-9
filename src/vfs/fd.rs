@@ -515,11 +515,11 @@ impl OpenFile {
 
     pub fn seek(&self, offset: i64, whence: u32) -> Result<u64, VfsError> {
         let meta = self.inode.metadata()?;
-        if matches!(
-            meta.kind,
-            InodeKind::Fifo | InodeKind::Socket | InodeKind::CharDevice
-        ) {
+        if matches!(meta.kind, InodeKind::Fifo | InodeKind::Socket) {
             return Err(VfsError::IllegalSeek);
+        }
+        if meta.kind == InodeKind::CharDevice {
+            return self.inode.seek(offset, whence);
         }
         let mut cur = self.offset.lock();
         let base: i64 = match whence {

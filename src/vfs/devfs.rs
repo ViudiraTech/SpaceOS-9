@@ -19,6 +19,218 @@ use super::{
 };
 use crate::block::{self, BlockDevice};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+pub struct KmsgInode;
+
+impl Inode for KmsgInode {
+    fn metadata(&self) -> Result<Stat, VfsError> {
+        let mut s = Stat::simple(19, InodeKind::CharDevice, 0o666, 0);
+        s.rdev = (1 << 8) | 11;
+        Ok(s)
+    }
+
+    fn open(&self, flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
+        let nonblock = flags & abi::O_NONBLOCK != 0;
+        let oldest = crate::printk::oldest_sequence();
+        Ok(Some(Arc::new(KmsgSession {
+            cursor: AtomicU64::new(oldest),
+            nonblock: AtomicBool::new(nonblock),
+        })))
+    }
+
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+        let oldest = crate::printk::oldest_sequence();
+        let session = KmsgSession {
+            cursor: AtomicU64::new(oldest),
+            nonblock: AtomicBool::new(true),
+        };
+        session.read_at(0, buf)
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
+        kmsg_write(buf)
+    }
+
+    fn poll(&self) -> u32 {
+        4 | 0x100 | 1 | 0x40
+    }
+}
+
+pub struct KmsgSession {
+    cursor: AtomicU64,
+    nonblock: AtomicBool,
+}
+
+impl Inode for KmsgSession {
+    fn metadata(&self) -> Result<Stat, VfsError> {
+        let mut s = Stat::simple(19, InodeKind::CharDevice, 0o666, 0);
+        s.rdev = (1 << 8) | 11;
+        Ok(s)
+    }
+
+    fn set_nonblock(&self, nonblock: bool) -> Result<(), VfsError> {
+        self.nonblock.store(nonblock, Ordering::Release);
+        Ok(())
+    }
+
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut wait = crate::ipc::pollwait::PollWait::new();
+        loop {
+            let cur = self.cursor.load(Ordering::Acquire);
+            let oldest = crate::printk::oldest_sequence();
+            let next = crate::printk::next_sequence();
+
+            if cur < oldest {
+                self.cursor.store(oldest, Ordering::Release);
+                return Err(VfsError::BrokenPipe);
+            }
+
+            if cur < next {
+                if let Some(rec) = crate::printk::read(cur) {
+                    self.cursor.store(cur + 1, Ordering::Release);
+                    return format_kmsg_record(&rec, buf);
+                } else {
+                    self.cursor.store(oldest, Ordering::Release);
+                    return Err(VfsError::BrokenPipe);
+                }
+            }
+
+            if self.nonblock.load(Ordering::Acquire) {
+                return Err(VfsError::WouldBlock);
+            }
+
+            let mut sources = crate::ipc::pollwait::PollSources::new();
+            sources.tick();
+            wait.arm(&sources);
+            wait.sleep();
+        }
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
+        kmsg_write(buf)
+    }
+
+    fn poll(&self) -> u32 {
+        let cur = self.cursor.load(Ordering::Acquire);
+        let next = crate::printk::next_sequence();
+        let mut events = 4 | 0x100;
+        if cur < next {
+            events |= 1 | 0x40;
+        }
+        events
+    }
+
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        sources.tick();
+    }
+
+    fn seek(&self, offset: i64, whence: u32) -> Result<u64, VfsError> {
+        match whence {
+            abi::SEEK_SET => {
+                let oldest = crate::printk::oldest_sequence();
+                let target = oldest.saturating_add(offset.max(0) as u64);
+                self.cursor.store(target, Ordering::Release);
+                Ok(target)
+            }
+            abi::SEEK_DATA => {
+                let oldest = crate::printk::oldest_sequence();
+                self.cursor.store(oldest, Ordering::Release);
+                Ok(oldest)
+            }
+            abi::SEEK_END => {
+                let next = crate::printk::next_sequence();
+                self.cursor.store(next, Ordering::Release);
+                Ok(next)
+            }
+            _ => Err(VfsError::InvalidArgument),
+        }
+    }
+}
+
+fn format_kmsg_record(rec: &crate::printk::Record, buf: &mut [u8]) -> Result<usize, VfsError> {
+    let prio = match rec.level {
+        crate::printk::Level::Error => 3,
+        crate::printk::Level::Warn => 4,
+        crate::printk::Level::Info => 6,
+        crate::printk::Level::Debug => 7,
+    };
+    let facility = rec.facility as u32;
+    let level_num = (facility << 3) | prio;
+
+    let msg_bytes = &rec.bytes[rec.prefix_len..rec.length];
+    let msg_trimmed = match msg_bytes.strip_suffix(b"\n") {
+        Some(s) => s.strip_suffix(b"\r").unwrap_or(s),
+        None => msg_bytes,
+    };
+    let msg_str = core::str::from_utf8(msg_trimmed).unwrap_or("<invalid utf8>");
+
+    use core::fmt::Write;
+    struct SliceWriter<'a> {
+        buf: &'a mut [u8],
+        pos: usize,
+    }
+    impl Write for SliceWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let rem = self.buf.len().saturating_sub(self.pos);
+            let count = bytes.len().min(rem);
+            self.buf[self.pos..self.pos + count].copy_from_slice(&bytes[..count]);
+            self.pos += count;
+            Ok(())
+        }
+    }
+
+    let mut writer = SliceWriter { buf, pos: 0 };
+    let _ = write!(
+        writer,
+        "{},{},{},-;{}\n",
+        level_num, rec.sequence, rec.timestamp_us, msg_str
+    );
+    Ok(writer.pos)
+}
+
+fn kmsg_write(buf: &[u8]) -> Result<usize, VfsError> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let mut text = buf;
+    let mut level = crate::printk::Level::Info;
+    let mut facility = 1u8;
+
+    if text.starts_with(b"<") {
+        if let Some(pos) = text.iter().position(|&b| b == b'>') {
+            if let Ok(p_str) = core::str::from_utf8(&text[1..pos]) {
+                if let Ok(num) = p_str.parse::<u32>() {
+                    let p = num & 7;
+                    facility = (num >> 3).min(255) as u8;
+                    if facility == 0 {
+                        facility = 1;
+                    }
+                    level = match p {
+                        0..=3 => crate::printk::Level::Error,
+                        4 => crate::printk::Level::Warn,
+                        5 | 6 => crate::printk::Level::Info,
+                        _ => crate::printk::Level::Debug,
+                    };
+                }
+            }
+            text = &text[pos + 1..];
+        }
+    }
+
+    let msg_trimmed = match text.strip_suffix(b"\n") {
+        Some(s) => s.strip_suffix(b"\r").unwrap_or(s),
+        None => text,
+    };
+    let msg_str = core::str::from_utf8(msg_trimmed).unwrap_or("<invalid utf8>");
+    crate::printk::record_with_facility(facility, level, format_args!("{}", msg_str));
+    Ok(buf.len())
+}
 
 enum SpecialCharKind {
     Null,
@@ -154,6 +366,7 @@ impl Inode for DevRootInode {
                 Ok(Arc::new(ConsoleInode::for_vt(30 + vt as u64, vt)))
             }
             "ttyS0" => Ok(Arc::new(ConsoleInode::with_ino(18))),
+            "kmsg" => Ok(Arc::new(KmsgInode)),
             _ => {
                 if let Some((dev_id, dev)) = block::find_device(name) {
                     Ok(Arc::new(BlockDevInode { dev_id, dev }))
@@ -178,7 +391,7 @@ impl Inode for DevRootInode {
         });
         for (idx, name) in [
             "null", "zero", "full", "random", "urandom", "console", "tty", "tty0", "ttyS0", "ptmx",
-            "tty1", "tty2", "tty3", "tty4", "tty5", "tty6", "tty7", "tty8",
+            "tty1", "tty2", "tty3", "tty4", "tty5", "tty6", "tty7", "tty8", "kmsg",
         ]
         .iter()
         .enumerate()

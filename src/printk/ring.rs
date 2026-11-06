@@ -14,7 +14,7 @@ use super::{Level, drain};
 use crate::{sync::SpinLock, time};
 use core::fmt::{self, Write};
 
-const CAPACITY: usize = 128;
+const CAPACITY: usize = 2048;
 const MAX_RECORD: usize = 512;
 
 #[derive(Clone, Copy)]
@@ -22,6 +22,8 @@ pub struct Record {
     pub sequence: u64,
     pub timestamp_us: u64,
     pub level: Level,
+    pub facility: u8,
+    pub prefix_len: usize,
     pub length: usize,
     pub truncated: bool,
     pub bytes: [u8; MAX_RECORD],
@@ -33,6 +35,8 @@ impl Record {
             sequence: 0,
             timestamp_us: 0,
             level: Level::Info,
+            facility: 0,
+            prefix_len: 0,
             length: 0,
             truncated: false,
             bytes: [0; MAX_RECORD],
@@ -59,6 +63,10 @@ impl Ring {
             return None;
         }
         Some(self.records[sequence as usize % CAPACITY])
+    }
+
+    fn oldest(&self) -> u64 {
+        self.next.saturating_sub(CAPACITY as u64)
     }
 }
 
@@ -88,10 +96,11 @@ impl Write for Buffer<'_> {
 
 /// `printk` never allocates. The ring lock protects only bounded memory
 /// copies; device output happens later under the independent console lock.
-pub fn record(level: Level, arguments: fmt::Arguments<'_>) {
+pub fn record_with_facility(facility: u8, level: Level, arguments: fmt::Arguments<'_>) {
     let now = time::uptime_micros();
     let mut item = Record::empty();
     item.level = level;
+    item.facility = facility;
     item.timestamp_us = now;
     let mut writer = Buffer {
         bytes: &mut item.bytes,
@@ -105,6 +114,7 @@ pub fn record(level: Level, arguments: fmt::Arguments<'_>) {
         mic = now % 1_000_000,
         label = level.label()
     );
+    item.prefix_len = writer.len;
     let _ = writer.write_fmt(arguments);
     let _ = writer.write_str("\n");
     item.length = writer.len;
@@ -129,8 +139,13 @@ pub fn record(level: Level, arguments: fmt::Arguments<'_>) {
     ring.records[slot] = item;
     ring.next = ring.next.wrapping_add(1);
     drop(ring);
+    crate::ipc::pollwait::poll_kick();
     drain::mark_pending();
     drain::flush();
+}
+
+pub fn record(level: Level, arguments: fmt::Arguments<'_>) {
+    record_with_facility(0, level, arguments);
 }
 
 /// Copy records for a future /dev/kmsg reader without exposing ring storage.
@@ -140,6 +155,10 @@ pub fn read(sequence: u64) -> Option<Record> {
 
 pub fn next_sequence() -> u64 {
     RING.lock().next
+}
+
+pub fn oldest_sequence() -> u64 {
+    RING.lock().oldest()
 }
 
 pub(super) fn next_for_drain(next: &mut u64) -> Option<Record> {

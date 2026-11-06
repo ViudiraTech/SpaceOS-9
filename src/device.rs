@@ -115,6 +115,10 @@ impl Inode for DeviceNode {
         self.check()?;
         self.session.sync()
     }
+    fn seek(&self, offset: i64, whence: u32) -> Result<u64, VfsError> {
+        self.check()?;
+        self.session.seek(offset, whence)
+    }
     fn set_nonblock(&self, nonblock: bool) -> Result<(), VfsError> {
         self.session.set_nonblock(nonblock)
     }

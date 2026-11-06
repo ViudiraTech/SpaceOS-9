@@ -70,6 +70,7 @@ enum Page {
     Input,
     Applications,
     DateTime,
+    Logs,
     About,
 }
 
@@ -83,6 +84,7 @@ impl Page {
             Self::Input => "鼠标与键盘",
             Self::Applications => "应用程序",
             Self::DateTime => "日期与时间",
+            Self::Logs => "启动日志",
             Self::About => "关于",
         }
     }
@@ -96,12 +98,13 @@ impl Page {
             Self::Input => &["input"],
             Self::Applications => &["terminal", "files", "editor"],
             Self::DateTime => &["datetime"],
+            Self::Logs => &[],
             Self::About => &[],
         }
     }
 }
 
-const NAV: [(Page, &str, Icon); 8] = [
+const NAV: [(Page, &str, Icon); 9] = [
     (Page::Appearance, "外观", Icon::Appearance),
     (Page::DesktopPanel, "桌面与面板", Icon::Panel),
     (Page::Windows, "窗口", Icon::WindowManager),
@@ -109,6 +112,7 @@ const NAV: [(Page, &str, Icon); 8] = [
     (Page::Input, "鼠标与键盘", Icon::InputDevices),
     (Page::Applications, "应用程序", Icon::Applications),
     (Page::DateTime, "日期与时间", Icon::DateTime),
+    (Page::Logs, "启动日志", Icon::FileText),
     (Page::About, "关于", Icon::About),
 ];
 
@@ -156,9 +160,183 @@ enum HitTarget {
     ClockShowDate,
     Timezone(usize),
     FactoryReset,
+    LogFilter(usize),
+    LogRefresh,
+    LogSelect(usize),
+    JumpToLogs,
 }
 
 static FACTORY_RESET_ARMED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogFilterType {
+    All,
+    Kernel,
+    Services,
+    ErrorsWarns,
+}
+
+#[derive(Clone, Debug)]
+struct SystemLogEntry {
+    #[allow(dead_code)]
+    seq: u64,
+    mono_us: u64,
+    prio: u8,
+    unit: String,
+    tag: String,
+    message: String,
+}
+
+struct LogViewerState {
+    entries: Vec<SystemLogEntry>,
+    filter: LogFilterType,
+    selected: Option<usize>,
+    total_count: usize,
+    kernel_count: usize,
+    service_count: usize,
+    error_count: usize,
+    warn_count: usize,
+    uptime_str: String,
+}
+
+impl LogViewerState {
+    fn load() -> Self {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::net::UnixStream;
+
+        let mut entries = Vec::new();
+
+        // 1. Ingest from /dev/kmsg
+        if let Ok(mut nb_file) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0o4000)
+            .open("/dev/kmsg")
+        {
+            let mut buf = [0u8; 2048];
+            while let Ok(n) = nb_file.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                    if let Some(comma1) = s.find(',') {
+                        let pnum: u32 = s[..comma1].parse().unwrap_or(6);
+                        let prio = (pnum & 7) as u8;
+                        let rem = &s[comma1 + 1..];
+                        if let Some(comma2) = rem.find(',') {
+                            let seq: u64 = rem[..comma2].parse().unwrap_or(0);
+                            let rem2 = &rem[comma2 + 1..];
+                            if let Some(comma3) = rem2.find(',') {
+                                let usec: u64 = rem2[..comma3].parse().unwrap_or(0);
+                                if let Some(semi) = rem2.find(';') {
+                                    let msg = rem2[semi + 1..].trim();
+                                    entries.push(SystemLogEntry {
+                                        seq,
+                                        mono_us: usec,
+                                        prio,
+                                        unit: "kernel".to_string(),
+                                        tag: "kernel".to_string(),
+                                        message: msg.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Query journal daemon if active
+        if let Ok(mut stream) = UnixStream::connect("/run/systemd/journal/query.sock") {
+            let _ = stream.write_all(b"QUERY limit=2000\n");
+            let reader = BufReader::new(stream);
+            for line in reader.lines().flatten() {
+                if line == "END" {
+                    break;
+                }
+                if let Some(rest) = line.strip_prefix("ENTRY|") {
+                    let parts: Vec<&str> = rest.split('|').collect();
+                    if parts.len() >= 13 {
+                        let seq: u64 = parts[0].parse().unwrap_or(0);
+                        let mono_us: u64 = parts[2].parse().unwrap_or(0);
+                        let prio: u8 = parts[3].parse().unwrap_or(6);
+                        let unit = parts[9].to_string();
+                        let comm = parts[10].to_string();
+                        let ident = parts[11].to_string();
+                        let msg = parts[12].replace("\\n", " ").replace("\\r", "");
+                        let tag = if !ident.is_empty() {
+                            ident
+                        } else if !comm.is_empty() {
+                            comm
+                        } else {
+                            unit.clone()
+                        };
+
+                        if unit == "kernel" && entries.iter().any(|e| e.mono_us == mono_us) {
+                            continue;
+                        }
+                        entries.push(SystemLogEntry {
+                            seq,
+                            mono_us,
+                            prio,
+                            unit,
+                            tag,
+                            message: msg,
+                        });
+                    }
+                }
+            }
+        }
+
+        entries.sort_by_key(|e| e.mono_us);
+
+        let total_count = entries.len();
+        let mut kernel_count = 0;
+        let mut service_count = 0;
+        let mut error_count = 0;
+        let mut warn_count = 0;
+
+        for e in &entries {
+            if e.unit == "kernel" {
+                kernel_count += 1;
+            } else {
+                service_count += 1;
+            }
+            if e.prio <= 3 {
+                error_count += 1;
+            } else if e.prio == 4 {
+                warn_count += 1;
+            }
+        }
+
+        let uptime_str = if let Ok(s) = fs::read_to_string("/proc/uptime") {
+            if let Some(sec_str) = s.split_whitespace().next() {
+                if let Ok(sec) = sec_str.parse::<f64>() {
+                    let s = sec as u64;
+                    format!("{}分 {}秒", s / 60, s % 60)
+                } else {
+                    "--".to_string()
+                }
+            } else {
+                "--".to_string()
+            }
+        } else {
+            "--".to_string()
+        };
+
+        Self {
+            entries,
+            filter: LogFilterType::All,
+            selected: None,
+            total_count,
+            kernel_count,
+            service_count,
+            error_count,
+            warn_count,
+            uptime_str,
+        }
+    }
+}
 
 struct HitBox {
     rect: Rect,
@@ -468,6 +646,7 @@ pub fn run() -> Result<()> {
     let mut last_clock_preview = String::new();
     let thumbnails = load_wallpaper_thumbnails();
     let sys_info = SystemInfo::gather();
+    let mut log_state = LogViewerState::load();
 
     loop {
         if page == Page::DateTime {
@@ -492,6 +671,7 @@ pub fn run() -> Result<()> {
                 &thumbnails,
                 screen_size,
                 &sys_info,
+                &log_state,
                 &status,
                 &mut hits,
             );
@@ -510,6 +690,7 @@ pub fn run() -> Result<()> {
                     &thumbnails,
                     screen_size,
                     &sys_info,
+                    &log_state,
                     &status,
                     &mut hits,
                 );
@@ -577,6 +758,7 @@ pub fn run() -> Result<()> {
                             &mut scroll_y,
                             &mut screen_size,
                             &mut status,
+                            &mut log_state,
                         );
                     }
                 }
@@ -594,6 +776,7 @@ fn handle_click(
     scroll_y: &mut i32,
     screen_size: &mut (u16, u16),
     status: &mut String,
+    log_state: &mut LogViewerState,
 ) {
     status.clear();
     match target {
@@ -889,6 +1072,30 @@ fn handle_click(
                 }
             }
         }
+        HitTarget::JumpToLogs => {
+            *page = Page::Logs;
+            *scroll_y = 0;
+        }
+        HitTarget::LogFilter(idx) => {
+            log_state.filter = match idx {
+                1 => LogFilterType::Kernel,
+                2 => LogFilterType::Services,
+                3 => LogFilterType::ErrorsWarns,
+                _ => LogFilterType::All,
+            };
+            *scroll_y = 0;
+        }
+        HitTarget::LogRefresh => {
+            *log_state = LogViewerState::load();
+            *status = format!("日志已刷新（共 {} 条记录）", log_state.entries.len());
+        }
+        HitTarget::LogSelect(idx) => {
+            if log_state.selected == Some(idx) {
+                log_state.selected = None;
+            } else {
+                log_state.selected = Some(idx);
+            }
+        }
     }
     app.needs_redraw = true;
 }
@@ -1033,6 +1240,7 @@ fn draw_settings(
     thumbnails: &[Option<Sprite>; 4],
     screen_size: (u16, u16),
     sys_info: &SystemInfo,
+    log_state: &LogViewerState,
     status: &str,
     hits: &mut Vec<HitBox>,
 ) -> i32 {
@@ -2199,6 +2407,234 @@ fn draw_settings(
                 y += c2.h + 18;
             }
 
+            Page::Logs => {
+                let hero = Rect::new(CONTENT_X, y + 4, card_w, 92);
+                ui::card(canvas, theme, hero);
+                text.draw(
+                    canvas,
+                    "启动与系统日志",
+                    (CONTENT_X + 20) as f32,
+                    (hero.y + 34) as f32,
+                    18.0,
+                    theme.text,
+                    Face::Bold,
+                );
+                text.draw(
+                    canvas,
+                    "内核引导加载、硬件探测及系统服务运行日志",
+                    (CONTENT_X + 20) as f32,
+                    (hero.y + 56) as f32,
+                    11.5,
+                    theme.text_dim,
+                    Face::Ui,
+                );
+
+                let up_label = format!("系统运行时间: {}", log_state.uptime_str);
+                let up_w = text.measure(&up_label, 11.0, Face::Ui);
+                text.draw(
+                    canvas,
+                    &up_label,
+                    (CONTENT_X + card_w - 20) as f32 - up_w,
+                    (hero.y + 34) as f32,
+                    11.0,
+                    theme.text_muted,
+                    Face::Ui,
+                );
+
+                let stats_y = hero.y + 70;
+                let stat_items: [(&str, usize, u32); 4] = [
+                    ("全部日志", log_state.total_count, theme.text),
+                    ("内核消息", log_state.kernel_count, theme.accent),
+                    ("系统服务", log_state.service_count, theme.success),
+                    ("异常/警告", log_state.error_count + log_state.warn_count, if log_state.error_count > 0 { theme.danger } else { theme.warning }),
+                ];
+                let mut sx = CONTENT_X + 20;
+                for (slabel, scnt, scolor) in stat_items {
+                    let stext = format!("{}: {}", slabel, scnt);
+                    text.draw(canvas, &stext, sx as f32, stats_y as f32, 11.0, scolor, Face::Bold);
+                    sx += (text.measure(&stext, 11.0, Face::Bold) as i32) + 24;
+                }
+                y = hero.bottom() + 14;
+
+                let act_h = 46;
+                let c_act = Rect::new(CONTENT_X, y, card_w, act_h);
+                ui::card(canvas, theme, c_act);
+
+                let filter_tabs = ["全部日志", "内核消息", "系统服务", "异常与告警"];
+                let filter_w = 92;
+                for (f_idx, flabel) in filter_tabs.iter().enumerate() {
+                    let btn_r = Rect::new(CONTENT_X + 8 + f_idx as i32 * (filter_w + 4), y + 7, filter_w, 32);
+                    let is_active = match log_state.filter {
+                        LogFilterType::All => f_idx == 0,
+                        LogFilterType::Kernel => f_idx == 1,
+                        LogFilterType::Services => f_idx == 2,
+                        LogFilterType::ErrorsWarns => f_idx == 3,
+                    };
+                    let target = HitTarget::LogFilter(f_idx);
+                    if is_active {
+                        canvas.rounded_rect(btn_r, RADIUS_CONTROL, theme.accent_soft, 1.0);
+                        canvas.fill(Rect::new(btn_r.x + 12, btn_r.bottom() - 2, btn_r.w - 24, 2), theme.accent);
+                    } else if hover == Some(target) {
+                        canvas.rounded_rect(btn_r, RADIUS_CONTROL, theme.panel_hover, 1.0);
+                    }
+                    let lw = text.measure(flabel, 11.5, if is_active { Face::Bold } else { Face::Ui });
+                    text.draw(
+                        canvas,
+                        flabel,
+                        btn_r.x as f32 + (btn_r.w as f32 - lw) * 0.5,
+                        (btn_r.y + 20) as f32,
+                        11.5,
+                        if is_active { theme.accent } else { theme.text_dim },
+                        if is_active { Face::Bold } else { Face::Ui },
+                    );
+                    push_clipped_hit(hits, viewport, btn_r, target);
+                }
+
+                let ref_btn = Rect::new(c_act.right() - 96, y + 7, 88, 32);
+                ui::button(
+                    canvas,
+                    text,
+                    theme,
+                    ref_btn,
+                    "刷新",
+                    Some(Icon::Refresh),
+                    false,
+                    hover == Some(HitTarget::LogRefresh),
+                );
+                push_clipped_hit(hits, viewport, ref_btn, HitTarget::LogRefresh);
+                y += c_act.h + 14;
+
+                if let Some(sel_idx) = log_state.selected {
+                    if let Some(entry) = log_state.entries.get(sel_idx) {
+                        let sec = entry.mono_us / 1000000;
+                        let mic = entry.mono_us % 1000000;
+                        let prio_label = match entry.prio {
+                            0..=3 => "错误 (Error)",
+                            4 => "警告 (Warning)",
+                            5 | 6 => "信息 (Info)",
+                            _ => "调试 (Debug)",
+                        };
+                        let d_card = Rect::new(CONTENT_X, y, card_w, 96);
+                        ui::card(canvas, theme, d_card);
+                        canvas.rounded_rect(
+                            Rect::new(d_card.x + 2, d_card.y + 2, 4, d_card.h - 4),
+                            2,
+                            if entry.prio <= 3 { theme.danger } else if entry.prio == 4 { theme.warning } else { theme.accent },
+                            1.0,
+                        );
+                        let meta_str = format!("时间戳: [{:5}.{:06}s]   源: [{}]   级别: {}", sec, mic, entry.unit, prio_label);
+                        text.draw(canvas, &meta_str, (CONTENT_X + 16) as f32, (d_card.y + 26) as f32, 11.5, theme.accent, Face::Bold);
+                        text.draw(canvas, "详细消息内容:", (CONTENT_X + 16) as f32, (d_card.y + 48) as f32, 11.0, theme.text_dim, Face::Ui);
+                        let msg_shown = text.truncate(&entry.message, (card_w - 36) as f32, 11.5, Face::Mono);
+                        text.draw(canvas, &msg_shown, (CONTENT_X + 16) as f32, (d_card.y + 72) as f32, 11.5, theme.text, Face::Mono);
+                        y += d_card.h + 14;
+                    }
+                }
+
+                let filtered: Vec<(usize, &SystemLogEntry)> = log_state
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| match log_state.filter {
+                        LogFilterType::All => true,
+                        LogFilterType::Kernel => e.unit == "kernel",
+                        LogFilterType::Services => e.unit != "kernel",
+                        LogFilterType::ErrorsWarns => e.prio <= 4,
+                    })
+                    .collect();
+
+                let row_h = 28;
+                let table_h = (filtered.len() as i32 * row_h).max(row_h);
+                let c_table = Rect::new(CONTENT_X, y, card_w, table_h + 12);
+                ui::card(canvas, theme, c_table);
+
+                if filtered.is_empty() {
+                    text.draw(
+                        canvas,
+                        "暂无符合条件的日志记录",
+                        (CONTENT_X + card_w / 2) as f32 - 70.0,
+                        (y + 26) as f32,
+                        12.0,
+                        theme.text_muted,
+                        Face::Ui,
+                    );
+                } else {
+                    for (list_idx, (orig_idx, entry)) in filtered.iter().enumerate() {
+                        let ry = y + 6 + list_idx as i32 * row_h;
+                        let row_r = Rect::new(CONTENT_X + 4, ry, card_w - 8, row_h);
+                        let is_selected = log_state.selected == Some(*orig_idx);
+                        let target = HitTarget::LogSelect(*orig_idx);
+
+                        if is_selected {
+                            canvas.rounded_rect(row_r, RADIUS_CONTROL, theme.accent_soft, 1.0);
+                        } else if hover == Some(target) {
+                            canvas.rounded_rect(row_r, RADIUS_CONTROL, theme.panel_hover, 1.0);
+                        }
+
+                        let (badge_txt, badge_bg, badge_fg) = match entry.prio {
+                            0..=3 => ("ERR", theme.danger, 0xffffff),
+                            4 => ("WARN", theme.warning, 0x18181b),
+                            5 | 6 => ("INFO", theme.accent_soft, theme.accent),
+                            _ => ("DBG", theme.panel_border, theme.text_muted),
+                        };
+                        let b_rect = Rect::new(CONTENT_X + 10, ry + 5, 38, 18);
+                        canvas.rounded_rect(b_rect, 3, badge_bg, 1.0);
+                        let bw = text.measure(badge_txt, 9.5, Face::Bold);
+                        text.draw(
+                            canvas,
+                            badge_txt,
+                            b_rect.x as f32 + (b_rect.w as f32 - bw) * 0.5,
+                            (b_rect.y + 13) as f32,
+                            9.5,
+                            badge_fg,
+                            Face::Bold,
+                        );
+
+                        let sec = entry.mono_us / 1000000;
+                        let mic = entry.mono_us % 1000000;
+                        let ts_str = format!("[{:5}.{:06}]", sec, mic);
+                        text.draw(
+                            canvas,
+                            &ts_str,
+                            (CONTENT_X + 54) as f32,
+                            (ry + 19) as f32,
+                            10.5,
+                            theme.text_muted,
+                            Face::Mono,
+                        );
+
+                        let tag_str = format!("[{}]", entry.tag);
+                        let tag_shown = text.truncate(&tag_str, 90.0, 10.5, Face::Bold);
+                        text.draw(
+                            canvas,
+                            &tag_shown,
+                            (CONTENT_X + 160) as f32,
+                            (ry + 19) as f32,
+                            10.5,
+                            if is_selected { theme.accent } else { theme.text_dim },
+                            Face::Bold,
+                        );
+
+                        let msg_x = CONTENT_X + 258;
+                        let max_msg_w = (card_w - 270).max(60) as f32;
+                        let msg_clean = entry.message.replace('\n', " ");
+                        let msg_shown = text.truncate(&msg_clean, max_msg_w, 11.0, Face::Ui);
+                        text.draw(
+                            canvas,
+                            &msg_shown,
+                            msg_x as f32,
+                            (ry + 19) as f32,
+                            11.0,
+                            if is_selected { theme.text } else { theme.text_dim },
+                            Face::Ui,
+                        );
+
+                        push_clipped_hit(hits, viewport, row_r, target);
+                    }
+                }
+                y += c_table.h + 18;
+            }
+
             Page::About => {
                 let hero = Rect::new(CONTENT_X, y + 4, card_w, 98);
                 ui::card(canvas, theme, hero);
@@ -2303,6 +2739,41 @@ fn draw_settings(
                     );
                 }
                 y += c_sw.h + 18;
+
+                y = draw_section_heading(canvas, text, theme, CONTENT_X, y, "系统诊断与启动日志");
+                let c_diag = Rect::new(CONTENT_X, y, card_w, 76);
+                ui::card(canvas, theme, c_diag);
+                text.draw(
+                    canvas,
+                    "系统启动与运行日志",
+                    (CONTENT_X + 16) as f32,
+                    (c_diag.y + 28) as f32,
+                    13.0,
+                    theme.text,
+                    Face::Bold,
+                );
+                text.draw(
+                    canvas,
+                    "查看内核引导、硬件探测以及系统服务初始化的完整时间戳日志。",
+                    (CONTENT_X + 16) as f32,
+                    (c_diag.y + 50) as f32,
+                    11.0,
+                    theme.text_muted,
+                    Face::Ui,
+                );
+                let logs_btn = Rect::new(c_diag.right() - 132, c_diag.y + 21, 112, 34);
+                ui::button(
+                    canvas,
+                    text,
+                    theme,
+                    logs_btn,
+                    "查看日志…",
+                    None,
+                    false,
+                    hover == Some(HitTarget::JumpToLogs),
+                );
+                push_clipped_hit(hits, viewport, logs_btn, HitTarget::JumpToLogs);
+                y += c_diag.h + 16;
 
                 y = draw_section_heading(canvas, text, theme, CONTENT_X, y, "系统维护");
                 let c_reset = Rect::new(CONTENT_X, y, card_w, 92);

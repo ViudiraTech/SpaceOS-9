@@ -94,6 +94,8 @@ pub const AT_EMPTY_PATH: u32 = 0x1000;
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
+pub const SEEK_DATA: u32 = 3;
+pub const SEEK_HOLE: u32 = 4;
 
 // fcntl Commands
 pub const F_DUPFD: u32 = 0;

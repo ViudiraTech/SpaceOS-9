@@ -43,6 +43,9 @@ link echo user/bin/echo.c
 link cat user/bin/cat.c
 [ -f user/bin/systemctl.c ] && link systemctl user/bin/systemctl.c
 [ -f user/bin/systemg-analyze.c ] && link systemg-analyze user/bin/systemg-analyze.c
+[ -f user/bin/journald.c ] && link journald user/bin/journald.c
+[ -f user/bin/journalctl.c ] && link journalctl user/bin/journalctl.c
+[ -f user/bin/dmesg.c ] && link dmesg user/bin/dmesg.c
 [ -f user/systemg/systemg.c ] && link systemg user/systemg/systemg.c
 [ -f user/sh/sh.c ] && link sh user/sh/sh.c
 

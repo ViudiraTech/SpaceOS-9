@@ -1,0 +1,8 @@
+[Unit]
+Description=SpaceOS Journal Logging Daemon
+
+[Service]
+Type=simple
+ExecStart=/bin/journald
+Restart=always
+RestartSec=1

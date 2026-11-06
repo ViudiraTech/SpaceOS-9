@@ -359,6 +359,10 @@ pub trait Inode: Send + Sync + core::any::Any {
     fn sync(&self) -> Result<(), VfsError> {
         Ok(())
     }
+
+    fn seek(&self, _offset: i64, _whence: u32) -> Result<u64, VfsError> {
+        Err(VfsError::IllegalSeek)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

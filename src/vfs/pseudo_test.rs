@@ -126,8 +126,21 @@ pub fn devices() {
     let a = devtmpfs::DevTmpFs.root_inode();
     let b = devtmpfs::DevTmpFs.root_inode();
     assert_eq!(a.metadata().unwrap().ino, b.metadata().unwrap().ino);
+
+    // /dev/kmsg Linux standard interface verification
+    let kmsg = open_abs("/dev/kmsg", abi::O_RDWR | abi::O_NONBLOCK, 0).expect("/dev/kmsg should exist");
+    assert_eq!(kmsg.inode.metadata().unwrap().rdev, (1 << 8) | 11);
+    let test_msg = b"<6>kmsg self-test message\n";
+    let w = kmsg.write(test_msg).unwrap();
+    assert_eq!(w, test_msg.len());
+    let mut kbuf = [0u8; 512];
+    let n = kmsg.read(&mut kbuf).unwrap();
+    assert!(n > 0);
+    let kmsg_str = core::str::from_utf8(&kbuf[..n]).unwrap();
+    assert!(kmsg_str.contains("kmsg self-test message"));
+
     crate::verbose::log(format_args!(
-        "devtmpfs/sysfs registry/snapshot/removal self-test passed"
+        "devtmpfs/sysfs registry/snapshot/removal and /dev/kmsg self-test passed"
     ));
 }
 pub fn processes() {

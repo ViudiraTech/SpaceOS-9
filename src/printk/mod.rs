@@ -14,7 +14,7 @@ mod drain;
 mod ring;
 
 pub use drain::emergency;
-pub use ring::{next_sequence, read, record};
+pub use ring::{next_sequence, oldest_sequence, read, record, record_with_facility, Record};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {

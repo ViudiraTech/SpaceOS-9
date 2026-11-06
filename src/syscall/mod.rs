@@ -549,6 +549,7 @@ fn continues_past_chunk(entry: &FdEntry) -> bool {
             vfs::InodeKind::Regular | vfs::InodeKind::BlockDevice | vfs::InodeKind::CharDevice
         ) && !entry.file.abs_path.starts_with("/dev/tty")
             && entry.file.abs_path != "/dev/console"
+            && entry.file.abs_path != "/dev/kmsg"
     })
 }
 
