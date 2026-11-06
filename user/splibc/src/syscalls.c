@@ -69,6 +69,18 @@ int ioctl(int fd, unsigned long request, void *arg) {
     return __sc3(SYS_IOCTL, fd, (long)request, (long)arg);
 }
 
+int init_module(const void *image, unsigned long length, const char *parameters) {
+    return __sc3(SYS_INIT_MODULE, (long)image, (long)length, (long)parameters);
+}
+
+int finit_module(int fd, const char *parameters, int flags) {
+    return __sc3(SYS_FINIT_MODULE, fd, (long)parameters, flags);
+}
+
+int delete_module(const char *name, int flags) {
+    return __sc2(SYS_DELETE_MODULE, (long)name, flags);
+}
+
 int fcntl(int fd, int cmd, long arg) {
     return __sc3(SYS_FCNTL, fd, cmd, arg);
 }

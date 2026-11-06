@@ -11,6 +11,7 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![cfg_attr(feature = "modules", feature(c_variadic))]
 #![allow(dead_code)]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
@@ -27,7 +28,11 @@ mod hardware;
 pub mod input;
 pub mod ipc;
 pub mod irq;
+#[cfg(feature = "kallsyms")]
+mod kallsyms;
 mod mm;
+#[cfg(feature = "modules")]
+pub mod module;
 pub mod pci;
 pub mod printk;
 mod random;
@@ -171,6 +176,8 @@ pub extern "C" fn kmain() -> ! {
     hardware::ps2::init();
     block::init();
     vfs::init();
+    #[cfg(feature = "modules")]
+    module::init();
     gpu::init();
     input::init();
     #[cfg(feature = "boot-self-test")]

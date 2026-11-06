@@ -10,6 +10,8 @@
 
 use core::arch::asm;
 
+use super::super::paging::KernelProt;
+
 const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
 pub fn paging_geometry() -> super::super::paging::Geometry {
@@ -59,6 +61,48 @@ pub fn pte_leaf(physical: u64, device: bool) -> u64 {
         | (1 << 53)
         | (1 << 54)
         | if device { 2 << 2 } else { 0 }
+}
+
+/// Kernel-only Normal WB leaf. UXN stays set, PXN is clear only for executable
+/// sections, and AP[2] selects read-only without permitting EL0 access.
+pub fn pte_kernel(physical: u64, prot: KernelProt) -> u64 {
+    physical
+        | 0b11
+        | (1 << 10)
+        | (0b11 << 8)
+        | (1 << 54)
+        | if prot.writable() { 0 } else { 1 << 7 }
+        | if prot.executable() { 0 } else { 1 << 53 }
+}
+
+/// Make freshly written module text visible to instruction fetch: clean data
+/// cache to the point of unification, then invalidate the matching I-cache.
+pub fn sync_instruction_cache(address: u64, length: usize) {
+    if length == 0 {
+        return;
+    }
+    let ctr: u64;
+    // SAFETY: CTR_EL0 is readable at EL1 and describes the cache geometry.
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+    let dline = 4u64 << ((ctr >> 16) & 0xf);
+    let iline = 4u64 << (ctr & 0xf);
+    let end = address.saturating_add(length as u64);
+    let mut cursor = address & !(dline - 1);
+    while cursor < end {
+        // SAFETY: the range is mapped Normal memory owned by the module image.
+        unsafe { asm!("dc cvau, {}", in(reg) cursor, options(nostack)) };
+        cursor += dline;
+    }
+    // SAFETY: required barrier between data cleaning and instruction invalidation.
+    unsafe { asm!("dsb ish", options(nostack)) };
+    let mut cursor = address & !(iline - 1);
+    while cursor < end {
+        // SAFETY: the range is mapped Normal memory owned by the module image.
+        unsafe { asm!("ic ivau, {}", in(reg) cursor, options(nostack)) };
+        cursor += iline;
+    }
+    // SAFETY: complete invalidation before the module entry is called.
+    unsafe { asm!("dsb ish", "isb", options(nostack)) };
 }
 
 pub fn setup_device_memory() {

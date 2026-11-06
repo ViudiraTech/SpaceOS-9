@@ -151,6 +151,12 @@ pub fn map(region: Region, index: usize, physical: u64, device: bool) -> Result<
     if !state.geometry.valid_physical(physical) {
         return Err(MapError::InvalidPhysicalAddress);
     }
+    install_mapping(&state, virtual_address, arch::pte_leaf(physical, device))
+}
+
+/// Install a leaf mapping for a page. The caller holds the VMM lock and has
+/// already validated the address and physical range.
+fn install_mapping(state: &State, virtual_address: u64, leaf_entry: u64) -> Result<(), MapError> {
     let mut table = state.root;
     // Build missing descendants privately, then publish a single link only
     // after every allocation succeeds. OOM leaves no visible partial mapping.
@@ -187,10 +193,7 @@ pub fn map(region: Region, index: usize, physical: u64, device: bool) -> Result<
             };
         }
         // SAFETY: the leaf is in a fresh, exclusively owned table.
-        unsafe {
-            entry_ptr(frames[level - 1], virtual_address, 0)
-                .write_volatile(arch::pte_leaf(physical, device))
-        };
+        unsafe { entry_ptr(frames[level - 1], virtual_address, 0).write_volatile(leaf_entry) };
         core::sync::atomic::fence(Ordering::Release);
         // SAFETY: publish the completed hierarchy while holding the VMM lock.
         unsafe { entry.write_volatile(arch::pte_table(frames[0])) };
@@ -203,9 +206,122 @@ pub fn map(region: Region, index: usize, physical: u64, device: bool) -> Result<
         return Err(MapError::AlreadyMapped);
     }
     // SAFETY: exclusively publish this newly populated page.
-    unsafe { leaf.write_volatile(arch::pte_leaf(physical, device)) }
+    unsafe { leaf.write_volatile(leaf_entry) }
     arch::flush_page(virtual_address);
     Ok(())
+}
+
+/// True when the kernel page tables resolve `virtual_address` to any leaf,
+/// including a huge mapping at an intermediate level.
+pub fn is_mapped(virtual_address: u64) -> bool {
+    let state = VMM.lock();
+    if state.root == 0 {
+        return false;
+    }
+    let mut table = state.root;
+    for level in (1..state.geometry.levels).rev() {
+        // SAFETY: the kernel root is owned by the VMM and this walk only reads.
+        let value = unsafe { entry_ptr(table, virtual_address, level).read_volatile() };
+        if !arch::pte_present(value) {
+            return false;
+        }
+        if !arch::pte_is_table(value, level) {
+            return true;
+        }
+        table = arch::pte_phys(value);
+    }
+    // SAFETY: the leaf table is reachable from the kernel root.
+    arch::pte_present(unsafe { entry_ptr(table, virtual_address, 0).read_volatile() })
+}
+
+/// Map a contiguous physical run into the higher half outside the managed
+/// VMM slot. Module text and data live here so code can be placed within the
+/// architecture's relocation range. Page-table frames stay owned by the VMM;
+/// leaf frames stay owned by the caller and are released by `unmap`.
+pub fn map_kernel(
+    virtual_address: u64,
+    physical: u64,
+    pages: usize,
+    prot: arch::paging::KernelProt,
+) -> Result<(), MapError> {
+    if pages == 0 {
+        return Err(MapError::OutOfRange);
+    }
+    if !virtual_address.is_multiple_of(PAGE_SIZE) || !physical.is_multiple_of(PAGE_SIZE) {
+        return Err(MapError::Unaligned);
+    }
+    let state = VMM.lock();
+    if state.root == 0 {
+        return Err(MapError::NotReady);
+    }
+    if (virtual_address >> (state.geometry.virtual_bits - 1)) & 1 == 0 {
+        return Err(MapError::OutOfRange);
+    }
+    let mut installed = 0usize;
+    for index in 0..pages {
+        let va = virtual_address + index as u64 * PAGE_SIZE;
+        let pa = physical + index as u64 * PAGE_SIZE;
+        if !state.geometry.valid_physical(pa) {
+            break;
+        }
+        match install_mapping(&state, va, arch::pte_kernel(pa, prot)) {
+            Ok(()) => installed += 1,
+            Err(error) => {
+                for rollback in 0..installed {
+                    clear_mapping(&state, virtual_address + rollback as u64 * PAGE_SIZE);
+                }
+                return Err(error);
+            }
+        }
+    }
+    if installed != pages {
+        for rollback in 0..installed {
+            clear_mapping(&state, virtual_address + rollback as u64 * PAGE_SIZE);
+        }
+        return Err(MapError::InvalidPhysicalAddress);
+    }
+    arch::tlb_shootdown(virtual_address, pages);
+    Ok(())
+}
+
+/// Clear `pages` leaves installed by `map_kernel` without releasing their
+/// backing frames; the module loader still owns every frame.
+pub fn unmap_kernel(virtual_address: u64, pages: usize) -> Result<(), MapError> {
+    if pages == 0 {
+        return Err(MapError::OutOfRange);
+    }
+    if !virtual_address.is_multiple_of(PAGE_SIZE) {
+        return Err(MapError::Unaligned);
+    }
+    let state = VMM.lock();
+    if state.root == 0 {
+        return Err(MapError::NotReady);
+    }
+    for index in 0..pages {
+        clear_mapping(&state, virtual_address + index as u64 * PAGE_SIZE);
+    }
+    arch::tlb_shootdown(virtual_address, pages);
+    Ok(())
+}
+
+/// Clear one leaf without releasing its physical page. Used to roll back a
+/// partially installed module image; the caller still owns every frame.
+fn clear_mapping(state: &State, virtual_address: u64) {
+    let mut table = state.root;
+    for level in (1..state.geometry.levels).rev() {
+        // SAFETY: VMM lock excludes concurrent writers.
+        let value = unsafe { entry_ptr(table, virtual_address, level).read_volatile() };
+        if !arch::pte_present(value) || !arch::pte_is_table(value, level) {
+            return;
+        }
+        table = arch::pte_phys(value);
+    }
+    let leaf = entry_ptr(table, virtual_address, 0);
+    // SAFETY: the leaf was installed by this VMM and the lock is held.
+    if arch::pte_present(unsafe { leaf.read_volatile() }) {
+        unsafe { leaf.write_volatile(0) };
+        arch::flush_page(virtual_address);
+    }
 }
 
 pub fn translate(virtual_address: u64) -> Option<u64> {

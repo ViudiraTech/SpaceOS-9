@@ -11,6 +11,8 @@
 //! Linux ABI system call dispatcher integrated with the VFS and scheduler subsystems.
 
 pub mod identity;
+#[cfg(feature = "modules")]
+mod kmod;
 mod linux;
 pub use linux::{flock_release, inherit_limits};
 mod memory;
@@ -113,7 +115,13 @@ pub fn current_syscall(tid: u64) -> Option<(u64, u64, u64)> {
     use core::sync::atomic::Ordering::Relaxed;
     let slot = tid as usize % CURRENT_SLOTS;
     let nr = CURRENT_NR[slot].load(Relaxed);
-    (nr != u64::MAX).then(|| (nr, CURRENT_ARG[slot][0].load(Relaxed), CURRENT_ARG[slot][1].load(Relaxed)))
+    (nr != u64::MAX).then(|| {
+        (
+            nr,
+            CURRENT_ARG[slot][0].load(Relaxed),
+            CURRENT_ARG[slot][1].load(Relaxed),
+        )
+    })
 }
 
 pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
@@ -458,6 +466,17 @@ fn dispatch_inner(
         SYS_VFORK => process::clone(0x4000 | 0x100 | 17, 0, 0, 0, 0),
         #[cfg(target_arch = "x86_64")]
         SYS_ALARM => process::alarm(arg0 as u32),
+
+        // Loadable kernel modules.
+        #[cfg(feature = "modules")]
+        SYS_INIT_MODULE => kmod::init_module(arg0, arg1 as usize, arg2),
+        #[cfg(feature = "modules")]
+        SYS_FINIT_MODULE => kmod::finit_module(arg0 as i32, arg1, arg2 as u32),
+        #[cfg(feature = "modules")]
+        SYS_DELETE_MODULE => kmod::delete_module(arg0, arg1 as u32),
+        #[cfg(not(feature = "modules"))]
+        SYS_INIT_MODULE | SYS_FINIT_MODULE | SYS_DELETE_MODULE => -abi::ENOSYS,
+
         // I/O port access has no user of record, and granting IOPL 3 would bypass
         // every kernel driver. Xorg treats this failure as "no legacy VGA ports".
         #[cfg(target_arch = "x86_64")]

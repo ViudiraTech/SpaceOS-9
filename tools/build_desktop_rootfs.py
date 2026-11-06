@@ -688,6 +688,14 @@ EndSection
                     dest.unlink()
                 dest.symlink_to(f"/bin/{name}")
 
+    module_dir = ROOT / "build" / "modules" / "x86_64"
+    if module_dir.is_dir():
+        module_names = []
+        for ko in sorted(module_dir.glob("*.ko")):
+            install_binary(ko, f"/lib/modules/{ko.name}", 0o644)
+            module_names.append(ko.stem)
+        write("/etc/modules", "".join(f"{name}\n" for name in module_names))
+
     for p in ("/bin/systemd-analyze", "/usr/bin/systemd-analyze"):
         dest = STAGE / p.lstrip("/")
         if dest.is_symlink() or dest.exists():

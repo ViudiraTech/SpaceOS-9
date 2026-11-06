@@ -74,9 +74,30 @@ endif
 ifeq ($(CONFIG_RISCV_SV48),y)
 CARGO_FEATURE_LIST += riscv-sv48
 endif
+
+ifeq ($(CONFIG_MODULES),y)
+CARGO_FEATURE_LIST += modules
+endif
+
+ifeq ($(CONFIG_MODULE_UNLOAD),y)
+CARGO_FEATURE_LIST += module-unload
+endif
+
+ifeq ($(CONFIG_MODULE_FORCE_UNLOAD),y)
+CARGO_FEATURE_LIST += module-force-unload
+endif
+
+ifeq ($(CONFIG_KALLSYMS),y)
+CARGO_FEATURE_LIST += kallsyms
+endif
+
+ifeq ($(CONFIG_KALLSYMS_ALL),y)
+CARGO_FEATURE_LIST += kallsyms-all
+endif
 CARGO_FEATURES = $(foreach feature,$(CARGO_FEATURE_LIST),--features $(feature))
 
 OUT := build/$(ARCH)/$(PROFILE)
+MODULE_OUT := build/modules/$(ARCH)
 KERNEL := target/$(TARGET)/$(PROFILE)/spacekernel
 ISO := $(OUT)/SpaceKernel-$(ARCH).iso
 ISO_ROOT := $(OUT)/iso
@@ -93,8 +114,8 @@ ROOTFS_SELFTEST ?= 0
 ROOTFS_IMG := build/rootfs/fat32.img
 ROOTFS_MODULE := $(if $(filter 1,$(WITH_ROOTFS)),module_path: boot():/rootfs.img,)
 
-.PHONY: desktop desktop-iso desktop-spui desktop-rootfs desktop-run release-try all kernel iso rootfs-image busybox run debug test test-single test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
-all: iso
+.PHONY: desktop desktop-iso desktop-spui desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
+all: release-try
 
 defconfig:
 	kconfig-conf --alldefconfig Kconfig
@@ -110,7 +131,14 @@ deps:
 	rustup target add $(TARGET)
 	cargo fetch --target $(TARGET)
 
-kernel: deps
+modules:
+	@if [ "$(CONFIG_MODULES)" = "y" ]; then \
+	  tools/build_modules.sh "$(ARCH)" "$(MODULE_OUT)"; \
+	else \
+	  echo "modules disabled by Kconfig"; \
+	fi
+
+kernel: deps modules
 	@mkdir -p build
 	@n=$$(cat build/kernel-build 2>/dev/null || echo 0); \
 	n=$$((n + 1)); \
@@ -122,7 +150,12 @@ kernel: deps
 	SPK_BUILD_USER="$$(id -un 2>/dev/null || echo unknown)" \
 	SPK_BUILD_HOST="$$(hostname 2>/dev/null || echo unknown)" \
 	SPK_BUILD_COMPILER="$$(rustc --version 2>/dev/null || echo rustc)" \
+	SPK_MODULE_DIR="$$(pwd)/$(MODULE_OUT)" \
+	SPK_KERNEL_ARCH="$(ARCH)" \
 	cargo build --target $(TARGET) $(CARGO_PROFILE) $(CARGO_FEATURES)
+	@if [ "$(CONFIG_KALLSYMS)" = "y" ]; then \
+	  python3 tools/gen_kallsyms.py "$(KERNEL)" $(if $(filter y,$(CONFIG_KALLSYMS_ALL)),--all,); \
+	fi
 
 $(LIMINE_ARCHIVE):
 	mkdir -p build/downloads
@@ -137,7 +170,7 @@ $(LIMINE_DIR)/.extracted: $(LIMINE_ARCHIVE)
 limine: $(LIMINE_DIR)/.extracted
 	$(MAKE) -C $(LIMINE_DIR)
 
-rootfs-image:
+rootfs-image: modules
 	WITH_ROOTFS=$(WITH_ROOTFS) ROOTFS_SELFTEST=$(ROOTFS_SELFTEST) python3 tools/build_rootfs.py
 
 busybox:
@@ -165,7 +198,7 @@ desktop-iso:
 desktop-spui:
 	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/desktop/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
 
-desktop-rootfs: desktop-spui
+desktop-rootfs: desktop-spui modules
 	tools/build_userland.sh
 	python3 tools/build_desktop_rootfs.py
 
@@ -220,7 +253,10 @@ test-host: test-sched-model test-subsystem-model test-drm-abi
 
 test-single: iso
 	python3 tools/check_no_simd.py $(ARCH) $(KERNEL)
-	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
+	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULES))),--require 'HELLO_MODULE_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
+
+test-modules: iso
+	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) --require 'HELLO_MODULE_OK' --online-cpus $(CPUS) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
 
 ifeq ($(origin ARCH),command line)
 test: test-single

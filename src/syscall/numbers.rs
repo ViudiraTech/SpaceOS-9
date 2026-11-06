@@ -921,3 +921,18 @@ pub const SYS_UTIMENSAT: u64 = 88;
 pub const SYS_UTIMES: u64 = 235;
 #[cfg(target_arch = "x86_64")]
 pub const SYS_VFORK: u64 = 58;
+
+// Loadable module syscalls. x86_64 keeps the historical numbers; AArch64 and
+// RISC-V use the asm-generic table.
+#[cfg(target_arch = "x86_64")]
+pub const SYS_INIT_MODULE: u64 = 175;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_INIT_MODULE: u64 = 105;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_DELETE_MODULE: u64 = 176;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_DELETE_MODULE: u64 = 106;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_FINIT_MODULE: u64 = 313;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_FINIT_MODULE: u64 = 273;

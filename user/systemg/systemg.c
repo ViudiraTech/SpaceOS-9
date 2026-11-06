@@ -824,6 +824,50 @@ static void handle_ipc_client(int client_fd) {
     write(client_fd, resp, strlen(resp));
 }
 
+/* Load the modules listed in /etc/modules through the Linux finit_module(2)
+ * syscall. Failures are reported but do not abort PID 1. */
+static void load_kernel_modules(void) {
+    int fd = open("/etc/modules", O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    char content[2048];
+    ssize_t count = read(fd, content, sizeof(content) - 1);
+    close(fd);
+    if (count <= 0) {
+        return;
+    }
+    content[count] = 0;
+    char *line = content;
+    while (line != NULL && *line != 0) {
+        char *next = strchr(line, '\n');
+        if (next != NULL) {
+            *next = 0;
+            next++;
+        }
+        char *name = trim(line);
+        if (*name != 0 && *name != '#') {
+            char path[256];
+            snprintf(path, sizeof(path), "/lib/modules/%s.ko", name);
+            int image = open(path, O_RDONLY | O_CLOEXEC);
+            if (image < 0) {
+                printf("systemg[1]: Failed to open kernel module %s: %s\n",
+                       path, strerror(errno));
+            } else {
+                int result = finit_module(image, "", 0);
+                close(image);
+                if (result < 0) {
+                    printf("systemg[1]: Failed to load kernel module %s: %s\n",
+                           name, strerror(errno));
+                } else {
+                    printf("systemg[1]: Loaded kernel module %s\n", name);
+                }
+            }
+        }
+        line = next;
+    }
+}
+
 int main(int argc, char **argv, char **envp) {
     (void)argc;
     (void)argv;
@@ -849,6 +893,7 @@ int main(int argc, char **argv, char **envp) {
     signal(SIGTTIN, SIG_IGN);
     signal(SIGTTOU, SIG_IGN);
     printf("SYSTEMG_OK pid=%d\n", getpid());
+    load_kernel_modules();
 
     /* Initialize control socket */
     const char *env_sock = getenv("SYSTEMG_SOCK");

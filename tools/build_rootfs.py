@@ -73,8 +73,8 @@ def main() -> int:
     with open(IMAGE, "wb") as image:
         image.truncate(64 * 1024 * 1024)
     run("mkfs.vfat", "-F", "32", "-n", "SPACEROOT", str(IMAGE))
-    for directory in ("/sbin", "/bin", "/lib", "/etc", "/etc/systemg", "/tmp",
-                      "/dev", "/proc", "/sys", "/run", "/root"):
+    for directory in ("/sbin", "/bin", "/lib", "/lib/modules", "/etc", "/etc/systemg",
+                      "/tmp", "/dev", "/proc", "/sys", "/run", "/root"):
         run("mmd", "-i", str(IMAGE), f"::{directory}")
 
     for name in ("hello", "cat", "echo", "sh", "fastfetch", "systemctl", "systemg-analyze"):
@@ -85,6 +85,18 @@ def main() -> int:
     if systemg.exists():
         run("mcopy", "-i", str(IMAGE), str(systemg), "::/sbin/systemg")
 
+    staging = BUILD / "services"
+    staging.mkdir(exist_ok=True)
+    module_dir = ROOT / "build" / "modules" / "x86_64"
+    module_names = []
+    if module_dir.is_dir():
+        for ko in sorted(module_dir.glob("*.ko")):
+            run("mcopy", "-i", str(IMAGE), str(ko), f"::/lib/modules/{ko.name}")
+            module_names.append(ko.stem)
+    modules_list = staging / "modules"
+    modules_list.write_text("".join(f"{name}\n" for name in module_names))
+    run("mcopy", "-i", str(IMAGE), str(modules_list), "::/etc/modules")
+
     run("mcopy", "-i", str(IMAGE), str(BUSYBOX), "::/bin/busybox")
     run("mcopy", "-i", str(IMAGE), str(MUSL / "ld-musl-x86_64.so.1"),
         "::/lib/ld-musl-x86_64.so.1")
@@ -93,8 +105,6 @@ def main() -> int:
     services = dict(SERVICES)
     if os.environ.get("ROOTFS_SELFTEST") == "1":
         services.update(SELFTEST_SERVICES)
-    staging = BUILD / "services"
-    staging.mkdir(exist_ok=True)
     for name, content in services.items():
         if name.startswith("console") and not (USERLAND / "sh").exists():
             continue

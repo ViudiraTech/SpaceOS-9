@@ -10,6 +10,8 @@
 
 use core::arch::asm;
 
+use super::super::paging::KernelProt;
+
 pub fn paging_geometry() -> super::super::paging::Geometry {
     let satp: u64;
     // SAFETY: this kernel runs in supervisor mode.
@@ -56,6 +58,24 @@ pub fn pte_table(physical: u64) -> u64 {
 }
 pub fn pte_leaf(physical: u64, _device: bool) -> u64 {
     ((physical >> 12) << 10) | 0xc7 // V,R,W,A,D; platform PMA controls MMIO.
+}
+
+/// Kernel-only leaf with no U bit. R is always set because W without R is
+/// reserved; X is granted only to executable module sections.
+pub fn pte_kernel(physical: u64, prot: KernelProt) -> u64 {
+    let mut entry = ((physical >> 12) << 10) | 0xc3; // V,R,A,D
+    if prot.writable() {
+        entry |= 0x4;
+    }
+    if prot.executable() {
+        entry |= 0x8;
+    }
+    entry
+}
+
+pub fn sync_instruction_cache(_address: u64, _length: usize) {
+    // SAFETY: fence.i orders prior stores before instruction fetch.
+    unsafe { asm!("fence.i", options(nostack)) };
 }
 
 pub fn flush_page(virtual_address: u64) {

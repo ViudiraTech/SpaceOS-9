@@ -170,6 +170,10 @@ pub fn syscalls() {
     );
     let address = dispatch(SYS_MMAP, 0, 8192, 3, 0x22, u64::MAX, 0);
     assert!(address > 0);
+    // Anonymous mmap is a lazy reservation.  A user store would fault the
+    // pages in; the kernel-side writer must do the same through the normal
+    // fault path before touching both pages of the cross-page range.
+    crate::user::uaccess::prefault(address as u64, 8192, true).unwrap();
     scratch
         .lock()
         .write_bytes(address as u64 + 4095, b"mapped cross page")
@@ -193,6 +197,7 @@ pub fn syscalls() {
     // Verify MAP_FIXED failure rollback preserves existing mapping
     let keep = dispatch(SYS_MMAP, 0, 4096, 3, 0x22, u64::MAX, 0) as u64;
     assert!(keep >= 0x4000_0000);
+    crate::user::uaccess::prefault(keep, 4096, true).unwrap();
     scratch.lock().write_bytes(keep, b"keep-alive").unwrap();
     // MAP_FIXED with invalid fd (-1) and non-anonymous flags (0x12) must fail before unmapping `keep`
     assert_eq!(
@@ -1153,6 +1158,7 @@ pub fn ipc_advanced() {
     assert_eq!(dispatch(SYS_FTRUNCATE, mfd as u64, 8192, 0, 0, 0, 0), 0);
     let mapped = dispatch(SYS_MMAP, 0, 8192, 3, 1, mfd as u64, 0);
     assert!(mapped > 0, "memfd mmap={}", mapped);
+    crate::user::uaccess::prefault(mapped as u64, 8192, true).unwrap();
     scratch
         .lock()
         .write_bytes(mapped as u64, b"SHARED")

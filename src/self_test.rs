@@ -22,6 +22,8 @@ pub fn run_early() {
     unsafe {
         crate::user::uaccess::kernel_test_scope(crate::syscall::run_vfs_syscall_self_test);
     }
+    #[cfg(feature = "modules")]
+    crate::module::self_test::run();
 }
 
 pub fn spawn_late() {

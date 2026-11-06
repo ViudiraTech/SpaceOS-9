@@ -10,6 +10,26 @@
 
 //! Page-table geometry shared by all supported architectures.
 
+/// Permissions for kernel mappings created after boot, such as loadable
+/// module sections. User mappings use their own per-architecture encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelProt {
+    ReadOnly,
+    ReadOnlyExec,
+    ReadWrite,
+    ReadWriteExec,
+}
+
+impl KernelProt {
+    pub const fn writable(self) -> bool {
+        matches!(self, Self::ReadWrite | Self::ReadWriteExec)
+    }
+
+    pub const fn executable(self) -> bool {
+        matches!(self, Self::ReadOnlyExec | Self::ReadWriteExec)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
     pub levels: usize,

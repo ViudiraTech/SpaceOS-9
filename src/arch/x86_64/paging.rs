@@ -10,6 +10,8 @@
 
 use core::arch::asm;
 
+use super::super::paging::KernelProt;
+
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 pub fn paging_geometry() -> super::super::paging::Geometry {
@@ -51,6 +53,20 @@ pub fn pte_table(physical: u64) -> u64 {
 pub fn pte_leaf(physical: u64, device: bool) -> u64 {
     let nx = crate::cpuid::has(crate::cpuid::Feature::Nx);
     physical | 0x003 | if nx { 1 << 63 } else { 0 } | if device { 0x018 } else { 0 }
+}
+
+/// Kernel-only leaf with explicit W^X permissions. Shadow-stack and SMEP/SMAP
+/// are not enabled here, so the user bit stays clear for every kernel page.
+pub fn pte_kernel(physical: u64, prot: KernelProt) -> u64 {
+    let base = physical | 0x001 | if prot.writable() { 0x002 } else { 0 };
+    let nx = crate::cpuid::has(crate::cpuid::Feature::Nx);
+    base | if nx && !prot.executable() { 1 << 63 } else { 0 }
+}
+
+/// Published instruction bytes are coherent with instruction fetch on x86-64;
+/// the compiler fence orders the stores before the indirect call.
+pub fn sync_instruction_cache(_address: u64, _length: usize) {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 pub fn setup_memory_protection() {

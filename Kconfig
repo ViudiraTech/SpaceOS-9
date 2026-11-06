@@ -196,6 +196,53 @@ config KSHELL
 
 endmenu
 
+menu "Loadable Kernel Modules & Symbol Table"
+
+config MODULES
+    bool "Loadable kernel modules (Linux-style ELF relocatable objects)"
+    default y
+    help
+      Enable init_module(2), finit_module(2) and delete_module(2) for
+      ET_REL modules built against the exported SpaceKernel C/Rust ABI.
+      Modules run in kernel space and are restricted to the exported
+      symbol whitelist.
+
+config MODULE_UNLOAD
+    bool "Allow unloading modules (delete_module)"
+    depends on MODULES
+    default y
+    help
+      Let delete_module(2) call the module exit routine and release its
+      sections. Without this, modules stay resident until reboot.
+
+config MODULE_FORCE_UNLOAD
+    bool "Allow forced unload of busy modules"
+    depends on MODULE_UNLOAD
+    default n
+    help
+      Permit delete_module(2) with O_TRUNC to unload a module even when its
+      reference count is nonzero. The caller must guarantee no CPU is
+      executing module code; this is a privileged last resort.
+
+config KALLSYMS
+    bool "Emit the full kernel symbol table through /proc/kallsyms"
+    default y
+    help
+      Patch the linked kernel image with all allocatable symbols and expose
+      them through /proc/kallsyms. Module symbols are appended at runtime.
+      Module linking still only resolves the explicit EXPORT_SYMBOL
+      whitelist; kallsyms is a diagnostic view, not a linking surface.
+
+config KALLSYMS_ALL
+    bool "Include data symbols in /proc/kallsyms"
+    depends on KALLSYMS
+    default n
+    help
+      Include data, BSS and read-only object symbols. With this disabled,
+      only function symbols are emitted, matching Linux KALLSYMS semantics.
+
+endmenu
+
 menu "Testing & QEMU Validation"
 
 config BOOT_SELF_TEST

@@ -26,10 +26,14 @@ const SYSTEM: &[&str] = &[
     "cmdline",
     "stat",
     "loadavg",
+    #[cfg(feature = "kallsyms")]
+    "kallsyms",
+    #[cfg(feature = "modules")]
+    "modules",
 ];
 const PROCESS: &[&str] = &[
-    "status", "stat", "statm", "syscall", "comm", "cmdline", "environ", "maps", "auxv", "cwd", "exe", "root",
-    "fd", "fdinfo", "task", "mounts",
+    "status", "stat", "statm", "syscall", "comm", "cmdline", "environ", "maps", "auxv", "cwd",
+    "exe", "root", "fd", "fdinfo", "task", "mounts",
 ];
 const SYS_FS: &[&str] = &["dentry-state", "inode-nr", "inode-state"];
 enum View {
@@ -354,6 +358,16 @@ fn system(name: &str) -> Result<String, VfsError> {
                 sched::last_tid()
             )
         }
+        #[cfg(feature = "kallsyms")]
+        "kallsyms" => {
+            let mut out = String::new();
+            crate::kallsyms::append(&mut out);
+            #[cfg(feature = "modules")]
+            crate::module::append_kallsyms(&mut out);
+            out
+        }
+        #[cfg(feature = "modules")]
+        "modules" => crate::module::proc_modules(),
         _ => return Err(VfsError::NotFound),
     })
 }

@@ -21,12 +21,14 @@ mod serial;
 
 pub use context::{Context, context_init, switch};
 pub use cpu::{
-    counter, disable_interrupts, enable_interrupts, halt, irq_restore, irq_save, irqs_enabled, system_reset,
+    counter, disable_interrupts, enable_interrupts, halt, irq_restore, irq_save, irqs_enabled,
+    system_reset,
 };
 pub use exceptions::{init_bsp as init_exceptions, load_cpu as load_exceptions};
 pub use paging::{
-    flush_page, flush_table, page_root, paging_geometry, pte_is_table, pte_leaf, pte_phys,
-    pte_present, pte_table, set_page_root, setup_device_memory, tlb_shootdown,
+    flush_page, flush_table, page_root, paging_geometry, pte_is_table, pte_kernel, pte_leaf,
+    pte_phys, pte_present, pte_table, set_page_root, setup_device_memory, sync_instruction_cache,
+    tlb_shootdown,
 };
 pub use serial::{SERIAL_PHYS, serial_enable_irq, serial_init, serial_try_read, serial_write};
 

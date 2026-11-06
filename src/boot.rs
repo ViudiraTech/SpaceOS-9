@@ -121,6 +121,14 @@ pub fn cmdline() -> &'static str {
     CMDLINE.response().map_or("", |response| response.cmdline())
 }
 
+/// Link-time request base reported by Limine. The kernel ELF is relocatable
+/// and the symbol table in the kallsyms blob is relative to this base.
+pub fn kernel_virtual() -> u64 {
+    ADDRESS
+        .response()
+        .map_or(0, |response| response.virtual_base)
+}
+
 pub fn framebuffer() -> Option<&'static limine::framebuffer::Framebuffer> {
     FRAMEBUFFER.response()?.framebuffers().first().copied()
 }

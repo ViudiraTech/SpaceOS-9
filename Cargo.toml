@@ -14,6 +14,11 @@ edition = "2024"
 [features]
 boot-self-test = []
 riscv-sv48 = []
+modules = []
+module-unload = []
+module-force-unload = []
+kallsyms = []
+kallsyms-all = []
 
 [dependencies]
 limine = { version = "=0.6.5", default-features = false }

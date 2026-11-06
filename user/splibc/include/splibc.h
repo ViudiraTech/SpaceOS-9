@@ -510,6 +510,10 @@ int timerfd_settime(int fd, int flags, const struct itimerspec *new_value,
                     struct itimerspec *old_value);
 int memfd_create(const char *name, unsigned int flags);
 
+int init_module(const void *image, unsigned long length, const char *parameters);
+int finit_module(int fd, const char *parameters, int flags);
+int delete_module(const char *name, int flags);
+
 pid_t fork(void);
 pid_t getpid(void);
 pid_t getppid(void);
