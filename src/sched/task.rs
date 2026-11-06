@@ -102,7 +102,9 @@ pub(crate) fn zombies() -> Vec<TaskRef> {
 pub(crate) fn take_zombie(pid: u64) -> Option<TaskRef> {
     let mut list = ZOMBIES.lock();
     let index = list.iter().position(|task| task.stats().tgid == pid)?;
-    Some(list.remove(index))
+    let reaped = list.remove(index);
+    reaped.lock().state = TaskState::Dead;
+    Some(reaped)
 }
 pub(crate) fn has_children(ppid: u64) -> bool {
     if ZOMBIES.lock().iter().any(|task| task.stats().ppid == ppid) {

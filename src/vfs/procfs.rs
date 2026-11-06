@@ -536,11 +536,22 @@ impl Inode for Node {
                 Ok(Self::make(view, 0x10000 + w.tid() * 64 + index as u64 + 1))
             }
             View::Tasks(w) => {
-                Self::task(w)?;
-                if name != format!("{}", w.tid()) {
-                    return Err(VfsError::NotFound);
+                let task = Self::task(w)?;
+                let stats = task.stats();
+                let target_tid = name.parse::<u64>().map_err(|_| VfsError::NotFound)?;
+                if target_tid == w.tid() || target_tid == stats.tgid || target_tid == stats.ltid {
+                    return Ok(Self::make(View::Process(w.clone()), 0x10000 + w.tid() * 64));
                 }
-                Ok(Self::make(View::Process(w.clone()), 0x10000 + w.tid() * 64))
+                if let Some(thread) = sched::tasks_in_group(stats.tgid)
+                    .into_iter()
+                    .find(|t| t.stats().ltid == target_tid || t.stats().tid == target_tid)
+                {
+                    return Ok(Self::make(
+                        View::Process(thread.downgrade()),
+                        0x10000 + thread.stats().tid * 64,
+                    ));
+                }
+                Err(VfsError::NotFound)
             }
             View::Fds(w, info) => {
                 let task = Self::task(w)?;
@@ -585,8 +596,19 @@ impl Inode for Node {
                 PROCESS.iter().map(|n| String::from(*n)).collect()
             }
             View::Tasks(w) => {
-                Self::task(w)?;
-                alloc::vec![format!("{}", w.tid())]
+                let task = Self::task(w)?;
+                let stats = task.stats();
+                let mut list =
+                    alloc::vec![format!("{}", if stats.user { stats.ltid } else { w.tid() })];
+                if stats.user {
+                    for member in sched::tasks_in_group(stats.tgid) {
+                        let id_str = format!("{}", member.stats().ltid);
+                        if !list.contains(&id_str) {
+                            list.push(id_str);
+                        }
+                    }
+                }
+                list
             }
             View::Fds(w, _) => Self::task(w)?
                 .files()

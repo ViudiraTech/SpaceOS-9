@@ -628,6 +628,9 @@ pub(crate) fn finish_switch() {
             if stats.ltid == stats.tgid {
                 // The group leader is retained until the whole group exits.
                 task::push_zombie(retired.value.clone());
+            } else {
+                // Non-leader threads do not need reaping by parent; once retired, they become Dead.
+                retired.value.lock().state = TaskState::Dead;
             }
             if !group_has_live_threads(stats.tgid) {
                 let init = init_pid();

@@ -128,8 +128,13 @@ pub fn devices() {
     assert_eq!(a.metadata().unwrap().ino, b.metadata().unwrap().ino);
 
     // /dev/kmsg Linux standard interface verification
-    let kmsg = open_abs("/dev/kmsg", abi::O_RDWR | abi::O_NONBLOCK, 0).expect("/dev/kmsg should exist");
+    let kmsg =
+        open_abs("/dev/kmsg", abi::O_RDWR | abi::O_NONBLOCK, 0).expect("/dev/kmsg should exist");
     assert_eq!(kmsg.inode.metadata().unwrap().rdev, (1 << 8) | 11);
+
+    // Seek to the end of buffer so we read newly written messages
+    kmsg.seek(0, abi::SEEK_END).unwrap();
+
     let test_msg = b"<6>kmsg self-test message\n";
     let w = kmsg.write(test_msg).unwrap();
     assert_eq!(w, test_msg.len());
