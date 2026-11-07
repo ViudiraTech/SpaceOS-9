@@ -1,0 +1,10 @@
+[Unit]
+Description=Network Manager
+After=uxconfd.service
+Requires=uxconfd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/NetworkManager
+Restart=always
+RestartSec=1

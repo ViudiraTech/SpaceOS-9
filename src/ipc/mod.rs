@@ -12,10 +12,10 @@ pub mod epoll;
 pub mod futex;
 pub mod inotify;
 pub mod memfd;
-pub mod netlink;
+pub use crate::net::netlink;
+pub mod pollwait;
 pub mod shm;
 pub mod signalfd;
-pub mod pollwait;
 pub mod timerfd;
 
 pub use pollwait::{block_briefly, poll_kick, wake_object, wake_pollers};
@@ -275,24 +275,7 @@ fn socket_from_kind(kind: u64) -> Result<(unix::SocketKind, bool, bool), i64> {
 }
 
 pub fn socket(domain: u64, kind: u64, protocol: u64) -> i64 {
-    if domain == netlink::AF_NETLINK {
-        return netlink_socket(kind, protocol);
-    }
-    if domain != unix::AF_UNIX as u64 {
-        return -abi::EAFNOSUPPORT;
-    }
-    if protocol != 0 {
-        return -abi::EPROTONOSUPPORT;
-    }
-    let (kind, cloexec, nonblock) = match socket_from_kind(kind) {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
-    let socket = unix::UnixSocket::new_socket(kind, nonblock);
-    match socket_file(socket, cloexec, nonblock) {
-        Ok(fd) => fd as i64,
-        Err(error) => error.to_errno(),
-    }
+    crate::net::socket::socket(domain, kind, protocol)
 }
 
 pub fn socketpair(domain: u64, kind: u64, protocol: u64, address: u64) -> i64 {
@@ -351,27 +334,6 @@ pub fn socketpair(domain: u64, kind: u64, protocol: u64, address: u64) -> i64 {
     0
 }
 
-fn netlink_socket(kind: u64, protocol: u64) -> i64 {
-    const SOCK_RAW: u32 = 3;
-    const SOCK_DGRAM: u32 = 2;
-    let raw = kind as u32;
-    let base = raw & !(unix::SOCK_CLOEXEC | unix::SOCK_NONBLOCK);
-    if base != SOCK_RAW && base != SOCK_DGRAM {
-        return -abi::ESOCKTNOSUPPORT;
-    }
-    if protocol != netlink::NETLINK_KOBJECT_UEVENT {
-        return -abi::EPROTONOSUPPORT;
-    }
-    let nonblock = raw & unix::SOCK_NONBLOCK != 0;
-    let socket = netlink::NetlinkSocket::create(nonblock);
-    let flags = abi::O_RDWR | if nonblock { O_NONBLOCK } else { 0 };
-    let file = Arc::new(OpenFile::new(socket, String::from("socket:netlink"), flags));
-    match alloc_file(file, raw & unix::SOCK_CLOEXEC != 0) {
-        Ok(fd) => fd as i64,
-        Err(error) => error.to_errno(),
-    }
-}
-
 /// Deliver a queued netlink datagram into a user buffer and source address.
 fn netlink_receive(
     socket: &Arc<netlink::NetlinkSocket>,
@@ -402,6 +364,14 @@ pub fn bind(fd: u64, address: u64, length: u64) -> i64 {
             Err(error) => error.to_errno(),
         };
     }
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        let result =
+            uaccess::read_vec(address, length as usize, 128).and_then(|raw| socket.bind(&raw));
+        return match result {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
@@ -417,6 +387,12 @@ pub fn bind(fd: u64, address: u64, length: u64) -> i64 {
 }
 
 pub fn listen(fd: u64, backlog: u64) -> i64 {
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        return match socket.listen(backlog as u32) {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
@@ -428,6 +404,14 @@ pub fn listen(fd: u64, backlog: u64) -> i64 {
 }
 
 pub fn connect(fd: u64, address: u64, length: u64) -> i64 {
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        let result = uaccess::read_vec(address, length as usize, 128)
+            .and_then(|raw| socket.connect(&raw, false));
+        return match result {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
@@ -450,12 +434,44 @@ pub fn accept4(fd: u64, address: u64, length: u64, flags: u64) -> i64 {
     if flags & !(unix::SOCK_CLOEXEC as u64 | unix::SOCK_NONBLOCK as u64) != 0 {
         return -abi::EINVAL;
     }
+    let nonblock = flags & unix::SOCK_NONBLOCK as u64 != 0;
+    let cloexec = flags & unix::SOCK_CLOEXEC as u64 != 0;
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        let (inode, peer) = match socket.accept(nonblock) {
+            Ok(result) => result,
+            Err(error) => return error.to_errno(),
+        };
+        let file = crate::net::socket::socket_file(inode, "socket:inet", nonblock);
+        let accepted = match alloc_file(file, cloexec) {
+            Ok(fd) => fd,
+            Err(error) => return error.to_errno(),
+        };
+        if let Some(peer) = peer
+            && address != 0
+            && length != 0
+        {
+            let room = match uaccess::read_value::<u32>(length) {
+                Ok(room) => room as usize,
+                Err(error) => {
+                    let _ = vfs::current_fd_table().lock().close(accepted as usize);
+                    return error.to_errno();
+                }
+            };
+            if let Err(error) = uaccess::write(address, &peer[..room.min(peer.len())]) {
+                let _ = vfs::current_fd_table().lock().close(accepted as usize);
+                return error.to_errno();
+            }
+            if let Err(error) = uaccess::write_value(length, &(peer.len() as u32)) {
+                let _ = vfs::current_fd_table().lock().close(accepted as usize);
+                return error.to_errno();
+            }
+        }
+        return accepted as i64;
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
     };
-    let nonblock = flags & unix::SOCK_NONBLOCK as u64 != 0;
-    let cloexec = flags & unix::SOCK_CLOEXEC as u64 != 0;
     let peer = match socket.accept(nonblock) {
         Ok(peer) => peer,
         Err(error) => return error.to_errno(),
@@ -484,6 +500,17 @@ pub fn getsockname(fd: u64, address: u64, length: u64) -> i64 {
             Err(error) => error.to_errno(),
         };
     }
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        let raw = socket.local_address();
+        let result = uaccess::read_value::<u32>(length).and_then(|room| {
+            uaccess::write(address, &raw[..(room as usize).min(raw.len())])?;
+            uaccess::write_value(length, &(raw.len() as u32))
+        });
+        return match result {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
@@ -495,6 +522,19 @@ pub fn getsockname(fd: u64, address: u64, length: u64) -> i64 {
 }
 
 pub fn getpeername(fd: u64, address: u64, length: u64) -> i64 {
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        let Some(raw) = socket.peer_address() else {
+            return -abi::ENOTCONN;
+        };
+        let result = uaccess::read_value::<u32>(length).and_then(|room| {
+            uaccess::write(address, &raw[..(room as usize).min(raw.len())])?;
+            uaccess::write_value(length, &(raw.len() as u32))
+        });
+        return match result {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
@@ -509,6 +549,12 @@ pub fn getpeername(fd: u64, address: u64, length: u64) -> i64 {
 }
 
 pub fn shutdown(fd: u64, how: u32) -> i64 {
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        return match socket.shutdown(how) {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
@@ -681,7 +727,11 @@ pub fn sendmsg(fd: u64, message: u64, flags: u64) -> i64 {
     if let Some(socket) = netlink::instance(fd) {
         let result = (|| -> Result<usize, VfsError> {
             let header = read_msghdr(message)?;
-            let destination = uaccess::read_vec(header.name, header.namelen as usize, 128)?;
+            let destination = if header.name == 0 || header.namelen == 0 {
+                Vec::new()
+            } else {
+                uaccess::read_vec(header.name, header.namelen as usize, 128)?
+            };
             let mut payload = Vec::new();
             for index in 0..header.iovlen.min(1024) {
                 let vector = uaccess::read_value::<abi::IoVec>(header.iov + index * 16)?;
@@ -692,6 +742,30 @@ pub fn sendmsg(fd: u64, message: u64, flags: u64) -> i64 {
                 )?);
             }
             socket.send(&destination, &payload)
+        })();
+        return match result {
+            Ok(count) => count as i64,
+            Err(error) => error.to_errno(),
+        };
+    }
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        if flags & !SEND_FLAGS != 0 {
+            return -abi::EINVAL;
+        }
+        let result = (|| -> Result<usize, VfsError> {
+            let header = read_msghdr(message)?;
+            let destination = if header.name != 0 && header.namelen != 0 {
+                Some(uaccess::read_vec(
+                    header.name,
+                    header.namelen as usize,
+                    128,
+                )?)
+            } else {
+                None
+            };
+            let iovecs = read_iovecs(header.iov, header.iovlen)?;
+            let payload = read_payload(&iovecs)?;
+            socket.send(&payload, destination.as_deref(), flags)
         })();
         return match result {
             Ok(count) => count as i64,
@@ -761,6 +835,32 @@ pub fn sendto(
         Ok(payload) => payload,
         Err(error) => return error.to_errno(),
     };
+    if let Some(socket) = netlink::instance(fd) {
+        let result = (if address != 0 && address_len != 0 {
+            uaccess::read_vec(address, address_len as usize, 128)
+        } else {
+            Ok(Vec::new())
+        })
+        .and_then(|destination| socket.send(&destination, &payload));
+        return match result {
+            Ok(count) => count as i64,
+            Err(error) => error.to_errno(),
+        };
+    }
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        let destination = if address != 0 && address_len != 0 {
+            match uaccess::read_vec(address, address_len as usize, 128) {
+                Ok(destination) => Some(destination),
+                Err(error) => return error.to_errno(),
+            }
+        } else {
+            None
+        };
+        return match socket.send(&payload, destination.as_deref(), flags) {
+            Ok(count) => count as i64,
+            Err(error) => error.to_errno(),
+        };
+    }
     let destination = if address != 0 && address_len != 0 {
         match read_sockaddr(address, address_len) {
             Ok(address) => Some(address),
@@ -937,6 +1037,60 @@ pub fn recvmsg(fd: u64, message: u64, flags: u64) -> i64 {
             Err(error) => error.to_errno(),
         };
     }
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        const MSG_ERRQUEUE: u64 = 0x2000;
+        const INET_MSG_CTRUNC: i32 = 0x08;
+        if flags & !(RECV_FLAGS | MSG_ERRQUEUE) != 0 {
+            return -abi::EINVAL;
+        }
+        if flags & MSG_ERRQUEUE != 0 {
+            return -abi::EAGAIN;
+        }
+        let result = (|| -> Result<usize, VfsError> {
+            let header = read_msghdr(message)?;
+            let iovecs = read_iovecs(header.iov, header.iovlen)?;
+            let total = iovecs.iter().map(|(_, length)| *length).sum::<usize>();
+            let received = socket.receive(total, flags)?;
+            write_payload(&iovecs, &received.data)?;
+            if header.name != 0
+                && let Some(source) = received.source.as_deref()
+            {
+                if header.namelen != 0 {
+                    let room = (header.namelen as usize).min(source.len());
+                    uaccess::write(header.name, &source[..room])?;
+                }
+                uaccess::write_value(message + 8, &(source.len() as u32))?;
+            }
+            let capacity = usize::try_from(header.controllen).unwrap_or(0);
+            let (control, control_truncated) = crate::net::socket::encode_cmsgs(
+                &received.cmsgs,
+                received.control_truncated,
+                header.control != 0,
+                capacity,
+            );
+            if header.control != 0 && !control.is_empty() {
+                uaccess::write(header.control, &control)?;
+            }
+            uaccess::write_value(message + 40, &(control.len() as u64))?;
+            let mut message_flags = 0i32;
+            if control_truncated {
+                message_flags |= INET_MSG_CTRUNC;
+            }
+            if received.truncated {
+                message_flags |= MSG_TRUNC as i32;
+            }
+            uaccess::write_value(message + 48, &message_flags)?;
+            if received.truncated && flags & MSG_TRUNC != 0 {
+                Ok(received.full_len)
+            } else {
+                Ok(received.data.len())
+            }
+        })();
+        return match result {
+            Ok(count) => count as i64,
+            Err(error) => error.to_errno(),
+        };
+    }
     if flags & !RECV_FLAGS != 0 {
         return -abi::EINVAL;
     }
@@ -1066,6 +1220,37 @@ pub fn recvfrom(
     if let Some(socket) = netlink::instance(fd) {
         return recvfrom_netlink(&socket, buffer, length, flags, address, address_len);
     }
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        let allowed = MSG_PEEK | MSG_DONTWAIT | MSG_TRUNC | MSG_WAITALL;
+        if flags & !allowed != 0 {
+            return -abi::EINVAL;
+        }
+        let received = match socket.receive(length as usize, flags) {
+            Ok(received) => received,
+            Err(error) => return error.to_errno(),
+        };
+        if let Err(error) = uaccess::write(buffer, &received.data) {
+            return error.to_errno();
+        }
+        if address != 0
+            && let Some(source) = received.source.as_deref()
+        {
+            let room = match uaccess::read_value::<u32>(address_len) {
+                Ok(room) => room as usize,
+                Err(error) => return error.to_errno(),
+            };
+            if let Err(error) = uaccess::write(address, &source[..room.min(source.len())]) {
+                return error.to_errno();
+            }
+            if let Err(error) = uaccess::write_value(address_len, &(source.len() as u32)) {
+                return error.to_errno();
+            }
+        }
+        if received.truncated && flags & MSG_TRUNC != 0 {
+            return received.full_len as i64;
+        }
+        return received.data.len() as i64;
+    }
     let allowed = MSG_PEEK | MSG_DONTWAIT | MSG_TRUNC | MSG_WAITALL;
     if flags & !allowed != 0 {
         return -abi::EINVAL;
@@ -1119,20 +1304,29 @@ fn write_option(value: &[u8], pointer: u64, length_pointer: u64) -> Result<(), V
 }
 
 pub fn getsockopt(fd: u64, level: u64, name: u64, value: u64, length: u64) -> i64 {
-    if netlink::instance(fd).is_some() {
-        let answer: Option<u32> = match (level, name) {
-            (1, 3) => Some(3),                                       // SO_TYPE: SOCK_RAW
-            (1, 39) => Some(netlink::AF_NETLINK as u32),             // SO_DOMAIN
-            (1, 38) => Some(netlink::NETLINK_KOBJECT_UEVENT as u32), // SO_PROTOCOL
-            (1, 4) => Some(0),                                       // SO_ERROR
-            (1, 7 | 8) => Some(212_992),                             // SO_SNDBUF, SO_RCVBUF
-            _ => None,
+    if let Some(socket) = netlink::instance(fd) {
+        let result = socket.getsockopt(level, name).and_then(|bytes| {
+            let room = uaccess::read_value::<u32>(length)? as usize;
+            uaccess::write(value, &bytes[..room.min(bytes.len())])?;
+            uaccess::write_value(length, &(bytes.len() as u32))
+        });
+        return match result {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
         };
-        let Some(answer) = answer else {
-            return -abi::ENOPROTOOPT;
-        };
-        let result =
-            uaccess::write_value(value, &answer).and_then(|()| uaccess::write_value(length, &4u32));
+    }
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        let result = socket.getsockopt(level, name).and_then(|bytes| {
+            let capacity = read_optlen(length)?;
+            let copy = capacity.min(bytes.len());
+            if copy != 0 {
+                if value == 0 {
+                    return Err(VfsError::Fault);
+                }
+                uaccess::write(value, &bytes[..copy])?;
+            }
+            uaccess::write_value(length, &(copy as u32))
+        });
         return match result {
             Ok(()) => 0,
             Err(error) => error.to_errno(),
@@ -1428,8 +1622,24 @@ pub fn timerfd_gettime(fd: u64, old_value: u64) -> i64 {
 }
 
 pub fn setsockopt(fd: u64, level: u64, name: u64, value: u64, length: u64) -> i64 {
-    if netlink::instance(fd).is_some() {
-        return match netlink::setsockopt(level, name) {
+    if let Some(socket) = netlink::instance(fd) {
+        let result = uaccess::read_vec(value, length as usize, 4096)
+            .and_then(|bytes| socket.setsockopt(level, name, &bytes));
+        return match result {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
+    if let Some(socket) = crate::net::socket::InetSocket::instance(fd) {
+        let result = if length == 0 {
+            socket.setsockopt(level, name, &[])
+        } else if value == 0 {
+            Err(VfsError::Fault)
+        } else {
+            uaccess::read_vec(value, length as usize, 4096)
+                .and_then(|bytes| socket.setsockopt(level, name, &bytes))
+        };
+        return match result {
             Ok(()) => 0,
             Err(error) => error.to_errno(),
         };

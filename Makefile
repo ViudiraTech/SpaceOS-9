@@ -109,6 +109,7 @@ LIMINE_URL ?= https://github.com/Limine-Bootloader/Limine/releases/download/$(LI
 DOWNLOAD_JOBS ?= 8
 QEMU_FLAGS := -machine $(MACHINE) $(QEMU_CPU) -m $(MEMORY_MIB) -smp $(CPUS) -serial stdio -monitor none -no-reboot
 QEMU_RESULT ?=
+QEMU_NIC ?=
 WITH_ROOTFS ?= 0
 ROOTFS_SELFTEST ?= 0
 ROOTFS_IMG := build/rootfs/fat32.img
@@ -205,7 +206,7 @@ desktop-rootfs: desktop-spui modules
 desktop: desktop-iso desktop-rootfs
 
 desktop-run: desktop
-	qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -m 4096 -smp $(CPUS) -serial stdio -monitor none -no-reboot -vga none -display gtk,zoom-to-fit=off -device virtio-gpu-pci,xres=1280,yres=800 -device virtio-tablet-pci -device virtio-keyboard-pci -drive file=$(DESKTOP_IMAGE),if=none,id=root,format=raw -device nvme,serial=SPROOT,drive=root -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
+	qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -m 4096 -smp $(CPUS) -serial stdio -monitor none -no-reboot -vga none -display gtk,zoom-to-fit=off -device virtio-gpu-pci,xres=1280,yres=800 -device virtio-tablet-pci -device virtio-keyboard-pci -nic $(or $(QEMU_NIC),user,model=e1000e) -drive file=$(DESKTOP_IMAGE),if=none,id=root,format=raw -device nvme,serial=SPROOT,drive=root -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
 
 # Reproducible release candidate requested by the release checklist.  The ISO
 # boots the release kernel; the matching desktop rootfs is build/rootfs/ext4.img.
@@ -253,7 +254,7 @@ test-host: test-sched-model test-subsystem-model test-drm-abi
 
 test-single: iso
 	python3 tools/check_no_simd.py $(ARCH) $(KERNEL)
-	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULES))),--require 'HELLO_MODULE_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
+	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULES))),--require 'HELLO_MODULE_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_NIC),--nic '$(QEMU_NIC)',) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
 
 test-modules: iso
 	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) --require 'HELLO_MODULE_OK' --online-cpus $(CPUS) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)

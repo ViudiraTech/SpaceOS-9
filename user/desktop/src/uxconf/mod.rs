@@ -16,6 +16,7 @@
 
 pub mod client;
 pub mod daemon;
+pub mod net;
 pub mod protocol;
 pub mod schema;
 pub mod storage;
@@ -569,6 +570,29 @@ impl CursorStyle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetMode {
+    Dhcp,
+    Static,
+}
+
+impl NetMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dhcp => "dhcp",
+            Self::Static => "static",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("static") {
+            Self::Static
+        } else {
+            Self::Dhcp
+        }
+    }
+}
+
 pub struct WallpaperInfo {
     pub file: &'static str,
     pub label: &'static str,
@@ -709,6 +733,14 @@ pub struct DesktopConfig {
     pub clock_seconds: bool,
     pub clock_show_date: bool,
     pub timezone: String,
+    // network
+    pub net_enabled: bool,
+    pub net_mode: NetMode,
+    pub net_address: String,
+    pub net_prefixlen: i32,
+    pub net_gateway: String,
+    pub net_dns: String,
+    pub net_apply_serial: i64,
 }
 
 impl Default for DesktopConfig {
@@ -753,6 +785,13 @@ impl Default for DesktopConfig {
             clock_seconds: false,
             clock_show_date: true,
             timezone: "UTC".to_string(),
+            net_enabled: true,
+            net_mode: NetMode::Dhcp,
+            net_address: "10.0.2.15".to_string(),
+            net_prefixlen: 24,
+            net_gateway: "10.0.2.2".to_string(),
+            net_dns: "10.0.2.3".to_string(),
+            net_apply_serial: 0,
         }
     }
 }
@@ -965,6 +1004,50 @@ impl DesktopConfig {
                     if !s.is_empty() && !s.contains("..") {
                         self.timezone = s.to_string();
                     }
+                }
+            }
+            ("network", "/enabled") => {
+                if let Some(b) = value.as_bool() {
+                    self.net_enabled = b;
+                }
+            }
+            ("network", "/mode") => {
+                if let Some(s) = value.as_str() {
+                    self.net_mode = NetMode::parse(s);
+                }
+            }
+            ("network", "/address") => {
+                if let Some(s) = value.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() && trimmed.len() <= 64 {
+                        self.net_address = trimmed.to_string();
+                    }
+                }
+            }
+            ("network", "/prefixlen") => {
+                if let Some(v) = value.as_int() {
+                    self.net_prefixlen = (v as i32).clamp(1, 32);
+                }
+            }
+            ("network", "/gateway") => {
+                if let Some(s) = value.as_str() {
+                    let trimmed = s.trim();
+                    if trimmed.len() <= 64 {
+                        self.net_gateway = trimmed.to_string();
+                    }
+                }
+            }
+            ("network", "/dns") => {
+                if let Some(s) = value.as_str() {
+                    let trimmed = s.trim();
+                    if trimmed.len() <= 128 {
+                        self.net_dns = trimmed.to_string();
+                    }
+                }
+            }
+            ("network", "/apply-serial") => {
+                if let Some(v) = value.as_int() {
+                    self.net_apply_serial = v;
                 }
             }
             _ => {}

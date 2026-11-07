@@ -14,7 +14,7 @@
 
 use crate::{ConfError, Value, ValueKind};
 
-pub const BUILTIN_CHANNELS: [&str; 10] = [
+pub const BUILTIN_CHANNELS: [&str; 11] = [
     "appearance",
     "desktop",
     "panel",
@@ -25,6 +25,7 @@ pub const BUILTIN_CHANNELS: [&str; 10] = [
     "files",
     "editor",
     "datetime",
+    "network",
 ];
 
 /// Return all default `(property, Value)` entries for a built-in `channel`.
@@ -97,6 +98,15 @@ pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {
             ("/clock-seconds", Value::Bool(false)),
             ("/clock-show-date", Value::Bool(true)),
             ("/timezone", Value::String("UTC".to_string())),
+        ],
+        "network" => vec![
+            ("/address", Value::String("10.0.2.15".to_string())),
+            ("/apply-serial", Value::Int(0)),
+            ("/dns", Value::String("10.0.2.3".to_string())),
+            ("/enabled", Value::Bool(true)),
+            ("/gateway", Value::String("10.0.2.2".to_string())),
+            ("/mode", Value::String("dhcp".to_string())),
+            ("/prefixlen", Value::Int(24)),
         ],
         _ => Vec::new(),
     }

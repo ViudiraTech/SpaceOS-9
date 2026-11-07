@@ -25,13 +25,16 @@ fn main() {
     if !stub.is_file() {
         fs::write(&stub, []).expect("write module stub");
     }
+    let want_self_test = env::var_os("CARGO_FEATURE_BOOT_SELF_TEST").is_some();
     println!("cargo:rerun-if-env-changed=SPK_MODULE_DIR");
     for (variable, file) in [
         ("SPK_HELLO_KO", "hello.ko"),
         ("SPK_HELLO_RUST_KO", "hello-rust.ko"),
+        ("SPK_E1000_KO", "e1000.ko"),
+        ("SPK_E1000E_KO", "e1000e.ko"),
     ] {
         let candidate = modules.join(file);
-        let path = if candidate.is_file() {
+        let path = if want_self_test && candidate.is_file() {
             candidate
         } else {
             stub.clone()

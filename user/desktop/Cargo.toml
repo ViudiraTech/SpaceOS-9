@@ -30,6 +30,14 @@ path = "src/bin/uxconfd.rs"
 name = "uxconf-query"
 path = "src/bin/uxconf_query.rs"
 
+[[bin]]
+name = "NetworkManager"
+path = "src/bin/network_manager.rs"
+
+[[bin]]
+name = "nmcli"
+path = "src/bin/nmcli.rs"
+
 [dependencies]
 x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "render", "shape", "randr"] }
 ttf-parser = "0.25"

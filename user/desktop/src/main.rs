@@ -17,6 +17,7 @@ mod apps;
 mod ddm;
 mod draw;
 mod icons;
+mod netmgr;
 mod shell;
 mod text;
 mod theme;
@@ -34,7 +35,7 @@ fn main() -> ExitCode {
         "term" => apps::term::run(arguments.get(2).map(String::as_str)),
         "files" => apps::files::run(arguments.get(2).map(String::as_str)),
         "edit" => apps::edit::run(arguments.get(2).map(String::as_str)),
-        "settings" => apps::settings::run(),
+        "settings" => apps::settings::run(arguments.get(2).map(String::as_str)),
         "calc" | "calculator" => apps::calc::run(),
         "monitor" | "taskmgr" => apps::monitor::run(),
         "view" | "image" => apps::view::run(arguments.get(2).map(String::as_str)),

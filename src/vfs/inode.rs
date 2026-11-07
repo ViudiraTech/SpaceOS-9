@@ -60,6 +60,12 @@ pub enum VfsError {
     TooManyLinks,
     MessageNotSupported,
     NoBuffers,
+    NetworkUnreachable,
+    HostUnreachable,
+    NetworkDown,
+    HostDown,
+    InProgress,
+    AlreadyInProgress,
 }
 
 impl VfsError {
@@ -110,6 +116,12 @@ impl VfsError {
             Self::TooManyLinks => -31,
             Self::MessageNotSupported => -abi::EOPNOTSUPP,
             Self::NoBuffers => -105,
+            Self::NetworkUnreachable => -abi::ENETUNREACH,
+            Self::HostUnreachable => -abi::EHOSTUNREACH,
+            Self::NetworkDown => -abi::ENETDOWN,
+            Self::HostDown => -abi::EHOSTDOWN,
+            Self::InProgress => -abi::EINPROGRESS,
+            Self::AlreadyInProgress => -abi::EALREADY,
         }
     }
 }

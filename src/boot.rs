@@ -129,6 +129,14 @@ pub fn kernel_virtual() -> u64 {
         .map_or(0, |response| response.virtual_base)
 }
 
+/// Physical base of the kernel image, the anchor for virtual-to-physical
+/// translation of kernel-image addresses.
+pub fn kernel_physical() -> u64 {
+    ADDRESS
+        .response()
+        .map_or(0, |response| response.physical_base)
+}
+
 pub fn framebuffer() -> Option<&'static limine::framebuffer::Framebuffer> {
     FRAMEBUFFER.response()?.framebuffers().first().copied()
 }

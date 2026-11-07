@@ -60,12 +60,18 @@ pub const ESOCKTNOSUPPORT: i64 = 94;
 pub const EAFNOSUPPORT: i64 = 97;
 pub const EADDRINUSE: i64 = 98;
 pub const EADDRNOTAVAIL: i64 = 99;
+pub const ENETDOWN: i64 = 100;
+pub const ENETUNREACH: i64 = 101;
 pub const ECONNRESET: i64 = 104;
 pub const ENOBUFS: i64 = 105;
 pub const EISCONN: i64 = 106;
 pub const ENOTCONN: i64 = 107;
 pub const ETOOMANYREFS: i64 = 109;
 pub const ECONNREFUSED: i64 = 111;
+pub const EHOSTDOWN: i64 = 112;
+pub const EHOSTUNREACH: i64 = 113;
+pub const EALREADY: i64 = 114;
+pub const EINPROGRESS: i64 = 115;
 pub const ETIMEDOUT: i64 = 110;
 
 // Open Flags (O_*)

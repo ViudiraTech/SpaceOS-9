@@ -92,6 +92,9 @@ BREEZE_ICONS = {
     "login": "usr/share/icons/breeze/preferences/32/preferences-system-login.svg",
     "notify": "usr/share/icons/breeze/preferences/32/preferences-desktop-notification-bell.svg",
     "appearance": "usr/share/icons/breeze/preferences/32/preferences-desktop-theme-global.svg",
+    "network": "usr/share/icons/breeze/preferences/32/preferences-system-network.svg",
+    "network-wired": "usr/share/icons/breeze/status/22/network-wired-activated.svg",
+    "network-offline": "usr/share/icons/breeze/status/22/network-wired-disconnected.svg",
     "wallpaper": "usr/share/icons/breeze/preferences/32/preferences-desktop-wallpaper.svg",
     "panel": "usr/share/icons/breeze/preferences/32/preferences-desktop-plasma.svg",
     "windows": "usr/share/icons/breeze/preferences/32/preferences-system-windows.svg",
@@ -317,7 +320,7 @@ def busybox_links() -> None:
     known = (
         "ash sh cat cp mv rm ls ln mkdir rmdir touch echo printf grep sed awk head tail wc "
         "sort uniq cut tr tee find xargs ps kill sleep usleep uname id whoami date env true false "
-        "clear reset stty tty hostname df du free mount umount dmesg top ping mknod chmod "
+        "clear reset stty tty hostname df du free mount umount dmesg top ping ip ifconfig route netstat nslookup wget mknod chmod "
         "chown basename dirname readlink realpath which test expr seq sync vi more less "
         "gzip gunzip tar poweroff reboot halt base64 cmp dd md5sum sha256sum strings nproc diff "
         "login getty nologin su passwd vlock adduser addgroup chpasswd"
@@ -439,12 +442,15 @@ def configure() -> None:
         "var/log", "var/log/ddm", "var/lib/xkb", "var/lib/ddm", "var/lib/spaceos",
         "etc/systemg", "etc/ddm", "usr/share/spui", "usr/share/xsessions", "etc/spui",
         "etc/uxconf/channels", "var/lib/uxconf/channels", "var/cache/fontconfig",
-        "var/mail", "run/ddm", "run/user",
+        "var/mail", "run/ddm", "run/user", "run/NetworkManager",
+        "etc/NetworkManager/system-connections", "usr/sbin",
     ):
         (STAGE / directory).mkdir(parents=True, exist_ok=True)
     os.chmod(STAGE / "tmp", 0o1777)
     os.chmod(STAGE / "run" / "ddm", 0o711)
     os.chmod(STAGE / "run" / "user", 0o755)
+    os.chmod(STAGE / "run" / "NetworkManager", 0o755)
+    os.chmod(STAGE / "etc" / "NetworkManager" / "system-connections", 0o755)
     os.chmod(STAGE / "var" / "lib" / "ddm", 0o700)
     os.chmod(STAGE / "var" / "log" / "ddm", 0o755)
     os.chmod(STAGE / "home", 0o755)
@@ -463,6 +469,7 @@ def configure() -> None:
         "usr/bin/drm-probe",
         "etc/spui/settings.conf",
         "etc/systemg/desktop.service",
+        "etc/systemg/netmgr.service",
         "home/user",
         "etc/systemg/oobe.service",
     ):
@@ -541,6 +548,16 @@ def configure() -> None:
             '/clock-seconds = bool:false\n'
             '/clock-show-date = bool:true\n'
             '/timezone = string:"UTC"\n'
+        ),
+        "network": (
+            '# uxconf channel: network\n'
+            '/address = string:"10.0.2.15"\n'
+            '/apply-serial = int:0\n'
+            '/dns = string:"10.0.2.3"\n'
+            '/enabled = bool:true\n'
+            '/gateway = string:"10.0.2.2"\n'
+            '/mode = string:"dhcp"\n'
+            '/prefixlen = int:24\n'
         ),
     }
     for channel_name, channel_body in uxconf_defaults.items():
@@ -711,8 +728,15 @@ EndSection
     spui = ROOT / "target" / "x86_64-unknown-linux-musl" / os.environ.get("SPUI_PROFILE", "release")
     if spui.is_dir():
         for path in sorted(spui.iterdir()):
-            if path.is_file() and os.access(path, os.X_OK) and path.name in ("spui", "uxconfd", "uxconf-query"):
+            if path.is_file() and os.access(path, os.X_OK) and path.name in (
+                "spui", "uxconfd", "uxconf-query", "NetworkManager", "nmcli"
+            ):
                 install_binary(path, f"/usr/bin/{path.name}")
+        if (STAGE / "usr/bin/NetworkManager").exists():
+            nm_sbin = STAGE / "usr/sbin/NetworkManager"
+            if nm_sbin.is_symlink() or nm_sbin.exists():
+                nm_sbin.unlink()
+            nm_sbin.symlink_to("/usr/bin/NetworkManager")
     assets = ROOT / "user" / "desktop" / "assets"
     if assets.is_dir():
         for path in assets.rglob("*"):

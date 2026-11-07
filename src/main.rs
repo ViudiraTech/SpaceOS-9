@@ -33,6 +33,7 @@ mod kallsyms;
 mod mm;
 #[cfg(feature = "modules")]
 pub mod module;
+pub mod net;
 pub mod pci;
 pub mod printk;
 mod random;
@@ -176,6 +177,7 @@ pub extern "C" fn kmain() -> ! {
     hardware::ps2::init();
     block::init();
     vfs::init();
+    net::init();
     #[cfg(feature = "modules")]
     module::init();
     gpu::init();
@@ -186,6 +188,7 @@ pub extern "C" fn kmain() -> ! {
     smp::start();
     kinfo!("Scheduler: per-CPU EEVDF ready");
     vfs::start_services();
+    net::start();
     match boot::init_path() {
         Some(path) => match vfs::read_file(&path) {
             Ok(image) => match user::spawn_init(&image, &path) {

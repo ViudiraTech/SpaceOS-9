@@ -43,6 +43,7 @@ pub enum Icon {
     WindowManager,
     Display,
     InputDevices,
+    Network,
     Applications,
     DateTime,
     About,
@@ -72,6 +73,8 @@ pub enum Icon {
     Shutdown,
     Bell,
     BellActive,
+    NetworkWired,
+    NetworkOffline,
     Info,
 }
 
@@ -95,6 +98,7 @@ impl Icon {
             Self::WindowManager => Some("windows.svg"),
             Self::Display => Some("display.svg"),
             Self::InputDevices => Some("peripherals.svg"),
+            Self::Network => Some("network.svg"),
             Self::Applications => Some("applications.svg"),
             Self::DateTime => Some("datetime.svg"),
             Self::About => Some("about.svg"),
@@ -124,6 +128,8 @@ impl Icon {
             Self::Shutdown => Some("shutdown.svg"),
             Self::Bell => Some("bell.svg"),
             Self::BellActive => Some("bell-active.svg"),
+            Self::NetworkWired => Some("network-wired.svg"),
+            Self::NetworkOffline => Some("network-offline.svg"),
             Self::Info => Some("info.svg"),
         }
     }
@@ -143,6 +149,8 @@ impl Icon {
                 | Self::Shutdown
                 | Self::Bell
                 | Self::BellActive
+                | Self::NetworkWired
+                | Self::NetworkOffline
                 | Self::Info
         )
     }

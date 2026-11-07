@@ -34,7 +34,7 @@ pub type InitFn = unsafe extern "C" fn() -> i32;
 pub type ExitFn = unsafe extern "C" fn();
 
 pub const SPK_MODULE_MAGIC: u32 = 0x4d4b_5053; // "SPKM"
-pub const SPK_MODULE_ABI_VERSION: u32 = 1;
+pub const SPK_MODULE_ABI_VERSION: u32 = 2;
 const METADATA_SIZE: usize = 56;
 
 const SHT_PROGBITS: u32 = 1;

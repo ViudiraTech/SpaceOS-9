@@ -16,6 +16,7 @@
 
 pub mod api;
 mod elf;
+pub mod hw;
 #[cfg(feature = "boot-self-test")]
 pub mod self_test;
 mod sysfs;
@@ -31,7 +32,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::{kinfo, kwarn, sched, sync::SpinLock, time, vfs::abi};
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 const MAX_PARAMS: usize = 1024;
 
 struct LoadedModule {

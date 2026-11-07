@@ -76,6 +76,7 @@ def start(arguments: argparse.Namespace) -> int:
         "-device", "virtio-gpu-pci,id=desktop-gpu,xres=1280,yres=800",
         "-device", "virtio-tablet-pci",
         "-device", "virtio-keyboard-pci",
+        *(["-nic", arguments.nic] if arguments.nic != "none" else []),
         "-drive", f"file={IMAGE},if=none,id=root,format=raw",
         "-device", "nvme,serial=SPROOT,drive=root",
         "-drive", f"if=pflash,format=raw,readonly=on,file={FIRMWARE}",
@@ -298,6 +299,8 @@ def main() -> int:
     start_parser.add_argument("--iso")
     start_parser.add_argument("--display", default="none",
                               help="QEMU display backend (none, sdl, gtk)")
+    start_parser.add_argument("--nic", default="user,model=e1000e",
+                              help="QEMU -nic specification (default: user,model=e1000e; 'none' disables)")
     start_parser.add_argument("--gdb", action="store_true",
                               help="Expose the QEMU GDB stub on tcp::1234")
     start_parser.set_defaults(handler=start)

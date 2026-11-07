@@ -95,8 +95,9 @@ const APPS: [AppEntry; 8] = [
     },
     AppEntry {
         name: "系统设置",
-        subtitle: "外观、桌面、输入设备与系统偏好",
-        keywords: "settings display wallpaper theme 外观 壁纸 分辨率 设置",
+        subtitle: "外观、网络、桌面、输入设备与系统偏好",
+        keywords:
+            "settings network ip dhcp ethernet display wallpaper theme 外观 网络 壁纸 分辨率 设置",
         icon: Icon::Settings,
         mode: "settings",
     },
@@ -116,6 +117,7 @@ enum Hit {
     Start,
     Pinned(usize),
     Window(usize),
+    Network,
     Bell,
     MenuRow(usize),
     Logout,
@@ -170,6 +172,9 @@ pub struct Shell {
     active: Option<Window>,
     hover: Hit,
     clock_tick: (i32, i32, i32),
+    net_fd: Option<i32>,
+    net_status: crate::netmgr::NetStatus,
+    last_net_refresh: Instant,
     last_launch: Option<(&'static str, Instant)>,
     running: bool,
 }
@@ -444,6 +449,9 @@ impl Shell {
         let toast_canvas =
             x.create_canvas(TOAST_WIDTH as usize, TOAST_HEIGHT as usize, theme.panel);
 
+        let net_fd = crate::netmgr::open_event_socket();
+        let net_status = crate::netmgr::query_status();
+
         let mut shell = Self {
             x,
             text,
@@ -473,6 +481,9 @@ impl Shell {
             active: None,
             hover: Hit::None,
             clock_tick: (-1, -1, -1),
+            net_fd,
+            net_status,
+            last_net_refresh: Instant::now(),
             last_launch: None,
             running: true,
         };
@@ -769,9 +780,27 @@ impl Shell {
         Ok(())
     }
 
+    fn refresh_net_status(&mut self) -> bool {
+        let next = crate::netmgr::query_status();
+        self.last_net_refresh = Instant::now();
+        let visual_changed = next.panel_label() != self.net_status.panel_label()
+            || next.connected() != self.net_status.connected()
+            || next.up != self.net_status.up
+            || next.has_device != self.net_status.has_device;
+        self.net_status = next;
+        visual_changed
+    }
+
     fn event_loop(&mut self) -> Result<()> {
         while self.running {
             self.poll_uxconf()?;
+
+            let mut net_dirty = false;
+            if let Some(fd) = self.net_fd {
+                if crate::netmgr::drain_events(fd) {
+                    net_dirty |= self.refresh_net_status();
+                }
+            }
 
             let mut raw = Vec::new();
             while let Some(event) = self.x.poll()? {
@@ -787,13 +816,23 @@ impl Shell {
                 } else {
                     500
                 };
-                let (_, ux_ready, _) = self.x.wait_fds(ux_fd, None, timeout);
+                let (_, ux_ready, net_ready) = self.x.wait_fds(ux_fd, self.net_fd, timeout);
                 if ux_ready {
                     self.poll_uxconf()?;
+                }
+                if net_ready {
+                    if let Some(fd) = self.net_fd {
+                        let _ = crate::netmgr::drain_events(fd);
+                    }
+                    net_dirty |= self.refresh_net_status();
                 }
                 while let Some(event) = self.x.poll()? {
                     raw.push(event);
                 }
+            }
+
+            if self.last_net_refresh.elapsed() >= Duration::from_secs(3) {
+                net_dirty |= self.refresh_net_status();
             }
 
             // Coalesce burst MotionNotify events on the same shell window.
@@ -815,7 +854,7 @@ impl Shell {
             }
 
             let anim_active = ui::has_active_animations();
-            if self.update_clock() || anim_active {
+            if self.update_clock() || anim_active || net_dirty {
                 self.draw_taskbar();
                 self.present_taskbar()?;
             }
@@ -1045,7 +1084,7 @@ impl Shell {
                 if (e.event == self.taskbar
                     && matches!(
                         prev,
-                        Hit::Start | Hit::Pinned(_) | Hit::Window(_) | Hit::Bell
+                        Hit::Start | Hit::Pinned(_) | Hit::Window(_) | Hit::Network | Hit::Bell
                     ))
                     || (e.event == self.menu && matches!(prev, Hit::MenuRow(_) | Hit::Logout))
                     || (e.event == self.ctx_menu && matches!(prev, Hit::ContextRow(_)))
@@ -1415,7 +1454,7 @@ impl Shell {
         } else {
             106
         };
-        let right_reserve = self.tray_width() + 56;
+        let right_reserve = self.tray_width() + 184;
         let available = (i32::from(self.x.width) - start_x - right_reserve).max(120);
         let count = self.windows.len().clamp(1, 6) as i32;
         let btn_w = ((available - (count - 1) * 4) / count).clamp(80, 160);
@@ -1425,6 +1464,11 @@ impl Shell {
             btn_w,
             bh,
         )
+    }
+
+    fn net_rect(&self) -> Rect {
+        let bell = self.bell_rect();
+        Rect::new(bell.x - 126, bell.y, 122, bell.h)
     }
 
     fn bell_rect(&self) -> Rect {
@@ -1449,6 +1493,9 @@ impl Shell {
             if self.window_button_rect(index).contains(x, y) {
                 return Hit::Window(index);
             }
+        }
+        if self.net_rect().contains(x, y) {
+            return Hit::Network;
         }
         if self.bell_rect().contains(x, y) {
             return Hit::Bell;
@@ -1475,6 +1522,32 @@ impl Shell {
                         self.activate(window)?;
                     }
                 }
+                Ok(())
+            }
+            Hit::Network => {
+                self.close_menu()?;
+                let _ = self.refresh_net_status();
+                let st = &self.net_status;
+                if let Some((ip, prefix)) = st.ipv4.filter(|_| st.up && st.carrier) {
+                    let gw = st
+                        .gateway
+                        .map(|g| g.to_string())
+                        .unwrap_or_else(|| "无".to_string());
+                    let rx = crate::netmgr::NetStatus::format_bytes(st.rx_bytes);
+                    let tx = crate::netmgr::NetStatus::format_bytes(st.tx_bytes);
+                    let title = format!("有线网络 · {} (已连接)", st.ifname);
+                    let body = format!("{ip}/{prefix} · 网关 {gw} · ↓{rx} ↑{tx}");
+                    self.show_toast(&title, &body);
+                } else {
+                    let title = if st.has_device {
+                        format!("有线网络 · {}", st.ifname)
+                    } else {
+                        "有线网络".to_string()
+                    };
+                    let body = format!("当前状态：{} · 点击配置网络", st.panel_label());
+                    self.show_toast(&title, &body);
+                }
+                self.launch_arg("settings", "network");
                 Ok(())
             }
             Hit::Bell => {
@@ -1615,6 +1688,14 @@ impl Shell {
     }
 
     fn launch(&mut self, mode: &'static str) {
+        self.launch_inner(mode, None);
+    }
+
+    fn launch_arg(&mut self, mode: &'static str, arg: &str) {
+        self.launch_inner(mode, Some(arg));
+    }
+
+    fn launch_inner(&mut self, mode: &'static str, extra_arg: Option<&str>) {
         let now = Instant::now();
         if let Some((prev_mode, ts)) = self.last_launch {
             if prev_mode == mode && now.duration_since(ts) < Duration::from_millis(350) {
@@ -1625,7 +1706,12 @@ impl Shell {
         let Ok(path) = std::env::current_exe() else {
             return;
         };
-        let _ = Command::new(path).arg(mode).spawn();
+        let mut cmd = Command::new(path);
+        cmd.arg(mode);
+        if let Some(arg) = extra_arg {
+            cmd.arg(arg);
+        }
+        let _ = cmd.spawn();
     }
 
     fn show_toast(&mut self, title: &str, body: &str) {
@@ -1725,6 +1811,7 @@ impl Shell {
         let pinned_rects: [Rect; 8] = std::array::from_fn(|i| self.pinned_rect(i));
         let win_count = self.windows.len().min(6);
         let win_rects: Vec<Rect> = (0..win_count).map(|i| self.window_button_rect(i)).collect();
+        let net = self.net_rect();
         let bell = self.bell_rect();
         let tray_w = self.tray_width();
         let border_y = if self.config.panel_position == PanelPosition::Top {
@@ -1821,7 +1908,13 @@ impl Shell {
             canvas.rounded_rect(rect, RADIUS_CONTROL, bg, 1.0);
             if is_active || hov_t > 0.001 {
                 let border_alpha = if is_active { 1.0 } else { hov_t };
-                canvas.rounded_border(rect, RADIUS_CONTROL, self.theme.panel_border, border_alpha, 1);
+                canvas.rounded_border(
+                    rect,
+                    RADIUS_CONTROL,
+                    self.theme.panel_border,
+                    border_alpha,
+                    1,
+                );
             }
             if is_active {
                 canvas.rounded_rect(
@@ -1866,7 +1959,72 @@ impl Shell {
             );
         }
 
-        // Right tray: notification bell & configurable clock.
+        // Right tray: live wired network pill, notification bell & configurable clock.
+        let net_hov = ui::animate_bool(net, self.hover == Hit::Network, ui::MOTION_HOVER);
+        let net_connected = self.net_status.connected();
+        canvas.rounded_rect(net, RADIUS_CONTROL, self.theme.window_alt, 0.55);
+        if net_hov > 0.001 {
+            canvas.rounded_rect(net, RADIUS_CONTROL, self.theme.panel_hover, net_hov);
+        }
+        canvas.rounded_border(
+            net,
+            RADIUS_CONTROL,
+            if net_hov > 0.001 {
+                crate::draw::mix(self.theme.panel_border, self.theme.accent, 0.5 * net_hov)
+            } else {
+                self.theme.panel_border
+            },
+            0.75,
+            1,
+        );
+        icons::draw(
+            canvas,
+            if net_connected {
+                Icon::NetworkWired
+            } else {
+                Icon::NetworkOffline
+            },
+            net.x + 8,
+            net.y + (net.h - 16) / 2,
+            16,
+            Some(if net_connected {
+                self.theme.text
+            } else {
+                self.theme.text_muted
+            }),
+        );
+        let dot_color = if net_connected {
+            self.theme.success
+        } else if self.net_status.has_device && self.net_status.up {
+            self.theme.warning
+        } else {
+            self.theme.text_muted
+        };
+        canvas.circle(
+            (net.x + 30) as f32,
+            net.y as f32 + net.h as f32 * 0.5,
+            3.0,
+            dot_color,
+            1.0,
+        );
+        let net_label = self.net_status.panel_label();
+        let net_shown = self
+            .text
+            .truncate(&net_label, (net.w - 44).max(32) as f32, 11.5, Face::Ui);
+        self.text.draw(
+            canvas,
+            &net_shown,
+            (net.x + 38) as f32,
+            net.y as f32 + net.h as f32 * 0.5 + 4.2,
+            11.5,
+            if net_connected {
+                self.theme.text
+            } else {
+                self.theme.text_dim
+            },
+            Face::Ui,
+        );
+
         let bell_hov = ui::animate_bool(bell, self.hover == Hit::Bell, ui::MOTION_HOVER);
         if bell_hov > 0.001 {
             canvas.rounded_rect(bell, RADIUS_CONTROL, self.theme.panel_hover, bell_hov);

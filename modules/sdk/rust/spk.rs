@@ -17,7 +17,7 @@
 use core::ffi::{c_char, c_int};
 
 pub const SPK_MODULE_MAGIC: u32 = 0x4D4B_5053;
-pub const SPK_MODULE_ABI_VERSION: u32 = 1;
+pub const SPK_MODULE_ABI_VERSION: u32 = 2;
 
 pub const VERMAGIC_C: &[u8] = concat!(env!("SPK_VERMAGIC"), "\0").as_bytes();
 

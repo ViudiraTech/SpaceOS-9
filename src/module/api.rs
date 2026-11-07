@@ -65,22 +65,190 @@ pub static EXPORTS: &[Export] = &[
     export!("memcpy", memcpy),
     export!("memmove", memmove),
     export!("memset", memset),
+    export!(
+        "spk_dma_alloc_coherent",
+        crate::module::hw::spk_dma_alloc_coherent
+    ),
+    export!(
+        "spk_dma_free_coherent",
+        crate::module::hw::spk_dma_free_coherent
+    ),
+    export!("spk_dma_map_single", crate::module::hw::spk_dma_map_single),
+    export!(
+        "spk_dma_unmap_single",
+        crate::module::hw::spk_dma_unmap_single
+    ),
+    export!(
+        "spk_eth_type_trans",
+        crate::net::module_api::spk_eth_type_trans
+    ),
+    export!("spk_free_irq", crate::module::hw::spk_free_irq),
     export!("spk_get_cpu", spk_get_cpu),
     export!("spk_getpid", spk_getpid),
+    export!("spk_ioremap", crate::module::hw::spk_ioremap),
+    export!("spk_iounmap", crate::module::hw::spk_iounmap),
     export!("spk_kernel_version", spk_kernel_version),
     export!("spk_kfree", spk_kfree),
+    export!("spk_kthread_create", crate::module::hw::spk_kthread_create),
     export!("spk_kmalloc", spk_kmalloc),
     export!("spk_krealloc", spk_krealloc),
     export!("spk_kzalloc", spk_kzalloc),
+    export!("spk_mb", crate::module::hw::spk_mb),
     export!("spk_module_name", spk_module_name),
     export!("spk_msleep", spk_msleep),
+    export!("spk_napi_add", crate::net::module_api::spk_napi_add),
+    export!(
+        "spk_napi_complete",
+        crate::net::module_api::spk_napi_complete
+    ),
+    export!("spk_napi_del", crate::net::module_api::spk_napi_del),
+    export!("spk_napi_disable", crate::net::module_api::spk_napi_disable),
+    export!("spk_napi_enable", crate::net::module_api::spk_napi_enable),
+    export!(
+        "spk_napi_schedule",
+        crate::net::module_api::spk_napi_schedule
+    ),
+    export!("spk_netdev_alloc", crate::net::module_api::spk_netdev_alloc),
+    export!("spk_netdev_free", crate::net::module_api::spk_netdev_free),
+    export!(
+        "spk_netdev_get_address",
+        crate::net::module_api::spk_netdev_get_address
+    ),
+    export!(
+        "spk_netdev_get_flags",
+        crate::net::module_api::spk_netdev_get_flags
+    ),
+    export!(
+        "spk_netdev_ifindex",
+        crate::net::module_api::spk_netdev_ifindex
+    ),
+    export!("spk_netdev_mtu", crate::net::module_api::spk_netdev_mtu),
+    export!("spk_netdev_name", crate::net::module_api::spk_netdev_name),
+    export!("spk_netdev_priv", crate::net::module_api::spk_netdev_priv),
+    export!(
+        "spk_netdev_register",
+        crate::net::module_api::spk_netdev_register
+    ),
+    export!(
+        "spk_netdev_unregister",
+        crate::net::module_api::spk_netdev_unregister
+    ),
+    export!(
+        "spk_netif_carrier_off",
+        crate::net::module_api::spk_netif_carrier_off
+    ),
+    export!(
+        "spk_netif_carrier_on",
+        crate::net::module_api::spk_netif_carrier_on
+    ),
+    export!("spk_netif_rx", crate::net::module_api::spk_netif_rx),
+    export!(
+        "spk_netif_stop_queue",
+        crate::net::module_api::spk_netif_stop_queue
+    ),
+    export!(
+        "spk_netif_wake_queue",
+        crate::net::module_api::spk_netif_wake_queue
+    ),
+    export!(
+        "spk_pci_disable_msi",
+        crate::module::hw::spk_pci_disable_msi
+    ),
+    export!(
+        "spk_pci_disable_msix",
+        crate::module::hw::spk_pci_disable_msix
+    ),
+    export!(
+        "spk_pci_driver_register",
+        crate::module::hw::spk_pci_driver_register
+    ),
+    export!(
+        "spk_pci_driver_unregister",
+        crate::module::hw::spk_pci_driver_unregister
+    ),
+    export!(
+        "spk_pci_enable_device",
+        crate::module::hw::spk_pci_enable_device
+    ),
+    export!("spk_pci_enable_msi", crate::module::hw::spk_pci_enable_msi),
+    export!(
+        "spk_pci_enable_msix",
+        crate::module::hw::spk_pci_enable_msix
+    ),
+    export!("spk_pci_irq_line", crate::module::hw::spk_pci_irq_line),
+    export!(
+        "spk_pci_read_config_byte",
+        crate::module::hw::spk_pci_read_config_byte
+    ),
+    export!(
+        "spk_pci_read_config_dword",
+        crate::module::hw::spk_pci_read_config_dword
+    ),
+    export!(
+        "spk_pci_read_config_word",
+        crate::module::hw::spk_pci_read_config_word
+    ),
+    export!(
+        "spk_pci_resource_len",
+        crate::module::hw::spk_pci_resource_len
+    ),
+    export!(
+        "spk_pci_resource_start",
+        crate::module::hw::spk_pci_resource_start
+    ),
+    export!("spk_pci_set_master", crate::module::hw::spk_pci_set_master),
+    export!(
+        "spk_pci_write_config_byte",
+        crate::module::hw::spk_pci_write_config_byte
+    ),
+    export!(
+        "spk_pci_write_config_dword",
+        crate::module::hw::spk_pci_write_config_dword
+    ),
+    export!(
+        "spk_pci_write_config_word",
+        crate::module::hw::spk_pci_write_config_word
+    ),
     export!("spk_pr_err", spk_pr_err),
     export!("spk_pr_info", spk_pr_info),
     export!("spk_pr_warn", spk_pr_warn),
     export!("spk_printk", spk_printk),
+    export!("spk_readb", crate::module::hw::spk_readb),
+    export!("spk_readl", crate::module::hw::spk_readl),
+    export!("spk_readw", crate::module::hw::spk_readw),
+    export!("spk_request_irq", crate::module::hw::spk_request_irq),
+    export!("spk_skb_alloc", crate::net::module_api::spk_skb_alloc),
+    export!("spk_skb_data", crate::net::module_api::spk_skb_data),
+    export!("spk_skb_free", crate::net::module_api::spk_skb_free),
+    export!("spk_skb_len", crate::net::module_api::spk_skb_len),
+    export!("spk_skb_pull", crate::net::module_api::spk_skb_pull),
+    export!("spk_skb_push", crate::net::module_api::spk_skb_push),
+    export!("spk_skb_put", crate::net::module_api::spk_skb_put),
+    export!("spk_skb_reserve", crate::net::module_api::spk_skb_reserve),
+    export!(
+        "spk_skb_set_protocol",
+        crate::net::module_api::spk_skb_set_protocol
+    ),
+    export!("spk_skb_trim", crate::net::module_api::spk_skb_trim),
+    export!("spk_spin_lock", crate::module::hw::spk_spin_lock),
+    export!(
+        "spk_spin_lock_irqsave",
+        crate::module::hw::spk_spin_lock_irqsave
+    ),
+    export!("spk_spin_unlock", crate::module::hw::spk_spin_unlock),
+    export!(
+        "spk_spin_unlock_irqrestore",
+        crate::module::hw::spk_spin_unlock_irqrestore
+    ),
+    export!("spk_timer_add", crate::module::hw::spk_timer_add),
+    export!("spk_timer_del", crate::module::hw::spk_timer_del),
     export!("spk_udelay", spk_udelay),
     export!("spk_uptime_ms", spk_uptime_ms),
     export!("spk_uptime_us", spk_uptime_us),
+    export!("spk_work_schedule", crate::module::hw::spk_work_schedule),
+    export!("spk_writeb", crate::module::hw::spk_writeb),
+    export!("spk_writel", crate::module::hw::spk_writel),
+    export!("spk_writew", crate::module::hw::spk_writew),
 ];
 
 pub fn lookup(name: &str) -> Option<u64> {

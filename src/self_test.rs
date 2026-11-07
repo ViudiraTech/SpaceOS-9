@@ -13,6 +13,7 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::verbose::log as verbose_log;
 
 pub fn run_early() {
+    crate::net::self_test::run();
     run();
     crate::user::self_test::run();
     crate::block::run_self_test();
@@ -37,6 +38,8 @@ pub fn spawn_late() {
             #[cfg(target_arch = "x86_64")]
             crate::user::process_signal_self_test()
                 .expect("process/signal self-test failed");
+            #[cfg(feature = "modules")]
+            crate::module::self_test::network_late();
             crate::vfs::pseudo_test::processes();
             crate::vfs::dcache::self_test();
             crate::user::self_test::syscalls();

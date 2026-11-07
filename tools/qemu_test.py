@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--gpu", choices=["2d", "virgl", "venus"])
     parser.add_argument("--cpu")
     parser.add_argument("--machine")
+    parser.add_argument("--nic", help="QEMU -nic argument, e.g. user,model=e1000")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--online-cpus", type=int)
     parser.add_argument("--require", action="append", default=[])
@@ -71,6 +72,8 @@ def main():
         command += ["-cpu", cpu]
     if args.accel:
         command += ["-accel", args.accel]
+    if args.nic:
+        command += ["-nic", args.nic]
 
     temp_dir = tempfile.TemporaryDirectory(prefix="spacekernel_disks_")
     nvme_img = os.path.join(temp_dir.name, "nvme.img")

@@ -18,16 +18,18 @@ use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
 use crate::ui;
-use crate::x11::Result;
+use crate::x11::{CursorKind, Result};
 use std::ffi::CStr;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use uxconf::{
     format_hex_rgb, BackdropStyle, ButtonLayout, CursorStyle, DesktopConfig, DoubleClickAction,
-    FocusMode, PanelPosition, ThemeMode, Value, WindowPlacement, ACCENT_PRESETS, RESOLUTIONS,
-    SOLID_BG_PRESETS, TIMEZONES, WALLPAPERS, WALLPAPER_DIR,
+    FocusMode, NetMode, PanelPosition, ThemeMode, Value, WindowPlacement, ACCENT_PRESETS,
+    RESOLUTIONS, SOLID_BG_PRESETS, TIMEZONES, WALLPAPERS, WALLPAPER_DIR,
 };
 use x11rb::protocol::xproto::ConnectionExt;
 
@@ -64,6 +66,7 @@ const TAB_WIDTHS: [(i64, &str); 3] = [(2, "2 空格"), (4, "4 空格"), (8, "8 �
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
     Appearance,
+    Network,
     DesktopPanel,
     Windows,
     Display,
@@ -78,6 +81,7 @@ impl Page {
     const fn title(self) -> &'static str {
         match self {
             Self::Appearance => "外观",
+            Self::Network => "网络",
             Self::DesktopPanel => "桌面与面板",
             Self::Windows => "窗口",
             Self::Display => "显示",
@@ -92,6 +96,7 @@ impl Page {
     const fn channels(self) -> &'static [&'static str] {
         match self {
             Self::Appearance => &["appearance"],
+            Self::Network => &["network"],
             Self::DesktopPanel => &["desktop", "panel"],
             Self::Windows => &["wm"],
             Self::Display => &["display"],
@@ -104,8 +109,9 @@ impl Page {
     }
 }
 
-const NAV: [(Page, &str, Icon); 9] = [
+const NAV: [(Page, &str, Icon); 10] = [
     (Page::Appearance, "外观", Icon::Appearance),
+    (Page::Network, "网络", Icon::Network),
     (Page::DesktopPanel, "桌面与面板", Icon::Panel),
     (Page::Windows, "窗口", Icon::WindowManager),
     (Page::Display, "显示", Icon::Display),
@@ -123,6 +129,13 @@ enum HitTarget {
     ThemeMode(ThemeMode),
     Accent(usize),
     FontScale(usize),
+    NetEnabled,
+    NetMode(usize),
+    NetInput(usize),
+    NetApply,
+    NetRenew,
+    NetRefresh,
+    NetPingGateway,
     BackdropStyle(usize),
     Wallpaper(usize),
     SolidColor(usize),
@@ -630,13 +643,103 @@ fn nearest_preset_index(presets: &[(i64, &str)], value: i64) -> usize {
         .map_or(0, |(idx, _)| idx)
 }
 
-pub fn run() -> Result<()> {
+struct NetPageState {
+    status: crate::netmgr::NetStatus,
+    inputs: [String; 4],
+    focused: Option<usize>,
+    ping_note: String,
+    last_refresh: Instant,
+}
+
+impl NetPageState {
+    fn new(cfg: &DesktopConfig) -> Self {
+        Self {
+            status: crate::netmgr::query_status(),
+            inputs: [
+                cfg.net_address.clone(),
+                cfg.net_prefixlen.to_string(),
+                cfg.net_gateway.clone(),
+                cfg.net_dns.clone(),
+            ],
+            focused: None,
+            ping_note: String::new(),
+            last_refresh: Instant::now(),
+        }
+    }
+
+    fn sync_from_config(&mut self, cfg: &DesktopConfig) {
+        self.inputs = [
+            cfg.net_address.clone(),
+            cfg.net_prefixlen.to_string(),
+            cfg.net_gateway.clone(),
+            cfg.net_dns.clone(),
+        ];
+    }
+
+    fn refresh(&mut self) {
+        self.status = crate::netmgr::query_status();
+        self.last_refresh = Instant::now();
+    }
+}
+
+fn parse_initial_page(arg: Option<&str>) -> Page {
+    match arg.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("network" | "net") => Page::Network,
+        Some("desktop" | "panel") => Page::DesktopPanel,
+        Some("windows" | "wm") => Page::Windows,
+        Some("display") => Page::Display,
+        Some("input") => Page::Input,
+        Some("apps" | "applications") => Page::Applications,
+        Some("datetime" | "time") => Page::DateTime,
+        Some("logs" | "journal") => Page::Logs,
+        Some("about") => Page::About,
+        _ => Page::Appearance,
+    }
+}
+
+fn apply_static_network_settings(app: &mut App, net_state: &mut NetPageState, status: &mut String) {
+    let addr_raw = net_state.inputs[0].trim();
+    if addr_raw.parse::<Ipv4Addr>().is_err() {
+        *status = "IPv4 地址格式无效（示例：10.0.2.15）".to_string();
+        return;
+    }
+    let Some(prefixlen) = crate::netmgr::parse_prefix_or_netmask(&net_state.inputs[1]) else {
+        *status = "子网前缀或掩码无效（示例：24 或 255.255.255.0）".to_string();
+        return;
+    };
+    let gw_raw = net_state.inputs[2].trim();
+    if !gw_raw.is_empty() && gw_raw.parse::<Ipv4Addr>().is_err() {
+        *status = "默认网关格式无效（示例：10.0.2.2）".to_string();
+        return;
+    }
+    let dns_raw = net_state.inputs[3].trim();
+    if !dns_raw.is_empty() && dns_raw.parse::<Ipv4Addr>().is_err() {
+        *status = "DNS 服务器地址格式无效（示例：10.0.2.3）".to_string();
+        return;
+    }
+
+    let next_serial = app.config.net_apply_serial.wrapping_add(1);
+    app.set_config_property("network", "/address", Value::String(addr_raw.to_string()));
+    app.set_config_property("network", "/prefixlen", Value::Int(i64::from(prefixlen)));
+    app.set_config_property("network", "/gateway", Value::String(gw_raw.to_string()));
+    app.set_config_property("network", "/dns", Value::String(dns_raw.to_string()));
+    app.set_config_property("network", "/apply-serial", Value::Int(next_serial));
+    net_state.inputs[1] = prefixlen.to_string();
+
+    match crate::netmgr::request_apply(&app.config) {
+        Ok(msg) => *status = msg,
+        Err(err) => *status = err,
+    }
+    net_state.refresh();
+}
+
+pub fn run(initial_page: Option<&str>) -> Result<()> {
     let mut app = App::new("系统设置", Icon::Settings, 840, 580)?;
     app.min_width = 760;
     app.min_height = 500;
     apply_local_timezone(&app.config.timezone);
 
-    let mut page = Page::Appearance;
+    let mut page = parse_initial_page(initial_page);
     let mut scroll_y: i32 = 0;
     let mut content_h: i32 = 0;
     let mut hover: Option<HitTarget> = None;
@@ -647,6 +750,8 @@ pub fn run() -> Result<()> {
     let thumbnails = load_wallpaper_thumbnails();
     let sys_info = SystemInfo::gather();
     let mut log_state = LogViewerState::load();
+    let mut net_state = NetPageState::new(&app.config);
+    let net_fd = crate::netmgr::open_event_socket();
 
     loop {
         if page == Page::DateTime {
@@ -655,6 +760,11 @@ pub fn run() -> Result<()> {
                 last_clock_preview = now_str;
                 app.needs_redraw = true;
             }
+        } else if page == Page::Network
+            && net_state.last_refresh.elapsed() >= Duration::from_millis(1800)
+        {
+            net_state.refresh();
+            app.needs_redraw = true;
         }
 
         if app.needs_redraw {
@@ -672,6 +782,7 @@ pub fn run() -> Result<()> {
                 screen_size,
                 &sys_info,
                 &log_state,
+                &net_state,
                 &status,
                 &mut hits,
             );
@@ -691,6 +802,7 @@ pub fn run() -> Result<()> {
                     screen_size,
                     &sys_info,
                     &log_state,
+                    &net_state,
                     &status,
                     &mut hits,
                 );
@@ -708,7 +820,16 @@ pub fn run() -> Result<()> {
         } else {
             500
         };
-        let (events, _) = app.pump_with_fd(None, timeout_ms)?;
+        let (events, net_ready) = app.pump_with_fd(net_fd, timeout_ms)?;
+        if net_ready {
+            if let Some(fd) = net_fd {
+                let _ = crate::netmgr::drain_events(fd);
+            }
+            net_state.refresh();
+            if page == Page::Network {
+                app.needs_redraw = true;
+            }
+        }
         for event in events {
             match event {
                 UiEvent::Close => app.request_close(),
@@ -719,7 +840,44 @@ pub fn run() -> Result<()> {
                 UiEvent::ConfigChanged => {
                     apply_local_timezone(&app.config.timezone);
                     screen_size = query_root_resolution(&app);
+                    if net_state.focused.is_none() {
+                        net_state.sync_from_config(&app.config);
+                    }
+                    net_state.refresh();
                     app.needs_redraw = true;
+                }
+                UiEvent::Key(key) if page == Page::Network => {
+                    if let Some(idx) = net_state.focused {
+                        if key.is_escape() {
+                            net_state.focused = None;
+                            app.needs_redraw = true;
+                        } else if key.is_tab() {
+                            net_state.focused = Some(if key.shift() {
+                                (idx + 3) % 4
+                            } else {
+                                (idx + 1) % 4
+                            });
+                            app.needs_redraw = true;
+                        } else if key.is_backspace() {
+                            net_state.inputs[idx].pop();
+                            app.needs_redraw = true;
+                        } else if key.ctrl_byte() == Some(21) {
+                            net_state.inputs[idx].clear();
+                            app.needs_redraw = true;
+                        } else if key.is_enter() {
+                            apply_static_network_settings(&mut app, &mut net_state, &mut status);
+                            app.needs_redraw = true;
+                        } else if !key.control() && !key.alt() {
+                            if let Some(ch) = key.text() {
+                                if (ch.is_ascii_digit() || matches!(ch, '.' | '/'))
+                                    && net_state.inputs[idx].len() < 31
+                                {
+                                    net_state.inputs[idx].push(ch);
+                                    app.needs_redraw = true;
+                                }
+                            }
+                        }
+                    }
                 }
                 UiEvent::Wheel { x, y, delta } => {
                     let vp = scroll_viewport(app.width as i32, app.height as i32);
@@ -738,6 +896,12 @@ pub fn run() -> Result<()> {
                     } else {
                         None
                     };
+                    let cursor = match next {
+                        Some(HitTarget::NetInput(_)) => CursorKind::Text,
+                        Some(_) => CursorKind::Pointer,
+                        None => CursorKind::Default,
+                    };
+                    app.set_content_cursor(cursor);
                     if next != hover {
                         hover = next;
                         app.needs_redraw = true;
@@ -750,7 +914,12 @@ pub fn run() -> Result<()> {
                     down: true,
                     ..
                 } if y >= TITLEBAR_HEIGHT => {
-                    if let Some(target) = find_hit(&hits, x, y) {
+                    let hit = find_hit(&hits, x, y);
+                    if !matches!(hit, Some(HitTarget::NetInput(_))) && net_state.focused.is_some() {
+                        net_state.focused = None;
+                        app.needs_redraw = true;
+                    }
+                    if let Some(target) = hit {
                         handle_click(
                             &mut app,
                             target,
@@ -759,6 +928,7 @@ pub fn run() -> Result<()> {
                             &mut screen_size,
                             &mut status,
                             &mut log_state,
+                            &mut net_state,
                         );
                     }
                 }
@@ -766,9 +936,17 @@ pub fn run() -> Result<()> {
             }
         }
     }
+
+    if let Some(fd) = net_fd {
+        // SAFETY: Owned Netlink event descriptor closed once on exit.
+        unsafe {
+            libc::close(fd);
+        }
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_click(
     app: &mut App,
     target: HitTarget,
@@ -777,6 +955,7 @@ fn handle_click(
     screen_size: &mut (u16, u16),
     status: &mut String,
     log_state: &mut LogViewerState,
+    net_state: &mut NetPageState,
 ) {
     status.clear();
     match target {
@@ -785,8 +964,11 @@ fn handle_click(
             if *page != next_page {
                 *page = next_page;
                 *scroll_y = 0;
+                net_state.focused = None;
                 if next_page == Page::Display {
                     *screen_size = query_root_resolution(app);
+                } else if next_page == Page::Network {
+                    net_state.refresh();
                 }
             }
         }
@@ -799,6 +981,11 @@ fn handle_click(
                 *screen_size = query_root_resolution(app);
             } else if *page == Page::DateTime {
                 apply_local_timezone(&app.config.timezone);
+            } else if *page == Page::Network {
+                net_state.focused = None;
+                net_state.sync_from_config(&app.config);
+                let _ = crate::netmgr::request_apply(&app.config);
+                net_state.refresh();
             }
             *status = "已恢复默认设置".to_string();
         }
@@ -819,6 +1006,86 @@ fn handle_click(
         }
         HitTarget::FontScale(i) => {
             app.set_config_property("appearance", "/font/scale", Value::Int(FONT_SCALES[i].0));
+        }
+        HitTarget::NetEnabled => {
+            let next = !app.config.net_enabled;
+            app.set_config_property("network", "/enabled", Value::Bool(next));
+            match crate::netmgr::request_connect(None, next) {
+                Ok(msg) => *status = msg,
+                Err(err) => *status = err,
+            }
+            net_state.refresh();
+        }
+        HitTarget::NetMode(i) => {
+            let mode = if i == 0 {
+                NetMode::Dhcp
+            } else {
+                NetMode::Static
+            };
+            if app.config.net_mode != mode {
+                app.set_config_property(
+                    "network",
+                    "/mode",
+                    Value::String(mode.as_str().to_string()),
+                );
+                if mode == NetMode::Dhcp {
+                    net_state.focused = None;
+                    match crate::netmgr::request_apply(&app.config) {
+                        Ok(msg) => *status = msg,
+                        Err(err) => *status = err,
+                    }
+                    net_state.refresh();
+                } else {
+                    if let Some((ip, plen)) = net_state.status.ipv4 {
+                        net_state.inputs[0] = ip.to_string();
+                        net_state.inputs[1] = plen.to_string();
+                    }
+                    if let Some(gw) = net_state.status.gateway {
+                        net_state.inputs[2] = gw.to_string();
+                    }
+                    if let Some(dns) = net_state.status.dns {
+                        net_state.inputs[3] = dns.to_string();
+                    }
+                    net_state.focused = Some(0);
+                    *status = "编辑静态 IPv4 参数后点击「应用网络配置」".to_string();
+                }
+            }
+        }
+        HitTarget::NetInput(i) => {
+            net_state.focused = Some(i.min(3));
+        }
+        HitTarget::NetApply => {
+            net_state.focused = None;
+            apply_static_network_settings(app, net_state, status);
+        }
+        HitTarget::NetRenew => {
+            match crate::netmgr::request_renew(None) {
+                Ok(msg) => *status = msg,
+                Err(err) => *status = err,
+            }
+            net_state.refresh();
+        }
+        HitTarget::NetRefresh => {
+            net_state.refresh();
+            *status = "网络状态已刷新".to_string();
+        }
+        HitTarget::NetPingGateway => {
+            let target = net_state
+                .status
+                .gateway
+                .unwrap_or_else(|| Ipv4Addr::new(10, 0, 2, 2));
+            match crate::netmgr::ping_once(target, 1000) {
+                Ok(rtt) => {
+                    let msg = format!("网关 {target} 可达 · RTT {rtt:.2} ms");
+                    net_state.ping_note = msg.clone();
+                    *status = msg;
+                }
+                Err(err) => {
+                    net_state.ping_note = err.clone();
+                    *status = err;
+                }
+            }
+            net_state.refresh();
         }
         HitTarget::BackdropStyle(i) => {
             let style = [
@@ -1181,7 +1448,14 @@ fn draw_toggle_row(
     let sw_rect = Rect::new(card_x + card_w - 16 - 42, y + (ROW_H - 22) / 2, 42, 22);
     let label_max_w = sw_rect.x - (card_x + 16) - 16;
     draw_row_labels(canvas, text, theme, card_x, y, label_max_w, title, subtitle);
-    ui::toggle_switch_with_id(canvas, theme, target, sw_rect, checked, hover == Some(target));
+    ui::toggle_switch_with_id(
+        canvas,
+        theme,
+        target,
+        sw_rect,
+        checked,
+        hover == Some(target),
+    );
     push_clipped_hit(hits, viewport, sw_rect, target);
 }
 
@@ -1241,6 +1515,7 @@ fn draw_settings(
     screen_size: (u16, u16),
     sys_info: &SystemInfo,
     log_state: &LogViewerState,
+    net_state: &NetPageState,
     status: &str,
     hits: &mut Vec<HitBox>,
 ) -> i32 {
@@ -1488,6 +1763,343 @@ fn draw_settings(
                     hover,
                 );
                 y += c2.h + 18;
+            }
+
+            Page::Network => {
+                let st = &net_state.status;
+                y = draw_section_heading(
+                    canvas,
+                    text,
+                    theme,
+                    CONTENT_X,
+                    y,
+                    "有线以太网与 NetworkManager 服务",
+                );
+
+                let connected = st.connected();
+                let header_h = 68;
+                let detail_row_h = 38;
+                let detail_count = if net_state.ping_note.is_empty() { 5 } else { 6 };
+                let c_status =
+                    Rect::new(CONTENT_X, y, card_w, header_h + detail_count * detail_row_h);
+                ui::card(canvas, theme, c_status);
+
+                let badge_r = Rect::new(CONTENT_X + 16, y + 14, 40, 40);
+                let badge_bg = if connected {
+                    theme.accent_soft
+                } else {
+                    theme.window_alt
+                };
+                canvas.rounded_rect(badge_r, RADIUS_CONTROL, badge_bg, 1.0);
+                let (net_ic, ic_tint) = if connected {
+                    (Icon::NetworkWired, theme.success)
+                } else {
+                    (Icon::NetworkOffline, theme.text_muted)
+                };
+                icons::draw(
+                    canvas,
+                    net_ic,
+                    badge_r.x + 10,
+                    badge_r.y + 10,
+                    20,
+                    Some(ic_tint),
+                );
+
+                let show_renew = cfg.net_enabled && cfg.net_mode == NetMode::Dhcp && st.has_device;
+                let refresh_btn = Rect::new(c_status.right() - 16 - 62, y + 19, 62, 30);
+                let ping_btn = Rect::new(refresh_btn.x - 8 - 82, y + 19, 82, 30);
+                let renew_btn = Rect::new(ping_btn.x - 8 - 76, y + 19, 76, 30);
+
+                ui::button(
+                    canvas,
+                    text,
+                    theme,
+                    refresh_btn,
+                    "刷新",
+                    None,
+                    false,
+                    hover == Some(HitTarget::NetRefresh),
+                );
+                push_clipped_hit(hits, viewport, refresh_btn, HitTarget::NetRefresh);
+
+                ui::button(
+                    canvas,
+                    text,
+                    theme,
+                    ping_btn,
+                    "探测网关",
+                    None,
+                    false,
+                    hover == Some(HitTarget::NetPingGateway),
+                );
+                push_clipped_hit(hits, viewport, ping_btn, HitTarget::NetPingGateway);
+
+                let right_limit = if show_renew {
+                    ui::button(
+                        canvas,
+                        text,
+                        theme,
+                        renew_btn,
+                        "续租",
+                        None,
+                        false,
+                        hover == Some(HitTarget::NetRenew),
+                    );
+                    push_clipped_hit(hits, viewport, renew_btn, HitTarget::NetRenew);
+                    renew_btn.x - 12
+                } else {
+                    ping_btn.x - 12
+                };
+
+                let title_str = if !st.has_device {
+                    "未检测到有线以太网适配器".to_string()
+                } else {
+                    format!("以太网 ({}) · {}", st.ifname, st.device_state.label_zh())
+                };
+                let daemon_tag = if st.daemon_running {
+                    "NetworkManager.service 运行中"
+                } else {
+                    "NetworkManager 未运行"
+                };
+                let sub_str = if st.mode_note.is_empty() {
+                    format!(
+                        "{daemon_tag} · 状态 {} ({})",
+                        st.device_state.code(),
+                        st.device_state.as_str()
+                    )
+                } else {
+                    format!("{daemon_tag} · {}", st.mode_note)
+                };
+                let text_x = badge_r.right() + 14;
+                let avail_w = (right_limit - text_x).max(80) as f32;
+                let shown_t = text.truncate(&title_str, avail_w, 13.0, Face::Bold);
+                text.draw(
+                    canvas,
+                    &shown_t,
+                    text_x as f32,
+                    (y + 30) as f32,
+                    13.0,
+                    theme.text,
+                    Face::Bold,
+                );
+                let shown_s = text.truncate(&sub_str, avail_w, 11.0, Face::Ui);
+                text.draw(
+                    canvas,
+                    &shown_s,
+                    text_x as f32,
+                    (y + 49) as f32,
+                    11.0,
+                    if connected {
+                        theme.text_dim
+                    } else {
+                        theme.text_muted
+                    },
+                    Face::Ui,
+                );
+
+                let hw_val = if st.has_device {
+                    format!(
+                        "{}  ·  MTU {}  ·  载波 {}",
+                        st.mac,
+                        st.mtu,
+                        if st.carrier { "已连接" } else { "未插入" }
+                    )
+                } else {
+                    "--".to_string()
+                };
+                let ipv4_val = match st.ipv4 {
+                    Some((ip, plen)) => match st.gateway {
+                        Some(gw) => format!("{ip}/{plen}  ·  默认网关 {gw}"),
+                        None => format!("{ip}/{plen}  ·  无默认网关"),
+                    },
+                    None => "未分配 IPv4 地址".to_string(),
+                };
+                let dns_v6_val = {
+                    let dns_part = st
+                        .dns
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| "--".to_string());
+                    let v6_part = st
+                        .ipv6_ll
+                        .map(|(ip6, p6)| format!("{ip6}/{p6}"))
+                        .unwrap_or_else(|| "--".to_string());
+                    format!("DNS {dns_part}  ·  IPv6 {v6_part}")
+                };
+                let lease_val = if st.lease_secs > 0 {
+                    format!(
+                        "{}  ·  租期 {}s (剩余 {}s · T1={}s / T2={}s)",
+                        st.profile_name,
+                        st.lease_secs,
+                        st.lease_remaining_secs,
+                        st.t1_secs,
+                        st.t2_secs
+                    )
+                } else if st.has_device {
+                    format!("{}  ·  {}", st.profile_name, st.device_state.as_str())
+                } else {
+                    "--".to_string()
+                };
+                let traffic_val = format!(
+                    "接收 {} ({} 包)  ·  发送 {} ({} 包)",
+                    crate::netmgr::NetStatus::format_bytes(st.rx_bytes),
+                    st.rx_packets,
+                    crate::netmgr::NetStatus::format_bytes(st.tx_bytes),
+                    st.tx_packets
+                );
+
+                let mut rows: Vec<(&str, String, u32)> = vec![
+                    ("物理链路", hw_val, theme.text),
+                    ("IPv4 与路由", ipv4_val, theme.text),
+                    ("DNS 与 IPv6", dns_v6_val, theme.text),
+                    ("连接配置与租约", lease_val, theme.text_dim),
+                    ("实时流量统计", traffic_val, theme.text_dim),
+                ];
+                if !net_state.ping_note.is_empty() {
+                    let col = if net_state.ping_note.contains("可达") {
+                        theme.success
+                    } else {
+                        theme.warning
+                    };
+                    rows.push(("网关连通性探测", net_state.ping_note.clone(), col));
+                }
+
+                for (idx, (k, v, v_col)) in rows.iter().enumerate() {
+                    let ry = y + header_h + idx as i32 * detail_row_h;
+                    draw_row_divider(canvas, theme, CONTENT_X, card_w, ry);
+                    text.draw(
+                        canvas,
+                        k,
+                        (CONTENT_X + 16) as f32,
+                        (ry + 24) as f32,
+                        11.5,
+                        theme.text_muted,
+                        Face::Ui,
+                    );
+                    let shown_v = text.truncate(v, (card_w - 154) as f32, 11.5, Face::Ui);
+                    let vw = text.measure(&shown_v, 11.5, Face::Ui);
+                    text.draw(
+                        canvas,
+                        &shown_v,
+                        (CONTENT_X + card_w - 16) as f32 - vw,
+                        (ry + 24) as f32,
+                        11.5,
+                        *v_col,
+                        Face::Ui,
+                    );
+                }
+                y += c_status.h + 16;
+
+                y = draw_section_heading(canvas, text, theme, CONTENT_X, y, "连接控制与 IPv4 参数");
+                let is_static = cfg.net_mode == NetMode::Static;
+                let static_extra_h = if is_static { 4 * ROW_H + 54 } else { 0 };
+                let c_cfg = Rect::new(CONTENT_X, y, card_w, ROW_H * 2 + static_extra_h);
+                ui::card(canvas, theme, c_cfg);
+
+                draw_toggle_row(
+                    canvas,
+                    text,
+                    theme,
+                    viewport,
+                    hits,
+                    CONTENT_X,
+                    card_w,
+                    y,
+                    "启用有线网络",
+                    "由 systemg 托管的 NetworkManager 服务自动维护链路、DHCP 与路由",
+                    cfg.net_enabled,
+                    HitTarget::NetEnabled,
+                    hover,
+                );
+                draw_row_divider(canvas, theme, CONTENT_X, card_w, y + ROW_H);
+                draw_segmented_row(
+                    canvas,
+                    text,
+                    theme,
+                    viewport,
+                    hits,
+                    CONTENT_X,
+                    card_w,
+                    y + ROW_H,
+                    "IPv4 配置方式",
+                    "自动通过 RFC 2131 DHCPv4 获取或手动指定静态 IPv4 地址",
+                    224,
+                    &["自动 (DHCP)", "手动 (静态)"],
+                    if is_static { 1 } else { 0 },
+                    HitTarget::NetMode,
+                    hover,
+                );
+
+                if is_static {
+                    let fields: [(&str, &str, &str); 4] = [
+                        ("IPv4 地址", "本机静态 IPv4 地址", "例如 10.0.2.15"),
+                        (
+                            "子网前缀或掩码",
+                            "支持 CIDR 前缀长度或点分十进制掩码",
+                            "24 或 255.255.255.0",
+                        ),
+                        (
+                            "默认网关",
+                            "下一跳路由器 IPv4 地址（可选）",
+                            "例如 10.0.2.2",
+                        ),
+                        (
+                            "首选 DNS",
+                            "写入 /etc/resolv.conf 的域名服务器",
+                            "例如 10.0.2.3",
+                        ),
+                    ];
+                    let input_w = 224;
+                    for (idx, (label, sub, placeholder)) in fields.iter().enumerate() {
+                        let fy = y + ROW_H * (2 + idx as i32);
+                        draw_row_divider(canvas, theme, CONTENT_X, card_w, fy);
+                        let in_rect = Rect::new(
+                            CONTENT_X + card_w - 16 - input_w,
+                            fy + (ROW_H - 32) / 2,
+                            input_w,
+                            32,
+                        );
+                        let max_lw = in_rect.x - (CONTENT_X + 16) - 14;
+                        draw_row_labels(canvas, text, theme, CONTENT_X, fy, max_lw, label, sub);
+                        ui::text_input(
+                            canvas,
+                            text,
+                            theme,
+                            in_rect,
+                            &net_state.inputs[idx],
+                            placeholder,
+                            net_state.focused == Some(idx),
+                            None,
+                        );
+                        push_clipped_hit(hits, viewport, in_rect, HitTarget::NetInput(idx));
+                    }
+
+                    let action_y = y + ROW_H * 6;
+                    draw_row_divider(canvas, theme, CONTENT_X, card_w, action_y);
+                    text.draw(
+                        canvas,
+                        "按 Tab 切换输入框，按 Enter 或点击右侧按钮提交至 NetworkManager",
+                        (CONTENT_X + 16) as f32,
+                        (action_y + 31) as f32,
+                        11.0,
+                        theme.text_muted,
+                        Face::Ui,
+                    );
+                    let apply_btn =
+                        Rect::new(CONTENT_X + card_w - 16 - 118, action_y + 10, 118, 34);
+                    ui::button(
+                        canvas,
+                        text,
+                        theme,
+                        apply_btn,
+                        "应用网络配置",
+                        None,
+                        true,
+                        hover == Some(HitTarget::NetApply),
+                    );
+                    push_clipped_hit(hits, viewport, apply_btn, HitTarget::NetApply);
+                }
+
+                y += c_cfg.h + 18;
             }
 
             Page::DesktopPanel => {
@@ -2446,12 +3058,28 @@ fn draw_settings(
                     ("全部日志", log_state.total_count, theme.text),
                     ("内核消息", log_state.kernel_count, theme.accent),
                     ("系统服务", log_state.service_count, theme.success),
-                    ("异常/警告", log_state.error_count + log_state.warn_count, if log_state.error_count > 0 { theme.danger } else { theme.warning }),
+                    (
+                        "异常/警告",
+                        log_state.error_count + log_state.warn_count,
+                        if log_state.error_count > 0 {
+                            theme.danger
+                        } else {
+                            theme.warning
+                        },
+                    ),
                 ];
                 let mut sx = CONTENT_X + 20;
                 for (slabel, scnt, scolor) in stat_items {
                     let stext = format!("{}: {}", slabel, scnt);
-                    text.draw(canvas, &stext, sx as f32, stats_y as f32, 11.0, scolor, Face::Bold);
+                    text.draw(
+                        canvas,
+                        &stext,
+                        sx as f32,
+                        stats_y as f32,
+                        11.0,
+                        scolor,
+                        Face::Bold,
+                    );
                     sx += (text.measure(&stext, 11.0, Face::Bold) as i32) + 24;
                 }
                 y = hero.bottom() + 14;
@@ -2463,7 +3091,12 @@ fn draw_settings(
                 let filter_tabs = ["全部日志", "内核消息", "系统服务", "异常与告警"];
                 let filter_w = 92;
                 for (f_idx, flabel) in filter_tabs.iter().enumerate() {
-                    let btn_r = Rect::new(CONTENT_X + 8 + f_idx as i32 * (filter_w + 4), y + 7, filter_w, 32);
+                    let btn_r = Rect::new(
+                        CONTENT_X + 8 + f_idx as i32 * (filter_w + 4),
+                        y + 7,
+                        filter_w,
+                        32,
+                    );
                     let is_active = match log_state.filter {
                         LogFilterType::All => f_idx == 0,
                         LogFilterType::Kernel => f_idx == 1,
@@ -2473,18 +3106,26 @@ fn draw_settings(
                     let target = HitTarget::LogFilter(f_idx);
                     if is_active {
                         canvas.rounded_rect(btn_r, RADIUS_CONTROL, theme.accent_soft, 1.0);
-                        canvas.fill(Rect::new(btn_r.x + 12, btn_r.bottom() - 2, btn_r.w - 24, 2), theme.accent);
+                        canvas.fill(
+                            Rect::new(btn_r.x + 12, btn_r.bottom() - 2, btn_r.w - 24, 2),
+                            theme.accent,
+                        );
                     } else if hover == Some(target) {
                         canvas.rounded_rect(btn_r, RADIUS_CONTROL, theme.panel_hover, 1.0);
                     }
-                    let lw = text.measure(flabel, 11.5, if is_active { Face::Bold } else { Face::Ui });
+                    let lw =
+                        text.measure(flabel, 11.5, if is_active { Face::Bold } else { Face::Ui });
                     text.draw(
                         canvas,
                         flabel,
                         btn_r.x as f32 + (btn_r.w as f32 - lw) * 0.5,
                         (btn_r.y + 20) as f32,
                         11.5,
-                        if is_active { theme.accent } else { theme.text_dim },
+                        if is_active {
+                            theme.accent
+                        } else {
+                            theme.text_dim
+                        },
                         if is_active { Face::Bold } else { Face::Ui },
                     );
                     push_clipped_hit(hits, viewport, btn_r, target);
@@ -2519,14 +3160,48 @@ fn draw_settings(
                         canvas.rounded_rect(
                             Rect::new(d_card.x + 2, d_card.y + 2, 4, d_card.h - 4),
                             2,
-                            if entry.prio <= 3 { theme.danger } else if entry.prio == 4 { theme.warning } else { theme.accent },
+                            if entry.prio <= 3 {
+                                theme.danger
+                            } else if entry.prio == 4 {
+                                theme.warning
+                            } else {
+                                theme.accent
+                            },
                             1.0,
                         );
-                        let meta_str = format!("时间戳: [{:5}.{:06}s]   源: [{}]   级别: {}", sec, mic, entry.unit, prio_label);
-                        text.draw(canvas, &meta_str, (CONTENT_X + 16) as f32, (d_card.y + 26) as f32, 11.5, theme.accent, Face::Bold);
-                        text.draw(canvas, "详细消息内容:", (CONTENT_X + 16) as f32, (d_card.y + 48) as f32, 11.0, theme.text_dim, Face::Ui);
-                        let msg_shown = text.truncate(&entry.message, (card_w - 36) as f32, 11.5, Face::Mono);
-                        text.draw(canvas, &msg_shown, (CONTENT_X + 16) as f32, (d_card.y + 72) as f32, 11.5, theme.text, Face::Mono);
+                        let meta_str = format!(
+                            "时间戳: [{:5}.{:06}s]   源: [{}]   级别: {}",
+                            sec, mic, entry.unit, prio_label
+                        );
+                        text.draw(
+                            canvas,
+                            &meta_str,
+                            (CONTENT_X + 16) as f32,
+                            (d_card.y + 26) as f32,
+                            11.5,
+                            theme.accent,
+                            Face::Bold,
+                        );
+                        text.draw(
+                            canvas,
+                            "详细消息内容:",
+                            (CONTENT_X + 16) as f32,
+                            (d_card.y + 48) as f32,
+                            11.0,
+                            theme.text_dim,
+                            Face::Ui,
+                        );
+                        let msg_shown =
+                            text.truncate(&entry.message, (card_w - 36) as f32, 11.5, Face::Mono);
+                        text.draw(
+                            canvas,
+                            &msg_shown,
+                            (CONTENT_X + 16) as f32,
+                            (d_card.y + 72) as f32,
+                            11.5,
+                            theme.text,
+                            Face::Mono,
+                        );
                         y += d_card.h + 14;
                     }
                 }
@@ -2611,7 +3286,11 @@ fn draw_settings(
                             (CONTENT_X + 160) as f32,
                             (ry + 19) as f32,
                             10.5,
-                            if is_selected { theme.accent } else { theme.text_dim },
+                            if is_selected {
+                                theme.accent
+                            } else {
+                                theme.text_dim
+                            },
                             Face::Bold,
                         );
 
@@ -2625,7 +3304,11 @@ fn draw_settings(
                             msg_x as f32,
                             (ry + 19) as f32,
                             11.0,
-                            if is_selected { theme.text } else { theme.text_dim },
+                            if is_selected {
+                                theme.text
+                            } else {
+                                theme.text_dim
+                            },
                             Face::Ui,
                         );
 
