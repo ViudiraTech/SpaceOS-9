@@ -34,9 +34,11 @@ pub mod card;
 pub mod control;
 #[cfg(feature = "sound-dummy")]
 pub mod dummy;
+pub mod hwdep;
 pub mod module_api;
 pub mod pcm;
 pub mod procfs;
+pub mod rawmidi;
 #[cfg(all(feature = "boot-self-test", feature = "sound-dummy"))]
 pub mod self_test;
 pub mod timer;

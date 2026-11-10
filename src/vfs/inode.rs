@@ -212,6 +212,13 @@ pub trait Inode: Send + Sync + core::any::Any {
         Ok(())
     }
 
+    /// PCM substream behind this file description, used by the PCM link
+    /// ioctl.  Non-PCM inodes leave the default.
+    #[cfg(feature = "sound")]
+    fn sound_substream(&self) -> Option<alloc::sync::Arc<crate::sound::pcm::Substream>> {
+        None
+    }
+
     fn poll(&self) -> u32 {
         1 | 4
     }

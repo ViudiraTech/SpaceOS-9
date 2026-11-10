@@ -23,12 +23,83 @@ use crate::{
     sound::{
         card::Card,
         control,
+        hwdep::{self, HwdepOps},
         pcm::{self, Direction, Pcm, PcmCaps, PcmOps, Substream},
+        rawmidi::{self, RawMidiOps, Stream},
         uapi,
     },
     sync::Mutex,
     time,
 };
+use core::sync::atomic::AtomicU32;
+
+const DUMMY_HWDEP_IOCTL_ECHO: u32 = 0x4004_4810;
+const DUMMY_HWDEP_ECHO_VALUE: u32 = 0x5a5a_5a5a;
+
+struct DummyHwdep {
+    loaded: AtomicU32,
+}
+
+impl HwdepOps for DummyHwdep {
+    fn dsp_status(
+        &self,
+        status: &mut uapi::snd_hwdep_dsp_status,
+    ) -> Result<(), crate::vfs::VfsError> {
+        status.version = 1;
+        crate::sound::set_string(&mut status.id, "dummy-dsp");
+        status.num_dsps = 1;
+        status.dsp_loaded = self.loaded.load(core::sync::atomic::Ordering::Acquire);
+        status.chip_ready = 1;
+        Ok(())
+    }
+
+    fn dsp_load(
+        &self,
+        index: u32,
+        _name: &[u8],
+        _data: &[u8],
+        _driver_data: u64,
+    ) -> Result<(), crate::vfs::VfsError> {
+        self.loaded
+            .fetch_or(1 << index, core::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn ioctl(&self, cmd: u32, arg: u64) -> Result<u64, crate::vfs::VfsError> {
+        if cmd != DUMMY_HWDEP_IOCTL_ECHO {
+            return Err(crate::vfs::VfsError::NotATty);
+        }
+        crate::user::uaccess::write_value(arg, &DUMMY_HWDEP_ECHO_VALUE)?;
+        Ok(0)
+    }
+}
+
+struct LoopbackMidi {
+    midi: Weak<rawmidi::RawMidi>,
+}
+
+impl RawMidiOps for LoopbackMidi {
+    fn trigger(&self, stream: Stream, up: bool) -> Result<(), i32> {
+        if stream != Stream::Output || !up {
+            return Ok(());
+        }
+        let Some(midi) = self.midi.upgrade() else {
+            return Ok(());
+        };
+        let mut buffer = [0u8; 64];
+        loop {
+            let count = midi.transmit(&mut buffer);
+            if count == 0 {
+                break;
+            }
+            midi.receive(&buffer[..count]);
+            if count < buffer.len() {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -217,10 +288,11 @@ pub fn init() {
     let flags = uapi::SNDRV_PCM_INFO_MMAP
         | uapi::SNDRV_PCM_INFO_MMAP_VALID
         | uapi::SNDRV_PCM_INFO_INTERLEAVED
+        | uapi::SNDRV_PCM_INFO_NONINTERLEAVED
         | uapi::SNDRV_PCM_INFO_BLOCK_TRANSFER
         | uapi::SNDRV_PCM_INFO_PAUSE
         | uapi::SNDRV_PCM_INFO_RESUME;
-    let device = Pcm::new(card.number, 0, "Dummy PCM", "Dummy PCM", true, true, flags);
+    let device = Pcm::new(card.number, 0, "Dummy PCM", "Dummy PCM", 2, 2, flags);
 
     let caps = PcmCaps {
         formats: full_format_mask(),
@@ -233,7 +305,7 @@ pub fn init() {
         buffer_bytes_max: 1024 * 1024,
     };
     for direction in [Direction::Playback, Direction::Capture] {
-        if let Some(substream) = device.substream(direction) {
+        for substream in device.substreams(direction) {
             *substream.caps.lock() = caps;
             substream.set_ops(DummyPcm::new());
         }
@@ -248,6 +320,38 @@ pub fn init() {
         control::enumerated_element("Master Playback Route", Vec::from(["Stereo", "Mono"])),
     ] {
         let _ = card.add_control(element);
+    }
+
+    let hwdep = hwdep::Hwdep::new(
+        card.number,
+        0,
+        "Dummy HWDEP",
+        "Dummy DSP",
+        uapi::SNDRV_HWDEP_IFACE_HDA,
+    );
+    hwdep.set_ops(Arc::new(DummyHwdep {
+        loaded: AtomicU32::new(0),
+    }));
+    let _ = card.add_hwdep(hwdep);
+
+    let midi = rawmidi::RawMidi::new(
+        card.number,
+        0,
+        "Dummy MIDI",
+        "Dummy MIDI loopback",
+        true,
+        true,
+    );
+    midi.set_ops(
+        Stream::Output,
+        Arc::new(LoopbackMidi {
+            midi: Arc::downgrade(&midi),
+        }),
+    );
+    let _ = card.add_rawmidi(midi);
+
+    if let Ok(jack) = control::jack_new(&card, "Headphone", 1) {
+        control::jack_report(&jack, 1);
     }
 
     let _ = card.register();

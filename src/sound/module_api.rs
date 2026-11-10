@@ -18,15 +18,17 @@
 
 use alloc::{boxed::Box, string::String, sync::Arc};
 use core::{
-    ffi::{CStr, c_char, c_int, c_void},
+    ffi::{CStr, c_char, c_int, c_uint, c_void},
     ptr,
 };
 
 use crate::sound::{
     self,
     card::Card,
-    control::{ControlElem, ControlOps},
+    control::{self, ControlElem, ControlOps},
+    hwdep::{self, HwdepOps},
     pcm::{self, Direction, Pcm, PcmOps, Substream},
+    rawmidi::{self, RawMidiOps, Stream, StreamState},
     uapi,
 };
 
@@ -62,6 +64,19 @@ pub fn lookup(name: &str) -> Option<u64> {
         export!("snd_ctl_add", snd_ctl_add),
         export!("snd_ctl_notify", snd_ctl_notify),
         export!("snd_ctl_free_one", snd_ctl_free_one),
+        export!("snd_hwdep_new", snd_hwdep_new),
+        export!("snd_hwdep_set_ops", snd_hwdep_set_ops),
+        export!("snd_jack_new", snd_jack_new),
+        export!("snd_jack_report", snd_jack_report),
+        export!("snd_rawmidi_new", snd_rawmidi_new),
+        export!("snd_rawmidi_set_ops", snd_rawmidi_set_ops),
+        export!("snd_rawmidi_receive", snd_rawmidi_receive),
+        export!("snd_rawmidi_transmit_peek", snd_rawmidi_transmit_peek),
+        export!("snd_rawmidi_transmit_ack", snd_rawmidi_transmit_ack),
+        export!("snd_rawmidi_transmit", snd_rawmidi_transmit),
+        export!("snd_rawmidi_transmit_empty", snd_rawmidi_transmit_empty),
+        export!("snd_rawmidi_drain", snd_rawmidi_drain),
+        export!("snd_rawmidi_drop", snd_rawmidi_drop),
     ];
     entries
         .iter()
@@ -197,11 +212,12 @@ pub unsafe extern "C" fn snd_pcm_new(
         device as u32,
         &id,
         &id,
-        playback_count > 0,
-        capture_count > 0,
+        playback_count.max(0) as u32,
+        capture_count.max(0) as u32,
         uapi::SNDRV_PCM_INFO_MMAP
             | uapi::SNDRV_PCM_INFO_MMAP_VALID
             | uapi::SNDRV_PCM_INFO_INTERLEAVED
+            | uapi::SNDRV_PCM_INFO_NONINTERLEAVED
             | uapi::SNDRV_PCM_INFO_BLOCK_TRANSFER
             | uapi::SNDRV_PCM_INFO_PAUSE,
     );
@@ -325,7 +341,7 @@ pub unsafe extern "C" fn snd_pcm_set_ops(
         uapi::SNDRV_PCM_STREAM_CAPTURE => Direction::Capture,
         _ => return -22,
     };
-    let Some(substream) = pcm.substream(direction) else {
+    let Some(substream) = pcm.first_substream(direction) else {
         return -19;
     };
     // SAFETY: the module guarantees a readable ops table for the call.
@@ -660,4 +676,408 @@ pub unsafe extern "C" fn snd_ctl_free_one(kcontrol: *mut snd_kcontrol) {
     }
     // SAFETY: the handle came from `snd_ctl_new1` and was not added.
     drop(unsafe { Box::from_raw(kcontrol as *mut CKControl) });
+}
+
+// ---- hwdep ------------------------------------------------------------------
+
+#[repr(C)]
+pub struct snd_hwdep {
+    _private: [u8; 0],
+}
+
+struct HwdepHandle {
+    hwdep: Arc<hwdep::Hwdep>,
+}
+
+pub type HwdepSimpleFn = Option<unsafe extern "C" fn(*mut snd_hwdep) -> c_int>;
+pub type HwdepIoctlFn = Option<unsafe extern "C" fn(*mut snd_hwdep, u32, *mut c_void) -> c_int>;
+pub type HwdepDspStatusFn =
+    Option<unsafe extern "C" fn(*mut snd_hwdep, *mut uapi::snd_hwdep_dsp_status) -> c_int>;
+pub type HwdepDspLoadFn =
+    Option<unsafe extern "C" fn(*mut snd_hwdep, *mut uapi::snd_hwdep_dsp_image) -> c_int>;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct snd_hwdep_ops {
+    pub open: HwdepSimpleFn,
+    pub release: Option<unsafe extern "C" fn(*mut snd_hwdep)>,
+    pub ioctl: HwdepIoctlFn,
+    pub dsp_status: HwdepDspStatusFn,
+    pub dsp_load: HwdepDspLoadFn,
+}
+
+struct CHwdepOps {
+    raw: *mut snd_hwdep,
+    table: snd_hwdep_ops,
+}
+
+unsafe impl Send for CHwdepOps {}
+unsafe impl Sync for CHwdepOps {}
+
+impl HwdepOps for CHwdepOps {
+    fn ioctl(&self, cmd: u32, arg: u64) -> Result<u64, crate::vfs::VfsError> {
+        match self.table.ioctl {
+            Some(callback) => match unsafe { callback(self.raw, cmd, arg as *mut c_void) } {
+                0 => Ok(0),
+                error => Err(sound::from_errno(error)),
+            },
+            None => Err(crate::vfs::VfsError::NotATty),
+        }
+    }
+    fn dsp_status(
+        &self,
+        status: &mut uapi::snd_hwdep_dsp_status,
+    ) -> Result<(), crate::vfs::VfsError> {
+        match self.table.dsp_status {
+            Some(callback) => match unsafe { callback(self.raw, status as *mut _) } {
+                0 => Ok(()),
+                error => Err(sound::from_errno(error)),
+            },
+            None => Err(crate::vfs::VfsError::NotSupported),
+        }
+    }
+    fn dsp_load(
+        &self,
+        index: u32,
+        name: &[u8],
+        data: &[u8],
+        driver_data: u64,
+    ) -> Result<(), crate::vfs::VfsError> {
+        match self.table.dsp_load {
+            Some(callback) => {
+                let mut image = uapi::snd_hwdep_dsp_image {
+                    index,
+                    name: [0; 64],
+                    _pad0: [0; 4],
+                    image: data.as_ptr() as u64,
+                    length: data.len(),
+                    driver_data,
+                };
+                let length = name.len().min(63);
+                image.name[..length].copy_from_slice(&name[..length]);
+                match unsafe { callback(self.raw, &mut image) } {
+                    0 => Ok(()),
+                    error => Err(sound::from_errno(error)),
+                }
+            }
+            None => Err(crate::vfs::VfsError::NotSupported),
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_hwdep_new(
+    card: *mut snd_card,
+    id: *const c_char,
+    device: c_int,
+    iface: c_int,
+    hw_out: *mut *mut snd_hwdep,
+) -> c_int {
+    let Some(card) = card_from(card) else {
+        return -22;
+    };
+    if hw_out.is_null() || device < 0 {
+        return -22;
+    }
+    let id = c_string(id, "HWDEP");
+    let hwdep = hwdep::Hwdep::new(card.number, device as u32, &id, &id, iface);
+    match card.add_hwdep(hwdep.clone()) {
+        Ok(()) => {
+            let handle = Box::into_raw(Box::new(HwdepHandle { hwdep }));
+            unsafe { *hw_out = handle as *mut snd_hwdep };
+            0
+        }
+        Err(error) => -(error.to_errno() as c_int),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_hwdep_set_ops(
+    hwdep: *mut snd_hwdep,
+    ops: *const snd_hwdep_ops,
+) -> c_int {
+    if hwdep.is_null() || ops.is_null() {
+        return -22;
+    }
+    let handle = unsafe { &*(hwdep as *const HwdepHandle) };
+    let table = unsafe { *ops };
+    handle
+        .hwdep
+        .set_ops(Arc::new(CHwdepOps { raw: hwdep, table }));
+    0
+}
+
+// ---- jack -------------------------------------------------------------------
+
+#[repr(C)]
+pub struct snd_jack {
+    _private: [u8; 0],
+}
+
+struct JackHandle {
+    jack: Arc<control::Jack>,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_jack_new(
+    card: *mut snd_card,
+    id: *const c_char,
+    jack_type: c_uint,
+    jack_out: *mut *mut snd_jack,
+) -> c_int {
+    let Some(card) = card_from(card) else {
+        return -22;
+    };
+    if jack_out.is_null() {
+        return -22;
+    }
+    let id = c_string(id, "Jack");
+    match control::jack_new(&card, &id, jack_type) {
+        Ok(jack) => {
+            let handle = Box::into_raw(Box::new(JackHandle { jack }));
+            unsafe { *jack_out = handle as *mut snd_jack };
+            0
+        }
+        Err(error) => -(error.to_errno() as c_int),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_jack_report(jack: *mut snd_jack, status: c_uint) {
+    if jack.is_null() {
+        return;
+    }
+    let handle = unsafe { &*(jack as *const JackHandle) };
+    control::jack_report(&handle.jack, status);
+}
+
+// ---- rawmidi ----------------------------------------------------------------
+
+#[repr(C)]
+pub struct snd_rawmidi {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct snd_rawmidi_substream {
+    _private: [u8; 0],
+}
+
+struct RawMidiHandle {
+    midi: Arc<rawmidi::RawMidi>,
+}
+
+pub type RawMidiSimpleFn = Option<unsafe extern "C" fn(*mut snd_rawmidi_substream) -> c_int>;
+pub type RawMidiTriggerFn =
+    Option<unsafe extern "C" fn(*mut snd_rawmidi_substream, c_int) -> c_int>;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct snd_rawmidi_ops {
+    pub open: RawMidiSimpleFn,
+    pub close: RawMidiSimpleFn,
+    pub trigger: RawMidiTriggerFn,
+    pub drain: Option<unsafe extern "C" fn(*mut snd_rawmidi_substream)>,
+}
+
+struct CRawMidiOps {
+    table: snd_rawmidi_ops,
+    stream: Arc<StreamState>,
+}
+
+fn opaque_rawmidi(stream: &StreamState) -> *mut snd_rawmidi_substream {
+    stream as *const StreamState as *mut snd_rawmidi_substream
+}
+
+impl RawMidiOps for CRawMidiOps {
+    fn open(&self, _stream: Stream) -> Result<(), i32> {
+        match self.table.open {
+            Some(callback) => match unsafe { callback(opaque_rawmidi(&self.stream)) } {
+                0 => Ok(()),
+                error => Err(error),
+            },
+            None => Ok(()),
+        }
+    }
+    fn close(&self, _stream: Stream) {
+        if let Some(callback) = self.table.close {
+            let _ = unsafe { callback(opaque_rawmidi(&self.stream)) };
+        }
+    }
+    fn trigger(&self, _stream: Stream, up: bool) -> Result<(), i32> {
+        match self.table.trigger {
+            Some(callback) => {
+                match unsafe { callback(opaque_rawmidi(&self.stream), c_int::from(up)) } {
+                    0 => Ok(()),
+                    error => Err(error),
+                }
+            }
+            None => Ok(()),
+        }
+    }
+    fn drain(&self, _stream: Stream) {
+        if let Some(callback) = self.table.drain {
+            unsafe { callback(opaque_rawmidi(&self.stream)) };
+        }
+    }
+}
+
+fn rawmidi_stream_from(raw: *mut snd_rawmidi_substream) -> Option<&'static StreamState> {
+    if raw.is_null() {
+        return None;
+    }
+    Some(unsafe { &*(raw as *const StreamState) })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_rawmidi_new(
+    card: *mut snd_card,
+    id: *const c_char,
+    device: c_int,
+    output_count: c_int,
+    input_count: c_int,
+    midi_out: *mut *mut snd_rawmidi,
+) -> c_int {
+    let Some(card) = card_from(card) else {
+        return -22;
+    };
+    if midi_out.is_null() || device < 0 {
+        return -22;
+    }
+    let id = c_string(id, "RawMIDI");
+    let midi = rawmidi::RawMidi::new(
+        card.number,
+        device as u32,
+        &id,
+        &id,
+        output_count > 0,
+        input_count > 0,
+    );
+    match card.add_rawmidi(midi.clone()) {
+        Ok(()) => {
+            let handle = Box::into_raw(Box::new(RawMidiHandle { midi }));
+            unsafe { *midi_out = handle as *mut snd_rawmidi };
+            0
+        }
+        Err(error) => -(error.to_errno() as c_int),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_rawmidi_set_ops(
+    midi: *mut snd_rawmidi,
+    stream: c_int,
+    ops: *const snd_rawmidi_ops,
+) -> c_int {
+    if midi.is_null() || ops.is_null() {
+        return -22;
+    }
+    let handle = unsafe { &*(midi as *const RawMidiHandle) };
+    let direction = match stream {
+        uapi::SNDRV_RAWMIDI_STREAM_OUTPUT => Stream::Output,
+        uapi::SNDRV_RAWMIDI_STREAM_INPUT => Stream::Input,
+        _ => return -22,
+    };
+    let Some(state) = handle.midi.stream(direction) else {
+        return -19;
+    };
+    handle.midi.set_ops(
+        direction,
+        Arc::new(CRawMidiOps {
+            table: unsafe { *ops },
+            stream: state,
+        }),
+    );
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_rawmidi_receive(
+    substream: *mut snd_rawmidi_substream,
+    data: *const u8,
+    count: c_int,
+) -> c_int {
+    let Some(stream) = rawmidi_stream_from(substream) else {
+        return -22;
+    };
+    if count <= 0 || data.is_null() {
+        return 0;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(data, count as usize) };
+    stream.receive(bytes) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_rawmidi_transmit_peek(
+    substream: *mut snd_rawmidi_substream,
+    data: *mut u8,
+    count: c_int,
+) -> c_int {
+    let Some(stream) = rawmidi_stream_from(substream) else {
+        return -22;
+    };
+    if count <= 0 || data.is_null() {
+        return 0;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts_mut(data, count as usize) };
+    stream.transmit_peek(bytes) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_rawmidi_transmit_ack(
+    substream: *mut snd_rawmidi_substream,
+    count: c_int,
+) -> c_int {
+    let Some(stream) = rawmidi_stream_from(substream) else {
+        return -22;
+    };
+    if count <= 0 {
+        return 0;
+    }
+    stream.transmit_ack(count as usize) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_rawmidi_transmit(
+    substream: *mut snd_rawmidi_substream,
+    data: *mut u8,
+    count: c_int,
+) -> c_int {
+    let peeked = unsafe { snd_rawmidi_transmit_peek(substream, data, count) };
+    if peeked > 0 {
+        unsafe { snd_rawmidi_transmit_ack(substream, peeked) };
+    }
+    peeked
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_rawmidi_transmit_empty(
+    substream: *mut snd_rawmidi_substream,
+) -> c_int {
+    match rawmidi_stream_from(substream) {
+        Some(stream) => c_int::from(stream.is_empty()),
+        None => -22,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_rawmidi_drain(substream: *mut snd_rawmidi_substream) -> c_int {
+    match rawmidi_stream_from(substream) {
+        Some(stream) => match stream.drain() {
+            Ok(()) => 0,
+            Err(error) => error.to_errno() as c_int,
+        },
+        None => -22,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_rawmidi_drop(substream: *mut snd_rawmidi_substream) -> c_int {
+    match rawmidi_stream_from(substream) {
+        Some(stream) => {
+            stream.drop_bytes();
+            0
+        }
+        None => -22,
+    }
 }

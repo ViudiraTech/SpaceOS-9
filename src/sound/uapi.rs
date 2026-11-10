@@ -1371,8 +1371,242 @@ pub const SNDRV_TIMER_IOCTL_CONTINUE: u32 = io(b'T', 0xa2);
 pub const SNDRV_TIMER_IOCTL_PAUSE: u32 = io(b'T', 0xa3);
 pub const SNDRV_TIMER_IOCTL_TREAD64: u32 = iow::<i32>(b'T', 0xa4);
 pub const SNDRV_TIMER_IOCTL_TREAD: u32 = SNDRV_TIMER_IOCTL_TREAD_OLD;
-pub const SNDRV_TIMER_IOCTL_CREATE: u32 = iowr::<u8>(b'T', 0xa5);
+pub const SNDRV_TIMER_IOCTL_CREATE: u32 = iowr::<snd_timer_uinfo>(b'T', 0xa5);
 pub const SNDRV_TIMER_IOCTL_TRIGGER: u32 = io(b'T', 0xa6);
+
+// ---- audio timestamp --------------------------------------------------------
+
+pub const SNDRV_PCM_AUDIO_TSTAMP_TYPE_COMPAT: i32 = 0;
+pub const SNDRV_PCM_AUDIO_TSTAMP_TYPE_DEFAULT: i32 = 1;
+pub const SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK: i32 = 2;
+pub const SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK_ABSOLUTE: i32 = 3;
+pub const SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK_ESTIMATED: i32 = 4;
+pub const SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED: i32 = 5;
+
+pub const SNDRV_PCM_TSTAMP_TYPE_GETTIMEOFDAY: i32 = 0;
+pub const SNDRV_PCM_TSTAMP_TYPE_MONOTONIC: i32 = 1;
+pub const SNDRV_PCM_TSTAMP_TYPE_MONOTONIC_RAW: i32 = 2;
+
+// ---- RawMIDI ----------------------------------------------------------------
+
+pub const SNDRV_RAWMIDI_STREAM_OUTPUT: i32 = 0;
+pub const SNDRV_RAWMIDI_STREAM_INPUT: i32 = 1;
+
+pub const SNDRV_RAWMIDI_INFO_OUTPUT: u32 = 0x0000_0001;
+pub const SNDRV_RAWMIDI_INFO_INPUT: u32 = 0x0000_0002;
+pub const SNDRV_RAWMIDI_INFO_DUPLEX: u32 = 0x0000_0004;
+
+pub const SNDRV_RAWMIDI_MODE_FRAMING_MASK: u32 = 7 << 0;
+pub const SNDRV_RAWMIDI_MODE_FRAMING_NONE: u32 = 0;
+pub const SNDRV_RAWMIDI_MODE_FRAMING_TSTAMP: u32 = 1;
+pub const SNDRV_RAWMIDI_MODE_CLOCK_MASK: u32 = 7 << 3;
+pub const SNDRV_RAWMIDI_MODE_CLOCK_NONE: u32 = 0;
+pub const SNDRV_RAWMIDI_MODE_CLOCK_REALTIME: u32 = 1 << 3;
+pub const SNDRV_RAWMIDI_MODE_CLOCK_MONOTONIC: u32 = 2 << 3;
+pub const SNDRV_RAWMIDI_MODE_CLOCK_MONOTONIC_RAW: u32 = 3 << 3;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct snd_rawmidi_info {
+    pub device: u32,
+    pub subdevice: u32,
+    pub stream: i32,
+    pub card: i32,
+    pub flags: u32,
+    pub id: [u8; 64],
+    pub name: [u8; 80],
+    pub subname: [u8; 32],
+    pub subdevices_count: u32,
+    pub subdevices_avail: u32,
+    pub tied_device: i32,
+    pub reserved: [u8; 60],
+}
+
+impl snd_rawmidi_info {
+    pub fn zeroed() -> Self {
+        Self {
+            device: 0,
+            subdevice: 0,
+            stream: 0,
+            card: 0,
+            flags: 0,
+            id: [0; 64],
+            name: [0; 80],
+            subname: [0; 32],
+            subdevices_count: 0,
+            subdevices_avail: 0,
+            tied_device: 0,
+            reserved: [0; 60],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct snd_rawmidi_params {
+    pub stream: i32,
+    pub _pad0: u32,
+    pub buffer_size: usize,
+    pub avail_min: usize,
+    pub no_active_sensing: u32,
+    pub mode: u32,
+    pub reserved: [u8; 12],
+    pub _pad1: [u8; 4],
+}
+
+impl snd_rawmidi_params {
+    pub fn zeroed() -> Self {
+        Self {
+            stream: 0,
+            _pad0: 0,
+            buffer_size: 0,
+            avail_min: 0,
+            no_active_sensing: 0,
+            mode: 0,
+            reserved: [0; 12],
+            _pad1: [0; 4],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct snd_rawmidi_status {
+    pub stream: i32,
+    pub pad1: [u8; 4],
+    pub tstamp: timespec,
+    pub avail: usize,
+    pub xruns: usize,
+    pub reserved: [u8; 16],
+}
+
+impl snd_rawmidi_status {
+    pub fn zeroed() -> Self {
+        Self {
+            stream: 0,
+            pad1: [0; 4],
+            tstamp: timespec::zero(),
+            avail: 0,
+            xruns: 0,
+            reserved: [0; 16],
+        }
+    }
+}
+
+pub const SNDRV_RAWMIDI_IOCTL_PVERSION: u32 = ior::<i32>(b'W', 0x00);
+pub const SNDRV_RAWMIDI_IOCTL_INFO: u32 = ior::<snd_rawmidi_info>(b'W', 0x01);
+pub const SNDRV_RAWMIDI_IOCTL_USER_PVERSION: u32 = iow::<i32>(b'W', 0x02);
+pub const SNDRV_RAWMIDI_IOCTL_PARAMS: u32 = iowr::<snd_rawmidi_params>(b'W', 0x10);
+pub const SNDRV_RAWMIDI_IOCTL_STATUS: u32 = iowr::<snd_rawmidi_status>(b'W', 0x20);
+pub const SNDRV_RAWMIDI_IOCTL_DROP: u32 = iow::<i32>(b'W', 0x30);
+pub const SNDRV_RAWMIDI_IOCTL_DRAIN: u32 = iow::<i32>(b'W', 0x31);
+
+// ---- hwdep ------------------------------------------------------------------
+
+pub const SNDRV_HWDEP_IFACE_OPL2: i32 = 0;
+pub const SNDRV_HWDEP_IFACE_OPL3: i32 = 1;
+pub const SNDRV_HWDEP_IFACE_OPL4: i32 = 2;
+pub const SNDRV_HWDEP_IFACE_SB16CSP: i32 = 3;
+pub const SNDRV_HWDEP_IFACE_EMU10K1: i32 = 4;
+pub const SNDRV_HWDEP_IFACE_YSS225: i32 = 5;
+pub const SNDRV_HWDEP_IFACE_ICS2115: i32 = 6;
+pub const SNDRV_HWDEP_IFACE_SSCAPE: i32 = 7;
+pub const SNDRV_HWDEP_IFACE_VX: i32 = 8;
+pub const SNDRV_HWDEP_IFACE_MIXART: i32 = 9;
+pub const SNDRV_HWDEP_IFACE_USX2Y: i32 = 10;
+pub const SNDRV_HWDEP_IFACE_EMUX_WAVETABLE: i32 = 11;
+pub const SNDRV_HWDEP_IFACE_BLUETOOTH: i32 = 12;
+pub const SNDRV_HWDEP_IFACE_USX2Y_PCM: i32 = 13;
+pub const SNDRV_HWDEP_IFACE_PCXHR: i32 = 14;
+pub const SNDRV_HWDEP_IFACE_SB_RC: i32 = 15;
+pub const SNDRV_HWDEP_IFACE_HDA: i32 = 16;
+pub const SNDRV_HWDEP_IFACE_USB_STREAM: i32 = 17;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct snd_hwdep_info {
+    pub device: u32,
+    pub card: i32,
+    pub id: [u8; 64],
+    pub name: [u8; 80],
+    pub iface: i32,
+    pub reserved: [u8; 64],
+}
+
+impl snd_hwdep_info {
+    pub fn zeroed() -> Self {
+        Self {
+            device: 0,
+            card: 0,
+            id: [0; 64],
+            name: [0; 80],
+            iface: 0,
+            reserved: [0; 64],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct snd_hwdep_dsp_status {
+    pub version: u32,
+    pub id: [u8; 32],
+    pub num_dsps: u32,
+    pub dsp_loaded: u32,
+    pub chip_ready: u32,
+    pub reserved: [u8; 16],
+}
+
+impl snd_hwdep_dsp_status {
+    pub fn zeroed() -> Self {
+        Self {
+            version: 0,
+            id: [0; 32],
+            num_dsps: 0,
+            dsp_loaded: 0,
+            chip_ready: 0,
+            reserved: [0; 16],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct snd_hwdep_dsp_image {
+    pub index: u32,
+    pub name: [u8; 64],
+    pub _pad0: [u8; 4],
+    pub image: u64,
+    pub length: usize,
+    pub driver_data: u64,
+}
+
+pub const SNDRV_HWDEP_IOCTL_PVERSION: u32 = ior::<i32>(b'H', 0x00);
+pub const SNDRV_HWDEP_IOCTL_INFO: u32 = ior::<snd_hwdep_info>(b'H', 0x01);
+pub const SNDRV_HWDEP_IOCTL_DSP_STATUS: u32 = ior::<snd_hwdep_dsp_status>(b'H', 0x02);
+pub const SNDRV_HWDEP_IOCTL_DSP_LOAD: u32 = iow::<snd_hwdep_dsp_image>(b'H', 0x03);
+
+// ---- userspace-driven timer -------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct snd_timer_uinfo {
+    pub resolution: u64,
+    pub fd: i32,
+    pub id: u32,
+    pub reserved: [u8; 16],
+}
+
+impl snd_timer_uinfo {
+    pub fn zeroed() -> Self {
+        Self {
+            resolution: 0,
+            fd: -1,
+            id: 0,
+            reserved: [0; 16],
+        }
+    }
+}
 
 // ---- compile-time ABI checks ------------------------------------------------
 
@@ -1404,6 +1638,13 @@ const _: () = assert!(size_of::<snd_timer_params>() == 80);
 const _: () = assert!(size_of::<snd_timer_status>() == 96);
 const _: () = assert!(size_of::<snd_timer_read>() == 8);
 const _: () = assert!(size_of::<snd_timer_tread>() == 32);
+const _: () = assert!(size_of::<snd_rawmidi_info>() == 268);
+const _: () = assert!(size_of::<snd_rawmidi_params>() == 48);
+const _: () = assert!(size_of::<snd_rawmidi_status>() == 56);
+const _: () = assert!(size_of::<snd_hwdep_info>() == 220);
+const _: () = assert!(size_of::<snd_hwdep_dsp_status>() == 64);
+const _: () = assert!(size_of::<snd_hwdep_dsp_image>() == 96);
+const _: () = assert!(size_of::<snd_timer_uinfo>() == 32);
 
 const _: () = assert!(core::mem::offset_of!(snd_pcm_hw_params, masks) == 4);
 const _: () = assert!(core::mem::offset_of!(snd_pcm_hw_params, intervals) == 260);
@@ -1429,6 +1670,13 @@ const _: () = assert!(SNDRV_CTL_IOCTL_ELEM_INFO == 0xc110_5511);
 const _: () = assert!(SNDRV_CTL_IOCTL_ELEM_READ == 0xc4c8_5512);
 const _: () = assert!(SNDRV_TIMER_IOCTL_GINFO == 0xc0f8_5403);
 const _: () = assert!(SNDRV_TIMER_IOCTL_PARAMS == 0x4050_5412);
+const _: () = assert!(SNDRV_RAWMIDI_IOCTL_INFO == 0x810c_5701);
+const _: () = assert!(SNDRV_RAWMIDI_IOCTL_PARAMS == 0xc030_5710);
+const _: () = assert!(SNDRV_RAWMIDI_IOCTL_STATUS == 0xc038_5720);
+const _: () = assert!(SNDRV_HWDEP_IOCTL_INFO == 0x80dc_4801);
+const _: () = assert!(SNDRV_HWDEP_IOCTL_DSP_LOAD == 0x4060_4803);
+const _: () = assert!(SNDRV_TIMER_IOCTL_CREATE == 0xc020_54a5);
+const _: () = assert!(SNDRV_TIMER_IOCTL_TRIGGER == 0x54a6);
 
 // ---- user-copy markers ------------------------------------------------------
 //
@@ -1469,3 +1717,10 @@ unsafe impl crate::user::uaccess::UserPod for snd_timer_params {}
 unsafe impl crate::user::uaccess::UserPod for snd_timer_status {}
 unsafe impl crate::user::uaccess::UserPod for snd_timer_read {}
 unsafe impl crate::user::uaccess::UserPod for snd_timer_tread {}
+unsafe impl crate::user::uaccess::UserPod for snd_rawmidi_info {}
+unsafe impl crate::user::uaccess::UserPod for snd_rawmidi_params {}
+unsafe impl crate::user::uaccess::UserPod for snd_rawmidi_status {}
+unsafe impl crate::user::uaccess::UserPod for snd_hwdep_info {}
+unsafe impl crate::user::uaccess::UserPod for snd_hwdep_dsp_status {}
+unsafe impl crate::user::uaccess::UserPod for snd_hwdep_dsp_image {}
+unsafe impl crate::user::uaccess::UserPod for snd_timer_uinfo {}

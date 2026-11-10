@@ -39,6 +39,7 @@ const MIN_PERIOD_US: u64 = 1_000;
 static RESOLUTION_NS: AtomicU64 = AtomicU64::new(DEFAULT_RESOLUTION_NS);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SESSIONS: Mutex<Vec<Weak<TimerSession>>> = Mutex::new(Vec::new());
+static UTIMERS: Mutex<Vec<Weak<UTimer>>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy)]
 struct TimerRecord {
@@ -62,6 +63,70 @@ struct Params {
 struct TimerRef {
     class: i32,
     card: i32,
+    device: i32,
+    subdevice: i32,
+}
+
+struct UTimer {
+    id: u32,
+    resolution_ns: AtomicU64,
+}
+
+impl UTimer {
+    fn trigger(&self) {
+        let id = self.id as i32;
+        for weak in SESSIONS.lock().iter() {
+            let Some(session) = weak.upgrade() else {
+                continue;
+            };
+            let bound = *session.bound.lock();
+            if bound.is_some_and(|timer| {
+                timer.class == uapi::SNDRV_TIMER_CLASS_GLOBAL
+                    && timer.device == uapi::SNDRV_TIMER_GLOBAL_UDRIVEN
+                    && timer.subdevice == id
+            }) {
+                session.push_tick();
+            }
+        }
+    }
+}
+
+impl Drop for UTimer {
+    fn drop(&mut self) {
+        let id = self.id;
+        UTIMERS
+            .lock()
+            .retain(|weak| weak.upgrade().is_some_and(|timer| timer.id != id));
+    }
+}
+
+struct UTimerInode {
+    timer: Arc<UTimer>,
+}
+
+impl Inode for UTimerInode {
+    fn metadata(&self) -> Result<Stat, VfsError> {
+        Ok(Stat::simple(ino(), InodeKind::CharDevice, 0o660, 0))
+    }
+    fn ioctl(&self, cmd: u64, arg: u64) -> Result<u64, VfsError> {
+        match cmd as u32 {
+            uapi::SNDRV_TIMER_IOCTL_PVERSION => {
+                uaccess::write_value(arg, &(uapi::SNDRV_TIMER_VERSION as i32))?;
+                Ok(0)
+            }
+            uapi::SNDRV_TIMER_IOCTL_TRIGGER => {
+                self.timer.trigger();
+                Ok(0)
+            }
+            _ => Err(VfsError::NotATty),
+        }
+    }
+    fn read_at(&self, _offset: u64, _buffer: &mut [u8]) -> Result<usize, VfsError> {
+        Err(VfsError::NotSupported)
+    }
+    fn write_at(&self, _offset: u64, _buffer: &[u8]) -> Result<usize, VfsError> {
+        Err(VfsError::NotSupported)
+    }
 }
 
 pub struct TimerSession {
@@ -221,27 +286,69 @@ fn all_timers() -> Vec<TimerRef> {
     timers.push(TimerRef {
         class: uapi::SNDRV_TIMER_CLASS_GLOBAL,
         card: -1,
+        device: uapi::SNDRV_TIMER_GLOBAL_SYSTEM,
+        subdevice: 0,
     });
     for card in card::cards() {
         timers.push(TimerRef {
             class: uapi::SNDRV_TIMER_CLASS_CARD,
             card: card.number as i32,
+            device: 0,
+            subdevice: 0,
         });
+    }
+    for weak in UTIMERS.lock().iter() {
+        if let Some(timer) = weak.upgrade() {
+            timers.push(TimerRef {
+                class: uapi::SNDRV_TIMER_CLASS_GLOBAL,
+                card: -1,
+                device: uapi::SNDRV_TIMER_GLOBAL_UDRIVEN,
+                subdevice: timer.id as i32,
+            });
+        }
     }
     timers
 }
 
 fn timer_matches(reference: TimerRef, id: &uapi::snd_timer_id) -> bool {
     if id.dev_class == uapi::SNDRV_TIMER_CLASS_GLOBAL {
+        if id.device == uapi::SNDRV_TIMER_GLOBAL_UDRIVEN {
+            return reference.class == uapi::SNDRV_TIMER_CLASS_GLOBAL
+                && reference.device == uapi::SNDRV_TIMER_GLOBAL_UDRIVEN
+                && reference.subdevice == id.subdevice;
+        }
         return reference.class == uapi::SNDRV_TIMER_CLASS_GLOBAL
+            && reference.device == uapi::SNDRV_TIMER_GLOBAL_SYSTEM
             && (id.device == uapi::SNDRV_TIMER_GLOBAL_SYSTEM || id.device < 0);
     }
     if id.dev_class == uapi::SNDRV_TIMER_CLASS_CARD {
         return reference.class == uapi::SNDRV_TIMER_CLASS_CARD
             && reference.card == id.card
+            && reference.device == 0
             && (id.device == 0 || id.device < 0);
     }
     false
+}
+
+fn utimer_resolution(id: i32) -> Option<u64> {
+    UTIMERS.lock().iter().find_map(|weak| {
+        weak.upgrade()
+            .filter(|timer| timer.id as i32 == id)
+            .map(|timer| timer.resolution_ns.load(Ordering::Acquire))
+    })
+}
+
+fn timer_resolution(timer: TimerRef) -> u64 {
+    if timer.device == uapi::SNDRV_TIMER_GLOBAL_UDRIVEN {
+        utimer_resolution(timer.subdevice).unwrap_or(DEFAULT_RESOLUTION_NS)
+    } else {
+        RESOLUTION_NS.load(Ordering::Acquire)
+    }
+}
+
+fn is_utimer(timer: TimerRef) -> bool {
+    timer.class == uapi::SNDRV_TIMER_CLASS_GLOBAL
+        && timer.device == uapi::SNDRV_TIMER_GLOBAL_UDRIVEN
 }
 
 fn resolve(timers: &[TimerRef], id: &uapi::snd_timer_id) -> Option<TimerRef> {
@@ -264,8 +371,12 @@ fn active_clients() -> u32 {
 fn fill_info(timer: TimerRef, info: &mut uapi::snd_timer_info) {
     info.flags = 0;
     info.card = timer.card;
-    match timer.class {
-        uapi::SNDRV_TIMER_CLASS_GLOBAL => {
+    match (timer.class, timer.device) {
+        (uapi::SNDRV_TIMER_CLASS_GLOBAL, uapi::SNDRV_TIMER_GLOBAL_UDRIVEN) => {
+            set_string(&mut info.id, &alloc::format!("uTimer{}", timer.subdevice));
+            set_string(&mut info.name, "Userspace timer");
+        }
+        (uapi::SNDRV_TIMER_CLASS_GLOBAL, _) => {
             set_string(&mut info.id, "System");
             set_string(&mut info.name, "System timer");
         }
@@ -275,7 +386,7 @@ fn fill_info(timer: TimerRef, info: &mut uapi::snd_timer_info) {
         }
     }
     info.reserved0 = 0;
-    info.resolution = RESOLUTION_NS.load(Ordering::Acquire);
+    info.resolution = timer_resolution(timer);
 }
 
 fn fill_ginfo(timer: TimerRef, info: &mut uapi::snd_timer_ginfo) {
@@ -287,23 +398,63 @@ fn fill_ginfo(timer: TimerRef, info: &mut uapi::snd_timer_ginfo) {
         uapi::SNDRV_TIMER_SCLASS_NONE
     };
     info.tid.card = timer.card;
-    info.tid.device = 0;
-    info.tid.subdevice = 0;
+    info.tid.device = timer.device;
+    info.tid.subdevice = timer.subdevice;
     info.flags = 0;
     info.card = timer.card;
-    if timer.class == uapi::SNDRV_TIMER_CLASS_GLOBAL {
-        set_string(&mut info.id, "System");
-        set_string(&mut info.name, "System timer");
-    } else {
-        set_string(&mut info.id, &alloc::format!("card{}", timer.card));
-        set_string(&mut info.name, "Application timer");
+    match (timer.class, timer.device) {
+        (uapi::SNDRV_TIMER_CLASS_GLOBAL, uapi::SNDRV_TIMER_GLOBAL_UDRIVEN) => {
+            set_string(&mut info.id, &alloc::format!("uTimer{}", timer.subdevice));
+            set_string(&mut info.name, "Userspace timer");
+        }
+        (uapi::SNDRV_TIMER_CLASS_GLOBAL, _) => {
+            set_string(&mut info.id, "System");
+            set_string(&mut info.name, "System timer");
+        }
+        _ => {
+            set_string(&mut info.id, &alloc::format!("card{}", timer.card));
+            set_string(&mut info.name, "Application timer");
+        }
     }
     info.reserved0 = 0;
-    let resolution = RESOLUTION_NS.load(Ordering::Acquire);
+    let resolution = timer_resolution(timer);
     info.resolution = resolution;
     info.resolution_min = resolution;
     info.resolution_max = resolution;
     info.clients = active_clients();
+}
+
+fn allocate_utimer_id() -> Option<u32> {
+    let timers = UTIMERS.lock();
+    let used: Vec<u32> = timers
+        .iter()
+        .filter_map(Weak::upgrade)
+        .map(|timer| timer.id)
+        .collect();
+    (0..128).find(|id| !used.contains(id))
+}
+
+fn create_utimer(resolution: u64) -> Result<(u32, i32), VfsError> {
+    let id = allocate_utimer_id().ok_or(VfsError::NoSpace)?;
+    let timer = Arc::new(UTimer {
+        id,
+        resolution_ns: AtomicU64::new(resolution.max(1)),
+    });
+    UTIMERS.lock().push(Arc::downgrade(&timer));
+    let inode: Arc<dyn Inode> = Arc::new(UTimerInode { timer });
+    let file = Arc::new(crate::vfs::OpenFile::new(
+        inode,
+        alloc::string::String::from("anon_inode:[alsatimer]"),
+        abi::O_RDWR | abi::O_NONBLOCK,
+    ));
+    let fd = crate::vfs::current_fd_table().lock().alloc_fd(
+        0,
+        crate::vfs::FdEntry {
+            file,
+            cloexec: false,
+        },
+    )?;
+    Ok((id, fd as i32))
 }
 
 fn timer_ioctl(session: &TimerSession, cmd: u32, arg: u64) -> Result<u64, VfsError> {
@@ -333,8 +484,8 @@ fn timer_ioctl(session: &TimerSession, cmd: u32, arg: u64) -> Result<u64, VfsErr
                         uapi::SNDRV_TIMER_SCLASS_NONE
                     };
                     response.card = timer.card;
-                    response.device = 0;
-                    response.subdevice = 0;
+                    response.device = timer.device;
+                    response.subdevice = timer.subdevice;
                 }
                 None => return Err(VfsError::NoDevice),
             }
@@ -385,6 +536,8 @@ fn timer_ioctl(session: &TimerSession, cmd: u32, arg: u64) -> Result<u64, VfsErr
             let timer = (*session.bound.lock()).unwrap_or(TimerRef {
                 class: uapi::SNDRV_TIMER_CLASS_GLOBAL,
                 card: -1,
+                device: uapi::SNDRV_TIMER_GLOBAL_SYSTEM,
+                subdevice: 0,
             });
             fill_info(timer, &mut info);
             uaccess::write_value(arg, &info)?;
@@ -406,7 +559,13 @@ fn timer_ioctl(session: &TimerSession, cmd: u32, arg: u64) -> Result<u64, VfsErr
         uapi::SNDRV_TIMER_IOCTL_STATUS => {
             let mut status = uapi::snd_timer_status::zeroed();
             status.tstamp = uapi::timespec::from_micros(time::uptime_micros());
-            status.resolution = RESOLUTION_NS.load(Ordering::Acquire).min(u32::MAX as u64) as u32;
+            let timer = (*session.bound.lock()).unwrap_or(TimerRef {
+                class: uapi::SNDRV_TIMER_CLASS_GLOBAL,
+                card: -1,
+                device: uapi::SNDRV_TIMER_GLOBAL_SYSTEM,
+                subdevice: 0,
+            });
+            status.resolution = timer_resolution(timer).min(u32::MAX as u64) as u32;
             status.lost = 0;
             status.overrun = session.overrun.load(Ordering::Acquire).min(u32::MAX as u64) as u32;
             status.queue = session.queue.lock().len() as u32;
@@ -422,14 +581,19 @@ fn timer_ioctl(session: &TimerSession, cmd: u32, arg: u64) -> Result<u64, VfsErr
                 params.running = true;
                 params.paused = false;
             }
+            let timer = *session.bound.lock();
             session.push(TimerRecord {
                 event: uapi::SNDRV_TIMER_EVENT_START,
                 tstamp: uapi::timespec::from_micros(time::uptime_micros()),
-                val: RESOLUTION_NS.load(Ordering::Acquire).min(u32::MAX as u64) as u32,
+                val: timer
+                    .map_or_else(|| RESOLUTION_NS.load(Ordering::Acquire), timer_resolution)
+                    .min(u32::MAX as u64) as u32,
                 ticks: 0,
                 resolution: 0,
             });
-            restart(session);
+            if !timer.is_some_and(is_utimer) {
+                restart(session);
+            }
             Ok(0)
         }
         uapi::SNDRV_TIMER_IOCTL_STOP => {
@@ -455,14 +619,19 @@ fn timer_ioctl(session: &TimerSession, cmd: u32, arg: u64) -> Result<u64, VfsErr
                 params.running = true;
                 params.paused = false;
             }
+            let timer = *session.bound.lock();
             session.push(TimerRecord {
                 event: uapi::SNDRV_TIMER_EVENT_CONTINUE,
                 tstamp: uapi::timespec::from_micros(time::uptime_micros()),
-                val: RESOLUTION_NS.load(Ordering::Acquire).min(u32::MAX as u64) as u32,
+                val: timer
+                    .map_or_else(|| RESOLUTION_NS.load(Ordering::Acquire), timer_resolution)
+                    .min(u32::MAX as u64) as u32,
                 ticks: 0,
                 resolution: 0,
             });
-            restart(session);
+            if !timer.is_some_and(is_utimer) {
+                restart(session);
+            }
             Ok(0)
         }
         uapi::SNDRV_TIMER_IOCTL_PAUSE => {
@@ -483,9 +652,15 @@ fn timer_ioctl(session: &TimerSession, cmd: u32, arg: u64) -> Result<u64, VfsErr
             session.tread.store(enable != 0, Ordering::Release);
             Ok(0)
         }
-        uapi::SNDRV_TIMER_IOCTL_CREATE | uapi::SNDRV_TIMER_IOCTL_TRIGGER => {
-            Err(VfsError::NotSupported)
+        uapi::SNDRV_TIMER_IOCTL_CREATE => {
+            let mut info = uaccess::read_value::<uapi::snd_timer_uinfo>(arg)?;
+            let (id, fd) = create_utimer(info.resolution)?;
+            info.id = id;
+            info.fd = fd;
+            uaccess::write_value(arg, &info)?;
+            Ok(0)
         }
+        uapi::SNDRV_TIMER_IOCTL_TRIGGER => Err(VfsError::NotATty),
         _ => Err(VfsError::NotATty),
     }
 }
@@ -584,6 +759,39 @@ pub fn test_session() -> Arc<TimerSession> {
 }
 
 #[cfg(feature = "boot-self-test")]
+fn utimer_self_test() -> bool {
+    let Ok((id, fd)) = create_utimer(1_000_000) else {
+        return false;
+    };
+    let client = TimerSession::session(false);
+    *client.bound.lock() = Some(TimerRef {
+        class: uapi::SNDRV_TIMER_CLASS_GLOBAL,
+        card: -1,
+        device: uapi::SNDRV_TIMER_GLOBAL_UDRIVEN,
+        subdevice: id as i32,
+    });
+    {
+        let mut params = client.params.lock();
+        params.ticks = 1;
+        params.queue_size = 32;
+        params.running = true;
+        params.paused = false;
+    }
+    let timer = UTIMERS
+        .lock()
+        .iter()
+        .find_map(|weak| weak.upgrade().filter(|timer| timer.id == id));
+    let Some(timer) = timer else {
+        return false;
+    };
+    timer.trigger();
+    let queued = client.queue.lock().len();
+    client.params.lock().running = false;
+    let _ = crate::vfs::current_fd_table().lock().close(fd as usize);
+    queued >= 1
+}
+
+#[cfg(feature = "boot-self-test")]
 pub fn self_test_late() -> bool {
     let session = TimerSession::session(false);
     {
@@ -602,7 +810,7 @@ pub fn self_test_late() -> bool {
         params.paused = false;
     }
     session.arm_generation.fetch_add(1, Ordering::AcqRel);
-    queued >= 2
+    queued >= 2 && utimer_self_test()
 }
 
 /// Register `/dev/snd/timer`.  The global timer device has the fixed minor 33,

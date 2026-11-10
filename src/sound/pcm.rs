@@ -23,6 +23,7 @@ use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
     vec,
+    vec::Vec,
 };
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
@@ -112,6 +113,7 @@ pub struct HardwareParams {
     pub periods: u32,
     pub buffer_size: u64,
     pub buffer_bytes: u64,
+    pub noninterleaved: bool,
 }
 
 pub struct RingBuffer {
@@ -226,6 +228,7 @@ pub trait PcmOps: Send + Sync {
 pub struct Substream {
     pub card: u32,
     pub device: u32,
+    pub subdevice: u32,
     pub direction: Direction,
     pub id: String,
     pub name: String,
@@ -239,12 +242,15 @@ pub struct Substream {
     pub avail: AtomicU64,
     pub state: AtomicI32,
     self_reference: SpinLock<Weak<Substream>>,
+    siblings: Mutex<Vec<Weak<Substream>>>,
+    group: Mutex<Vec<Weak<Substream>>>,
 }
 
 impl Substream {
     pub fn new(
         card: u32,
         device: u32,
+        subdevice: u32,
         direction: Direction,
         id: &str,
         name: &str,
@@ -253,6 +259,7 @@ impl Substream {
         Arc::new_cyclic(|weak| Self {
             card,
             device,
+            subdevice,
             direction,
             id: String::from(id),
             name: String::from(name),
@@ -266,6 +273,8 @@ impl Substream {
             avail: AtomicU64::new(0),
             state: AtomicI32::new(uapi::SNDRV_PCM_STATE_OPEN),
             self_reference: SpinLock::new(weak.clone()),
+            siblings: Mutex::new(Vec::new()),
+            group: Mutex::new(Vec::new()),
         })
     }
 
@@ -291,7 +300,7 @@ impl Substream {
     pub fn info(&self) -> uapi::snd_pcm_info {
         let mut info = uapi::snd_pcm_info::zeroed();
         info.device = self.device;
-        info.subdevice = 0;
+        info.subdevice = self.subdevice;
         info.stream = self.direction.stream();
         info.card = self.card as i32;
         set_string(&mut info.id, &self.id);
@@ -299,8 +308,13 @@ impl Substream {
         set_string(&mut info.subname, "subdevice #0");
         info.dev_class = uapi::SNDRV_PCM_CLASS_GENERIC;
         info.dev_subclass = uapi::SNDRV_PCM_SUBCLASS_GENERIC_MIX;
-        info.subdevices_count = 1;
-        info.subdevices_avail = u32::from(!self.opened.load(Ordering::Acquire));
+        let siblings = self.siblings.lock();
+        info.subdevices_count = siblings.len().max(1) as u32;
+        info.subdevices_avail = siblings
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|substream| !substream.opened.load(Ordering::Acquire))
+            .count() as u32;
         info
     }
 
@@ -394,10 +408,10 @@ fn sync_pages(runtime: &mut Runtime) {
             state: runtime.state,
             pad1: 0,
             hw_ptr: runtime.hw_ptr,
-            tstamp: runtime.tstamp,
+            tstamp: clock_from_uptime(timespec_micros(runtime.tstamp), runtime.tstamp_type),
             suspended_state: runtime.suspended_state,
             pad2: 0,
-            audio_tstamp: runtime.tstamp,
+            audio_tstamp: clock_from_uptime(timespec_micros(runtime.tstamp), runtime.tstamp_type),
         };
         // SAFETY: the coherent page is owned by this substream and is exactly
         // one page; the status structure lives in its first 56 bytes.
@@ -498,11 +512,38 @@ pub fn snd_pcm_period_elapsed(substream: &Substream) {
     period_elapsed(substream);
 }
 
-fn fill_status(substream: &Substream, runtime: &Runtime) -> uapi::snd_pcm_status {
+fn timespec_micros(value: uapi::timespec) -> u64 {
+    (value.tv_sec.max(0) as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add((value.tv_nsec.max(0) as u64) / 1_000)
+}
+
+fn clock_from_uptime(micros: u64, kind: i32) -> uapi::timespec {
+    if kind == uapi::SNDRV_PCM_TSTAMP_TYPE_GETTIMEOFDAY {
+        let now_uptime = time::uptime_micros();
+        let now_realtime = time::realtime_micros();
+        uapi::timespec::from_micros(now_realtime.saturating_sub(now_uptime.saturating_sub(micros)))
+    } else {
+        uapi::timespec::from_micros(micros)
+    }
+}
+
+/// Build the status structure.  `config` is present for `STATUS_EXT`, whose
+/// `audio_tstamp_data` is read/write; legacy `STATUS` leaves it zero.
+fn fill_status(
+    substream: &Substream,
+    runtime: &Runtime,
+    config: Option<u32>,
+) -> uapi::snd_pcm_status {
     let mut status = uapi::snd_pcm_status::zeroed();
     status.state = runtime.state;
-    status.trigger_tstamp = runtime.trigger_tstamp;
-    status.tstamp = runtime.tstamp;
+    let kind = runtime.tstamp_type;
+    status.trigger_tstamp = clock_from_uptime(timespec_micros(runtime.trigger_tstamp), kind);
+    status.tstamp = if runtime.tstamp_mode == uapi::SNDRV_PCM_TSTAMP_ENABLE {
+        clock_from_uptime(timespec_micros(runtime.tstamp), kind)
+    } else {
+        uapi::timespec::zero()
+    };
     status.appl_ptr = runtime.appl_ptr;
     status.hw_ptr = runtime.hw_ptr;
     let in_flight = if runtime.boundary == 0 {
@@ -521,8 +562,34 @@ fn fill_status(substream: &Substream, runtime: &Runtime) -> uapi::snd_pcm_status
     status.avail_max = runtime.avail_max.max(status.avail);
     status.overrange = runtime.overrange;
     status.suspended_state = runtime.suspended_state;
-    status.audio_tstamp = runtime.tstamp;
-    status.driver_tstamp = runtime.tstamp;
+    if runtime.tstamp_mode == uapi::SNDRV_PCM_TSTAMP_ENABLE {
+        // Default DMA timestamp: the time at which the current hw_ptr was
+        // reached, anchored at the trigger timestamp.
+        let dma_micros = runtime.hw.map_or(0, |hw| {
+            runtime.hw_ptr.saturating_mul(1_000_000) / u64::from(hw.rate.max(1))
+        });
+        status.audio_tstamp = clock_from_uptime(
+            timespec_micros(runtime.trigger_tstamp).saturating_add(dma_micros),
+            kind,
+        );
+        status.driver_tstamp = status.tstamp;
+        status.audio_tstamp_data = if let Some(config) = config {
+            let requested = config & 0x1F;
+            let type_requested = (config & 0xF) as i32;
+            let actual = match type_requested {
+                uapi::SNDRV_PCM_AUDIO_TSTAMP_TYPE_COMPAT
+                | uapi::SNDRV_PCM_AUDIO_TSTAMP_TYPE_DEFAULT => {
+                    uapi::SNDRV_PCM_AUDIO_TSTAMP_TYPE_DEFAULT
+                }
+                other => other,
+            };
+            // valid | actual_type << 1 | accuracy_report << 5, packed at bit 16.
+            requested | (1 << 16) | (((actual as u32) & 0xF) << 17)
+        } else {
+            0
+        };
+        status.audio_tstamp_accuracy = 0;
+    }
     status
 }
 
@@ -539,7 +606,9 @@ fn mask_from_formats(formats: u64) -> uapi::snd_mask {
 fn default_access_mask() -> uapi::snd_mask {
     let mut mask = uapi::snd_mask::zeroed();
     mask.set(uapi::SNDRV_PCM_ACCESS_MMAP_INTERLEAVED);
+    mask.set(uapi::SNDRV_PCM_ACCESS_MMAP_NONINTERLEAVED);
     mask.set(uapi::SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+    mask.set(uapi::SNDRV_PCM_ACCESS_RW_NONINTERLEAVED);
     mask
 }
 
@@ -668,17 +737,15 @@ fn solve(
     input: &uapi::snd_pcm_hw_params,
 ) -> Result<HardwareParams, VfsError> {
     let caps = *substream.caps.lock();
-    if input.flags & uapi::SNDRV_PCM_HW_PARAMS_EXPORT_BUFFER != 0 {
-        return Err(VfsError::NotSupported);
-    }
+    // EXPORT_BUFFER is a userspace-plugin hint; the kernel only carries it.
 
     let access = choose_mask_value(
         input.mask(uapi::SNDRV_PCM_HW_PARAM_ACCESS),
         uapi::SNDRV_PCM_ACCESS_MMAP_INTERLEAVED,
     )
     .ok_or(VfsError::InvalidArgument)?;
-    if access != uapi::SNDRV_PCM_ACCESS_MMAP_INTERLEAVED
-        && access != uapi::SNDRV_PCM_ACCESS_RW_INTERLEAVED
+    if access == uapi::SNDRV_PCM_ACCESS_MMAP_COMPLEX
+        || access > uapi::SNDRV_PCM_ACCESS_RW_NONINTERLEAVED
     {
         return Err(VfsError::InvalidArgument);
     }
@@ -774,6 +841,10 @@ fn solve(
         periods,
         buffer_size: buffer_size as u64,
         buffer_bytes,
+        noninterleaved: matches!(
+            access,
+            uapi::SNDRV_PCM_ACCESS_MMAP_NONINTERLEAVED | uapi::SNDRV_PCM_ACCESS_RW_NONINTERLEAVED
+        ),
     })
 }
 
@@ -923,7 +994,7 @@ fn configure(
     uaccess::write_value(arg, &params)
 }
 
-fn prepare(substream: &Arc<Substream>) -> Result<(), VfsError> {
+fn prepare_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     {
         let mut runtime = substream.runtime.lock();
         if runtime.hw.is_none() {
@@ -947,7 +1018,7 @@ fn prepare(substream: &Arc<Substream>) -> Result<(), VfsError> {
     Ok(())
 }
 
-fn trigger(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
+fn trigger_one(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
     let (new_state, allowed): (i32, &'static [i32]) = match cmd {
         uapi::SNDRV_PCM_TRIGGER_START => (
             uapi::SNDRV_PCM_STATE_RUNNING,
@@ -1012,7 +1083,86 @@ fn trigger(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
     Ok(())
 }
 
+fn prepare(substream: &Arc<Substream>) -> Result<(), VfsError> {
+    for member in group_members(substream) {
+        prepare_one(&member)?;
+    }
+    Ok(())
+}
+
+fn group_members(substream: &Arc<Substream>) -> Vec<Arc<Substream>> {
+    let group = substream.group.lock();
+    if group.is_empty() {
+        return alloc::vec![substream.clone()];
+    }
+    let members: Vec<_> = group.iter().filter_map(Weak::upgrade).collect();
+    if members.is_empty() {
+        alloc::vec![substream.clone()]
+    } else {
+        members
+    }
+}
+
+fn trigger(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
+    for member in group_members(substream) {
+        trigger_one(&member, cmd)?;
+    }
+    Ok(())
+}
+
+fn link(substream: &Arc<Substream>, fd: i32) -> Result<(), VfsError> {
+    if fd < 0 {
+        return Err(VfsError::InvalidArgument);
+    }
+    let entry = crate::vfs::current_fd_table()
+        .lock()
+        .get(fd as usize)
+        .ok_or(VfsError::BadFileDescriptor)?;
+    let target = entry
+        .file
+        .inode
+        .sound_substream()
+        .ok_or(VfsError::InvalidArgument)?;
+    if Arc::ptr_eq(substream, &target) {
+        return Err(VfsError::InvalidArgument);
+    }
+    {
+        let own = substream.group.lock();
+        let other = target.group.lock();
+        if !own.is_empty() || !other.is_empty() {
+            return Err(VfsError::Busy);
+        }
+    }
+    {
+        let mut own = substream.group.lock();
+        own.push(Arc::downgrade(substream));
+        own.push(Arc::downgrade(&target));
+    }
+    {
+        let mut other = target.group.lock();
+        other.push(Arc::downgrade(substream));
+        other.push(Arc::downgrade(&target));
+    }
+    Ok(())
+}
+
+fn unlink(substream: &Arc<Substream>) -> Result<(), VfsError> {
+    let members = group_members(substream);
+    for member in &members {
+        member.group.lock().clear();
+    }
+    substream.group.lock().clear();
+    Ok(())
+}
+
 fn reset(substream: &Arc<Substream>) -> Result<(), VfsError> {
+    for member in group_members(substream) {
+        reset_one(&member)?;
+    }
+    Ok(())
+}
+
+fn reset_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     {
         let runtime = substream.runtime.lock();
         if runtime.hw.is_none() {
@@ -1236,7 +1386,234 @@ fn read_frames(
     Ok(done)
 }
 
-fn drain(substream: &Arc<Substream>) -> Result<(), VfsError> {
+fn channel_pointers(bufs: u64, channels: usize) -> Result<Vec<u64>, VfsError> {
+    if bufs == 0 || channels == 0 || channels > 32 {
+        return Err(VfsError::InvalidArgument);
+    }
+    let bytes = uaccess::read_vec(bufs, channels * 8, 256)?;
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|chunk| {
+            u64::from_ne_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        })
+        .collect())
+}
+
+fn write_frames_planar(
+    substream: &Arc<Substream>,
+    bufs: u64,
+    frames: u64,
+    nonblock: bool,
+) -> Result<u64, VfsError> {
+    let (frame_bytes, channels, ring_frames) = {
+        let runtime = substream.runtime.lock();
+        let hw = runtime.hw.ok_or(VfsError::InvalidArgument)?;
+        (hw.frame_bytes, hw.channels as usize, hw.buffer_size)
+    };
+    if frames == 0 {
+        return Ok(0);
+    }
+    let sample_bytes = frame_bytes / channels.max(1);
+    let pointers = channel_pointers(bufs, channels)?;
+    let mut done = 0u64;
+    while done < frames {
+        loop {
+            let state = substream.state.load(Ordering::Acquire);
+            if state == uapi::SNDRV_PCM_STATE_XRUN {
+                return Err(VfsError::BrokenPipe);
+            }
+            if substream.avail.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            if state == uapi::SNDRV_PCM_STATE_SETUP || state == uapi::SNDRV_PCM_STATE_OPEN {
+                return Err(VfsError::InvalidArgument);
+            }
+            if nonblock {
+                return if done == 0 {
+                    Err(VfsError::WouldBlock)
+                } else {
+                    Ok(done)
+                };
+            }
+            let generation = substream.generation.load(Ordering::Acquire);
+            substream.wait.wait_until(|| {
+                substream.generation.load(Ordering::Acquire) != generation
+                    && substream.avail.load(Ordering::Acquire) != 0
+            });
+        }
+
+        let remaining = frames - done;
+        let chunk = remaining
+            .min((MAX_RW_BYTES / frame_bytes.max(1)) as u64)
+            .min(ring_frames)
+            .max(1) as usize;
+        let plane_bytes = chunk * sample_bytes;
+        let mut planes = vec![0u8; plane_bytes * channels];
+        for channel in 0..channels {
+            let user = pointers[channel]
+                .checked_add(done.saturating_mul(sample_bytes as u64))
+                .ok_or(VfsError::Fault)?;
+            let start = channel * plane_bytes;
+            uaccess::read(user, &mut planes[start..start + plane_bytes])?;
+        }
+
+        let mut runtime = substream.runtime.lock();
+        refresh_control(&mut runtime);
+        let avail = avail_locked(&runtime, Direction::Playback);
+        if avail == 0 {
+            drop(runtime);
+            continue;
+        }
+        let take = avail.min(chunk as u64) as usize;
+        let pages = runtime.pages.clone().ok_or(VfsError::InvalidArgument)?;
+        let ring = &pages.ring;
+        let frames_per_plane = ring.frames as usize;
+        let plane_total = frames_per_plane * sample_bytes;
+        let start_frame = (runtime.appl_ptr % ring.frames) as usize;
+        let bytes = take * sample_bytes;
+        for channel in 0..channels {
+            let source = channel * plane_bytes;
+            let plane = channel * plane_total;
+            let start = start_frame * sample_bytes;
+            let first = bytes.min(plane_total - start);
+            // SAFETY: both ranges stay inside the ring allocation; the source is
+            // a channel slice of the temporary plane buffer.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    planes.as_ptr().add(source),
+                    ring.pointer().add(plane + start),
+                    first,
+                );
+                if bytes > first {
+                    core::ptr::copy_nonoverlapping(
+                        planes.as_ptr().add(source + first),
+                        ring.pointer().add(plane),
+                        bytes - first,
+                    );
+                }
+            }
+        }
+        runtime.appl_ptr = (runtime.appl_ptr + take as u64) % runtime.boundary;
+        runtime.tstamp = now();
+        publish(substream, &mut runtime);
+        drop(runtime);
+        wake(substream);
+        done += take as u64;
+        start_if_threshold(substream);
+    }
+    Ok(done)
+}
+
+fn read_frames_planar(
+    substream: &Arc<Substream>,
+    bufs: u64,
+    frames: u64,
+    nonblock: bool,
+) -> Result<u64, VfsError> {
+    let (frame_bytes, channels, ring_frames) = {
+        let runtime = substream.runtime.lock();
+        let hw = runtime.hw.ok_or(VfsError::InvalidArgument)?;
+        (hw.frame_bytes, hw.channels as usize, hw.buffer_size)
+    };
+    if frames == 0 {
+        return Ok(0);
+    }
+    if substream.state.load(Ordering::Acquire) == uapi::SNDRV_PCM_STATE_PREPARED {
+        let _ = trigger(substream, uapi::SNDRV_PCM_TRIGGER_START);
+    }
+    let sample_bytes = frame_bytes / channels.max(1);
+    let pointers = channel_pointers(bufs, channels)?;
+    let mut done = 0u64;
+    while done < frames {
+        period_elapsed(substream);
+        loop {
+            let state = substream.state.load(Ordering::Acquire);
+            if state == uapi::SNDRV_PCM_STATE_XRUN {
+                return Err(VfsError::BrokenPipe);
+            }
+            if substream.avail.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            if state == uapi::SNDRV_PCM_STATE_SETUP || state == uapi::SNDRV_PCM_STATE_OPEN {
+                return Err(VfsError::InvalidArgument);
+            }
+            if nonblock {
+                return if done == 0 {
+                    Err(VfsError::WouldBlock)
+                } else {
+                    Ok(done)
+                };
+            }
+            let generation = substream.generation.load(Ordering::Acquire);
+            substream.wait.wait_until(|| {
+                substream.generation.load(Ordering::Acquire) != generation
+                    && substream.avail.load(Ordering::Acquire) != 0
+            });
+        }
+
+        let remaining = frames - done;
+        let chunk = remaining
+            .min((MAX_RW_BYTES / frame_bytes.max(1)) as u64)
+            .min(ring_frames)
+            .max(1) as usize;
+        let plane_bytes = chunk * sample_bytes;
+        let mut planes = vec![0u8; plane_bytes * channels];
+        let mut runtime = substream.runtime.lock();
+        refresh_control(&mut runtime);
+        let avail = avail_locked(&runtime, Direction::Capture);
+        if avail == 0 {
+            drop(runtime);
+            continue;
+        }
+        let take = avail.min(chunk as u64) as usize;
+        let pages = runtime.pages.clone().ok_or(VfsError::InvalidArgument)?;
+        let ring = &pages.ring;
+        let frames_per_plane = ring.frames as usize;
+        let plane_total = frames_per_plane * sample_bytes;
+        let start_frame = (runtime.appl_ptr % ring.frames) as usize;
+        let bytes = take * sample_bytes;
+        for channel in 0..channels {
+            let destination = channel * plane_bytes;
+            let plane = channel * plane_total;
+            let start = start_frame * sample_bytes;
+            let first = bytes.min(plane_total - start);
+            // SAFETY: as in the write path; both sides are bounded ring or
+            // temporary plane slices.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    ring.pointer().add(plane + start),
+                    planes.as_mut_ptr().add(destination),
+                    first,
+                );
+                if bytes > first {
+                    core::ptr::copy_nonoverlapping(
+                        ring.pointer().add(plane),
+                        planes.as_mut_ptr().add(destination + first),
+                        bytes - first,
+                    );
+                }
+            }
+        }
+        runtime.appl_ptr = (runtime.appl_ptr + take as u64) % runtime.boundary;
+        runtime.tstamp = now();
+        publish(substream, &mut runtime);
+        drop(runtime);
+        wake(substream);
+        for channel in 0..channels {
+            let user = pointers[channel]
+                .checked_add(done.saturating_mul(sample_bytes as u64))
+                .ok_or(VfsError::Fault)?;
+            let start = channel * plane_bytes;
+            uaccess::write(user, &planes[start..start + bytes])?;
+        }
+        done += take as u64;
+    }
+    Ok(done)
+}
+
+fn drain_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     if substream.direction == Direction::Capture {
         return Ok(());
     }
@@ -1278,6 +1655,13 @@ fn drain(substream: &Arc<Substream>) -> Result<(), VfsError> {
     publish(substream, &mut runtime);
     drop(runtime);
     wake(substream);
+    Ok(())
+}
+
+fn drain(substream: &Arc<Substream>) -> Result<(), VfsError> {
+    for member in group_members(substream) {
+        drain_one(&member)?;
+    }
     Ok(())
 }
 
@@ -1386,10 +1770,18 @@ pub fn ioctl(
             Ok(0)
         }
         uapi::SNDRV_PCM_IOCTL_STATUS | uapi::SNDRV_PCM_IOCTL_STATUS_EXT => {
+            let config = if cmd == uapi::SNDRV_PCM_IOCTL_STATUS_EXT {
+                Some(
+                    uaccess::read_value::<uapi::snd_pcm_status>(arg)
+                        .map_or(0, |status| status.audio_tstamp_data),
+                )
+            } else {
+                None
+            };
             period_elapsed(substream);
             let mut runtime = substream.runtime.lock();
             refresh_control(&mut runtime);
-            let status = fill_status(substream, &runtime);
+            let status = fill_status(substream, &runtime, config);
             runtime.avail_max = status.avail;
             runtime.overrange = 0;
             sync_pages(&mut runtime);
@@ -1400,7 +1792,7 @@ pub fn ioctl(
         uapi::SNDRV_PCM_IOCTL_DELAY => {
             period_elapsed(substream);
             let runtime = substream.runtime.lock();
-            let status = fill_status(substream, &runtime);
+            let status = fill_status(substream, &runtime, None);
             drop(runtime);
             uaccess::write_value(arg, &status.delay)?;
             Ok(0)
@@ -1416,7 +1808,7 @@ pub fn ioctl(
             }
             let mut runtime = substream.runtime.lock();
             refresh_control(&mut runtime);
-            let status = fill_status(substream, &runtime);
+            let status = fill_status(substream, &runtime, None);
             let mmap_status = uapi::snd_pcm_mmap_status {
                 state: status.state,
                 pad1: 0,
@@ -1443,9 +1835,17 @@ pub fn ioctl(
             if request.channel >= hw.channels {
                 return Err(VfsError::InvalidArgument);
             }
-            request.offset = 0;
-            request.first = request.channel * hw.sample_bits;
-            request.step = hw.frame_bits;
+            let sample_bytes = hw.frame_bytes / hw.channels.max(1) as usize;
+            if hw.noninterleaved {
+                request.offset =
+                    (request.channel as u64 * hw.buffer_size * sample_bytes as u64) as i64;
+                request.first = 0;
+                request.step = hw.sample_bits;
+            } else {
+                request.offset = 0;
+                request.first = request.channel * hw.sample_bits;
+                request.step = hw.frame_bits;
+            }
             drop(runtime);
             uaccess::write_value(arg, &request)?;
             Ok(0)
@@ -1541,8 +1941,15 @@ pub fn ioctl(
         uapi::SNDRV_PCM_IOCTL_WRITEN_FRAMES | uapi::SNDRV_PCM_IOCTL_READN_FRAMES => {
             Err(VfsError::InvalidArgument)
         }
-        uapi::SNDRV_PCM_IOCTL_UNLINK => Ok(0),
-        uapi::SNDRV_PCM_IOCTL_LINK => Err(VfsError::NotSupported),
+        uapi::SNDRV_PCM_IOCTL_LINK => {
+            let fd = uaccess::read_value::<i32>(arg)?;
+            link(substream, fd)?;
+            Ok(0)
+        }
+        uapi::SNDRV_PCM_IOCTL_UNLINK => {
+            unlink(substream)?;
+            Ok(0)
+        }
         _ => Err(VfsError::NotATty),
     }
 }
@@ -1552,8 +1959,8 @@ pub struct Pcm {
     pub device: u32,
     pub id: String,
     pub name: String,
-    pub playback: Option<Arc<Substream>>,
-    pub capture: Option<Arc<Substream>>,
+    pub playback: Vec<Arc<Substream>>,
+    pub capture: Vec<Arc<Substream>>,
     pub info_flags: u32,
 }
 
@@ -1563,29 +1970,171 @@ impl Pcm {
         device: u32,
         id: &str,
         name: &str,
-        playback: bool,
-        capture: bool,
+        playback_count: u32,
+        capture_count: u32,
         info_flags: u32,
     ) -> Arc<Self> {
+        fn build(
+            card: u32,
+            device: u32,
+            direction: Direction,
+            id: &str,
+            name: &str,
+            count: u32,
+            info_flags: u32,
+        ) -> Vec<Arc<Substream>> {
+            let stream: Vec<_> = (0..count)
+                .map(|subdevice| {
+                    Substream::new(card, device, subdevice, direction, id, name, info_flags)
+                })
+                .collect();
+            for substream in &stream {
+                *substream.siblings.lock() = stream.iter().map(Arc::downgrade).collect();
+            }
+            stream
+        }
         Arc::new(Self {
             card,
             device,
             id: id.to_string(),
             name: name.to_string(),
-            playback: playback
-                .then(|| Substream::new(card, device, Direction::Playback, id, name, info_flags)),
-            capture: capture
-                .then(|| Substream::new(card, device, Direction::Capture, id, name, info_flags)),
+            playback: build(
+                card,
+                device,
+                Direction::Playback,
+                id,
+                name,
+                playback_count,
+                info_flags,
+            ),
+            capture: build(
+                card,
+                device,
+                Direction::Capture,
+                id,
+                name,
+                capture_count,
+                info_flags,
+            ),
             info_flags,
         })
     }
 
-    pub fn substream(&self, direction: Direction) -> Option<Arc<Substream>> {
+    pub fn substream(&self, direction: Direction, subdevice: u32) -> Option<Arc<Substream>> {
+        self.substreams(direction)
+            .into_iter()
+            .find(|substream| substream.subdevice == subdevice)
+    }
+
+    pub fn first_substream(&self, direction: Direction) -> Option<Arc<Substream>> {
+        self.substreams(direction).into_iter().next()
+    }
+
+    pub fn substreams(&self, direction: Direction) -> Vec<Arc<Substream>> {
         match direction {
             Direction::Playback => self.playback.clone(),
             Direction::Capture => self.capture.clone(),
         }
     }
+
+    pub fn substream_count(&self, direction: Direction) -> u32 {
+        match direction {
+            Direction::Playback => self.playback.len() as u32,
+            Direction::Capture => self.capture.len() as u32,
+        }
+    }
+}
+
+/// Direction node (`pcmC<n>D<m>{p,c}`).  An open picks the first free
+/// substream, matching Linux's `snd_pcm_attach_substream`; when every
+/// substream is busy the open fails with EAGAIN.
+pub struct PcmDeviceNode {
+    substreams: Vec<Arc<Substream>>,
+}
+
+impl PcmDeviceNode {
+    pub fn new(substreams: Vec<Arc<Substream>>) -> Arc<Self> {
+        Arc::new(Self { substreams })
+    }
+}
+
+impl Inode for PcmDeviceNode {
+    fn metadata(&self) -> Result<Stat, VfsError> {
+        Ok(Stat::simple(ino(), InodeKind::CharDevice, 0o660, 0))
+    }
+
+    fn open(&self, flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
+        let nonblock = flags & crate::vfs::abi::O_NONBLOCK != 0;
+        for substream in &self.substreams {
+            if substream.opened.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            if let Some(ops) = substream.ops.lock().clone()
+                && let Err(error) = ops.open(substream)
+            {
+                substream.opened.store(false, Ordering::Release);
+                return Err(from_errno(error));
+            }
+            return Ok(Some(PcmSession::session(substream.clone(), nonblock)));
+        }
+        Err(VfsError::WouldBlock)
+    }
+
+    fn read_at(&self, _offset: u64, _buffer: &mut [u8]) -> Result<usize, VfsError> {
+        Err(VfsError::NotSupported)
+    }
+
+    fn write_at(&self, _offset: u64, _buffer: &[u8]) -> Result<usize, VfsError> {
+        Err(VfsError::NotSupported)
+    }
+}
+
+#[cfg(feature = "boot-self-test")]
+fn link_self_test() -> bool {
+    let Some(card) = crate::sound::find_card(0) else {
+        return false;
+    };
+    let Some(pcm) = card.find_pcm(0) else {
+        return false;
+    };
+    let (Some(playback), Some(capture)) = (
+        pcm.first_substream(Direction::Playback),
+        pcm.first_substream(Direction::Capture),
+    ) else {
+        return false;
+    };
+    if prepare(&playback).is_err() || prepare(&capture).is_err() {
+        return false;
+    }
+    let session: Arc<dyn Inode> = PcmSession::session(capture.clone(), false);
+    let file = Arc::new(crate::vfs::OpenFile::new(
+        session,
+        String::from("sound-link"),
+        crate::vfs::abi::O_RDWR,
+    ));
+    let fd = match crate::vfs::current_fd_table().lock().alloc_fd(
+        0,
+        crate::vfs::FdEntry {
+            file,
+            cloexec: true,
+        },
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return false,
+    };
+    let linked = link(&playback, fd as i32).is_ok()
+        && playback.group.lock().len() == 2
+        && capture.group.lock().len() == 2
+        && trigger(&playback, uapi::SNDRV_PCM_TRIGGER_START).is_ok()
+        && playback.state.load(Ordering::Acquire) == uapi::SNDRV_PCM_STATE_RUNNING
+        && capture.state.load(Ordering::Acquire) == uapi::SNDRV_PCM_STATE_RUNNING;
+    let _ = unlink(&playback);
+    let groups_empty = playback.group.lock().is_empty() && capture.group.lock().is_empty();
+    let _ = trigger(&playback, uapi::SNDRV_PCM_TRIGGER_STOP);
+    let _ = prepare(&playback);
+    let _ = prepare(&capture);
+    let _ = crate::vfs::current_fd_table().lock().close(fd);
+    linked && groups_empty
 }
 
 #[cfg(feature = "boot-self-test")]
@@ -1596,7 +2145,7 @@ pub fn self_test_late() -> bool {
     let Some(pcm) = card.find_pcm(0) else {
         return false;
     };
-    let Some(playback) = pcm.playback.clone() else {
+    let Some(playback) = pcm.first_substream(Direction::Playback) else {
         return false;
     };
     if prepare(&playback).is_err() || trigger(&playback, uapi::SNDRV_PCM_TRIGGER_START).is_err() {
@@ -1616,7 +2165,7 @@ pub fn self_test_late() -> bool {
     period_elapsed(&playback);
     let playing = {
         let runtime = playback.runtime.lock();
-        let status = fill_status(&playback, &runtime);
+        let status = fill_status(&playback, &runtime, None);
         status.state == uapi::SNDRV_PCM_STATE_RUNNING && status.hw_ptr > 0
     };
     let paused = trigger(&playback, uapi::SNDRV_PCM_TRIGGER_PAUSE_PUSH).is_ok()
@@ -1627,7 +2176,7 @@ pub fn self_test_late() -> bool {
     let _ = prepare(&playback);
 
     let mut capture_ok = true;
-    if let Some(capture) = pcm.capture.clone() {
+    if let Some(capture) = pcm.first_substream(Direction::Capture) {
         capture_ok =
             prepare(&capture).is_ok() && trigger(&capture, uapi::SNDRV_PCM_TRIGGER_START).is_ok();
         if capture_ok {
@@ -1641,7 +2190,7 @@ pub fn self_test_late() -> bool {
             let _ = prepare(&capture);
         }
     }
-    playing && paused && resumed && capture_ok
+    playing && paused && resumed && capture_ok && link_self_test()
 }
 
 /// Per-open PCM file state.  The object stored in the device registry is a
@@ -1650,27 +2199,15 @@ pub struct PcmSession {
     substream: Arc<Substream>,
     nonblock: AtomicBool,
     owns_open: AtomicBool,
-    template: AtomicBool,
     self_reference: SpinLock<Weak<PcmSession>>,
 }
 
 impl PcmSession {
-    pub fn device_node(substream: Arc<Substream>) -> Self {
-        Self {
-            substream,
-            nonblock: AtomicBool::new(false),
-            owns_open: AtomicBool::new(false),
-            template: AtomicBool::new(true),
-            self_reference: SpinLock::new(Weak::new()),
-        }
-    }
-
     fn session(substream: Arc<Substream>, nonblock: bool) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             substream,
             nonblock: AtomicBool::new(nonblock),
             owns_open: AtomicBool::new(true),
-            template: AtomicBool::new(false),
             self_reference: SpinLock::new(weak.clone()),
         })
     }
@@ -1703,22 +2240,8 @@ impl Inode for PcmSession {
         Ok(Stat::simple(ino(), InodeKind::CharDevice, 0o660, 0))
     }
 
-    fn open(&self, flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
-        if !self.template.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        if self.substream.opened.swap(true, Ordering::AcqRel) {
-            return Err(VfsError::Busy);
-        }
-        let nonblock = flags & crate::vfs::abi::O_NONBLOCK != 0;
-        if let Some(ops) = self.substream.ops.lock().clone()
-            && let Err(error) = ops.open(&self.substream)
-        {
-            self.substream.opened.store(false, Ordering::Release);
-            return Err(from_errno(error));
-        }
-        let session = Self::session(self.substream.clone(), nonblock);
-        Ok(Some(session))
+    fn open(&self, _flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
+        Ok(None)
     }
 
     fn ioctl(&self, cmd: u64, arg: u64) -> Result<u64, VfsError> {
@@ -1733,6 +2256,11 @@ impl Inode for PcmSession {
     fn set_nonblock(&self, nonblock: bool) -> Result<(), VfsError> {
         self.nonblock.store(nonblock, Ordering::Release);
         Ok(())
+    }
+
+    #[cfg(feature = "sound")]
+    fn sound_substream(&self) -> Option<Arc<Substream>> {
+        Some(self.substream.clone())
     }
 
     fn poll(&self) -> u32 {

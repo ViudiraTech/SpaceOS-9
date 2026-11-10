@@ -15,7 +15,7 @@
 //! behaviour is expressed through [`ControlOps`].
 
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::{
     ipc::pollwait,
@@ -329,6 +329,15 @@ impl ControlElem {
         Ok(self.tlv.lock().clone())
     }
 
+    /// Update one stored value without going through the userspace ABI.  Used
+    /// by jack reporting and other in-kernel producers.
+    pub fn set_value(&self, index: usize, value: i64) {
+        let mut values = self.values.lock();
+        if let Some(slot) = values.get_mut(index) {
+            *slot = value;
+        }
+    }
+
     pub fn tlv_write(&self, input: &[u32]) -> Result<(), VfsError> {
         if let Some(ops) = &self.ops {
             return ops.tlv_write(input);
@@ -465,13 +474,20 @@ fn fill_card_info(card: &Card) -> uapi::snd_ctl_card_info {
     info
 }
 
-fn find_substream(card: &Card, device: u32, stream: i32) -> Option<Arc<super::pcm::Substream>> {
+fn find_substream(
+    card: &Card,
+    device: u32,
+    subdevice: u32,
+    stream: i32,
+) -> Option<Arc<super::pcm::Substream>> {
     let pcm = card.find_pcm(device)?;
-    match stream {
-        uapi::SNDRV_PCM_STREAM_PLAYBACK => pcm.playback.clone(),
-        uapi::SNDRV_PCM_STREAM_CAPTURE => pcm.capture.clone(),
-        _ => None,
-    }
+    let direction = match stream {
+        uapi::SNDRV_PCM_STREAM_PLAYBACK => super::pcm::Direction::Playback,
+        uapi::SNDRV_PCM_STREAM_CAPTURE => super::pcm::Direction::Capture,
+        _ => return None,
+    };
+    pcm.substream(direction, subdevice)
+        .or_else(|| pcm.first_substream(direction))
 }
 
 fn control_ioctl(
@@ -763,8 +779,8 @@ fn control_ioctl(
         }
         uapi::SNDRV_CTL_IOCTL_PCM_INFO => {
             let mut request = uaccess::read_value::<uapi::snd_pcm_info>(arg)?;
-            let substream =
-                find_substream(card, request.device, request.stream).ok_or(VfsError::NoDevice)?;
+            let substream = find_substream(card, request.device, request.subdevice, request.stream)
+                .ok_or(VfsError::NoDevice)?;
             let info = substream.info();
             request = info;
             uaccess::write_value(arg, &request)?;
@@ -784,11 +800,68 @@ fn control_ioctl(
             uaccess::write_value(arg, &(uapi::SNDRV_CTL_POWER_D0 as i32))?;
             Ok(0)
         }
-        uapi::SNDRV_CTL_IOCTL_HWDEP_NEXT_DEVICE
-        | uapi::SNDRV_CTL_IOCTL_HWDEP_INFO
-        | uapi::SNDRV_CTL_IOCTL_RAWMIDI_NEXT_DEVICE
-        | uapi::SNDRV_CTL_IOCTL_RAWMIDI_INFO
-        | uapi::SNDRV_CTL_IOCTL_RAWMIDI_PREFER_SUBDEVICE => Err(VfsError::NoDevice),
+        uapi::SNDRV_CTL_IOCTL_HWDEP_NEXT_DEVICE => {
+            let current = uaccess::read_value::<i32>(arg)?;
+            let mut next = -1;
+            for hwdep in card.hwdeps() {
+                if current < 0 || hwdep.device as i32 > current {
+                    next = hwdep.device as i32;
+                    break;
+                }
+            }
+            uaccess::write_value(arg, &next)?;
+            Ok(0)
+        }
+        uapi::SNDRV_CTL_IOCTL_HWDEP_INFO => {
+            let mut info = uaccess::read_value::<uapi::snd_hwdep_info>(arg)?;
+            let hwdep = card
+                .hwdeps()
+                .into_iter()
+                .find(|hwdep| hwdep.device == info.device)
+                .ok_or(VfsError::NoDevice)?;
+            info = hwdep.info();
+            uaccess::write_value(arg, &info)?;
+            Ok(0)
+        }
+        uapi::SNDRV_CTL_IOCTL_RAWMIDI_NEXT_DEVICE => {
+            let current = uaccess::read_value::<i32>(arg)?;
+            let mut next = -1;
+            for midi in card.rawmidis() {
+                if current < 0 || midi.device as i32 > current {
+                    next = midi.device as i32;
+                    break;
+                }
+            }
+            uaccess::write_value(arg, &next)?;
+            Ok(0)
+        }
+        uapi::SNDRV_CTL_IOCTL_RAWMIDI_INFO => {
+            let mut info = uaccess::read_value::<uapi::snd_rawmidi_info>(arg)?;
+            let midi = card
+                .rawmidis()
+                .into_iter()
+                .find(|midi| midi.device == info.device)
+                .ok_or(VfsError::NoDevice)?;
+            let stream = match info.stream {
+                uapi::SNDRV_RAWMIDI_STREAM_OUTPUT => midi.output.clone(),
+                uapi::SNDRV_RAWMIDI_STREAM_INPUT => midi.input.clone(),
+                _ => midi.input.clone().or_else(|| midi.output.clone()),
+            }
+            .ok_or(VfsError::NoDevice)?;
+            info = stream.info(
+                midi.card,
+                midi.device,
+                &midi.id,
+                &midi.name,
+                midi.info_flags,
+            );
+            uaccess::write_value(arg, &info)?;
+            Ok(0)
+        }
+        uapi::SNDRV_CTL_IOCTL_RAWMIDI_PREFER_SUBDEVICE => {
+            let _ = uaccess::read_value::<i32>(arg)?;
+            Ok(0)
+        }
         _ => Err(VfsError::NotATty),
     }
 }
@@ -849,4 +922,44 @@ pub fn enumerated_element(name: &str, items: Vec<&str>) -> Arc<ControlElem> {
         0,
     );
     element.with_items(items)
+}
+
+/// A jack element exposed as a read-only, volatile boolean control, matching
+/// the kcontrol the Linux jack core creates for non-root userspace.
+pub struct Jack {
+    pub card: Arc<Card>,
+    pub element: Arc<ControlElem>,
+    pub status: AtomicU32,
+}
+
+pub fn jack_new(card: &Arc<Card>, id: &str, _jack_type: u32) -> Result<Arc<Jack>, VfsError> {
+    let element = ControlElem::new(
+        uapi::SNDRV_CTL_ELEM_IFACE_CARD,
+        0,
+        0,
+        &alloc::format!("{id} Jack"),
+        0,
+        uapi::SNDRV_CTL_ELEM_TYPE_BOOLEAN,
+        1,
+        0,
+        1,
+        0,
+    )
+    .with_access(uapi::SNDRV_CTL_ELEM_ACCESS_READ | uapi::SNDRV_CTL_ELEM_ACCESS_VOLATILE);
+    card.add_control(element.clone())?;
+    Ok(Arc::new(Jack {
+        card: card.clone(),
+        element,
+        status: AtomicU32::new(0),
+    }))
+}
+
+pub fn jack_report(jack: &Jack, status: u32) {
+    let previous = jack.status.swap(status, Ordering::AcqRel);
+    if previous == status {
+        return;
+    }
+    jack.element.set_value(0, i64::from(status != 0));
+    let id = jack.element.id();
+    jack.card.notify(uapi::SNDRV_CTL_EVENT_MASK_VALUE, &id);
 }

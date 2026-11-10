@@ -8,10 +8,10 @@
 
 | 项 | 决定 |
 | --- | --- |
-| 首期接口 | PCM + Control + Timer；RawMIDI / Seq / Hwdep / Jack / UMP 预留接入点 |
+| 已实现接口 | PCM + Control + Timer + RawMIDI + Hwdep + Jack；Seq / UMP 预留接入点 |
 | 用户态 ABI | 二进制兼容 Linux：`/dev/snd`、主设备号 116、原始 ioctl 命令字、结构体逐字节一致、版本号一致 |
 | 驱动 API | 对外 Linux 风格 `snd_*` C ABI；内部 Rust trait `PcmOps` / `ControlOps` |
-| 数据通路 | mmap 环形缓冲 + status/control 页 + RW interleaved + 周期唤醒 + xrun/drain/pause |
+| 数据通路 | mmap 环形缓冲 + status/control 页 + interleaved/non-interleaved RW 与 mmap + 周期唤醒 + xrun/drain/pause |
 | 验证后端 | 内置 dummy 全双工声卡；启动自测覆盖 ABI、约束求解、状态机、定时器 |
 
 ## 参照的 Linux 源码
@@ -31,7 +31,9 @@
 | `src/sound/card.rs` | 卡编号、minor 分配、`controlC*` / `pcmC*D*p/c` 节点、`/sys/class/sound`、卡生命周期 |
 | `src/sound/pcm.rs` | 约束求解、环形缓冲、status/control 页、状态机、RW、mmap、xrun、poll、drain |
 | `src/sound/control.rs` | 元素表、`ELEM_LIST/INFO/READ/WRITE/ADD/REPLACE/REMOVE`、LOCK、TLV、通知队列 |
-| `src/sound/timer.rs` | 全局 `/dev/snd/timer`、系统定时器源、tick 队列、tread |
+| `src/sound/timer.rs` | 全局 `/dev/snd/timer`、系统/每卡/用户驱动定时器、tick 队列、tread |
+| `src/sound/rawmidi.rs` | RawMIDI 字节队列、参数/状态/poll、`'W'` ioctl |
+| `src/sound/hwdep.rs` | Hwdep 标准 ioctl、DSP 加载与驱动私有 ioctl |
 | `src/sound/module_api.rs` | 对 `.ko` 导出的 `snd_*` C ABI 与 C ops 适配 |
 | `src/sound/dummy.rs` | 内置全双工 dummy 卡，也是驱动参考实现 |
 | `src/sound/procfs.rs` | `/proc/asound/{cards,pcm,devices,timers,version,cardN/...}` |
@@ -62,6 +64,19 @@
 
 ## PCM 运行时
 
+### 子设备与打开语义
+
+每个方向可有多个 substream（`snd_pcm_new` 的 playback/capture count）。方向节点
+`pcmC<n>D<m>{p,c}` 上的 open 选择第一个空闲 substream；全部占用时返回 `EAGAIN`，
+与 Linux `snd_pcm_attach_substream` 一致。`snd_pcm_info` 报告
+`subdevices_count/subdevices_avail` 与所选 `subdevice`。
+
+### 链接组
+
+`LINK` 通过 fd 找到目标 substream，双方进入同一组；`START/STOP/PAUSE/RESUME/DRAIN`
+与 `prepare/reset` 对组内成员一起执行，`UNLINK` 解散组。自链接与重复链接返回
+`EINVAL/EBUSY`。
+
 ### 约束求解
 
 - `HW_REFINE` 以驱动 caps 为基础填满 mask/interval，再与调用者已固定的值求交并设置 `cmask`。
@@ -74,6 +89,15 @@
 `OPEN → SETUP(hw_params) → PREPARED(prepare) → RUNNING(start) → PAUSED(pause) / XRUN / DRAINING(drain) → SETUP(stop)`。
 `STATUS`、`HWSYNC`、`DELAY` 与阻塞读写都会先读取驱动指针；播放侧 hw_ptr 越过 appl_ptr 或捕获侧超出缓冲即进入 `XRUN`，并停止驱动。
 
+### 非交错与时间戳
+
+- 访问方式通告 `MMAP_INTERLEAVED/RW_INTERLEAVED/MMAP_NONINTERLEAVED/RW_NONINTERLEAVED`；
+  非交错时缓冲按声道平面布局，`CHANNEL_INFO.offset` 给出每声道平面偏移，
+  `READN/WRITEN_FRAMES` 在平面与用户声道指针之间搬运。
+- 记录 `tstamp_type`；`STATUS_EXT` 的 `audio_tstamp_data` 解析请求类型并回填
+  valid/actual_type 报告位；`audio_tstamp` 默认按 `trigger_tstamp + hw_ptr/rate`
+  计算 DMA 时间。`EXPORT_BUFFER` 作为用户态插件提示原样携带。
+
 ### 环形缓冲与唤醒
 
 - `hw_ptr/appl_ptr` 在 `boundary`（默认 `buffer_size * 2`）内回绕，环形偏移取 `ptr % buffer_size`。
@@ -81,12 +105,15 @@
 - `period_elapsed` 由驱动周期中断调用；dummy 用内核软件定时器按 period 驱动。
 - `poll`：播放可写返回 `POLLOUT`，捕获可读返回 `POLLIN`，`XRUN` 返回 `POLLERR`；`poll_sources` 绑定 substream 对象并保留 1 ms 兜底 tick。
 
-## Control 与 Timer
+## Control、RawMIDI、Hwdep 与 Jack
 
 - 元素支持 `BOOLEAN/INTEGER/INTEGER64/ENUMERATED/BYTES/IEC958`，驱动元素通过 `ControlOps` 回调，用户元素带 `SNDRV_CTL_ELEM_ACCESS_USER`。
 - 事件队列按卡维护序号，每个打开文件有独立游标；`read()` 返回 `snd_ctl_event`，`poll`/阻塞读由 `WaitQueue` 与对象唤醒支撑。
 - TLV 支持读写和标准 `DB_MINMAX` 音量树；`ELEM_LOCK` 以进程 pid 记录所有者。
-- Timer 同时提供全局系统定时器与每卡应用定时器；分辨率默认 1 ms，可通过 `GPARAMS` 调整；tick 在软件定时器线程生成，`read()` 返回 `snd_timer_read` 或启用 tread 后返回 `snd_timer_tread`。
+- RawMIDI：`/dev/snd/midiC<n>D<m>`，按 open 方向选择输入/输出流；参数、状态、DROP/DRAIN、阻塞/poll 与 `snd_rawmidi_*` 驱动接口齐备，dummy 卡提供回环。
+- Hwdep：`/dev/snd/hwC<n>D<m>`，标准 PVERSION/INFO/DSP_STATUS/DSP_LOAD 与驱动私有 ioctl；dummy 卡提供可加载 DSP 镜像测试。
+- Jack：以只读易变控制元素 `"<id> Jack"` 暴露插孔状态，`snd_jack_report` 更新并发送控制事件。
+- Timer 同时提供全局系统定时器、每卡应用定时器与用户驱动定时器（`CREATE/TRIGGER`，匿名 fd）；分辨率默认 1 ms，可通过 `GPARAMS` 调整；tick 在软件定时器线程生成，`read()` 返回 `snd_timer_read` 或启用 tread 后返回 `snd_timer_tread`。
 
 ## 可加载驱动 API
 
@@ -150,8 +177,8 @@ Makefile 将其映射为 Cargo feature `sound` / `sound-dummy`。禁用 `CONFIG_
 
 ## 当前边界与后续阶段
 
-1. 每个方向一个 substream，同一节点重复 `open` 返回 `EBUSY`（Linux 多打开共享 runtime 的语义留待后续）。
-2. `SNDRV_PCM_IOCTL_LINK/UNLINK` 暂不支持链接组；`UNLINK` 返回成功。
-3. 非交错 `RW_NONINTERLEAVED`、`EXPORT_BUFFER` 未实现，且不向用户态通告。
-4. RawMIDI、Sequencer、Hwdep、Jack、UMP 尚未实现，Control 对应枚举 ioctl 返回 `ENODEV`。
-5. 后续驱动阶段：QEMU HDA（intel-hda）、AC'97、virtio-sound、USB Audio；每个驱动只需实现 `snd_pcm_ops`，核心与自测无需改动。
+1. Sequencer 与 UMP 尚未实现；Control 对应枚举 ioctl 返回 `ENODEV`。这两者需要独立的 client/port/event 模型，留作下一阶段。
+2. 未提供 OSS `/dev/dsp`、`/dev/mixer` 模拟与 32 位 compat ioctl；当前用户态仅 64 位。
+3. `MMAP_COMPLEX`、`AUDIO_TSTAMP` 的 LINK_* 类型目前回退为 DEFAULT 报告；驱动可通过后续 `get_time_info` 扩展精确链路时间。
+4. 多 substream 已支持；同一 substream 的重复 open 仍返回 `EAGAIN`（Linux 也只在有空闲 substream 时成功）。
+5. 后续驱动阶段：QEMU HDA（intel-hda）、AC'97、virtio-sound、USB Audio；每个驱动只需实现 `snd_pcm_ops`/`snd_rawmidi_ops`/`snd_hwdep_ops`，核心与自测无需改动。

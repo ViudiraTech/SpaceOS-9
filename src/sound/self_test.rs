@@ -14,7 +14,7 @@
 //! period timer, dummy pointer advancement and pause/resume transitions.
 
 use crate::{
-    sound::{self, control::ControlSession, pcm, timer, uapi},
+    sound::{self, control::ControlSession, hwdep, pcm, rawmidi, timer, uapi},
     vfs::Inode,
 };
 
@@ -119,7 +119,7 @@ pub fn run_early() {
         "sound: CTL PCM_INFO failed"
     );
     assert_eq!(pcm_info.card, 0, "sound: CTL PCM_INFO card");
-    assert_eq!(pcm_info.subdevices_count, 1, "sound: PCM subdevice count");
+    assert_eq!(pcm_info.subdevices_count, 2, "sound: PCM subdevice count");
 
     let mut next = -1i32;
     assert!(
@@ -129,13 +129,26 @@ pub fn run_early() {
     assert_eq!(next, 0, "sound: PCM_NEXT_DEVICE value");
 
     let pcm = card.find_pcm(0).expect("sound: PCM 0 missing");
-    let playback = pcm.playback.clone().expect("sound: playback missing");
-    let capture = pcm.capture.clone().expect("sound: capture missing");
+    let node = pcm::PcmDeviceNode::new(pcm.substreams(pcm::Direction::Playback));
+    let first = node.open(0).expect("sound: first PCM open");
+    let second = node.open(0).expect("sound: second PCM subdevice open");
+    assert!(
+        node.open(0).is_err(),
+        "sound: third open should fail with EAGAIN"
+    );
+    drop(first);
+    drop(second);
+    let playback = pcm
+        .first_substream(pcm::Direction::Playback)
+        .expect("sound: playback missing");
+    let capture = pcm
+        .first_substream(pcm::Direction::Capture)
+        .expect("sound: capture missing");
 
     let mut info = uapi::snd_pcm_info::zeroed();
     assert!(pcm_ctl(&playback, uapi::SNDRV_PCM_IOCTL_INFO, &mut info));
     assert_eq!(info.stream, uapi::SNDRV_PCM_STREAM_PLAYBACK);
-    assert_eq!(info.subdevices_avail, 1);
+    assert_eq!(info.subdevices_avail, 2);
 
     let mut refine = uapi::snd_pcm_hw_params::zeroed();
     assert!(
@@ -230,6 +243,200 @@ pub fn run_early() {
         ),
         "sound: capture PREPARE failed"
     );
+
+    // Non-interleaved parameter set on the second playback substream.
+    if let Some(noninterleaved) = pcm.substream(pcm::Direction::Playback, 1) {
+        let mut ni = hw_params_exact(256, 4);
+        ni.masks[uapi::SNDRV_PCM_HW_PARAM_ACCESS as usize] = uapi::snd_mask::zeroed();
+        ni.masks[uapi::SNDRV_PCM_HW_PARAM_ACCESS as usize]
+            .set(uapi::SNDRV_PCM_ACCESS_RW_NONINTERLEAVED);
+        ni.flags = uapi::SNDRV_PCM_HW_PARAMS_EXPORT_BUFFER;
+        assert!(
+            pcm_ctl(&noninterleaved, uapi::SNDRV_PCM_IOCTL_HW_PARAMS, &mut ni),
+            "sound: noninterleaved HW_PARAMS failed"
+        );
+        assert!(
+            ni.info & uapi::SNDRV_PCM_INFO_NONINTERLEAVED != 0,
+            "sound: noninterleaved info flag"
+        );
+        let mut channel_one = uapi::snd_pcm_channel_info::zeroed();
+        channel_one.channel = 1;
+        assert!(
+            pcm_ctl(
+                &noninterleaved,
+                uapi::SNDRV_PCM_IOCTL_CHANNEL_INFO,
+                &mut channel_one
+            ),
+            "sound: noninterleaved channel info"
+        );
+        assert_eq!(channel_one.offset, 2048);
+        assert_eq!(channel_one.first, 0);
+        assert_eq!(channel_one.step, 16);
+        assert!(
+            pcm_ctl(
+                &noninterleaved,
+                uapi::SNDRV_PCM_IOCTL_HW_FREE,
+                core::ptr::null_mut::<u8>()
+            ),
+            "sound: noninterleaved HW_FREE"
+        );
+    }
+
+    // Audio timestamp request/report round trip.
+    let mut mode = uapi::SNDRV_PCM_TSTAMP_ENABLE;
+    assert!(pcm_ctl(&playback, uapi::SNDRV_PCM_IOCTL_TSTAMP, &mut mode));
+    let mut tstamp_type = uapi::SNDRV_PCM_TSTAMP_TYPE_MONOTONIC;
+    assert!(pcm_ctl(
+        &playback,
+        uapi::SNDRV_PCM_IOCTL_TTSTAMP,
+        &mut tstamp_type
+    ));
+    let mut extended = uapi::snd_pcm_status::zeroed();
+    extended.audio_tstamp_data = uapi::SNDRV_PCM_AUDIO_TSTAMP_TYPE_DEFAULT as u32;
+    assert!(pcm_ctl(
+        &playback,
+        uapi::SNDRV_PCM_IOCTL_STATUS_EXT,
+        &mut extended
+    ));
+    assert!(
+        extended.audio_tstamp_data & (1 << 16) != 0,
+        "sound: audio timestamp report missing"
+    );
+    assert_eq!(
+        (extended.audio_tstamp_data >> 17) & 0xF,
+        uapi::SNDRV_PCM_AUDIO_TSTAMP_TYPE_DEFAULT as u32
+    );
+
+    // hwdep: info, DSP status/load and a driver-private ioctl.
+    let hwdep_object = card.hwdeps().into_iter().next().expect("sound: hwdep");
+    let hwdep_node = hwdep::HwdepDeviceNode::new(hwdep_object);
+    let hwdep_session = hwdep_node
+        .open(0)
+        .expect("sound: hwdep open")
+        .expect("sound: hwdep session");
+    let mut hwdep_version = 0i32;
+    assert!(
+        hwdep_session
+            .ioctl(
+                uapi::SNDRV_HWDEP_IOCTL_PVERSION as u64,
+                &mut hwdep_version as *mut i32 as u64
+            )
+            .is_ok()
+    );
+    assert_eq!(hwdep_version, uapi::SNDRV_HWDEP_VERSION as i32);
+    let mut hwdep_info = uapi::snd_hwdep_info::zeroed();
+    assert!(
+        hwdep_session
+            .ioctl(
+                uapi::SNDRV_HWDEP_IOCTL_INFO as u64,
+                &mut hwdep_info as *mut _ as u64
+            )
+            .is_ok()
+    );
+    assert_eq!(hwdep_info.iface, uapi::SNDRV_HWDEP_IFACE_HDA);
+    let mut dsp_status = uapi::snd_hwdep_dsp_status::zeroed();
+    assert!(
+        hwdep_session
+            .ioctl(
+                uapi::SNDRV_HWDEP_IOCTL_DSP_STATUS as u64,
+                &mut dsp_status as *mut _ as u64
+            )
+            .is_ok()
+    );
+    assert_eq!(dsp_status.num_dsps, 1);
+    let dsp_data = b"firmware";
+    let mut image = uapi::snd_hwdep_dsp_image {
+        index: 0,
+        name: [0; 64],
+        _pad0: [0; 4],
+        image: dsp_data.as_ptr() as u64,
+        length: dsp_data.len(),
+        driver_data: 0,
+    };
+    assert!(
+        hwdep_session
+            .ioctl(
+                uapi::SNDRV_HWDEP_IOCTL_DSP_LOAD as u64,
+                &mut image as *mut _ as u64
+            )
+            .is_ok()
+    );
+    let mut loaded = uapi::snd_hwdep_dsp_status::zeroed();
+    assert!(
+        hwdep_session
+            .ioctl(
+                uapi::SNDRV_HWDEP_IOCTL_DSP_STATUS as u64,
+                &mut loaded as *mut _ as u64
+            )
+            .is_ok()
+    );
+    assert_eq!(loaded.dsp_loaded & 1, 1);
+    let mut echo = 0u32;
+    assert!(
+        hwdep_session
+            .ioctl(0x4004_4810, &mut echo as *mut u32 as u64)
+            .is_ok()
+    );
+    assert_eq!(echo, 0x5a5a_5a5a);
+
+    // Jack state is exported as a read-only control.
+    let jack = card
+        .controls()
+        .into_iter()
+        .find(|element| element.id().name_str() == b"Headphone Jack")
+        .expect("sound: jack control");
+    let mut jack_value = uapi::snd_ctl_elem_value::zeroed();
+    jack.read(&mut jack_value);
+    assert_eq!(jack_value.integer()[0], 1, "sound: jack state");
+
+    // RawMIDI loopback: write to the output stream and read it back.
+    let midi = card.rawmidis().into_iter().next().expect("sound: rawmidi");
+    let midi_node = rawmidi::RawMidiDeviceNode::new(midi);
+    let midi_session = midi_node
+        .open(crate::vfs::abi::O_RDWR)
+        .expect("sound: rawmidi open")
+        .expect("sound: rawmidi session");
+    let mut midi_info = uapi::snd_rawmidi_info::zeroed();
+    midi_info.stream = uapi::SNDRV_RAWMIDI_STREAM_INPUT;
+    assert!(
+        midi_session
+            .ioctl(
+                uapi::SNDRV_RAWMIDI_IOCTL_INFO as u64,
+                &mut midi_info as *mut _ as u64
+            )
+            .is_ok()
+    );
+    assert_eq!(
+        midi_info.flags & uapi::SNDRV_RAWMIDI_INFO_DUPLEX,
+        uapi::SNDRV_RAWMIDI_INFO_DUPLEX
+    );
+    let mut midi_params = uapi::snd_rawmidi_params::zeroed();
+    midi_params.stream = uapi::SNDRV_RAWMIDI_STREAM_OUTPUT;
+    midi_params.buffer_size = 64;
+    midi_params.avail_min = 1;
+    assert!(
+        midi_session
+            .ioctl(
+                uapi::SNDRV_RAWMIDI_IOCTL_PARAMS as u64,
+                &mut midi_params as *mut _ as u64
+            )
+            .is_ok()
+    );
+    let payload = b"MIDI";
+    assert_eq!(
+        midi_session
+            .write_at(0, payload)
+            .expect("sound: midi write"),
+        4
+    );
+    let mut midi_read = [0u8; 4];
+    assert_eq!(
+        midi_session
+            .read_at(0, &mut midi_read)
+            .expect("sound: midi read"),
+        4
+    );
+    assert_eq!(&midi_read, payload);
 
     let timers = timer::test_session();
     let mut version = 0i32;

@@ -312,6 +312,84 @@ unsigned int snd_pcm_get_rate(struct snd_pcm_substream *substream);
 unsigned int snd_pcm_get_channels(struct snd_pcm_substream *substream);
 unsigned int snd_pcm_get_format(struct snd_pcm_substream *substream);
 
+/* ---- hwdep ------------------------------------------------------------ */
+
+#define SNDRV_HWDEP_IFACE_OPL2 0
+#define SNDRV_HWDEP_IFACE_OPL3 1
+#define SNDRV_HWDEP_IFACE_OPL4 2
+#define SNDRV_HWDEP_IFACE_SB16CSP 3
+#define SNDRV_HWDEP_IFACE_EMU10K1 4
+#define SNDRV_HWDEP_IFACE_HDA 16
+#define SNDRV_HWDEP_IFACE_USB_STREAM 17
+
+struct snd_hwdep;
+struct snd_hwdep_dsp_status {
+    unsigned int version;
+    unsigned char id[32];
+    unsigned int num_dsps;
+    unsigned int dsp_loaded;
+    unsigned int chip_ready;
+    unsigned char reserved[16];
+};
+
+struct snd_hwdep_dsp_image {
+    unsigned int index;
+    unsigned char name[64];
+    unsigned long long image;
+    unsigned long length;
+    unsigned long long driver_data;
+};
+
+struct snd_hwdep_ops {
+    int (*open)(struct snd_hwdep *hw);
+    void (*release)(struct snd_hwdep *hw);
+    int (*ioctl)(struct snd_hwdep *hw, unsigned int cmd, void *arg);
+    int (*dsp_status)(struct snd_hwdep *hw, struct snd_hwdep_dsp_status *status);
+    int (*dsp_load)(struct snd_hwdep *hw, struct snd_hwdep_dsp_image *image);
+};
+
+int snd_hwdep_new(struct snd_card *card, const char *id, int device, int iface,
+                  struct snd_hwdep **hw_out);
+int snd_hwdep_set_ops(struct snd_hwdep *hw, const struct snd_hwdep_ops *ops);
+
+/* ---- jack ------------------------------------------------------------- */
+
+struct snd_jack;
+int snd_jack_new(struct snd_card *card, const char *id, unsigned int jack_type,
+                 struct snd_jack **jack_out);
+void snd_jack_report(struct snd_jack *jack, unsigned int status);
+
+/* ---- rawmidi ---------------------------------------------------------- */
+
+#define SNDRV_RAWMIDI_STREAM_OUTPUT 0
+#define SNDRV_RAWMIDI_STREAM_INPUT 1
+
+struct snd_rawmidi;
+struct snd_rawmidi_substream;
+
+struct snd_rawmidi_ops {
+    int (*open)(struct snd_rawmidi_substream *substream);
+    int (*close)(struct snd_rawmidi_substream *substream);
+    int (*trigger)(struct snd_rawmidi_substream *substream, int up);
+    void (*drain)(struct snd_rawmidi_substream *substream);
+};
+
+int snd_rawmidi_new(struct snd_card *card, const char *id, int device,
+                    int output_count, int input_count,
+                    struct snd_rawmidi **rmidi_out);
+int snd_rawmidi_set_ops(struct snd_rawmidi *rmidi, int stream,
+                        const struct snd_rawmidi_ops *ops);
+int snd_rawmidi_receive(struct snd_rawmidi_substream *substream,
+                        const unsigned char *data, int count);
+int snd_rawmidi_transmit_peek(struct snd_rawmidi_substream *substream,
+                              unsigned char *data, int count);
+int snd_rawmidi_transmit_ack(struct snd_rawmidi_substream *substream, int count);
+int snd_rawmidi_transmit(struct snd_rawmidi_substream *substream,
+                         unsigned char *data, int count);
+int snd_rawmidi_transmit_empty(struct snd_rawmidi_substream *substream);
+int snd_rawmidi_drain(struct snd_rawmidi_substream *substream);
+int snd_rawmidi_drop(struct snd_rawmidi_substream *substream);
+
 /* ---- control ---------------------------------------------------------- */
 
 struct snd_kcontrol *snd_ctl_new1(const struct snd_kcontrol_new *template,

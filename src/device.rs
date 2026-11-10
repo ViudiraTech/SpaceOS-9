@@ -122,6 +122,10 @@ impl Inode for DeviceNode {
     fn set_nonblock(&self, nonblock: bool) -> Result<(), VfsError> {
         self.session.set_nonblock(nonblock)
     }
+    #[cfg(feature = "sound")]
+    fn sound_substream(&self) -> Option<alloc::sync::Arc<crate::sound::pcm::Substream>> {
+        self.session.sound_substream()
+    }
     fn console_vt(&self) -> Option<usize> {
         self.session.console_vt()
     }

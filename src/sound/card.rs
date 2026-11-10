@@ -14,18 +14,21 @@
 //! `/dev/snd` nodes, the `/sys/class/sound` entries and the uevents udev
 //! expects.  Registration is explicit, mirroring `snd_card_register`.
 
-use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::{
     device,
     sched::WaitQueue,
     sync::Mutex,
-    vfs::{Inode, InodeKind, Stat, VfsError, abi, tree::ino},
+    vfs::{
+        Inode, InodeKind, Stat, VfsError, abi,
+        tree::{Attribute, ino},
+    },
 };
 
 use super::{
-    SUBSYSTEM, control, pcm,
+    SUBSYSTEM, control, hwdep, pcm, rawmidi,
     uapi::{self, SNDRV_MAJOR},
 };
 
@@ -45,6 +48,8 @@ pub struct Card {
     pub mixername: String,
     pub components: Mutex<String>,
     pub pcms: Mutex<Vec<Arc<pcm::Pcm>>>,
+    pub hwdeps: Mutex<Vec<Arc<hwdep::Hwdep>>>,
+    pub rawmidis: Mutex<Vec<Arc<rawmidi::RawMidi>>>,
     pub controls: Mutex<Vec<Arc<control::ControlElem>>>,
     pub next_numid: AtomicU32,
     pub events: Mutex<VecDeque<ControlEvent>>,
@@ -144,6 +149,10 @@ impl Inode for MinorNode {
     fn set_nonblock(&self, nonblock: bool) -> Result<(), VfsError> {
         self.session.set_nonblock(nonblock)
     }
+    #[cfg(feature = "sound")]
+    fn sound_substream(&self) -> Option<Arc<pcm::Substream>> {
+        self.session.sound_substream()
+    }
 }
 
 impl Card {
@@ -183,6 +192,8 @@ impl Card {
             mixername: String::from(shortname),
             components: Mutex::new(String::new()),
             pcms: Mutex::new(Vec::new()),
+            hwdeps: Mutex::new(Vec::new()),
+            rawmidis: Mutex::new(Vec::new()),
             controls: Mutex::new(Vec::new()),
             next_numid: AtomicU32::new(1),
             events: Mutex::new(VecDeque::new()),
@@ -254,6 +265,35 @@ impl Card {
 
     pub fn minors(&self) -> Vec<u32> {
         self.minors.lock().clone()
+    }
+
+    pub fn add_hwdep(&self, device: Arc<hwdep::Hwdep>) -> Result<(), VfsError> {
+        let mut hwdeps = self.hwdeps.lock();
+        if hwdeps
+            .iter()
+            .any(|existing| existing.device == device.device)
+        {
+            return Err(VfsError::AlreadyExists);
+        }
+        hwdeps.push(device);
+        Ok(())
+    }
+
+    pub fn hwdeps(&self) -> Vec<Arc<hwdep::Hwdep>> {
+        self.hwdeps.lock().clone()
+    }
+
+    pub fn add_rawmidi(&self, device: Arc<rawmidi::RawMidi>) -> Result<(), VfsError> {
+        let mut mids = self.rawmidis.lock();
+        if mids.iter().any(|existing| existing.device == device.device) {
+            return Err(VfsError::AlreadyExists);
+        }
+        mids.push(device);
+        Ok(())
+    }
+
+    pub fn rawmidis(&self) -> Vec<Arc<rawmidi::RawMidi>> {
+        self.rawmidis.lock().clone()
     }
 
     pub fn pcms(&self) -> Vec<Arc<pcm::Pcm>> {
@@ -330,27 +370,68 @@ impl Card {
         }
 
         for pcm in self.pcms() {
-            for substream in [pcm.playback.clone(), pcm.capture.clone()]
-                .into_iter()
-                .flatten()
-            {
+            for direction in [pcm::Direction::Playback, pcm::Direction::Capture] {
+                let substreams = pcm.substreams(direction);
+                if substreams.is_empty() {
+                    continue;
+                }
                 let minor = MINORS.lock().alloc().ok_or(VfsError::NoSpace)?;
                 self.minors.lock().push(minor);
-                let name = substream.node_name();
-                let node: Arc<dyn Inode> = Arc::new(pcm::PcmSession::device_node(substream));
+                let name = format!("pcmC{}D{}{}", self.number, pcm.device, direction.suffix());
+                let node: Arc<dyn Inode> = pcm::PcmDeviceNode::new(substreams);
                 let backend = minor_device(minor, node);
                 match device::register(
                     &name,
                     SUBSYSTEM,
                     Some(&format!("snd/{name}")),
                     Some(backend),
-                    Vec::new(),
+                    vec![("pcm_class", Attribute::text("generic\n"))],
                 ) {
                     Ok(device) => self.nodes.lock().push(device.id),
                     Err(error) => {
                         MINORS.lock().release(minor);
                         return Err(error);
                     }
+                }
+            }
+        }
+        for hwdep in self.hwdeps() {
+            let minor = MINORS.lock().alloc().ok_or(VfsError::NoSpace)?;
+            self.minors.lock().push(minor);
+            let name = format!("hwC{}D{}", self.number, hwdep.device);
+            let node: Arc<dyn Inode> = hwdep::HwdepDeviceNode::new(hwdep);
+            let backend = minor_device(minor, node);
+            match device::register(
+                &name,
+                SUBSYSTEM,
+                Some(&format!("snd/{name}")),
+                Some(backend),
+                Vec::new(),
+            ) {
+                Ok(device) => self.nodes.lock().push(device.id),
+                Err(error) => {
+                    MINORS.lock().release(minor);
+                    return Err(error);
+                }
+            }
+        }
+        for midi in self.rawmidis() {
+            let minor = MINORS.lock().alloc().ok_or(VfsError::NoSpace)?;
+            self.minors.lock().push(minor);
+            let name = midi.node_name();
+            let node: Arc<dyn Inode> = rawmidi::RawMidiDeviceNode::new(midi);
+            let backend = minor_device(minor, node);
+            match device::register(
+                &name,
+                SUBSYSTEM,
+                Some(&format!("snd/{name}")),
+                Some(backend),
+                Vec::new(),
+            ) {
+                Ok(device) => self.nodes.lock().push(device.id),
+                Err(error) => {
+                    MINORS.lock().release(minor);
+                    return Err(error);
                 }
             }
         }
