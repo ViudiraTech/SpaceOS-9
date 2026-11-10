@@ -163,6 +163,27 @@ endmenu
 
 endif # BLOCK
 
+menu "Sound"
+
+menuconfig SOUND
+	bool "ALSA-compatible sound support"
+	default y
+	help
+	  Linux ALSA ABI compatible sound core: /dev/snd character devices,
+	  PCM playback/capture, the mixer control interface and the timer
+	  device.  Unmodified alsa-lib and tinyalsa programs can use it.
+
+if SOUND
+
+config SOUND_DUMMY
+	bool "Dummy sound card"
+	default y
+	help
+	  Built-in full-duplex software card used by the boot self-test.  It
+	  is also the reference implementation for loadable drivers.
+
+endif # SOUND
+
 endmenu
 
 menu "File systems"

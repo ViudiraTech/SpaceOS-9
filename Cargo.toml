@@ -19,6 +19,8 @@ module-unload = []
 module-force-unload = []
 kallsyms = []
 kallsyms-all = []
+sound = []
+sound-dummy = ["sound"]
 
 [dependencies]
 limine = { version = "=0.6.5", default-features = false }

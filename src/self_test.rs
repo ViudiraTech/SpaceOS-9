@@ -25,6 +25,12 @@ pub fn run_early() {
     }
     #[cfg(feature = "modules")]
     crate::module::self_test::run();
+    #[cfg(all(feature = "sound", feature = "sound-dummy"))]
+    // SAFETY: still before the scheduler, so kernel test buffers are the only
+    // pointers handed to the user-copy layer.
+    unsafe {
+        crate::user::uaccess::kernel_test_scope(crate::sound::self_test::run_early)
+    };
 }
 
 pub fn spawn_late() {
@@ -45,6 +51,10 @@ pub fn spawn_late() {
             crate::user::self_test::syscalls();
             crate::user::self_test::ipc_advanced();
             let gpu_status = crate::gpu::self_test::run();
+            #[cfg(all(feature = "sound", feature = "sound-dummy"))]
+            let sound_status = crate::sound::self_test::run_late();
+            #[cfg(not(all(feature = "sound", feature = "sound-dummy")))]
+            let sound_status = "off";
             let rng_status = if crate::random::supported() {
                 "hw"
             } else {
@@ -60,10 +70,11 @@ pub fn spawn_late() {
                 "unknown"
             };
             crate::kinfo!(
-                "SELFTEST_OK arch={} cpu_fpu=ok mm_irq_fdt=ok block=ok vfs_abi=ok vfs_cache=ok dev_sys_proc=ok user_elf=ok sched=ok rng={} gpu={}",
+                "SELFTEST_OK arch={} cpu_fpu=ok mm_irq_fdt=ok block=ok vfs_abi=ok vfs_cache=ok dev_sys_proc=ok user_elf=ok sched=ok rng={} gpu={} sound={}",
                 arch_name,
                 rng_status,
                 gpu_status,
+                sound_status,
             );
             crate::kinfo!("BOOT_OK");
         },

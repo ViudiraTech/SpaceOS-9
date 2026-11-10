@@ -43,6 +43,8 @@ pub mod self_test;
 pub mod shell;
 pub mod signal;
 mod smp;
+#[cfg(feature = "sound")]
+pub mod sound;
 pub mod spk;
 mod sync;
 pub mod syscall;
@@ -180,6 +182,8 @@ pub extern "C" fn kmain() -> ! {
     net::init();
     #[cfg(feature = "modules")]
     module::init();
+    #[cfg(feature = "sound")]
+    sound::init();
     gpu::init();
     input::init();
     #[cfg(feature = "boot-self-test")]

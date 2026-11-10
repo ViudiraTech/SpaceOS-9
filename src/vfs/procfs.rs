@@ -30,6 +30,8 @@ const SYSTEM: &[&str] = &[
     "kallsyms",
     #[cfg(feature = "modules")]
     "modules",
+    #[cfg(feature = "sound")]
+    "asound",
 ];
 const PROCESS: &[&str] = &[
     "status", "stat", "statm", "syscall", "comm", "cmdline", "environ", "maps", "auxv", "cwd",
@@ -487,6 +489,10 @@ impl Inode for Node {
                 }
                 if name == "sys" {
                     return Ok(Self::make(View::Sys, 30));
+                }
+                #[cfg(feature = "sound")]
+                if name == "asound" {
+                    return Ok(crate::sound::procfs::root());
                 }
                 if let Some(index) = SYSTEM.iter().position(|n| *n == name) {
                     return Ok(Self::make(

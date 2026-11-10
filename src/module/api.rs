@@ -252,10 +252,20 @@ pub static EXPORTS: &[Export] = &[
 ];
 
 pub fn lookup(name: &str) -> Option<u64> {
-    EXPORTS
+    if let Some(address) = EXPORTS
         .iter()
         .find(|export| export.name == name)
         .map(|export| export.address as usize as u64)
+    {
+        return Some(address);
+    }
+    #[cfg(feature = "sound")]
+    {
+        if let Some(address) = crate::sound::module_api::lookup(name) {
+            return Some(address);
+        }
+    }
+    None
 }
 
 pub fn set_current_name(name: &str) {

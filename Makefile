@@ -94,6 +94,14 @@ endif
 ifeq ($(CONFIG_KALLSYMS_ALL),y)
 CARGO_FEATURE_LIST += kallsyms-all
 endif
+
+ifeq ($(CONFIG_SOUND),y)
+CARGO_FEATURE_LIST += sound
+endif
+
+ifeq ($(CONFIG_SOUND_DUMMY),y)
+CARGO_FEATURE_LIST += sound-dummy
+endif
 CARGO_FEATURES = $(foreach feature,$(CARGO_FEATURE_LIST),--features $(feature))
 
 MODULE_LIST := $(strip \
