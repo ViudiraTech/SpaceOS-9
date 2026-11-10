@@ -35,7 +35,7 @@ SpaceOS-9 的长期目标：
 构建环境需要 Rust/rustup、GNU Make、Python 3、`tar`、`sha256sum`、`xorriso`，以及目标架构的 QEMU 和 UEFI 固件。`make menuconfig`/`make defconfig` 需要 Kconfig frontends 提供的 `kconfig-mconf`/`kconfig-conf`。主机侧 ABI 探针需要 `gcc` 和系统 DRM UAPI 头文件；GPU 图形测试需要宿主提供可用的 DRM render node 和 virglrenderer。
 
 ```sh
-make menuconfig  # 选择架构、profile、KASLR、内核命令行与 QEMU 配置
+make menuconfig  # 选择架构、profile、驱动、模块、内核命令行与 QEMU 配置
 make             # 构建启动 ISO
 make run         # 在 QEMU 中启动
 ```

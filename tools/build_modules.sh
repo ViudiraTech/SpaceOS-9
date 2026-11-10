@@ -14,10 +14,28 @@
 
 set -eu
 
-ARCH=${1:?usage: build_modules.sh <x86_64|aarch64|riscv64> <out-dir>}
-OUT=${2:?usage: build_modules.sh <arch> <out-dir>}
+ARCH=${1:?usage: build_modules.sh <x86_64|aarch64|riscv64> <out-dir> [module...]}
+OUT=${2:?usage: build_modules.sh <arch> <out-dir> [module...]}
 CC=${CC:-clang}
 RUSTC=${RUSTC:-rustc}
+
+# No third argument means "build every module" for direct script use. An
+# explicit (possibly empty) list selects exactly the modules Kconfig enabled.
+if [ "$#" -ge 3 ]; then
+    MODULES=$3
+else
+    MODULES=__all__
+fi
+
+enabled() {
+    if [ "$MODULES" = "__all__" ]; then
+        return 0
+    fi
+    case " $MODULES " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
 
 case "$ARCH" in
 x86_64)
@@ -49,9 +67,23 @@ COMMON_FLAGS="-ffreestanding -fno-builtin -fno-pic -fno-pie -fno-common \
 
 mkdir -p "$OUT"
 
+# Drop artifacts for modules that are no longer selected, so a stale .ko does
+# not end up in the root filesystem after a configuration change.
+for artifact in "$OUT"/*.ko; do
+    [ -e "$artifact" ] || continue
+    name=$(basename "$artifact" .ko)
+    enabled "$name" || rm -f "$artifact"
+done
+
+if [ -z "$MODULES" ]; then
+    echo "module: no modules selected by Kconfig"
+    exit 0
+fi
+
 for source in modules/*/*.c; do
     [ -f "$source" ] || continue
     name=$(basename "$source" .c)
+    enabled "$name" || continue
     "$CC" $C_TARGET $COMMON_FLAGS -DSPK_VERMAGIC="\"$VERMAGIC\"" \
         -c "$source" -o "$OUT/$name.ko"
     printf 'module: %s -> %s\n' "$source" "$OUT/$name.ko"
@@ -61,6 +93,7 @@ for source in modules/*/src/lib.rs; do
     [ -f "$source" ] || continue
     directory=$(dirname "$(dirname "$source")")
     name=$(basename "$directory")
+    enabled "$name" || continue
     SPK_VERMAGIC="$VERMAGIC" "$RUSTC" \
         --edition 2024 \
         --crate-type lib \

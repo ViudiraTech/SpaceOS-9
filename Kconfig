@@ -1,6 +1,6 @@
 #
 #       Kconfig
-#       Kernel architecture, devices, subsystems and boot configuration
+#       Kernel configuration menu
 #
 #       2026/9/30 By JiTianYu391
 #       Copyright (C) 2026 ViudiraTech.
@@ -8,262 +8,291 @@
 
 mainmenu "SpaceKernel configuration"
 
-menu "Target Platform & Build"
+menu "Platform"
 
 choice
-    prompt "Target architecture"
-    default ARCH_X86_64
+	prompt "Target architecture"
+	default ARCH_X86_64
 
 config ARCH_X86_64
-    bool "x86_64"
+	bool "x86_64"
 
 config ARCH_AARCH64
-    bool "aarch64"
+	bool "AArch64"
 
 config ARCH_RISCV64
-    bool "RISC-V 64"
+	bool "RISC-V 64"
 endchoice
 
+config SMP
+	bool "Symmetric multiprocessing support"
+	default y
+	help
+	  Multi-core boot, per-CPU scheduling queues and inter-processor
+	  interrupts.
+
+config MAX_CPUS
+	int "Maximum number of CPUs"
+	depends on SMP
+	range 1 256
+	default 64
+
+config RISCV_SV48
+	bool "Sv48 paging"
+	depends on ARCH_RISCV64
+	help
+	  Use four-level paging on CPUs that support it. Sv39 is the default.
+
+endmenu
+
+menu "General setup"
+
 choice
-    prompt "Build profile"
-    default PROFILE_DEBUG
+	prompt "Build profile"
+	default PROFILE_DEBUG
 
 config PROFILE_DEBUG
-    bool "Debug"
+	bool "Debug"
 
 config PROFILE_RELEASE
-    bool "Release"
+	bool "Release"
 endchoice
 
 config KASLR
-    bool "Enable Limine KASLR"
-    default y
-    help
-      Ask Limine to randomize the position of the relocatable kernel and HHDM.
+	bool "Randomize kernel address layout (KASLR)"
+	default y
+	help
+	  Ask Limine to randomize the kernel and direct-map base addresses.
 
 config KERNEL_CMDLINE
-    string "Limine kernel command line"
-    default "console=tty0 console=ttyS0"
-    help
-      Select the kernel console with console=ttyS0 or console=tty0..tty8.
-      Multiple console= arguments enable multiple outputs.
-
-endmenu
-
-menu "Processor Architecture & SMP"
-
-config SMP
-    bool "Symmetric Multiprocessing (SMP) support"
-    default y
-    help
-      Enable multi-core SMP bootstrap, per-CPU scheduler queues and IPIs.
-
-config MAX_CPUS
-    int "Maximum supported CPU count"
-    depends on SMP
-    range 1 256
-    default 64
-    help
-      Maximum number of CPU cores tracked in SMP topology.
-
-config RISCV_SV48
-    bool "Use Sv48 instead of Sv39 on RISC-V"
-    depends on ARCH_RISCV64
-    default n
-    help
-      Sv39 uses three page-table levels and is the default for RV64.
-      Enable this only on machines with Sv48 (4-level paging) support.
-
-endmenu
-
-menu "Device Drivers & Input Subsystem"
-
-config PS2
-    bool "PS/2 (i8042) controller and input subsystem"
-    default y
-    help
-      Enable the i8042 PS/2 controller driver, dual-channel detection,
-      keyboard and mouse input support.
-
-config PS2_KEYBOARD
-    bool "PS/2 Keyboard driver"
-    depends on PS2
-    default y
-    help
-      Enable PS/2 keyboard support with Scancode Set 1/2 translation,
-      modifier key tracking, LED synchronization, and virtual console integration.
-
-config PS2_MOUSE
-    bool "PS/2 Mouse driver (IntelliMouse scroll wheel)"
-    depends on PS2
-    default y
-    help
-      Enable PS/2 mouse support with IntelliMouse 4-byte scroll wheel detection,
-      packet sync alignment, and cursor coordinate tracking.
-
-config SERIAL
-    bool "Serial console driver (16550 / PL011)"
-    default y
-    help
-      Enable standard serial port drivers for early and runtime console output.
-
-config TTY
-    bool "TTY virtual terminals and line discipline"
-    default y
-    help
-      Enable terminal line discipline, raw/canonical input, and virtual consoles.
-
-config FRAMEBUFFER
-    bool "Limine Framebuffer graphics console"
-    default y
-    help
-      Enable graphical framebuffer console rendering with Unicode font support.
-
-config PCI
-    bool "PCI / PCIe ECAM bus enumeration"
-    default y
-    help
-      Enable PCIe ECAM config space discovery and device enumeration.
-
-config BLOCK
-    bool "Block device layer, LRU sector cache and MBR/GPT partitioning"
-    default y
-    help
-      Enable the unified block device layer, LRU sector cache, RAMDisk,
-      and automatic MBR/GPT partition table discovery.
-
-config IDE
-    bool "PCI IDE / PATA storage driver (Bus Master DMA + LBA28/48 PIO)"
-    depends on BLOCK && PCI
-    default y
-    help
-      Enable PCI IDE / PATA controller support with Bus Master PRDT DMA
-      transfers and automatic LBA28/LBA48 PIO fallback.
-
-config AHCI
-    bool "PCI AHCI 1.0 SATA HBA driver (Command List / FIS / PRDT DMA)"
-    depends on BLOCK && PCI
-    default y
-    help
-      Enable AHCI 1.0 SATA Host Bus Adapter support using ABAR MMIO,
-      Command Lists, H2D Register FIS, and PRDT DMA.
-
-config NVME
-    bool "PCIe NVMe 1.4 storage driver (Admin/IO Queue Pairs & PRP DMA)"
-    depends on BLOCK && PCI
-    default y
-    help
-      Enable PCIe NVMe controller and namespace support using Admin and I/O
-      Submission/Completion Queue Pairs, Doorbells, and PRP DMA.
-
-endmenu
-
-menu "Kernel Features & Subsystems"
-
-config VFS
-    bool "Linux ABI Virtual File System (RamFS / DevFS / ProcFS)"
-    default y
-    help
-      Enable the Linux 64-bit ABI compliant Virtual File System layer,
-      per-task file descriptor tables, pipes, and virtual filesystems.
-
-config FAT32
-    bool "FAT32 (VFAT) filesystem driver with Long File Name (LFN) support"
-    depends on VFS && BLOCK
-    default y
-    help
-      Enable on-disk FAT32 filesystem mounting, formatting, cluster allocation,
-      and VFAT Long File Name read/write support.
-
-config EEVDF_SCHED
-    bool "EEVDF preemptive fair scheduler"
-    default y
-    help
-      Enable Earliest Eligible Virtual Deadline First (EEVDF) per-CPU scheduler.
-
-config USER_SPACE
-    bool "Linux ABI user space and ELF loader"
-    default y
-    help
-      Enable isolated user virtual address spaces, Ring 3 / EL0 / U-mode privilege
-      transitions, Linux ABI system calls, and 64-bit static ELF loading.
-
-config KSHELL
-    bool "Interactive kernel diagnostic shell (kshell)"
-    default y
-    help
-      Enable the interactive kernel shell task on serial and foreground consoles.
-
-endmenu
-
-menu "Loadable Kernel Modules & Symbol Table"
-
-config MODULES
-    bool "Loadable kernel modules (Linux-style ELF relocatable objects)"
-    default y
-    help
-      Enable init_module(2), finit_module(2) and delete_module(2) for
-      ET_REL modules built against the exported SpaceKernel C/Rust ABI.
-      Modules run in kernel space and are restricted to the exported
-      symbol whitelist.
-
-config MODULE_UNLOAD
-    bool "Allow unloading modules (delete_module)"
-    depends on MODULES
-    default y
-    help
-      Let delete_module(2) call the module exit routine and release its
-      sections. Without this, modules stay resident until reboot.
-
-config MODULE_FORCE_UNLOAD
-    bool "Allow forced unload of busy modules"
-    depends on MODULE_UNLOAD
-    default n
-    help
-      Permit delete_module(2) with O_TRUNC to unload a module even when its
-      reference count is nonzero. The caller must guarantee no CPU is
-      executing module code; this is a privileged last resort.
+	string "Kernel command line"
+	default "console=tty0 console=ttyS0"
+	help
+	  Console selection passed to the kernel by the bootloader. Repeat
+	  console= to enable more than one output.
 
 config KALLSYMS
-    bool "Emit the full kernel symbol table through /proc/kallsyms"
-    default y
-    help
-      Patch the linked kernel image with all allocatable symbols and expose
-      them through /proc/kallsyms. Module symbols are appended at runtime.
-      Module linking still only resolves the explicit EXPORT_SYMBOL
-      whitelist; kallsyms is a diagnostic view, not a linking surface.
+	bool "Kernel symbol table"
+	default y
+	help
+	  Expose kernel symbols through /proc/kallsyms.
 
 config KALLSYMS_ALL
-    bool "Include data symbols in /proc/kallsyms"
-    depends on KALLSYMS
-    default n
-    help
-      Include data, BSS and read-only object symbols. With this disabled,
-      only function symbols are emitted, matching Linux KALLSYMS semantics.
+	bool "Include data symbols in the symbol table"
+	depends on KALLSYMS
+	help
+	  Also emit data, BSS and read-only symbols. Without this, only
+	  functions are listed.
 
 endmenu
 
-menu "Testing & QEMU Validation"
+menu "Device drivers"
+
+menuconfig PS2
+	bool "PS/2 controller"
+	default y
+	help
+	  i8042 controller and PS/2 input devices.
+
+if PS2
+
+config PS2_KEYBOARD
+	bool "PS/2 keyboard"
+	default y
+
+config PS2_MOUSE
+	bool "PS/2 mouse"
+	default y
+
+endif # PS2
+
+config SERIAL
+	bool "Serial console"
+	default y
+	help
+	  16550-compatible UART and PL011 console output.
+
+config TTY
+	bool "Virtual terminals"
+	default y
+	help
+	  TTY line discipline, canonical input and virtual consoles.
+
+config FRAMEBUFFER
+	bool "Framebuffer console"
+	default y
+	help
+	  Graphical console on the Limine framebuffer.
+
+config PCI
+	bool "PCI support"
+	default y
+	help
+	  PCI and PCIe ECAM configuration space access.
+
+menuconfig BLOCK
+	bool "Block device support"
+	default y
+	help
+	  Block layer, sector cache and MBR/GPT partition parsing.
+
+if BLOCK
+
+menu "Storage controllers"
+	depends on PCI
+
+config IDE
+	bool "IDE/PATA support"
+	default y
+	help
+	  PCI IDE controllers with bus-master DMA and LBA28/48 PIO.
+
+config AHCI
+	bool "AHCI SATA support"
+	default y
+	help
+	  AHCI 1.0 controllers with command lists and PRDT DMA.
+
+config NVME
+	bool "NVMe support"
+	default y
+	help
+	  PCIe NVMe controllers with admin and I/O queue pairs.
+
+endmenu
+
+endif # BLOCK
+
+endmenu
+
+menu "File systems"
+
+config VFS
+	bool "Virtual file system"
+	default y
+	help
+	  Linux ABI VFS, file descriptor tables, pipes, RamFS, DevFS and
+	  ProcFS.
+
+if VFS
+
+config FAT32
+	bool "FAT32 (VFAT) support"
+	depends on BLOCK
+	default y
+	help
+	  FAT32 read/write with VFAT long file names.
+
+endif # VFS
+
+endmenu
+
+menu "Kernel features"
+
+config EEVDF_SCHED
+	bool "EEVDF scheduler"
+	default y
+	help
+	  Earliest Eligible Virtual Deadline First scheduling per CPU.
+
+config USER_SPACE
+	bool "User space support"
+	default y
+	help
+	  Isolated address spaces, privilege transitions, ELF loading and
+	  Linux ABI system calls.
+
+config KSHELL
+	bool "Kernel shell"
+	default y
+	help
+	  Interactive diagnostic shell on the serial and foreground
+	  consoles.
+
+endmenu
+
+menu "Module support"
+
+menuconfig MODULES
+	bool "Loadable kernel modules"
+	default y
+	help
+	  init_module(2), finit_module(2) and delete_module(2) for ET_REL
+	  modules built against the exported symbol ABI.
+
+if MODULES
+
+config MODULE_UNLOAD
+	bool "Module unloading"
+	default y
+	help
+	  Allow delete_module(2) to run a module's exit routine.
+
+config MODULE_FORCE_UNLOAD
+	bool "Forced module unloading (DANGEROUS)"
+	depends on MODULE_UNLOAD
+	help
+	  Allow unloading a module with a non-zero reference count. The
+	  caller must ensure that no CPU is executing module code.
+
+menu "Modules to build"
+
+menu "Network drivers"
+
+config MODULE_E1000
+	bool "Intel PRO/1000 gigabit Ethernet"
+	depends on PCI
+	default y
+	help
+	  Build e1000.ko for 8254x-based adapters.
+
+config MODULE_E1000E
+	bool "Intel PRO/1000e PCIe gigabit Ethernet"
+	depends on PCI
+	default y
+	help
+	  Build e1000e.ko for 82574L and related PCIe adapters.
+
+endmenu
+
+menu "Sample modules"
+
+config MODULE_HELLO
+	bool "C hello module"
+	default y
+	help
+	  Build hello.ko, the C sample used by the boot self-test.
+
+config MODULE_HELLO_RUST
+	bool "Rust hello module"
+	default y
+	help
+	  Build hello-rust.ko, the Rust sample used by the boot self-test.
+
+endmenu
+
+endmenu
+
+endif # MODULES
+
+endmenu
+
+menu "Testing"
 
 config BOOT_SELF_TEST
-    bool "Run automated self-tests at boot"
-    default n
-    help
-      Execute comprehensive smoke tests at boot: CPU/FPU, PMM/VMM/SLAB,
-      SMP, EEVDF scheduler preemption/fairness, and user-mode Linux ABI self-tests.
+	bool "Boot self-tests"
+	help
+	  Run CPU, memory, SMP, scheduler and user-space smoke tests at
+	  boot.
 
 config QEMU_CPUS
-    int "QEMU virtual CPUs"
-    range 1 64
-    default 4
-    help
-      Number of virtual CPUs configured when launching QEMU.
+	int "QEMU CPUs"
+	range 1 64
+	default 4
 
 config QEMU_MEMORY_MIB
-    int "QEMU memory (MiB)"
-    range 128 8192
-    default 512
-    help
-      Amount of RAM allocated to the QEMU virtual machine in megabytes.
+	int "QEMU memory (MiB)"
+	range 128 8192
+	default 512
 
 endmenu

@@ -96,6 +96,12 @@ CARGO_FEATURE_LIST += kallsyms-all
 endif
 CARGO_FEATURES = $(foreach feature,$(CARGO_FEATURE_LIST),--features $(feature))
 
+MODULE_LIST := $(strip \
+  $(if $(filter y,$(CONFIG_MODULE_E1000)),e1000) \
+  $(if $(filter y,$(CONFIG_MODULE_E1000E)),e1000e) \
+  $(if $(filter y,$(CONFIG_MODULE_HELLO)),hello) \
+  $(if $(filter y,$(CONFIG_MODULE_HELLO_RUST)),hello-rust))
+
 OUT := build/$(ARCH)/$(PROFILE)
 MODULE_OUT := build/modules/$(ARCH)
 KERNEL := target/$(TARGET)/$(PROFILE)/spacekernel
@@ -134,8 +140,9 @@ deps:
 
 modules:
 	@if [ "$(CONFIG_MODULES)" = "y" ]; then \
-	  tools/build_modules.sh "$(ARCH)" "$(MODULE_OUT)"; \
+	  tools/build_modules.sh "$(ARCH)" "$(MODULE_OUT)" "$(MODULE_LIST)"; \
 	else \
+	  rm -rf "$(MODULE_OUT)"; \
 	  echo "modules disabled by Kconfig"; \
 	fi
 
@@ -254,9 +261,13 @@ test-host: test-sched-model test-subsystem-model test-drm-abi
 
 test-single: iso
 	python3 tools/check_no_simd.py $(ARCH) $(KERNEL)
-	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULES))),--require 'HELLO_MODULE_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_NIC),--nic '$(QEMU_NIC)',) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
+	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULES)),$(filter y,$(CONFIG_MODULE_HELLO))),--require 'HELLO_MODULE_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_NIC),--nic '$(QEMU_NIC)',) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
 
 test-modules: iso
+	@if [ "$(CONFIG_MODULES)" != "y" ] || [ "$(CONFIG_MODULE_HELLO)" != "y" ]; then \
+	  echo "test-modules requires CONFIG_MODULES=y and CONFIG_MODULE_HELLO=y" >&2; \
+	  exit 1; \
+	fi
 	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) --require 'HELLO_MODULE_OK' --online-cpus $(CPUS) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
 
 ifeq ($(origin ARCH),command line)
@@ -281,7 +292,7 @@ clean:
 
 help:
 	@printf '%s\n' \
-	  'make menuconfig   Configure architecture, profile, KASLR and QEMU' \
+	  'make menuconfig   Configure architecture, drivers, modules and QEMU' \
 	  'make defconfig    Restore checked-in Kconfig defaults' \
 	  'make             Build bootable ISO' \
 	  'make run         Boot ISO in QEMU' \
