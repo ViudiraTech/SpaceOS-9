@@ -224,6 +224,41 @@ pub fn alloc(pages: usize) -> Option<u64> {
     None
 }
 
+/// Allocate `pages` physically contiguous frames whose end stays below
+/// `max_end` (exclusive).  Used by ISA DMA, which is limited to 24-bit
+/// addresses.
+pub fn alloc_below(pages: usize, max_end: u64) -> Option<u64> {
+    if pages == 0 {
+        return None;
+    }
+    let max_frame = (max_end / PAGE_SIZE as u64) as usize;
+    let mut state = PMM.lock();
+    if pages >= max_frame || pages > state.free {
+        return None;
+    }
+    let end = max_frame.min(state.frames);
+    let mut run = 0;
+    for frame in 1..end {
+        if state.free_frame(frame) {
+            run += 1;
+            if run == pages {
+                let first = frame + 1 - pages;
+                for index in first..=frame {
+                    state.set_bit(state.used_addr, index, true);
+                    debug_assert_eq!(state.ref_count(index), 0);
+                    state.set_ref_count(index, 1);
+                }
+                state.free -= pages;
+                state.hint = (frame + 1).min(state.frames);
+                return Some(first as u64 * PAGE_SIZE as u64);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
 /// Free an exclusively owned frame span. Shared frames must go through
 /// `release`; returning an error here prevents a double free from silently
 /// dropping another mapping's page.

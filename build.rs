@@ -32,6 +32,8 @@ fn main() {
         ("SPK_HELLO_RUST_KO", "hello-rust.ko"),
         ("SPK_E1000_KO", "e1000.ko"),
         ("SPK_E1000E_KO", "e1000e.ko"),
+        ("SPK_SB16_KO", "sb16.ko"),
+        ("SPK_HDA_KO", "hda.ko"),
     ] {
         let candidate = modules.join(file);
         let path = if want_self_test && candidate.is_file() {

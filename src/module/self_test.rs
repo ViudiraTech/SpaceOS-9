@@ -15,6 +15,8 @@ static HELLO: &[u8] = include_bytes!(env!("SPK_HELLO_KO"));
 static HELLO_RUST: &[u8] = include_bytes!(env!("SPK_HELLO_RUST_KO"));
 static E1000: &[u8] = include_bytes!(env!("SPK_E1000_KO"));
 static E1000E: &[u8] = include_bytes!(env!("SPK_E1000E_KO"));
+static SB16: &[u8] = include_bytes!(env!("SPK_SB16_KO"));
+static HDA: &[u8] = include_bytes!(env!("SPK_HDA_KO"));
 
 fn check_module(name: &str) {
     assert!(crate::module::is_loaded(name), "module {name} missing");
@@ -60,6 +62,19 @@ pub fn run() {
         {
             crate::module::unload("hello-rust", false).expect("Rust hello module failed to unload");
             assert!(!crate::module::is_loaded("hello-rust"));
+        }
+    }
+    #[cfg(feature = "sound")]
+    {
+        if !SB16.is_empty() {
+            match crate::module::load(SB16, "") {
+                Ok(()) => check_module("sb16"),
+                Err(error) => crate::kwarn!("module: sb16 not attached ({})", error),
+            }
+        }
+        if !HDA.is_empty() && has_pci_device(0x2668) {
+            crate::module::load(HDA, "").expect("HDA module failed to load");
+            check_module("hda");
         }
     }
     crate::verbose::log(format_args!("loadable module self-test passed"));

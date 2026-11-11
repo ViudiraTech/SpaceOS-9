@@ -704,6 +704,210 @@ pub unsafe extern "C" fn spk_pci_irq_line(device: *mut CPciDevice) -> c_int {
     c_int::from(device.info.interrupt_line)
 }
 
+// ---- ISA port I/O and legacy interrupts ---------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn port_inb(port: u16) -> u8 {
+    let value: u8;
+    // SAFETY: caller asserts the port belongs to the device.
+    unsafe {
+        core::arch::asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn port_outb(port: u16, value: u8) {
+    // SAFETY: caller asserts the port belongs to the device.
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn port_inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe {
+        core::arch::asm!("in ax, dx", in("dx") port, out("ax") value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn port_outw(port: u16, value: u16) {
+    unsafe {
+        core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn port_inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn port_outl(port: u16, value: u32) {
+    unsafe {
+        core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// # Safety
+/// The module must own the I/O port.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spk_inb(port: u16) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: forwarded caller contract.
+        unsafe { port_inb(port) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = port;
+        0
+    }
+}
+
+/// # Safety
+/// The module must own the I/O port.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spk_outb(port: u16, value: u8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: forwarded caller contract.
+        unsafe { port_outb(port, value) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (port, value);
+    }
+}
+
+/// # Safety
+/// The module must own the I/O port.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spk_inw(port: u16) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { port_inw(port) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = port;
+        0
+    }
+}
+
+/// # Safety
+/// The module must own the I/O port.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spk_outw(port: u16, value: u16) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { port_outw(port, value) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (port, value);
+    }
+}
+
+/// # Safety
+/// The module must own the I/O port.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spk_inl(port: u16) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { port_inl(port) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = port;
+        0
+    }
+}
+
+/// # Safety
+/// The module must own the I/O port.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spk_outl(port: u16, value: u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { port_outl(port, value) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (port, value);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+static ISA_ROUTES: SpinLock<[Option<crate::arch::apic::Route>; 16]> =
+    SpinLock::new([None; 16]);
+
+/// Register a handler for a legacy ISA IRQ line (0-15).
+/// # Safety
+/// `handler` must stay valid until `spk_free_isa_irq`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spk_request_isa_irq(
+    irq: u32,
+    handler: extern "C" fn(c_int, *mut c_void),
+    data: *mut c_void,
+) -> c_int {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if irq >= 16 {
+            return -(abi::EINVAL as c_int);
+        }
+        let mut routes = ISA_ROUTES.lock();
+        if routes[irq as usize].is_some() {
+            return -(abi::EBUSY as c_int);
+        }
+        match crate::arch::apic::request_isa(irq as u8, irq_trampoline) {
+            Ok(route) => {
+                install_interrupt(route.vector, handler, data);
+                routes[irq as usize] = Some(route);
+                0
+            }
+            Err(_) => -(abi::ENODEV as c_int),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (irq, handler, data);
+        -(abi::ENODEV as c_int)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn spk_free_isa_irq(irq: u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if irq >= 16 {
+            return;
+        }
+        let route = ISA_ROUTES.lock()[irq as usize].take();
+        if let Some(route) = route {
+            remove_interrupt(route.vector);
+            let _ = crate::arch::apic::release_route(route);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = irq;
+    }
+}
+
 // ---- Interrupts ---------------------------------------------------------------
 
 #[derive(Clone, Copy)]

@@ -137,6 +137,16 @@ void spk_writel(unsigned int value, volatile void *address);
 unsigned short spk_readw(const volatile void *address);
 void spk_writew(unsigned short value, volatile void *address);
 unsigned char spk_readb(const volatile void *address);
+/* ISA port I/O (x86 only; other architectures return 0 / ignore writes). */
+unsigned char spk_inb(unsigned short port);
+unsigned short spk_inw(unsigned short port);
+unsigned int spk_inl(unsigned short port);
+void spk_outb(unsigned short port, unsigned char value);
+void spk_outw(unsigned short port, unsigned short value);
+void spk_outl(unsigned short port, unsigned int value);
+/* Legacy ISA IRQ routing (x86 only). */
+int spk_request_isa_irq(unsigned int irq, void (*handler)(int irq, void *data), void *data);
+void spk_free_isa_irq(unsigned int irq);
 void spk_writeb(unsigned char value, volatile void *address);
 void spk_mb(void);
 

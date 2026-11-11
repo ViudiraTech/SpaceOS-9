@@ -112,6 +112,31 @@ pub fn alloc_coherent(size: usize, align: usize) -> Option<Coherent> {
     })
 }
 
+/// Like [`alloc_coherent`], but the whole allocation must end below
+/// `max_end`.  Alignment padding is included in the range check.
+pub fn alloc_coherent_below(size: usize, align: usize, max_end: u64) -> Option<Coherent> {
+    let align = align.max(PAGE_SIZE).next_power_of_two();
+    let pages = pages_for(size, align)?;
+    if pages as u64 * PAGE_SIZE as u64 > max_end {
+        return None;
+    }
+    let physical_base = pmm::alloc_below(pages, max_end)?;
+    let aligned = (physical_base + align as u64 - 1) & !(align as u64 - 1);
+    let virtual_base = pmm::phys_to_virt(physical_base);
+    // SAFETY: the PMM handed us `pages` writable frames.
+    unsafe {
+        core::ptr::write_bytes(virtual_base as *mut u8, 0, pages * PAGE_SIZE);
+    }
+    COHERENT_BYTES.fetch_add((pages * PAGE_SIZE) as u64, Ordering::AcqRel);
+    Some(Coherent {
+        physical_base,
+        virtual_base,
+        device_address: aligned,
+        pages,
+        size,
+    })
+}
+
 /// Translate a virtual address to the physical address a device programs.
 /// Handles the three mappings the kernel uses: the kernel image, VMM regions
 /// and the HHDM direct map.

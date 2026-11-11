@@ -87,6 +87,17 @@ pub static EXPORTS: &[Export] = &[
     export!("spk_getpid", spk_getpid),
     export!("spk_ioremap", crate::module::hw::spk_ioremap),
     export!("spk_iounmap", crate::module::hw::spk_iounmap),
+    export!("spk_inb", crate::module::hw::spk_inb),
+    export!("spk_inl", crate::module::hw::spk_inl),
+    export!("spk_inw", crate::module::hw::spk_inw),
+    export!(
+        "spk_request_isa_irq",
+        crate::module::hw::spk_request_isa_irq
+    ),
+    export!("spk_free_isa_irq", crate::module::hw::spk_free_isa_irq),
+    export!("spk_outb", crate::module::hw::spk_outb),
+    export!("spk_outl", crate::module::hw::spk_outl),
+    export!("spk_outw", crate::module::hw::spk_outw),
     export!("spk_kernel_version", spk_kernel_version),
     export!("spk_kfree", spk_kfree),
     export!("spk_kthread_create", crate::module::hw::spk_kthread_create),

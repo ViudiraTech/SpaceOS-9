@@ -542,6 +542,24 @@ pub fn run_late() -> &'static str {
         timer::self_test_late(),
         "sound: timer tick self-test failed"
     );
+    #[cfg(feature = "modules")]
+    {
+        if crate::module::is_loaded("hda") {
+            assert!(
+                pcm::module_driver_test("HDA", false) && pcm::module_driver_test("HDA", true),
+                "sound: HDA PCM acceptance failed"
+            );
+            crate::kinfo!("HDA_PCM_OK");
+        }
+        if crate::module::is_loaded("sb16") {
+            assert!(
+                pcm::module_driver_test("SB16", false),
+                "sound: SB16 playback acceptance failed"
+            );
+            crate::kinfo!("SB16_PCM_OK");
+            crate::kinfo!("SB16_CAPTURE_UNVERIFIED qemu-sb16-has-no-adc");
+        }
+    }
     "ok"
 }
 

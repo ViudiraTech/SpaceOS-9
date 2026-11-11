@@ -172,6 +172,10 @@ pub fn request_gsi(
         let _ = irq::unregister(u32::from(vector));
         return Err(error);
     }
+    if let Err(error) = ioapic::set_mask(gsi, false) {
+        let _ = irq::unregister(u32::from(vector));
+        return Err(error);
+    }
     state.used[vector as usize] = true;
     let route = Route { gsi, vector };
     state.routes.push(route);

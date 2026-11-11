@@ -168,11 +168,61 @@ CONFIG_SOUND_DUMMY=y    # 内置 dummy 卡与启动自测后端
 
 Makefile 将其映射为 Cargo feature `sound` / `sound-dummy`。禁用 `CONFIG_SOUND` 时整个子系统不参与编译，不导出 `snd_*` 符号。
 
+## 硬件驱动（可加载模块）
+
+### Intel HDA（`modules/hda`）
+
+- 匹配 ICH6 兼容控制器 `8086:2668`；BAR0 映射控制器寄存器。
+- 复位序列：`GCTL.RST` 置位/清除，等待 `STATESTS` 报告 codec。
+- 命令通道：CORB/RIRB 各 256 项、128 字节对齐；`CORBWP` 写入触发处理，
+  `RIRBWP` 轮询取响应；`RINTCNT` 设为 255，避免 QEMU 在每个响应后停止取指。
+- 命令编码遵循 Linux `snd_hdac_make_cmd`：`CAd/NID` 后接 12 位 verb 与 16 位
+  parameter 的重叠布局，因此 `SET_STREAM_FORMAT`/`SET_AMP_GAIN_MUTE` 的 16 位
+  payload 与 12 位 verb 共用位域。
+- Codec：枚举 root 节点，识别 AFG、DAC、ADC 与 Pin Complex；QEMU hda-duplex
+  拓扑为 AFG 1、DAC 2、line-out 3、ADC 4、line-in 5。
+- 流：输出 SD4（0x100）、输入 SD0（0x80），stream tag 1；BDL 每项 16 字节，
+  `addr64/len/flags`，IOC 置位；要求 period/buffer 字节数为 128 的倍数。
+- 中断：INTSTS 位 0-3 对应输入、4-7 对应输出；handler 清 SD_STS（写 0x1c 清除
+  IOC 状态）并投递工作项，周期回调在进程上下文执行。
+- 混音器：`Master Playback Volume` 映射到 DAC amp gain。
+
+### Sound Blaster 16（`modules/sb16`）
+
+- 固定经典配置 0x220 / IRQ5 / 16-bit DMA 5（QEMU sb16 默认）。
+- DSP：复位握手（0x2x6、0x2xE/0x2xA=0xAA）、`0xE1` 版本、`0x41/0x42` 采样率
+  （高字节先写）、`0xB6/0xBE` 16 位 auto-init（mode、长度低、长度高）、
+  `0xD9` 停止、`0xD5/0xD6` 暂停/继续、`0xD1/0xD3` 扬声器。
+- 8237：16-bit 通道 5，mask 0xD4、flip-flop 0xD8、mode 0xD6（0x59 播放 /
+  0x55 录音）、地址 0xC4、计数 0xC6、页 0x8B；DMA 控制器按整环计数，DSP 按
+  period 产生 IRQ。
+- ALSA 环形缓冲通过 `snd_pcm_set_isa_dma` 强制分配在 16 MiB 以下且 64 KiB 对齐，
+  避免 128 KiB 边界跨越；驱动直接让 DMA 指向环形缓冲，不额外拷贝。
+- 半双工：同一时刻只允许一个方向；混音器提供 Master Playback Volume。
+- 捕获使用 `0xBE` 与 DMA 控制器写通道路径；QEMU 的 sb16 模拟器不实现 ADC，
+  因此启动自测只验证播放，捕获标记为未验证，真实硬件路径仍完整实现。
+
+### 内核新增能力
+
+- `spk_inb/spk_outb/spk_inw/spk_outw/spk_inl/spk_outl`：ISA 端口 I/O（x86）。
+- `spk_request_isa_irq/spk_free_isa_irq`：传统 IRQ 路由；同时修复 IOAPIC 路由
+  编程后未解除屏蔽的问题。
+- `mm::pmm::alloc_below` / `mm::dma::alloc_coherent_below`：16 MiB 以下连续分配。
+- `snd_pcm_set_isa_dma`、`snd_pcm_hw_constraint_step`：ISA 缓冲约束与
+  HDA 128 字节 BDL 对齐约束。
+- 驱动 IRQ 通过 `spk_work_schedule` 把周期处理投递到进程上下文，避免在中断
+  上下文获取可睡眠的 PCM runtime 锁。
+
 ## 验证
 
 - 编译期：三架构 `cargo check`；UAPI 尺寸、字段偏移、ioctl 命令字静态断言。
 - 启动早期（调度器之前，`kernel_test_scope`）：真实 ioctl 入口 + 内核缓冲，覆盖 `CARD_INFO`、`ELEM_LIST/INFO/READ/WRITE`、`PCM_INFO`、`PCM_NEXT_DEVICE`、`HW_REFINE`、`HW_PARAMS` 求解、`SW_PARAMS`、`PREPARE`、`STATUS`、`CHANNEL_INFO`、timer `NEXT_DEVICE/GINFO/PARAMS/INFO/STATUS`。
 - 启动晚期（内核线程）：dummy 播放/捕获启动、周期指针推进、pause/resume、timer 连续 tick。
+- QEMU 音频设备：`-sound both` 同时创建 `sb16` 与 `intel-hda`+`hda-duplex`，
+  加载对应 `.ko` 并执行真实流式验收：
+  - `HDA_MODULE_OK`、`HDA_PCM_OK`（播放 + 捕获）
+  - `SB16_MODULE_OK`、`SB16_PCM_OK`（播放；`SB16_CAPTURE_UNVERIFIED` 说明 QEMU
+    模拟器无 ADC）
 - 自测成功后 `SELFTEST_OK` 行包含 `sound=ok`；任何断言失败都会在串口打印并中止自测。
 
 ## 当前边界与后续阶段

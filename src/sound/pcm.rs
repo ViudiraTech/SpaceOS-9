@@ -79,6 +79,7 @@ pub struct PcmCaps {
     pub periods_min: u32,
     pub periods_max: u32,
     pub buffer_bytes_max: usize,
+    pub period_step_bytes: usize,
 }
 
 impl PcmCaps {
@@ -94,6 +95,7 @@ impl PcmCaps {
             periods_min: 2,
             periods_max: 32,
             buffer_bytes_max: 1024 * 1024,
+            period_step_bytes: 0,
         }
     }
 }
@@ -241,6 +243,7 @@ pub struct Substream {
     pub generation: AtomicU64,
     pub avail: AtomicU64,
     pub state: AtomicI32,
+    pub isa_dma: AtomicBool,
     self_reference: SpinLock<Weak<Substream>>,
     siblings: Mutex<Vec<Weak<Substream>>>,
     group: Mutex<Vec<Weak<Substream>>>,
@@ -272,10 +275,18 @@ impl Substream {
             generation: AtomicU64::new(0),
             avail: AtomicU64::new(0),
             state: AtomicI32::new(uapi::SNDRV_PCM_STATE_OPEN),
+            isa_dma: AtomicBool::new(false),
             self_reference: SpinLock::new(weak.clone()),
             siblings: Mutex::new(Vec::new()),
             group: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Force the ring buffer into ISA-DMA-safe memory: physically contiguous,
+    /// below 16 MiB and aligned so a 16-bit channel cannot cross a 128 KiB
+    /// boundary.  Called by ISA drivers from `open`.
+    pub fn set_isa_dma(&self) {
+        self.isa_dma.store(true, Ordering::Release);
     }
 
     /// Strong handle used by drivers that need to schedule a period callback
@@ -603,12 +614,14 @@ fn mask_from_formats(formats: u64) -> uapi::snd_mask {
     mask
 }
 
-fn default_access_mask() -> uapi::snd_mask {
+fn default_access_mask(info_flags: u32) -> uapi::snd_mask {
     let mut mask = uapi::snd_mask::zeroed();
     mask.set(uapi::SNDRV_PCM_ACCESS_MMAP_INTERLEAVED);
-    mask.set(uapi::SNDRV_PCM_ACCESS_MMAP_NONINTERLEAVED);
     mask.set(uapi::SNDRV_PCM_ACCESS_RW_INTERLEAVED);
-    mask.set(uapi::SNDRV_PCM_ACCESS_RW_NONINTERLEAVED);
+    if info_flags & uapi::SNDRV_PCM_INFO_NONINTERLEAVED != 0 {
+        mask.set(uapi::SNDRV_PCM_ACCESS_MMAP_NONINTERLEAVED);
+        mask.set(uapi::SNDRV_PCM_ACCESS_RW_NONINTERLEAVED);
+    }
     mask
 }
 
@@ -632,7 +645,7 @@ fn refine(substream: &Substream, params: &mut uapi::snd_pcm_hw_params) {
     let caps = *substream.caps.lock();
     let requested = params.rmask;
 
-    let access = default_access_mask();
+    let access = default_access_mask(substream.info_flags);
     let format = mask_from_formats(caps.formats);
     let mut subformat = uapi::snd_mask::zeroed();
     subformat.set(uapi::SNDRV_PCM_SUBFORMAT_STD);
@@ -749,6 +762,13 @@ fn solve(
     {
         return Err(VfsError::InvalidArgument);
     }
+    if matches!(
+        access,
+        uapi::SNDRV_PCM_ACCESS_MMAP_NONINTERLEAVED | uapi::SNDRV_PCM_ACCESS_RW_NONINTERLEAVED
+    ) && substream.info_flags & uapi::SNDRV_PCM_INFO_NONINTERLEAVED == 0
+    {
+        return Err(VfsError::InvalidArgument);
+    }
     if !input
         .mask(uapi::SNDRV_PCM_HW_PARAM_SUBFORMAT)
         .test(uapi::SNDRV_PCM_SUBFORMAT_STD)
@@ -803,7 +823,11 @@ fn solve(
             buffer_size = Some(((micros as u64 * rate as u64) / 1_000_000).max(1) as u32);
         }
     }
-    let period_size = period_size.unwrap_or(1024).max(1);
+    let mut period_size = period_size.unwrap_or(1024).max(1);
+    if caps.period_step_bytes > 1 {
+        let frames_step = (caps.period_step_bytes).div_ceil(frame_bytes).max(1) as u32;
+        period_size = period_size.div_ceil(frames_step) * frames_step;
+    }
     if buffer_size.is_none() {
         buffer_size = Some(period_size.saturating_mul(periods));
     }
@@ -935,6 +959,14 @@ fn configure(
     mut params: uapi::snd_pcm_hw_params,
     arg: u64,
 ) -> Result<(), VfsError> {
+    apply_hw_params(substream, &mut params)?;
+    uaccess::write_value(arg, &params)
+}
+
+fn apply_hw_params(
+    substream: &Arc<Substream>,
+    params: &mut uapi::snd_pcm_hw_params,
+) -> Result<(), VfsError> {
     let hw = solve(substream, &params)?;
     {
         let runtime = substream.runtime.lock();
@@ -949,7 +981,16 @@ fn configure(
         .ok_or(VfsError::NoMemory)?
         / PAGE_SIZE
         * PAGE_SIZE;
-    let buffer = dma::alloc_coherent(mapped_bytes, PAGE_SIZE).ok_or(VfsError::NoMemory)?;
+    let isa = substream.isa_dma.load(Ordering::Acquire);
+    if isa && mapped_bytes > 64 * 1024 {
+        return Err(VfsError::InvalidArgument);
+    }
+    let buffer = if isa {
+        dma::alloc_coherent_below(mapped_bytes, 64 * 1024, 16 * 1024 * 1024)
+            .ok_or(VfsError::NoMemory)?
+    } else {
+        dma::alloc_coherent(mapped_bytes, PAGE_SIZE).ok_or(VfsError::NoMemory)?
+    };
     let status_page = dma::alloc_coherent(PAGE_SIZE, PAGE_SIZE).ok_or(VfsError::NoMemory)?;
     let control_page = dma::alloc_coherent(PAGE_SIZE, PAGE_SIZE).ok_or(VfsError::NoMemory)?;
     let ring = RingBuffer {
@@ -980,9 +1021,9 @@ fn configure(
         runtime.no_period_wakeup = params.flags & uapi::SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP != 0;
         publish(substream, &mut runtime);
     }
-    write_hw_params(&mut params, &hw, substream.info_flags);
+    write_hw_params(params, &hw, substream.info_flags);
     if let Some(ops) = substream.ops.lock().clone()
-        && let Err(error) = ops.hw_params(substream, &params)
+        && let Err(error) = ops.hw_params(substream, params)
     {
         let mut runtime = substream.runtime.lock();
         runtime.hw = None;
@@ -991,7 +1032,18 @@ fn configure(
         publish(substream, &mut runtime);
         return Err(from_errno(error));
     }
-    uaccess::write_value(arg, &params)
+    Ok(())
+}
+
+fn release_buffer(substream: &Arc<Substream>) {
+    let mut runtime = substream.runtime.lock();
+    runtime.hw = None;
+    runtime.pages = None;
+    runtime.boundary = 0;
+    runtime.hw_ptr = 0;
+    runtime.appl_ptr = 0;
+    runtime.state = uapi::SNDRV_PCM_STATE_OPEN;
+    publish(substream, &mut runtime);
 }
 
 fn prepare_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
@@ -1723,18 +1775,12 @@ pub fn ioctl(
                 _ => {}
             }
             {
-                let mut runtime = substream.runtime.lock();
+                let runtime = substream.runtime.lock();
                 if runtime.hw.is_none() {
                     return Ok(0);
                 }
-                runtime.hw = None;
-                runtime.pages = None;
-                runtime.boundary = 0;
-                runtime.hw_ptr = 0;
-                runtime.appl_ptr = 0;
-                runtime.state = uapi::SNDRV_PCM_STATE_OPEN;
-                publish(substream, &mut runtime);
             }
+            release_buffer(substream);
             if let Some(ops) = substream.ops.lock().clone() {
                 ops.hw_free(substream);
             }
@@ -2135,6 +2181,97 @@ fn link_self_test() -> bool {
     let _ = prepare(&capture);
     let _ = crate::vfs::current_fd_table().lock().close(fd);
     linked && groups_empty
+}
+
+#[cfg(feature = "boot-self-test")]
+fn test_params() -> uapi::snd_pcm_hw_params {
+    let mut params = uapi::snd_pcm_hw_params::zeroed();
+    params.masks[uapi::SNDRV_PCM_HW_PARAM_ACCESS as usize]
+        .set(uapi::SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+    params.masks[uapi::SNDRV_PCM_HW_PARAM_FORMAT as usize].set(uapi::SNDRV_PCM_FORMAT_S16_LE);
+    params.masks[uapi::SNDRV_PCM_HW_PARAM_SUBFORMAT as usize].set(uapi::SNDRV_PCM_SUBFORMAT_STD);
+    params.intervals[(uapi::SNDRV_PCM_HW_PARAM_CHANNELS - 8) as usize] =
+        uapi::snd_interval::exact(2);
+    params.intervals[(uapi::SNDRV_PCM_HW_PARAM_RATE - 8) as usize] =
+        uapi::snd_interval::exact(44_100);
+    params.intervals[(uapi::SNDRV_PCM_HW_PARAM_PERIOD_SIZE - 8) as usize] =
+        uapi::snd_interval::exact(1024);
+    params.intervals[(uapi::SNDRV_PCM_HW_PARAM_PERIODS - 8) as usize] =
+        uapi::snd_interval::exact(4);
+    params.intervals[(uapi::SNDRV_PCM_HW_PARAM_BUFFER_SIZE - 8) as usize] =
+        uapi::snd_interval::exact(4096);
+    params
+}
+
+#[cfg(feature = "boot-self-test")]
+fn module_driver_direction(substream: &Arc<Substream>) -> bool {
+    let Some(ops) = substream.ops.lock().clone() else {
+        return false;
+    };
+    if ops.open(substream).is_err() {
+        return false;
+    }
+    substream.opened.store(true, Ordering::Release);
+    let mut params = test_params();
+    let configured = apply_hw_params(substream, &mut params).is_ok();
+    let prepared = configured && prepare(substream).is_ok();
+    if prepared && substream.direction == Direction::Playback {
+        let mut runtime = substream.runtime.lock();
+        if let Some(hw) = runtime.hw {
+            runtime.appl_ptr = (runtime.hw_ptr + hw.buffer_size) % runtime.boundary;
+            publish(substream, &mut runtime);
+        }
+    }
+    let started = prepared && trigger(substream, uapi::SNDRV_PCM_TRIGGER_START).is_ok();
+    if started {
+        crate::sched::sleep_micros(80_000);
+    }
+    let (running, pointer) = {
+        let runtime = substream.runtime.lock();
+        let status = fill_status(substream, &runtime, None);
+        (status.state == uapi::SNDRV_PCM_STATE_RUNNING, status.hw_ptr)
+    };
+    let _ = trigger(substream, uapi::SNDRV_PCM_TRIGGER_STOP);
+    let _ = prepare(substream);
+    release_buffer(substream);
+    ops.hw_free(substream);
+    ops.close(substream);
+    substream.opened.store(false, Ordering::Release);
+    started && running && pointer > 0
+}
+
+/// End-to-end acceptance for a loaded hardware driver: open, configure,
+/// start, wait for period interrupts, inspect the hardware pointer, stop.
+/// `capture` selects the direction so QEMU sb16 (playback-only emulation) can
+/// validate its DAC path while a real SB16 also exercises the ADC path.
+#[cfg(feature = "boot-self-test")]
+pub fn module_driver_test(card_id: &str, capture: bool) -> bool {
+    let Some(card) = crate::sound::cards()
+        .into_iter()
+        .find(|card| card.id == card_id)
+    else {
+        return false;
+    };
+    let Some(pcm) = card.find_pcm(0) else {
+        return false;
+    };
+    let direction = if capture {
+        Direction::Capture
+    } else {
+        Direction::Playback
+    };
+    let Some(substream) = pcm.first_substream(direction) else {
+        return false;
+    };
+    if !module_driver_direction(&substream) {
+        crate::kinfo!(
+            "sound: {} {} acceptance failed",
+            card_id,
+            if capture { "capture" } else { "playback" }
+        );
+        return false;
+    }
+    true
 }
 
 #[cfg(feature = "boot-self-test")]

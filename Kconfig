@@ -276,6 +276,24 @@ config MODULE_E1000E
 
 endmenu
 
+menu "Sound drivers"
+
+config MODULE_SB16
+	bool "Creative Sound Blaster 16 (ISA)"
+	depends on ARCH_X86_64
+	default y
+	help
+	  Build sb16.ko for the 0x220/IRQ5/DMA5 configuration.
+
+config MODULE_HDA
+	bool "Intel High Definition Audio"
+	depends on PCI
+	default y
+	help
+	  Build hda.ko for ICH6-compatible HDA controllers.
+
+endmenu
+
 menu "Sample modules"
 
 config MODULE_HELLO

@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--cpu")
     parser.add_argument("--machine")
     parser.add_argument("--nic", help="QEMU -nic argument, e.g. user,model=e1000")
+    parser.add_argument("--sound", choices=["sb16", "hda", "both"])
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--online-cpus", type=int)
     parser.add_argument("--require", action="append", default=[])
@@ -74,6 +75,12 @@ def main():
         command += ["-accel", args.accel]
     if args.nic:
         command += ["-nic", args.nic]
+    if arch == "x86_64" and args.sound:
+        command += ["-audiodev", "none,id=snd0"]
+    if arch == "x86_64" and args.sound in ("hda", "both"):
+        command += ["-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0"]
+    if arch == "x86_64" and args.sound in ("sb16", "both"):
+        command += ["-device", "sb16,audiodev=snd0"]
 
     temp_dir = tempfile.TemporaryDirectory(prefix="spacekernel_disks_")
     nvme_img = os.path.join(temp_dir.name, "nvme.img")

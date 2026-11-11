@@ -50,7 +50,9 @@ pub fn lookup(name: &str) -> Option<u64> {
         export!("snd_pcm_stop_xrun", snd_pcm_stop_xrun),
         export!("snd_pcm_hw_constraint_minmax", snd_pcm_hw_constraint_minmax),
         export!("snd_pcm_hw_constraint_mask64", snd_pcm_hw_constraint_mask64),
+        export!("snd_pcm_hw_constraint_step", snd_pcm_hw_constraint_step),
         export!("snd_pcm_set_formats", snd_pcm_set_formats),
+        export!("snd_pcm_set_isa_dma", snd_pcm_set_isa_dma),
         export!("snd_pcm_lib_malloc_pages", snd_pcm_lib_malloc_pages),
         export!("snd_pcm_lib_free_pages", snd_pcm_lib_free_pages),
         export!("snd_pcm_get_dma_addr", snd_pcm_get_dma_addr),
@@ -217,7 +219,6 @@ pub unsafe extern "C" fn snd_pcm_new(
         uapi::SNDRV_PCM_INFO_MMAP
             | uapi::SNDRV_PCM_INFO_MMAP_VALID
             | uapi::SNDRV_PCM_INFO_INTERLEAVED
-            | uapi::SNDRV_PCM_INFO_NONINTERLEAVED
             | uapi::SNDRV_PCM_INFO_BLOCK_TRANSFER
             | uapi::SNDRV_PCM_INFO_PAUSE,
     );
@@ -424,6 +425,24 @@ pub unsafe extern "C" fn snd_pcm_hw_constraint_mask64(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_pcm_hw_constraint_step(
+    substream: *mut snd_pcm_substream,
+    param: u32,
+    step: u32,
+) -> c_int {
+    let Some(substream) = substream_from(substream) else {
+        return -22;
+    };
+    match param {
+        uapi::SNDRV_PCM_HW_PARAM_PERIOD_BYTES | uapi::SNDRV_PCM_HW_PARAM_BUFFER_BYTES => {
+            substream.caps.lock().period_step_bytes = step.max(1) as usize;
+            0
+        }
+        _ => -22,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn snd_pcm_set_formats(
     substream: *mut snd_pcm_substream,
     formats: u64,
@@ -433,6 +452,17 @@ pub unsafe extern "C" fn snd_pcm_set_formats(
     };
     substream.caps.lock().formats = formats;
     0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snd_pcm_set_isa_dma(substream: *mut snd_pcm_substream) -> c_int {
+    match substream_from(substream) {
+        Some(substream) => {
+            substream.set_isa_dma();
+            0
+        }
+        None => -22,
+    }
 }
 
 #[unsafe(no_mangle)]

@@ -301,6 +301,9 @@ int snd_pcm_hw_constraint_mask64(struct snd_pcm_substream *substream,
                                  unsigned int param, unsigned long long mask);
 int snd_pcm_set_formats(struct snd_pcm_substream *substream,
                         unsigned long long formats);
+int snd_pcm_hw_constraint_step(struct snd_pcm_substream *substream,
+                               unsigned int param, unsigned int step);
+int snd_pcm_set_isa_dma(struct snd_pcm_substream *substream);
 int snd_pcm_lib_malloc_pages(struct snd_pcm_substream *substream,
                              unsigned long size);
 int snd_pcm_lib_free_pages(struct snd_pcm_substream *substream);

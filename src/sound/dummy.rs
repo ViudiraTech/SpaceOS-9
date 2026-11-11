@@ -303,6 +303,7 @@ pub fn init() {
         periods_min: 2,
         periods_max: 32,
         buffer_bytes_max: 1024 * 1024,
+        period_step_bytes: 0,
     };
     for direction in [Direction::Playback, Direction::Capture] {
         for substream in device.substreams(direction) {
