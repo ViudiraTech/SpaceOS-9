@@ -34,6 +34,7 @@ pub enum Icon {
     Monitor,
     Calculator,
     ImageViewer,
+    Music,
     Help,
     Login,
     Notify,
@@ -78,62 +79,87 @@ pub enum Icon {
     Info,
 }
 
-impl Icon {
-    fn svg_name(self) -> Option<&'static str> {
-        match self {
-            Self::SpaceLogo => None,
-            Self::Terminal => Some("terminal.svg"),
-            Self::Files => Some("files.svg"),
-            Self::Editor => Some("editor.svg"),
-            Self::Settings => Some("settings.svg"),
-            Self::Monitor => Some("monitor.svg"),
-            Self::Calculator => Some("calculator.svg"),
-            Self::ImageViewer => Some("image-viewer.svg"),
-            Self::Help => Some("help.svg"),
-            Self::Login => Some("login.svg"),
-            Self::Notify => Some("notify.svg"),
-            Self::Appearance => Some("appearance.svg"),
-            Self::Wallpaper => Some("wallpaper.svg"),
-            Self::Panel => Some("panel.svg"),
-            Self::WindowManager => Some("windows.svg"),
-            Self::Display => Some("display.svg"),
-            Self::InputDevices => Some("peripherals.svg"),
-            Self::Network => Some("network.svg"),
-            Self::Applications => Some("applications.svg"),
-            Self::DateTime => Some("datetime.svg"),
-            Self::About => Some("about.svg"),
-            Self::Folder => Some("folder.svg"),
-            Self::FolderLarge => Some("folder-large.svg"),
-            Self::UserHome => Some("user-home.svg"),
-            Self::FolderRoot => Some("folder-root.svg"),
-            Self::FolderDocuments => Some("folder-documents.svg"),
-            Self::FolderTemp => Some("folder-temp.svg"),
-            Self::FolderScript => Some("folder-script.svg"),
-            Self::FileText => Some("file-text.svg"),
-            Self::FileRust => Some("file-rust.svg"),
-            Self::FileC => Some("file-c.svg"),
-            Self::FileScript => Some("file-script.svg"),
-            Self::FileExec => Some("file-exec.svg"),
-            Self::FileBin => Some("file-bin.svg"),
-            Self::FileImage => Some("file-image.svg"),
-            Self::Search => Some("search.svg"),
-            Self::Save => Some("save.svg"),
-            Self::NewFile => Some("new-file.svg"),
-            Self::NewFolder => Some("new-folder.svg"),
-            Self::Refresh => Some("refresh.svg"),
-            Self::GoUp => Some("go-up.svg"),
-            Self::GoBack => Some("go-back.svg"),
-            Self::GoHome => Some("go-home.svg"),
-            Self::Logout => Some("logout.svg"),
-            Self::Shutdown => Some("shutdown.svg"),
-            Self::Bell => Some("bell.svg"),
-            Self::BellActive => Some("bell-active.svg"),
-            Self::NetworkWired => Some("network-wired.svg"),
-            Self::NetworkOffline => Some("network-offline.svg"),
-            Self::Info => Some("info.svg"),
-        }
-    }
+macro_rules! define_svg_icons {
+    ($($variant:ident => $file:literal),* $(,)?) => {
+        impl Icon {
+            fn svg_name(self) -> Option<&'static str> {
+                match self {
+                    Self::SpaceLogo => None,
+                    $(Self::$variant => Some($file),)*
+                }
+            }
 
+            /// Canonical identifier stored on X11 windows via `_SPUI_ICON`.
+            pub fn prop_name(self) -> &'static str {
+                self.svg_name().unwrap_or("space-logo")
+            }
+
+            /// Parse a `_SPUI_ICON` property value back into an [`Icon`].
+            pub fn from_prop_name(name: &str) -> Option<Self> {
+                match name.trim() {
+                    "space-logo" => Some(Self::SpaceLogo),
+                    $($file => Some(Self::$variant),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+define_svg_icons! {
+    Terminal => "terminal.svg",
+    Files => "files.svg",
+    Editor => "editor.svg",
+    Settings => "settings.svg",
+    Monitor => "monitor.svg",
+    Calculator => "calculator.svg",
+    ImageViewer => "image-viewer.svg",
+    Music => "music.svg",
+    Help => "help.svg",
+    Login => "login.svg",
+    Notify => "notify.svg",
+    Appearance => "appearance.svg",
+    Wallpaper => "wallpaper.svg",
+    Panel => "panel.svg",
+    WindowManager => "windows.svg",
+    Display => "display.svg",
+    InputDevices => "peripherals.svg",
+    Network => "network.svg",
+    Applications => "applications.svg",
+    DateTime => "datetime.svg",
+    About => "about.svg",
+    Folder => "folder.svg",
+    FolderLarge => "folder-large.svg",
+    UserHome => "user-home.svg",
+    FolderRoot => "folder-root.svg",
+    FolderDocuments => "folder-documents.svg",
+    FolderTemp => "folder-temp.svg",
+    FolderScript => "folder-script.svg",
+    FileText => "file-text.svg",
+    FileRust => "file-rust.svg",
+    FileC => "file-c.svg",
+    FileScript => "file-script.svg",
+    FileExec => "file-exec.svg",
+    FileBin => "file-bin.svg",
+    FileImage => "file-image.svg",
+    Search => "search.svg",
+    Save => "save.svg",
+    NewFile => "new-file.svg",
+    NewFolder => "new-folder.svg",
+    Refresh => "refresh.svg",
+    GoUp => "go-up.svg",
+    GoBack => "go-back.svg",
+    GoHome => "go-home.svg",
+    Logout => "logout.svg",
+    Shutdown => "shutdown.svg",
+    Bell => "bell.svg",
+    BellActive => "bell-active.svg",
+    NetworkWired => "network-wired.svg",
+    NetworkOffline => "network-offline.svg",
+    Info => "info.svg",
+}
+
+impl Icon {
     pub fn is_symbolic(self) -> bool {
         matches!(
             self,
@@ -169,6 +195,7 @@ impl Icon {
             Some("c" | "h" | "cpp" | "hpp") => Self::FileC,
             Some("sh" | "py") => Self::FileScript,
             Some("png" | "jpg" | "jpeg" | "svg" | "bmp") => Self::FileImage,
+            Some("mp3" | "flac" | "wav" | "ogg") => Self::Music,
             Some(
                 "txt" | "md" | "toml" | "json" | "yaml" | "yml" | "conf" | "log" | "ini"
                 | "service",

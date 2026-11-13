@@ -17,6 +17,7 @@ pub mod greeter;
 pub mod help;
 pub mod login;
 pub mod monitor;
+pub mod music;
 pub mod notify;
 pub mod oobe;
 pub mod session_ui;

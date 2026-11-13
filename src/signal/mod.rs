@@ -235,6 +235,9 @@ impl Default for ThreadSignals {
 }
 
 pub fn signal_bit(number: u32) -> u64 {
+    if number == 0 || number > SIGRTMAX {
+        return 0;
+    }
     1u64 << (number - 1)
 }
 
@@ -520,7 +523,7 @@ pub fn current_pid() -> u32 {
 /// checks remain, while uid/gid checks cannot fail.
 fn send_by_pid(pid: i64, signal: Signal) -> Result<(), i64> {
     let current_pid = current_pid() as i64;
-    if signal.number as u64 > SIGRTMAX as u64 {
+    if signal.number == 0 || signal.number as u64 > SIGRTMAX as u64 {
         return Err(abi::EINVAL);
     }
     let mut delivered = false;
@@ -559,11 +562,25 @@ pub fn kill(pid: i64, sig: u64) -> i64 {
         return -abi::EINVAL;
     }
     if sig == 0 {
-        let signal = Signal::kernel(0);
-        return match send_by_pid(pid, signal) {
-            Ok(()) => 0,
-            Err(error) => -error,
+        // Signal 0 only performs existence/permission checking; it must never
+        // enter the pending queue (Linux kill(2)).
+        let current = current_pid() as i64;
+        let tasks = sched::tasks();
+        let exists = if pid > 0 {
+            tasks.iter().any(|task| task.stats().tgid == pid as u64)
+        } else if pid == 0 {
+            let pgid = sched::current()
+                .map(|task| task.stats().pgid)
+                .unwrap_or(u64::MAX);
+            tasks.iter().any(|task| task.stats().pgid == pgid)
+        } else if pid == -1 {
+            tasks.iter().any(|task| task.stats().tgid != current as u64)
+                || sched::current().is_some()
+        } else {
+            let pgid = (-pid) as u64;
+            tasks.iter().any(|task| task.stats().pgid == pgid)
         };
+        return if exists { 0 } else { -abi::ESRCH };
     }
     let signal = Signal::user(sig as u32, current_pid());
     match send_by_pid(pid, signal) {

@@ -28,7 +28,7 @@ SpaceOS-9 的长期目标：
 | 文件系统与设备 | VFS、devtmpfs、sysfs、procfs、设备注册/注销、IDE/AHCI/NVMe、TTY 与输入设备 |
 | Linux ABI | ELF/PIE/PT_INTERP 装载、进程与线程、mmap/mprotect/brk、文件与元数据系统调用、信号与 futex 演进 |
 | 图形与显示 | DRM/KMS、GEM、PRIME、syncobj、fbcon 控制台、VirtIO GPU 2D/VirGL/Venus |
-| 音频 | Linux ALSA ABI 兼容的 PCM/Control/Timer/RawMIDI/Hwdep/Jack、`/dev/snd`、`snd_*` 模块 API、dummy 自测卡与 SB16/HDA 驱动模块 |
+| 音频 | Linux ALSA ABI 兼容的 PCM/Control/Timer/RawMIDI/Hwdep/Jack、`/dev/snd`、`snd_*` 模块 API、dummy 自测卡、SB16/HDA 驱动模块与用户态 MP3 播放器 |
 | 构建与验证 | Kconfig、三架构 ISO、QEMU 启动矩阵、主机侧模型测试、协议/ABI 探针与资源回收检查 |
 
 ## 构建与运行

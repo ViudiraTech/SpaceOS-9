@@ -228,6 +228,22 @@ pub struct Gpu {
     live_resources: AtomicU32,
 }
 impl Gpu {
+    fn submit_call(
+        &self,
+        kind: u32,
+        context: u32,
+        words: &[u32],
+        size: usize,
+    ) -> Result<Arc<transport::Request>, VfsError> {
+        let mut bytes = command(kind, context, words);
+        put32(&mut bytes, 4, 1);
+        put64(
+            &mut bytes,
+            8,
+            self.next_fence.fetch_add(1, Ordering::Relaxed),
+        );
+        self.transport.submit(false, &bytes, size, Vec::new())
+    }
     fn call(
         &self,
         kind: u32,
@@ -235,16 +251,8 @@ impl Gpu {
         words: &[u32],
         size: usize,
     ) -> Result<Vec<u8>, VfsError> {
-        {
-            let mut bytes = command(kind, context, words);
-            put32(&mut bytes, 4, 1);
-            put64(
-                &mut bytes,
-                8,
-                self.next_fence.fetch_add(1, Ordering::Relaxed),
-            );
-            self.transport.call(&bytes, size)
-        }
+        let request = self.submit_call(kind, context, words, size)?;
+        self.transport.wait(&request)
     }
     fn id(counter: &AtomicU32) -> Result<u32, VfsError> {
         let id = counter.fetch_add(1, Ordering::Relaxed);

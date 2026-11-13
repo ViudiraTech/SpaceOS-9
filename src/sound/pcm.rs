@@ -165,6 +165,7 @@ pub struct Runtime {
     pub sw: uapi::snd_pcm_sw_params,
     pub pages: Option<Arc<BufferSet>>,
     pub hw_ptr: u64,
+    pub raw_hw_ptr: u64,
     pub appl_ptr: u64,
     pub boundary: u64,
     pub state: i32,
@@ -186,6 +187,7 @@ impl Runtime {
             sw: uapi::snd_pcm_sw_params::zeroed(),
             pages: None,
             hw_ptr: 0,
+            raw_hw_ptr: 0,
             appl_ptr: 0,
             boundary: 0,
             state: uapi::SNDRV_PCM_STATE_OPEN,
@@ -477,11 +479,17 @@ pub fn period_elapsed(substream: &Substream) {
     let Some(ops) = substream.ops.lock().clone() else {
         return;
     };
-    let boundary = substream.runtime.lock().boundary;
-    if boundary == 0 {
+    let (boundary, buffer_size) = {
+        let runtime = substream.runtime.lock();
+        (runtime.boundary, runtime.hw.map_or(0, |hw| hw.buffer_size))
+    };
+    if boundary == 0 || buffer_size == 0 {
         return;
     }
-    let pointer = ops.pointer(substream) % boundary;
+    // Drivers report a position in 0..buffer_size, so convert the wrapped
+    // value into a monotonic offset inside `boundary`; otherwise the first
+    // ring wrap looks like the hardware pointer moving backwards.
+    let raw = ops.pointer(substream) % buffer_size;
     let mut runtime = substream.runtime.lock();
     if runtime.state != uapi::SNDRV_PCM_STATE_RUNNING
         && runtime.state != uapi::SNDRV_PCM_STATE_DRAINING
@@ -491,7 +499,9 @@ pub fn period_elapsed(substream: &Substream) {
     let Some(hw) = runtime.hw else {
         return;
     };
-    runtime.hw_ptr = pointer;
+    let delta = (raw + buffer_size - runtime.raw_hw_ptr) % buffer_size;
+    runtime.raw_hw_ptr = raw;
+    runtime.hw_ptr = (runtime.hw_ptr + delta) % boundary;
     runtime.tstamp = now();
     let queued = match substream.direction {
         Direction::Playback => {
@@ -501,9 +511,16 @@ pub fn period_elapsed(substream: &Substream) {
             (runtime.hw_ptr + runtime.boundary - runtime.appl_ptr) % runtime.boundary
         }
     };
-    let mut xrun = false;
-    if queued > hw.buffer_size {
-        xrun = true;
+    let mut stop = false;
+    if runtime.state == uapi::SNDRV_PCM_STATE_DRAINING && substream.direction == Direction::Playback
+    {
+        if queued == 0 || queued > hw.buffer_size {
+            runtime.hw_ptr = runtime.appl_ptr;
+            runtime.state = uapi::SNDRV_PCM_STATE_SETUP;
+            stop = true;
+        }
+    } else if queued > hw.buffer_size {
+        stop = true;
         runtime.state = uapi::SNDRV_PCM_STATE_XRUN;
         runtime.hw_ptr = match substream.direction {
             Direction::Playback => runtime.appl_ptr,
@@ -513,7 +530,7 @@ pub fn period_elapsed(substream: &Substream) {
     publish(substream, &mut runtime);
     drop(runtime);
     wake(substream);
-    if xrun {
+    if stop {
         let _ = ops.trigger(substream, uapi::SNDRV_PCM_TRIGGER_STOP);
     }
 }
@@ -1011,6 +1028,7 @@ fn apply_hw_params(
         runtime.pages = Some(pages);
         runtime.sw = default_sw_params(&hw, substream.direction);
         runtime.hw_ptr = 0;
+        runtime.raw_hw_ptr = 0;
         runtime.appl_ptr = 0;
         runtime.boundary = runtime.sw.boundary.max(hw.buffer_size + 1);
         runtime.sw.boundary = runtime.boundary;
@@ -1041,6 +1059,7 @@ fn release_buffer(substream: &Arc<Substream>) {
     runtime.pages = None;
     runtime.boundary = 0;
     runtime.hw_ptr = 0;
+    runtime.raw_hw_ptr = 0;
     runtime.appl_ptr = 0;
     runtime.state = uapi::SNDRV_PCM_STATE_OPEN;
     publish(substream, &mut runtime);
@@ -1056,6 +1075,7 @@ fn prepare_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
             pages.ring.zero();
         }
         runtime.hw_ptr = 0;
+        runtime.raw_hw_ptr = 0;
         runtime.appl_ptr = 0;
         runtime.avail_max = 0;
         runtime.overrange = 0;
@@ -1226,6 +1246,7 @@ fn reset_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     }
     let mut runtime = substream.runtime.lock();
     runtime.hw_ptr = 0;
+    runtime.raw_hw_ptr = 0;
     runtime.appl_ptr = 0;
     runtime.avail_max = 0;
     runtime.state = uapi::SNDRV_PCM_STATE_SETUP;
@@ -1236,20 +1257,56 @@ fn reset_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
 }
 
 fn start_if_threshold(substream: &Arc<Substream>) {
-    let (state, avail, threshold) = {
+    let (state, queued, threshold) = {
         let runtime = substream.runtime.lock();
-        (
-            runtime.state,
-            avail_locked(&runtime, substream.direction),
-            runtime.sw.start_threshold,
-        )
+        let (queued, limit) = match runtime.hw {
+            Some(hw) if runtime.boundary != 0 => {
+                let raw_queued =
+                    (runtime.appl_ptr + runtime.boundary - runtime.hw_ptr) % runtime.boundary;
+                (raw_queued.min(hw.buffer_size), hw.buffer_size)
+            }
+            _ => (0, 0),
+        };
+        let threshold = if limit != 0 {
+            runtime.sw.start_threshold.min(limit)
+        } else {
+            runtime.sw.start_threshold
+        };
+        (runtime.state, queued, threshold)
     };
     if state == uapi::SNDRV_PCM_STATE_PREPARED
         && threshold != 0
-        && avail >= threshold
+        && queued >= threshold
         && substream.direction == Direction::Playback
     {
         let _ = trigger(substream, uapi::SNDRV_PCM_TRIGGER_START);
+    }
+}
+
+fn wait_for_io(substream: &Substream, nonblock: bool) -> Result<(), VfsError> {
+    loop {
+        let state = substream.state.load(Ordering::Acquire);
+        if state == uapi::SNDRV_PCM_STATE_XRUN {
+            return Err(VfsError::BrokenPipe);
+        }
+        if substream.avail.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        if state == uapi::SNDRV_PCM_STATE_SETUP || state == uapi::SNDRV_PCM_STATE_OPEN {
+            return Err(VfsError::InvalidArgument);
+        }
+        if nonblock {
+            return Err(VfsError::WouldBlock);
+        }
+        substream.wait.wait_until(|| {
+            substream.avail.load(Ordering::Acquire) != 0
+                || !matches!(
+                    substream.state.load(Ordering::Acquire),
+                    uapi::SNDRV_PCM_STATE_RUNNING
+                        | uapi::SNDRV_PCM_STATE_PREPARED
+                        | uapi::SNDRV_PCM_STATE_PAUSED
+                )
+        });
     }
 }
 
@@ -1271,29 +1328,12 @@ fn write_frames(
     while done < frames {
         // Wait for space using only atomics; the runtime mutex is not valid in a
         // wait predicate.
-        loop {
-            let state = substream.state.load(Ordering::Acquire);
-            if state == uapi::SNDRV_PCM_STATE_XRUN {
-                return Err(VfsError::BrokenPipe);
-            }
-            if substream.avail.load(Ordering::Acquire) != 0 {
-                break;
-            }
-            if state == uapi::SNDRV_PCM_STATE_SETUP || state == uapi::SNDRV_PCM_STATE_OPEN {
-                return Err(VfsError::InvalidArgument);
-            }
-            if nonblock {
-                return if done == 0 {
-                    Err(VfsError::WouldBlock)
-                } else {
-                    Ok(done)
-                };
-            }
-            let generation = substream.generation.load(Ordering::Acquire);
-            substream.wait.wait_until(|| {
-                substream.generation.load(Ordering::Acquire) != generation
-                    && substream.avail.load(Ordering::Acquire) != 0
-            });
+        if let Err(err) = wait_for_io(substream, nonblock) {
+            return if matches!(err, VfsError::WouldBlock) && done != 0 {
+                Ok(done)
+            } else {
+                Err(err)
+            };
         }
 
         let remaining = frames - done;
@@ -1365,29 +1405,12 @@ fn read_frames(
     let mut done = 0u64;
     while done < frames {
         period_elapsed(substream);
-        loop {
-            let state = substream.state.load(Ordering::Acquire);
-            if state == uapi::SNDRV_PCM_STATE_XRUN {
-                return Err(VfsError::BrokenPipe);
-            }
-            if substream.avail.load(Ordering::Acquire) != 0 {
-                break;
-            }
-            if state == uapi::SNDRV_PCM_STATE_SETUP || state == uapi::SNDRV_PCM_STATE_OPEN {
-                return Err(VfsError::InvalidArgument);
-            }
-            if nonblock {
-                return if done == 0 {
-                    Err(VfsError::WouldBlock)
-                } else {
-                    Ok(done)
-                };
-            }
-            let generation = substream.generation.load(Ordering::Acquire);
-            substream.wait.wait_until(|| {
-                substream.generation.load(Ordering::Acquire) != generation
-                    && substream.avail.load(Ordering::Acquire) != 0
-            });
+        if let Err(err) = wait_for_io(substream, nonblock) {
+            return if matches!(err, VfsError::WouldBlock) && done != 0 {
+                Ok(done)
+            } else {
+                Err(err)
+            };
         }
 
         let remaining = frames - done;
@@ -1471,29 +1494,12 @@ fn write_frames_planar(
     let pointers = channel_pointers(bufs, channels)?;
     let mut done = 0u64;
     while done < frames {
-        loop {
-            let state = substream.state.load(Ordering::Acquire);
-            if state == uapi::SNDRV_PCM_STATE_XRUN {
-                return Err(VfsError::BrokenPipe);
-            }
-            if substream.avail.load(Ordering::Acquire) != 0 {
-                break;
-            }
-            if state == uapi::SNDRV_PCM_STATE_SETUP || state == uapi::SNDRV_PCM_STATE_OPEN {
-                return Err(VfsError::InvalidArgument);
-            }
-            if nonblock {
-                return if done == 0 {
-                    Err(VfsError::WouldBlock)
-                } else {
-                    Ok(done)
-                };
-            }
-            let generation = substream.generation.load(Ordering::Acquire);
-            substream.wait.wait_until(|| {
-                substream.generation.load(Ordering::Acquire) != generation
-                    && substream.avail.load(Ordering::Acquire) != 0
-            });
+        if let Err(err) = wait_for_io(substream, nonblock) {
+            return if matches!(err, VfsError::WouldBlock) && done != 0 {
+                Ok(done)
+            } else {
+                Err(err)
+            };
         }
 
         let remaining = frames - done;
@@ -1580,29 +1586,12 @@ fn read_frames_planar(
     let mut done = 0u64;
     while done < frames {
         period_elapsed(substream);
-        loop {
-            let state = substream.state.load(Ordering::Acquire);
-            if state == uapi::SNDRV_PCM_STATE_XRUN {
-                return Err(VfsError::BrokenPipe);
-            }
-            if substream.avail.load(Ordering::Acquire) != 0 {
-                break;
-            }
-            if state == uapi::SNDRV_PCM_STATE_SETUP || state == uapi::SNDRV_PCM_STATE_OPEN {
-                return Err(VfsError::InvalidArgument);
-            }
-            if nonblock {
-                return if done == 0 {
-                    Err(VfsError::WouldBlock)
-                } else {
-                    Ok(done)
-                };
-            }
-            let generation = substream.generation.load(Ordering::Acquire);
-            substream.wait.wait_until(|| {
-                substream.generation.load(Ordering::Acquire) != generation
-                    && substream.avail.load(Ordering::Acquire) != 0
-            });
+        if let Err(err) = wait_for_io(substream, nonblock) {
+            return if matches!(err, VfsError::WouldBlock) && done != 0 {
+                Ok(done)
+            } else {
+                Err(err)
+            };
         }
 
         let remaining = frames - done;
@@ -1669,31 +1658,57 @@ fn drain_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     if substream.direction == Direction::Capture {
         return Ok(());
     }
-    {
+    let (buffer_size, need_start) = {
         let mut runtime = substream.runtime.lock();
-        if runtime.hw.is_none() {
+        let Some(hw) = runtime.hw else {
             return Err(VfsError::InvalidArgument);
-        }
+        };
+        let avail = avail_locked(&runtime, Direction::Playback);
         match runtime.state {
             uapi::SNDRV_PCM_STATE_XRUN => return Err(VfsError::BrokenPipe),
+            uapi::SNDRV_PCM_STATE_PREPARED => {
+                if avail >= hw.buffer_size {
+                    runtime.state = uapi::SNDRV_PCM_STATE_SETUP;
+                    runtime.hw_ptr = 0;
+                    runtime.appl_ptr = 0;
+                    runtime.raw_hw_ptr = 0;
+                    publish(substream, &mut runtime);
+                    drop(runtime);
+                    wake(substream);
+                    return Ok(());
+                }
+                (hw.buffer_size, true)
+            }
             uapi::SNDRV_PCM_STATE_RUNNING | uapi::SNDRV_PCM_STATE_DRAINING => {
                 runtime.state = uapi::SNDRV_PCM_STATE_DRAINING;
                 publish(substream, &mut runtime);
+                (hw.buffer_size, false)
             }
             _ => return Ok(()),
         }
+    };
+    if need_start {
+        trigger(substream, uapi::SNDRV_PCM_TRIGGER_START)?;
+        let mut runtime = substream.runtime.lock();
+        if runtime.state == uapi::SNDRV_PCM_STATE_RUNNING {
+            runtime.state = uapi::SNDRV_PCM_STATE_DRAINING;
+            publish(substream, &mut runtime);
+        }
     }
     loop {
-        if substream.state.load(Ordering::Acquire) == uapi::SNDRV_PCM_STATE_XRUN {
+        let state = substream.state.load(Ordering::Acquire);
+        if state == uapi::SNDRV_PCM_STATE_XRUN {
             return Err(VfsError::BrokenPipe);
         }
-        if substream.avail.load(Ordering::Acquire) == 0 {
+        if state != uapi::SNDRV_PCM_STATE_DRAINING
+            || substream.avail.load(Ordering::Acquire) >= buffer_size
+        {
             break;
         }
-        let generation = substream.generation.load(Ordering::Acquire);
         substream.wait.wait_until(|| {
-            substream.generation.load(Ordering::Acquire) != generation
-                && substream.avail.load(Ordering::Acquire) == 0
+            let state = substream.state.load(Ordering::Acquire);
+            state != uapi::SNDRV_PCM_STATE_DRAINING
+                || substream.avail.load(Ordering::Acquire) >= buffer_size
         });
     }
     if let Some(ops) = substream.ops.lock().clone() {
@@ -1704,6 +1719,7 @@ fn drain_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     runtime.state = uapi::SNDRV_PCM_STATE_SETUP;
     runtime.hw_ptr = 0;
     runtime.appl_ptr = 0;
+    runtime.raw_hw_ptr = 0;
     publish(substream, &mut runtime);
     drop(runtime);
     wake(substream);

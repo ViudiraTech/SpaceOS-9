@@ -1072,26 +1072,40 @@ fn flush(gpu: &Gpu, fb: &Framebuffer, clips: &[Clip]) -> Result<(), VfsError> {
             min_y
         );
     }
+    let mut pending = Vec::with_capacity(transfers.len());
     for clip in transfers {
         let offset = (clip.y as u64)
             .checked_mul(fb.pitch as u64)
             .and_then(|value| value.checked_add((clip.x as u64) * 4))
             .ok_or(VfsError::InvalidArgument)?;
-        gpu.call(
-            0x105,
+        let words = [
+            clip.x,
+            clip.y,
+            clip.width,
+            clip.height,
+            offset as u32,
+            (offset >> 32) as u32,
+            fb.resource.id,
             0,
-            &[
-                clip.x,
-                clip.y,
-                clip.width,
-                clip.height,
-                offset as u32,
-                (offset >> 32) as u32,
-                fb.resource.id,
-                0,
-            ],
-            24,
-        )?;
+        ];
+        match gpu.submit_call(0x105, 0, &words, 24) {
+            Ok(req) => pending.push(req),
+            Err(VfsError::WouldBlock) if !pending.is_empty() => {
+                for req in pending.drain(..) {
+                    gpu.transport.wait(&req)?;
+                }
+                pending.push(gpu.submit_call(0x105, 0, &words, 24)?);
+            }
+            Err(err) => {
+                for req in pending {
+                    let _ = gpu.transport.wait(&req);
+                }
+                return Err(err);
+            }
+        }
+    }
+    for req in pending {
+        gpu.transport.wait(&req)?;
     }
     if fb.resource.blob_mem == 0 {
         // One flush for the union: each RESOURCE_FLUSH makes the host present

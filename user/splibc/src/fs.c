@@ -38,7 +38,7 @@ int fstat(int fd, struct stat *st) {
 }
 
 int mkdir(const char *path, mode_t mode) {
-    return __sc3(SYS_MKDIR, AT_FDCWD, (long)path, mode);
+    return __sc2(SYS_MKDIR, (long)path, mode);
 }
 
 int mknod(const char *path, mode_t mode, dev_t dev) {

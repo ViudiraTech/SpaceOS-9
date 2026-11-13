@@ -852,8 +852,7 @@ pub unsafe extern "C" fn spk_outl(port: u16, value: u32) {
 }
 
 #[cfg(target_arch = "x86_64")]
-static ISA_ROUTES: SpinLock<[Option<crate::arch::apic::Route>; 16]> =
-    SpinLock::new([None; 16]);
+static ISA_ROUTES: SpinLock<[Option<crate::arch::apic::Route>; 16]> = SpinLock::new([None; 16]);
 
 /// Register a handler for a legacy ISA IRQ line (0-15).
 /// # Safety

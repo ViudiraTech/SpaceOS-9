@@ -53,6 +53,50 @@ def iso_path() -> pathlib.Path:
     raise SystemExit("no ISO; run `make desktop-iso` first")
 
 
+def _audio_env_and_args(arguments: argparse.Namespace) -> tuple[dict[str, str], list[str]]:
+    """Build QEMU process env (restoring user audio runtime under sudo) and HDA flags."""
+    env = os.environ.copy()
+    runtime_dir = env.get("XDG_RUNTIME_DIR", "")
+    if not runtime_dir:
+        sudo_uid = env.get("SUDO_UID")
+        if sudo_uid and pathlib.Path(f"/run/user/{sudo_uid}").exists():
+            runtime_dir = f"/run/user/{sudo_uid}"
+            env["XDG_RUNTIME_DIR"] = runtime_dir
+    if runtime_dir:
+        env.setdefault("PIPEWIRE_RUNTIME_DIR", runtime_dir)
+        pulse_sock = pathlib.Path(runtime_dir) / "pulse" / "native"
+        if pulse_sock.exists():
+            env.setdefault("PULSE_SERVER", f"unix:{pulse_sock}")
+
+    backend = arguments.audio
+    if backend == "auto":
+        if arguments.display == "none":
+            backend = "none"
+        elif runtime_dir and (pathlib.Path(runtime_dir) / "pipewire-0").is_socket():
+            backend = "pipewire"
+        elif runtime_dir and (pathlib.Path(runtime_dir) / "pulse" / "native").is_socket():
+            backend = "pa"
+        elif arguments.display == "sdl":
+            backend = "sdl"
+        else:
+            backend = "alsa"
+
+    if backend == "none":
+        return env, []
+    if backend == "wav":
+        wav_path = RUN / "audio.wav"
+        return env, [
+            "-audiodev", f"wav,id=snd0,path={wav_path}",
+            "-device", "intel-hda",
+            "-device", "hda-duplex,audiodev=snd0",
+        ]
+    return env, [
+        "-audiodev", f"{backend},id=snd0",
+        "-device", "intel-hda",
+        "-device", "hda-duplex,audiodev=snd0",
+    ]
+
+
 def start(arguments: argparse.Namespace) -> int:
     RUN.mkdir(parents=True, exist_ok=True)
     for path in (SERIAL, QMP):
@@ -61,11 +105,13 @@ def start(arguments: argparse.Namespace) -> int:
     LOG.write_text("")
     iso = pathlib.Path(arguments.iso) if arguments.iso else iso_path()
     accel = ["-enable-kvm", "-cpu", "host"] if os.access("/dev/kvm", os.W_OK) else ["-cpu", "max"]
+    env, audio_args = _audio_env_and_args(arguments)
     command = [
         "qemu-system-x86_64", *accel,
         "-machine", "q35",
         "-m", str(arguments.memory),
         "-smp", str(arguments.cpus),
+        "-vga", "none",
         "-display", arguments.display,
         "-no-reboot",
         "-chardev", f"socket,id=ser0,path={SERIAL},server=on,wait=off,logfile={LOG}",
@@ -76,6 +122,7 @@ def start(arguments: argparse.Namespace) -> int:
         "-device", "virtio-gpu-pci,id=desktop-gpu,xres=1280,yres=800",
         "-device", "virtio-tablet-pci",
         "-device", "virtio-keyboard-pci",
+        *audio_args,
         *(["-nic", arguments.nic] if arguments.nic != "none" else []),
         "-drive", f"file={IMAGE},if=none,id=root,format=raw",
         "-device", "nvme,serial=SPROOT,drive=root",
@@ -83,7 +130,7 @@ def start(arguments: argparse.Namespace) -> int:
         "-cdrom", str(iso),
         "-daemonize", "-pidfile", str(PID),
     ]
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=env)
     print(f"VM started, log: {LOG}")
     return 0
 
@@ -299,6 +346,9 @@ def main() -> int:
     start_parser.add_argument("--iso")
     start_parser.add_argument("--display", default="none",
                               help="QEMU display backend (none, sdl, gtk)")
+    start_parser.add_argument("--audio", default="auto",
+                              choices=["auto", "pipewire", "pa", "sdl", "alsa", "wav", "none"],
+                              help="QEMU HDA audio backend (default: auto for graphical display, none for headless)")
     start_parser.add_argument("--nic", default="user,model=e1000e",
                               help="QEMU -nic specification (default: user,model=e1000e; 'none' disables)")
     start_parser.add_argument("--gdb", action="store_true",

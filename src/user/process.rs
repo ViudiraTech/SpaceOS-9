@@ -38,18 +38,28 @@ pub unsafe fn install_tls(tp: u64) {
     }
 }
 
-/// Start the init process as PID 1.  Must be called before any other user
-/// process so the PID allocator yields 1.
-pub fn spawn_init(data: &[u8], name: &str) -> Result<u64, &'static str> {
+/// Start the init process as PID 1.  `path` may be an ELF image or a `#!`
+/// script; must be called before any other user process so the PID allocator
+/// yields 1.
+pub fn spawn_init(path: &str) -> Result<u64, &'static str> {
     if sched::init_pid() != 0 {
         return Err("init already started");
     }
+    let argv = [alloc::string::String::from(path)];
+    let resolved = match crate::user::exec::resolve(path, &argv) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            crate::kwarn!("init {} resolve failed: {:?}", path, error);
+            return Err("init image unavailable or not executable");
+        }
+    };
+    let mut space = UserAddressSpace::new()?;
+    let loaded = elf::load_elf(&mut space, &resolved.data)?;
+    let args: alloc::vec::Vec<&str> = resolved.argv.iter().map(|s| s.as_str()).collect();
+    let user_sp = stack::setup(&mut space, &loaded, path, &args, &[])?;
     if sched::alloc_pid() != 1 {
         return Err("PID 1 was already allocated");
     }
-    let mut space = UserAddressSpace::new()?;
-    let loaded = elf::load_elf(&mut space, data)?;
-    let user_sp = stack::setup_user_stack(&mut space, &loaded, name)?;
     let space_arc = Arc::new(SpinLock::new(space));
     let entry_va = loaded.initial_pc;
     let tls_tp = loaded.tls_tp;
@@ -63,7 +73,7 @@ pub fn spawn_init(data: &[u8], name: &str) -> Result<u64, &'static str> {
         clear_child_tid: 0,
         creds: sched::Credentials::default(),
         groups: alloc::vec::Vec::new(),
-        comm: sched::comm_from_path(name),
+        comm: sched::comm_from_path(path),
         no_new_privs: false,
         fd_table: Arc::new(SpinLock::new(
             crate::vfs::FileDescriptorTable::new_with_stdio(),

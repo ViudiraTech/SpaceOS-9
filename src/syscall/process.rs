@@ -44,10 +44,10 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
         }
         let argv = strings(argv)?;
         let env = strings(envp)?;
-        let data = vfs::read_file(&path)?;
+        let resolved = crate::user::exec::resolve(&path, &argv)?;
         let mut space = UserAddressSpace::new().map_err(|_| VfsError::NoMemory)?;
-        let loaded = elf::load_elf(&mut space, &data).map_err(|_| VfsError::ExecFormat)?;
-        let args: Vec<_> = argv.iter().map(|s| s.as_str()).collect();
+        let loaded = elf::load_elf(&mut space, &resolved.data).map_err(|_| VfsError::ExecFormat)?;
+        let args: Vec<_> = resolved.argv.iter().map(|s| s.as_str()).collect();
         let environment: Vec<_> = env.iter().map(|s| s.as_str()).collect();
         let sp = stack::setup(&mut space, &loaded, &path, &args, &environment)
             .map_err(|_| VfsError::NoSpace)?;

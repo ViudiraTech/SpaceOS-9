@@ -194,12 +194,9 @@ pub extern "C" fn kmain() -> ! {
     vfs::start_services();
     net::start();
     match boot::init_path() {
-        Some(path) => match vfs::read_file(&path) {
-            Ok(image) => match user::spawn_init(&image, &path) {
-                Ok(pid) => kinfo!("init started: {} (pid {})", path, pid),
-                Err(error) => kwarn!("init {} could not start: {}", path, error),
-            },
-            Err(_) => kwarn!("init image not found: {}", path),
+        Some(path) => match user::spawn_init(&path) {
+            Ok(pid) => kinfo!("init started: {} (pid {})", path, pid),
+            Err(error) => kwarn!("init {} could not start: {}", path, error),
         },
         None => shell::start(),
     }

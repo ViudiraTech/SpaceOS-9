@@ -50,7 +50,7 @@ struct AppEntry {
     mode: &'static str,
 }
 
-const APPS: [AppEntry; 8] = [
+const APPS: [AppEntry; 9] = [
     AppEntry {
         name: "文件管理器",
         subtitle: "浏览目录与系统文件",
@@ -94,6 +94,13 @@ const APPS: [AppEntry; 8] = [
         mode: "view",
     },
     AppEntry {
+        name: "音乐播放器",
+        subtitle: "播放示例 MP3 曲目",
+        keywords: "music mp3 audio player media 音乐 播放器 音频 歌曲",
+        icon: Icon::Music,
+        mode: "music",
+    },
+    AppEntry {
         name: "系统设置",
         subtitle: "外观、网络、桌面、输入设备与系统偏好",
         keywords:
@@ -109,6 +116,14 @@ const APPS: [AppEntry; 8] = [
         mode: "help",
     },
 ];
+
+/// Curated taskbar quick-launch apps; all applications remain in Start Menu & Desktop.
+const PINNED_MODES: [&str; 4] = ["files", "term", "edit", "settings"];
+
+fn pinned_app_entry(slot: usize) -> Option<&'static AppEntry> {
+    let mode = *PINNED_MODES.get(slot)?;
+    APPS.iter().find(|app| app.mode == mode)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hit {
@@ -278,14 +293,85 @@ fn infer_window_icon(title: &str) -> Icon {
         Icon::Calculator
     } else if title.contains("看图") || lower.contains("view") || lower.contains("image") {
         Icon::ImageViewer
+    } else if title.contains("音乐")
+        || title.contains("播放器")
+        || lower.contains("music")
+        || lower.contains("audio")
+        || lower.contains("mp3")
+    {
+        Icon::Music
     } else if title.contains("设置") || lower.contains("setting") {
         Icon::Settings
     } else if title.contains("帮助") || lower.contains("help") || title.contains("手册") {
         Icon::Help
+    } else if title.contains("通知") || lower.contains("notify") {
+        Icon::Notify
     } else if title.contains("登录") || title.contains("账户") {
         Icon::Login
     } else {
         Icon::SpaceLogo
+    }
+}
+
+struct TaskbarLayout {
+    start: Rect,
+    start_sep_x: i32,
+    pinned_sep_x: i32,
+    win_start_x: i32,
+    bell: Rect,
+    net: Rect,
+    clock_sep_x: i32,
+}
+
+impl TaskbarLayout {
+    fn compute(screen_w: i32, panel_h: i32, tray_w: i32, show_pinned: bool) -> Self {
+        let start_bh = (panel_h - 10).clamp(28, 42);
+        let start = Rect::new(6, (panel_h - start_bh) / 2, 86, start_bh);
+        let start_sep_x = start.right() + 6;
+        let pinned_start_x = start_sep_x + 6;
+        let pinned_sep_x = pinned_start_x + (PINNED_MODES.len() as i32) * 36 + 2;
+        let win_start_x = if show_pinned {
+            pinned_sep_x + 8
+        } else {
+            start_sep_x + 8
+        };
+        let tray_bh = (panel_h - 12).clamp(26, 38);
+        let tray_y = (panel_h - tray_bh) / 2;
+        let clock_sep_x = screen_w - tray_w;
+        let bell = Rect::new(clock_sep_x - 40, tray_y, 32, tray_bh);
+        let net = Rect::new(bell.x - 36, tray_y, 32, tray_bh);
+        Self {
+            start,
+            start_sep_x,
+            pinned_sep_x,
+            win_start_x,
+            bell,
+            net,
+            clock_sep_x,
+        }
+    }
+
+    fn pinned_rect(&self, panel_h: i32, slot: usize) -> Rect {
+        let bh = (panel_h - 12).clamp(26, 38);
+        Rect::new(
+            self.start_sep_x + 6 + slot as i32 * 36,
+            (panel_h - bh) / 2,
+            32,
+            bh,
+        )
+    }
+
+    fn window_button_rect(&self, panel_h: i32, count: usize, index: usize) -> Rect {
+        let bh = (panel_h - 12).clamp(26, 40);
+        let available = (self.net.x - 10 - self.win_start_x).max(80);
+        let count = count.clamp(1, 6) as i32;
+        let btn_w = ((available - (count - 1) * 4) / count).clamp(48, 160);
+        Rect::new(
+            self.win_start_x + index as i32 * (btn_w + 4),
+            (panel_h - bh) / 2,
+            btn_w,
+            bh,
+        )
     }
 }
 
@@ -564,16 +650,21 @@ impl Shell {
         )
     }
 
+    fn taskbar_layout(&self) -> TaskbarLayout {
+        TaskbarLayout::compute(
+            i32::from(self.x.width),
+            self.panel_height(),
+            self.tray_width(),
+            self.config.panel_show_pinned,
+        )
+    }
+
     fn start_button_rect(&self) -> Rect {
-        let ph = self.panel_height();
-        let bh = (ph - 10).clamp(28, 42);
-        Rect::new(6, (ph - bh) / 2, 86, bh)
+        self.taskbar_layout().start
     }
 
     fn pinned_rect(&self, index: usize) -> Rect {
-        let ph = self.panel_height();
-        let bh = (ph - 10).clamp(28, 42);
-        Rect::new(102 + index as i32 * 38, (ph - bh) / 2, 34, bh)
+        self.taskbar_layout().pinned_rect(self.panel_height(), index)
     }
 
     fn apply_x11_settings(&self, prev: Option<&DesktopConfig>) {
@@ -1043,9 +1134,10 @@ impl Shell {
                     }
                 } else if self.windows.iter().any(|w| w.window == e.window) {
                     let title = self.window_title(e.window);
+                    let icon = self.window_icon(e.window, &title);
                     if let Some(managed) = self.windows.iter_mut().find(|w| w.window == e.window) {
-                        if managed.title != title {
-                            managed.icon = infer_window_icon(&title);
+                        if managed.title != title || managed.icon != icon {
+                            managed.icon = icon;
                             managed.title = title;
                             self.draw_taskbar();
                             self.present_taskbar()?;
@@ -1250,6 +1342,15 @@ impl Shell {
         "应用".to_string()
     }
 
+    fn window_icon(&self, window: Window, title: &str) -> Icon {
+        self.x
+            .get_icon_name(window)
+            .ok()
+            .flatten()
+            .and_then(|name| Icon::from_prop_name(&name))
+            .unwrap_or_else(|| infer_window_icon(title))
+    }
+
     fn manage(&mut self, window: Window) -> Result<()> {
         if let Some(existing) = self.windows.iter_mut().find(|w| w.window == window) {
             existing.minimized = false;
@@ -1258,7 +1359,7 @@ impl Shell {
             return Ok(());
         }
         let title = self.window_title(window);
-        let icon = infer_window_icon(&title);
+        let icon = self.window_icon(window, &title);
         let geometry = self.x.conn.get_geometry(window)?.reply()?;
         // Listen for title changes and pointer entry (for focus-follows-mouse) on managed client.
         let _ = self.x.conn.change_window_attributes(
@@ -1447,35 +1548,16 @@ impl Shell {
     }
 
     fn window_button_rect(&self, index: usize) -> Rect {
-        let ph = self.panel_height();
-        let bh = (ph - 12).clamp(26, 40);
-        let start_x = if self.config.panel_show_pinned {
-            102 + (APPS.len() as i32) * 38 + 10
-        } else {
-            106
-        };
-        let right_reserve = self.tray_width() + 184;
-        let available = (i32::from(self.x.width) - start_x - right_reserve).max(120);
-        let count = self.windows.len().clamp(1, 6) as i32;
-        let btn_w = ((available - (count - 1) * 4) / count).clamp(80, 160);
-        Rect::new(
-            start_x + index as i32 * (btn_w + 4),
-            (ph - bh) / 2,
-            btn_w,
-            bh,
-        )
+        self.taskbar_layout()
+            .window_button_rect(self.panel_height(), self.windows.len(), index)
     }
 
     fn net_rect(&self) -> Rect {
-        let bell = self.bell_rect();
-        Rect::new(bell.x - 126, bell.y, 122, bell.h)
+        self.taskbar_layout().net
     }
 
     fn bell_rect(&self) -> Rect {
-        let w = i32::from(self.x.width);
-        let ph = self.panel_height();
-        let bh = (ph - 12).clamp(26, 38);
-        Rect::new(w - self.tray_width() - 40, (ph - bh) / 2, 34, bh)
+        self.taskbar_layout().bell
     }
 
     fn taskbar_hit(&self, x: i32, y: i32) -> Hit {
@@ -1483,7 +1565,7 @@ impl Shell {
             return Hit::Start;
         }
         if self.config.panel_show_pinned {
-            for i in 0..APPS.len() {
+            for i in 0..PINNED_MODES.len() {
                 if self.pinned_rect(i).contains(x, y) {
                     return Hit::Pinned(i);
                 }
@@ -1508,7 +1590,9 @@ impl Shell {
             Hit::Start => self.toggle_menu(),
             Hit::Pinned(idx) => {
                 self.close_menu()?;
-                self.launch(APPS[idx].mode);
+                if let Some(app) = pinned_app_entry(idx) {
+                    self.launch(app.mode);
+                }
                 Ok(())
             }
             Hit::Window(index) => {
@@ -1806,14 +1890,17 @@ impl Shell {
     fn draw_taskbar(&mut self) {
         let w = self.taskbar_canvas.width as i32;
         let h = self.panel_height();
-        let start = self.start_button_rect();
         let show_pinned = self.config.panel_show_pinned;
-        let pinned_rects: [Rect; 8] = std::array::from_fn(|i| self.pinned_rect(i));
+        let layout = TaskbarLayout::compute(w, h, self.tray_width(), show_pinned);
+        let start = layout.start;
+        let pinned_rects: [Rect; PINNED_MODES.len()] =
+            std::array::from_fn(|i| layout.pinned_rect(h, i));
         let win_count = self.windows.len().min(6);
-        let win_rects: Vec<Rect> = (0..win_count).map(|i| self.window_button_rect(i)).collect();
-        let net = self.net_rect();
-        let bell = self.bell_rect();
-        let tray_w = self.tray_width();
+        let win_rects: Vec<Rect> = (0..win_count)
+            .map(|i| layout.window_button_rect(h, win_count, i))
+            .collect();
+        let net = layout.net;
+        let bell = layout.bell;
         let border_y = if self.config.panel_position == PanelPosition::Top {
             h - 1
         } else {
@@ -1870,12 +1957,17 @@ impl Shell {
 
         let sep_h = (h - 20).clamp(16, 26);
         let sep_y = (h - sep_h) / 2;
-        canvas.fill(Rect::new(97, sep_y, 1, sep_h), self.theme.panel_border);
+        canvas.fill(
+            Rect::new(layout.start_sep_x, sep_y, 1, sep_h),
+            self.theme.panel_border,
+        );
 
-        // Quick-launch pinned icons (optional).
+        // Quick-launch curated core apps (optional).
         if show_pinned {
-            for (i, app) in APPS.iter().enumerate() {
-                let rect = pinned_rects[i];
+            for (i, &rect) in pinned_rects.iter().enumerate() {
+                let Some(app) = pinned_app_entry(i) else {
+                    continue;
+                };
                 let hov_t = ui::animate_bool(rect, self.hover == Hit::Pinned(i), ui::MOTION_HOVER);
                 if hov_t > 0.001 {
                     canvas.rounded_rect(rect, RADIUS_CONTROL, self.theme.panel_hover, hov_t);
@@ -1883,13 +1975,16 @@ impl Shell {
                 icons::draw(
                     canvas,
                     app.icon,
-                    rect.x + 6,
-                    rect.y + (rect.h - 22) / 2,
-                    22,
+                    rect.x + (rect.w - 20) / 2,
+                    rect.y + (rect.h - 20) / 2,
+                    20,
                     None,
                 );
             }
-            canvas.fill(Rect::new(257, sep_y, 1, sep_h), self.theme.panel_border);
+            canvas.fill(
+                Rect::new(layout.pinned_sep_x, sep_y, 1, sep_h),
+                self.theme.panel_border,
+            );
         }
 
         // Running window buttons.
@@ -1934,12 +2029,12 @@ impl Shell {
             icons::draw(
                 canvas,
                 managed.icon,
-                rect.x + 9,
-                rect.y + (rect.h - 16) / 2,
-                16,
+                rect.x + 8,
+                rect.y + (rect.h - 18) / 2,
+                18,
                 None,
             );
-            let max_w = (rect.w - 36).max(24) as f32;
+            let max_w = (rect.w - 38).max(20) as f32;
             let label = self.text.truncate(&managed.title, max_w, 12.0, Face::Ui);
             let fg = if is_active {
                 self.theme.text
@@ -1951,7 +2046,7 @@ impl Shell {
             self.text.draw(
                 canvas,
                 &label,
-                (rect.x + 30) as f32,
+                (rect.x + 31) as f32,
                 rect.y as f32 + rect.h as f32 * 0.5 + 4.5,
                 12.0,
                 fg,
@@ -1959,70 +2054,26 @@ impl Shell {
             );
         }
 
-        // Right tray: live wired network pill, notification bell & configurable clock.
+        // Right tray: compact wired network status, notification bell & clock.
         let net_hov = ui::animate_bool(net, self.hover == Hit::Network, ui::MOTION_HOVER);
         let net_connected = self.net_status.connected();
-        canvas.rounded_rect(net, RADIUS_CONTROL, self.theme.window_alt, 0.55);
         if net_hov > 0.001 {
             canvas.rounded_rect(net, RADIUS_CONTROL, self.theme.panel_hover, net_hov);
         }
-        canvas.rounded_border(
-            net,
-            RADIUS_CONTROL,
-            if net_hov > 0.001 {
-                crate::draw::mix(self.theme.panel_border, self.theme.accent, 0.5 * net_hov)
-            } else {
-                self.theme.panel_border
-            },
-            0.75,
-            1,
-        );
+        let (net_icon, net_tint) = if net_connected {
+            (Icon::NetworkWired, self.theme.text)
+        } else if self.net_status.has_device && self.net_status.up {
+            (Icon::NetworkWired, self.theme.warning)
+        } else {
+            (Icon::NetworkOffline, self.theme.text_muted)
+        };
         icons::draw(
             canvas,
-            if net_connected {
-                Icon::NetworkWired
-            } else {
-                Icon::NetworkOffline
-            },
-            net.x + 8,
-            net.y + (net.h - 16) / 2,
-            16,
-            Some(if net_connected {
-                self.theme.text
-            } else {
-                self.theme.text_muted
-            }),
-        );
-        let dot_color = if net_connected {
-            self.theme.success
-        } else if self.net_status.has_device && self.net_status.up {
-            self.theme.warning
-        } else {
-            self.theme.text_muted
-        };
-        canvas.circle(
-            (net.x + 30) as f32,
-            net.y as f32 + net.h as f32 * 0.5,
-            3.0,
-            dot_color,
-            1.0,
-        );
-        let net_label = self.net_status.panel_label();
-        let net_shown = self
-            .text
-            .truncate(&net_label, (net.w - 44).max(32) as f32, 11.5, Face::Ui);
-        self.text.draw(
-            canvas,
-            &net_shown,
-            (net.x + 38) as f32,
-            net.y as f32 + net.h as f32 * 0.5 + 4.2,
-            11.5,
-            if net_connected {
-                self.theme.text
-            } else {
-                self.theme.text_dim
-            },
-            Face::Ui,
+            net_icon,
+            net.x + (net.w - 18) / 2,
+            net.y + (net.h - 18) / 2,
+            18,
+            Some(net_tint),
         );
 
         let bell_hov = ui::animate_bool(bell, self.hover == Hit::Bell, ui::MOTION_HOVER);
@@ -2036,9 +2087,9 @@ impl Shell {
             } else {
                 Icon::Bell
             },
-            bell.x + (bell.w - 16) / 2,
-            bell.y + (bell.h - 16) / 2,
-            16,
+            bell.x + (bell.w - 18) / 2,
+            bell.y + (bell.h - 18) / 2,
+            18,
             Some(if self.toast.is_some() {
                 self.theme.accent
             } else {
@@ -2046,7 +2097,7 @@ impl Shell {
             }),
         );
         canvas.fill(
-            Rect::new(w - tray_w, sep_y, 1, sep_h),
+            Rect::new(layout.clock_sep_x, sep_y, 1, sep_h),
             self.theme.panel_border,
         );
 
@@ -2350,5 +2401,90 @@ impl Shell {
         self.x
             .put_canvas(self.toast_window, &self.toast_canvas, area)?;
         self.x.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_window_icon_matches_all_apps() {
+        assert_eq!(infer_window_icon("终端"), Icon::Terminal);
+        assert_eq!(infer_window_icon("文件管理器"), Icon::Files);
+        assert_eq!(infer_window_icon("文本编辑器"), Icon::Editor);
+        assert_eq!(infer_window_icon("系统监视器"), Icon::Monitor);
+        assert_eq!(infer_window_icon("计算器"), Icon::Calculator);
+        assert_eq!(infer_window_icon("看图工具"), Icon::ImageViewer);
+        assert_eq!(infer_window_icon("音乐播放器"), Icon::Music);
+        assert_eq!(infer_window_icon("系统设置"), Icon::Settings);
+        assert_eq!(infer_window_icon("帮助手册"), Icon::Help);
+        assert_eq!(infer_window_icon("系统通知"), Icon::Notify);
+        assert_eq!(infer_window_icon("会话账户"), Icon::Login);
+        assert_eq!(infer_window_icon("Unknown App"), Icon::SpaceLogo);
+    }
+
+    #[test]
+    fn icon_prop_name_roundtrips() {
+        for app in APPS {
+            let prop = app.icon.prop_name();
+            assert_eq!(Icon::from_prop_name(prop), Some(app.icon));
+        }
+        assert_eq!(
+            Icon::from_prop_name(Icon::SpaceLogo.prop_name()),
+            Some(Icon::SpaceLogo)
+        );
+    }
+
+    #[test]
+    fn pinned_modes_resolve_cleanly() {
+        assert!(PINNED_MODES.len() <= 4);
+        for slot in 0..PINNED_MODES.len() {
+            let entry = pinned_app_entry(slot).expect("pinned mode must exist in APPS");
+            assert_eq!(entry.mode, PINNED_MODES[slot]);
+        }
+    }
+
+    #[test]
+    fn taskbar_geometry_has_no_overlaps() {
+        for screen_w in [800, 1024, 1280, 1920] {
+            for panel_h in [38, 46, 56] {
+                for tray_w in [108, 136] {
+                    for show_pinned in [true, false] {
+                        let layout = TaskbarLayout::compute(screen_w, panel_h, tray_w, show_pinned);
+                        assert!(layout.start.right() < layout.start_sep_x);
+                        if show_pinned {
+                            for slot in 0..PINNED_MODES.len() {
+                                let r = layout.pinned_rect(panel_h, slot);
+                                assert!(r.x > layout.start_sep_x);
+                                assert!(r.right() < layout.pinned_sep_x);
+                                if slot + 1 < PINNED_MODES.len() {
+                                    let next = layout.pinned_rect(panel_h, slot + 1);
+                                    assert!(r.right() < next.x);
+                                }
+                            }
+                            assert!(layout.win_start_x > layout.pinned_sep_x);
+                        } else {
+                            assert!(layout.win_start_x > layout.start_sep_x);
+                        }
+
+                        assert!(layout.net.right() < layout.bell.x);
+                        assert!(layout.bell.right() < layout.clock_sep_x);
+
+                        for count in [1, 3, 6] {
+                            for idx in 0..count {
+                                let wr = layout.window_button_rect(panel_h, count, idx);
+                                assert!(wr.x >= layout.win_start_x);
+                                assert!(wr.right() <= layout.net.x);
+                                if idx + 1 < count {
+                                    let next = layout.window_button_rect(panel_h, count, idx + 1);
+                                    assert!(wr.right() < next.x);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

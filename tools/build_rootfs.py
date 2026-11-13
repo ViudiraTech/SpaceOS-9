@@ -74,10 +74,12 @@ def main() -> int:
         image.truncate(64 * 1024 * 1024)
     run("mkfs.vfat", "-F", "32", "-n", "SPACEROOT", str(IMAGE))
     for directory in ("/sbin", "/bin", "/lib", "/lib/modules", "/etc", "/etc/systemg",
-                      "/tmp", "/dev", "/proc", "/sys", "/run", "/root"):
+                      "/tmp", "/dev", "/proc", "/sys", "/run", "/root", "/usr",
+                      "/usr/share", "/usr/share/music"):
         run("mmd", "-i", str(IMAGE), f"::{directory}")
 
-    for name in ("hello", "cat", "echo", "sh", "fastfetch", "systemctl", "systemg-analyze"):
+    for name in ("hello", "cat", "echo", "sh", "fastfetch", "systemctl", "systemg-analyze",
+                 "mp3play"):
         source = USERLAND / name
         if source.exists():
             run("mcopy", "-i", str(IMAGE), str(source), f"::/bin/{name}")
@@ -97,6 +99,9 @@ def main() -> int:
     modules_list.write_text("".join(f"{name}\n" for name in module_names))
     run("mcopy", "-i", str(IMAGE), str(modules_list), "::/etc/modules")
 
+    music = ROOT / "user" / "assets" / "music" / "spaceos-theme.mp3"
+    if music.exists():
+        run("mcopy", "-i", str(IMAGE), str(music), "::/usr/share/music/spaceos-theme.mp3")
     run("mcopy", "-i", str(IMAGE), str(BUSYBOX), "::/bin/busybox")
     run("mcopy", "-i", str(IMAGE), str(MUSL / "ld-musl-x86_64.so.1"),
         "::/lib/ld-musl-x86_64.so.1")

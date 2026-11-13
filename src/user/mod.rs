@@ -13,6 +13,7 @@
 pub mod address_space;
 pub mod elf;
 mod elf_format;
+pub mod exec;
 pub mod process;
 #[cfg(feature = "boot-self-test")]
 pub mod self_test;

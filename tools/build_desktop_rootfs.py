@@ -21,6 +21,7 @@ import argparse
 import base64
 import hashlib
 import io
+import json
 import os
 import pathlib
 import shutil
@@ -88,6 +89,7 @@ BREEZE_ICONS = {
     "calculator": "usr/share/icons/breeze/apps/48/accessories-calculator.svg",
     "monitor": "usr/share/icons/breeze/apps/48/utilities-system-monitor.svg",
     "image-viewer": "usr/share/icons/breeze/apps/48/gwenview.svg",
+    "music": "usr/share/icons/breeze/mimetypes/32/audio-mp3.svg",
     "help": "usr/share/icons/breeze/apps/48/help-browser.svg",
     "login": "usr/share/icons/breeze/preferences/32/preferences-system-login.svg",
     "notify": "usr/share/icons/breeze/preferences/32/preferences-desktop-notification-bell.svg",
@@ -127,7 +129,7 @@ BREEZE_ICONS = {
     "go-home": "usr/share/icons/breeze/actions/22/go-home.svg",
     "logout": "usr/share/icons/breeze/actions/22/system-log-out.svg",
     "shutdown": "usr/share/icons/breeze/actions/22/system-shutdown.svg",
-    "bell": "usr/share/icons/breeze/actions/22/notification-empty.svg",
+    "bell": "usr/share/icons/breeze/actions/22/notifications.svg",
     "bell-active": "usr/share/icons/breeze/actions/22/notification-active.svg",
     "info": "usr/share/icons/breeze/actions/22/help-about.svg",
 }
@@ -377,8 +379,14 @@ def install_spui_assets() -> None:
 
     icon_dir = STAGE / "usr/share/spui/icons/breeze"
     icon_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = BUILD / ".breeze-icons-manifest.json"
+    expected_manifest = json.dumps(BREEZE_ICONS, sort_keys=True)
     missing_icons = [k for k in BREEZE_ICONS if not (icon_dir / f"{k}.svg").exists()]
-    if missing_icons:
+    manifest_stale = (
+        not manifest_path.exists()
+        or manifest_path.read_text(encoding="utf-8") != expected_manifest
+    )
+    if missing_icons or manifest_stale:
         log(f"extracting {len(BREEZE_ICONS)} curated Breeze SVG icons")
         apk = ensure_cached_package("breeze-icons")
         data = split_gzip_members(apk.read_bytes())[-1]
@@ -392,6 +400,8 @@ def install_spui_assets() -> None:
                 out_path = icon_dir / f"{key}.svg"
                 out_path.write_bytes(source.read())
                 os.chmod(out_path, 0o644)
+        manifest_path.write_text(expected_manifest, encoding="utf-8")
+        os.chmod(manifest_path, 0o644)
 
     wallpaper_cache = ROOT / "build" / "downloads" / "wallpapers"
     wallpaper_cache.mkdir(parents=True, exist_ok=True)
@@ -695,7 +705,8 @@ EndSection
         source = USERLAND / name
         if source.exists():
             install_binary(source, f"/sbin/{name}")
-    for name in ("hello", "systemctl", "systemg-analyze", "journald", "journalctl", "dmesg"):
+    for name in ("hello", "systemctl", "systemg-analyze", "journald", "journalctl", "dmesg",
+                 "mp3play"):
         source = USERLAND / name
         if source.exists():
             install_binary(source, f"/bin/{name}")
@@ -737,6 +748,9 @@ EndSection
             if nm_sbin.is_symlink() or nm_sbin.exists():
                 nm_sbin.unlink()
             nm_sbin.symlink_to("/usr/bin/NetworkManager")
+    music = ROOT / "user" / "assets" / "music" / "spaceos-theme.mp3"
+    if music.exists():
+        install_binary(music, "/usr/share/music/spaceos-theme.mp3", 0o644)
     assets = ROOT / "user" / "desktop" / "assets"
     if assets.is_dir():
         for path in assets.rglob("*"):

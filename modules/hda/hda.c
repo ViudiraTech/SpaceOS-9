@@ -79,10 +79,15 @@
 #define AC_PAR_FUNCTION_TYPE 0x05u
 #define AC_PAR_AUDIO_WIDGET_CAP 0x09u
 #define AC_PAR_PIN_CAP 0x0cu
+#define AC_PAR_AMP_IN_CAP 0x11u
+#define AC_PAR_AMP_OUT_CAP 0x12u
 
 #define AC_WID_AUD_OUT 0x0u
 #define AC_WID_AUD_IN 0x1u
 #define AC_WID_PIN 0x4u
+
+#define AC_WCAP_IN_AMP 0x00000002u
+#define AC_WCAP_OUT_AMP 0x00000004u
 
 #define AC_PINCAP_OUT 0x10u
 #define AC_PINCAP_IN 0x20u
@@ -127,6 +132,14 @@ struct hda_chip {
     unsigned int running[2];
 
     unsigned char gains[2];
+    unsigned char out_gain_max;
+    unsigned char out_gain_default;
+    unsigned char in_gain_max;
+    unsigned char in_gain_default;
+    unsigned char pin_out_amp;
+    unsigned char pin_out_gain;
+    unsigned char pin_in_amp;
+    unsigned char pin_in_gain;
     unsigned char codec_ready;
     volatile unsigned int period_pending[2];
     volatile unsigned int shutdown;
@@ -174,20 +187,19 @@ static unsigned int hda_verb(struct hda_chip *chip, unsigned int nid,
     unsigned int command = ((chip->codec & 0xfu) << 28) | ((nid & 0xffu) << 20) |
                            ((verb & 0xfffu) << 8) | (parm & 0xffffu);
     unsigned int timeout;
-
+    unsigned short next_wp = (unsigned short)((chip->corb_wp + 1u) & 0xffu);
     unsigned char previous = chip->rirb_wp;
-    int seen = chip->rirb_seen;
 
-    chip->corb[chip->corb_wp & 0xff] = command;
+    chip->corb[next_wp] = command;
     spk_mb();
-    hda_writew(chip, HDA_CORBWP, chip->corb_wp & 0xff);
+    hda_writew(chip, HDA_CORBWP, next_wp);
+    chip->corb_wp = next_wp;
     for (timeout = 0; timeout < 100000u; timeout++) {
         unsigned char current = (unsigned char)(hda_readw(chip, HDA_RIRBWP) & 0xffu);
-        if (!seen || current != previous) {
+        if (current != previous) {
             unsigned int response = (unsigned int)chip->rirb[current];
             chip->rirb_wp = current;
             chip->rirb_seen = 1;
-            chip->corb_wp = (unsigned short)((chip->corb_wp + 1) & 0xff);
             return response;
         }
         spk_udelay(1);
@@ -227,14 +239,42 @@ static void hda_init_rings(struct hda_chip *chip)
         spk_udelay(10);
     }
     hda_writew(chip, HDA_CORBRP, 0);
+    for (timeout = 0; timeout < 1000u; timeout++) {
+        if ((hda_readw(chip, HDA_CORBRP) & HDA_CORBRP_RST) == 0) {
+            break;
+        }
+        spk_udelay(10);
+    }
     hda_writew(chip, HDA_CORBWP, 0);
     hda_writew(chip, HDA_RIRBWP, HDA_RIRBWP_RST);
     hda_writew(chip, HDA_RINTCNT, 0xff);
     hda_writeb(chip, HDA_CORBCTL, HDA_CORBCTL_RUN);
     hda_writeb(chip, HDA_RIRBCTL, HDA_RIRBCTL_DMA);
     chip->corb_wp = 0;
-    chip->rirb_wp = 0;
+    chip->rirb_wp = (unsigned char)(hda_readw(chip, HDA_RIRBWP) & 0xffu);
     chip->rirb_seen = 0;
+}
+
+static void hda_query_amp_caps(struct hda_chip *chip, unsigned int nid,
+                               unsigned int param, unsigned char *max_out,
+                               unsigned char *def_out)
+{
+    unsigned int amp = hda_verb(chip, nid, AC_VERB_GET_PARAMETERS, param);
+    unsigned int steps;
+    unsigned int offset;
+
+    if (amp == 0xffffffffu || amp == 0u) {
+        *max_out = 0x4au;
+        *def_out = 0x4au;
+        return;
+    }
+    steps = (amp >> 8) & AC_AMP_GAIN_MASK;
+    offset = amp & AC_AMP_GAIN_MASK;
+    if (offset > steps) {
+        offset = steps;
+    }
+    *max_out = (unsigned char)steps;
+    *def_out = (unsigned char)(offset > 0u ? offset : steps);
 }
 
 static int hda_discover_codec(struct hda_chip *chip)
@@ -244,6 +284,10 @@ static int hda_discover_codec(struct hda_chip *chip)
     unsigned int start = nodes & 0xffu;
     unsigned int count = (nodes >> 8) & 0xffu;
     unsigned int index;
+    unsigned int dac_cap = 0;
+    unsigned int adc_cap = 0;
+    unsigned int pin_out_cap = 0;
+    unsigned int pin_in_cap = 0;
 
     chip->afg = 0;
     chip->dac = 0;
@@ -270,32 +314,64 @@ static int hda_discover_codec(struct hda_chip *chip)
         unsigned int type = (cap >> 20) & 0xfu;
         if (type == AC_WID_AUD_OUT && chip->dac == 0) {
             chip->dac = index;
+            dac_cap = cap;
         } else if (type == AC_WID_AUD_IN && chip->adc == 0) {
             chip->adc = index;
+            adc_cap = cap;
         } else if (type == AC_WID_PIN) {
             unsigned int pincap = hda_verb(chip, index, AC_VERB_GET_PARAMETERS,
                                            AC_PAR_PIN_CAP);
             if ((pincap & AC_PINCAP_OUT) && chip->pin_out == 0) {
                 chip->pin_out = index;
+                pin_out_cap = cap;
             }
             if ((pincap & AC_PINCAP_IN) && chip->pin_in == 0) {
                 chip->pin_in = index;
+                pin_in_cap = cap;
             }
         }
     }
     /* QEMU hda-duplex: AFG 1, DAC 2, line-out 3, ADC 4, line-in 5. */
     if (chip->dac == 0) {
         chip->dac = 2;
+        dac_cap = hda_verb(chip, chip->dac, AC_VERB_GET_PARAMETERS,
+                           AC_PAR_AUDIO_WIDGET_CAP);
     }
     if (chip->pin_out == 0) {
         chip->pin_out = 3;
+        pin_out_cap = hda_verb(chip, chip->pin_out, AC_VERB_GET_PARAMETERS,
+                               AC_PAR_AUDIO_WIDGET_CAP);
     }
     if (chip->adc == 0) {
         chip->adc = 4;
+        adc_cap = hda_verb(chip, chip->adc, AC_VERB_GET_PARAMETERS,
+                           AC_PAR_AUDIO_WIDGET_CAP);
     }
     if (chip->pin_in == 0) {
         chip->pin_in = 5;
+        pin_in_cap = hda_verb(chip, chip->pin_in, AC_VERB_GET_PARAMETERS,
+                              AC_PAR_AUDIO_WIDGET_CAP);
     }
+    (void)dac_cap;
+    (void)adc_cap;
+    hda_query_amp_caps(chip, chip->dac, AC_PAR_AMP_OUT_CAP,
+                       &chip->out_gain_max, &chip->out_gain_default);
+    hda_query_amp_caps(chip, chip->adc, AC_PAR_AMP_IN_CAP,
+                       &chip->in_gain_max, &chip->in_gain_default);
+    chip->pin_out_amp = (pin_out_cap & AC_WCAP_OUT_AMP) ? 1u : 0u;
+    if (chip->pin_out_amp) {
+        unsigned char dummy_max = 0;
+        hda_query_amp_caps(chip, chip->pin_out, AC_PAR_AMP_OUT_CAP,
+                           &dummy_max, &chip->pin_out_gain);
+    }
+    chip->pin_in_amp = (pin_in_cap & AC_WCAP_IN_AMP) ? 1u : 0u;
+    if (chip->pin_in_amp) {
+        unsigned char dummy_max = 0;
+        hda_query_amp_caps(chip, chip->pin_in, AC_PAR_AMP_IN_CAP,
+                           &dummy_max, &chip->pin_in_gain);
+    }
+    chip->gains[0] = chip->out_gain_default;
+    chip->gains[1] = chip->in_gain_default;
     chip->codec_ready = 1;
     return 0;
 }
@@ -361,7 +437,10 @@ static int hda_configure_codec(struct hda_chip *chip, int capture,
                  AC_AMP_OUT_BOTH | chip->gains[0]);
         hda_program_converter(chip, nid, HDA_STREAM_TAG);
         hda_verb(chip, pin, AC_VERB_SET_PIN_WIDGET_CONTROL, AC_PINCTL_OUT_EN);
-        hda_verb(chip, pin, AC_VERB_SET_AMP_GAIN_MUTE, AC_AMP_OUT_BOTH);
+        if (chip->pin_out_amp) {
+            hda_verb(chip, pin, AC_VERB_SET_AMP_GAIN_MUTE,
+                     AC_AMP_OUT_BOTH | chip->pin_out_gain);
+        }
         hda_verb(chip, pin, AC_VERB_SET_EAPD_BTLENABLE, 0x02);
         hda_verb(chip, pin, AC_VERB_SET_POWER_STATE, 0);
     } else {
@@ -370,7 +449,10 @@ static int hda_configure_codec(struct hda_chip *chip, int capture,
         hda_verb(chip, nid, AC_VERB_SET_AMP_GAIN_MUTE,
                  AC_AMP_IN_BOTH | chip->gains[1]);
         hda_verb(chip, pin, AC_VERB_SET_PIN_WIDGET_CONTROL, AC_PINCTL_IN_EN);
-        hda_verb(chip, pin, AC_VERB_SET_AMP_GAIN_MUTE, AC_AMP_IN_BOTH);
+        if (chip->pin_in_amp) {
+            hda_verb(chip, pin, AC_VERB_SET_AMP_GAIN_MUTE,
+                     AC_AMP_IN_BOTH | chip->pin_in_gain);
+        }
         hda_verb(chip, pin, AC_VERB_SET_POWER_STATE, 0);
     }
     return 0;
@@ -460,6 +542,15 @@ static void hda_stream_reset(struct hda_chip *chip, int capture)
     unsigned int timeout;
 
     hda_writel(chip, offset + SD_CTL, SD_CTL_RESET);
+    for (timeout = 0; timeout < 100u; timeout++) {
+        unsigned int ctl = hda_readl(chip, offset + SD_CTL);
+        if ((ctl & SD_CTL_RESET) != 0) {
+            break;
+        }
+        spk_udelay(10);
+    }
+    hda_writel(chip, offset + SD_CTL,
+               hda_readl(chip, offset + SD_CTL) & ~SD_CTL_RESET);
     for (timeout = 0; timeout < 1000u; timeout++) {
         if ((hda_readl(chip, offset + SD_CTL) & SD_CTL_RESET) == 0) {
             break;
@@ -525,8 +616,6 @@ static void hda_irq(int irq, void *data)
     if (status & hda_int_bit(0)) {
         unsigned char stream = hda_readb(chip, HDA_PLAY_SD + SD_STS);
         hda_writeb(chip, HDA_PLAY_SD + SD_STS, SD_INT_MASK);
-        hda_writel(chip, HDA_PLAY_SD + SD_CTL,
-                   hda_readl(chip, HDA_PLAY_SD + SD_CTL) & ~(1u << 26));
         if ((stream & 0x04u) != 0 && chip->playback != 0 &&
             !chip->shutdown && !chip->period_pending[0]) {
             chip->period_pending[0] = 1;
@@ -536,8 +625,6 @@ static void hda_irq(int irq, void *data)
     if (status & hda_int_bit(1)) {
         unsigned char stream = hda_readb(chip, HDA_CAP_SD + SD_STS);
         hda_writeb(chip, HDA_CAP_SD + SD_STS, SD_INT_MASK);
-        hda_writel(chip, HDA_CAP_SD + SD_CTL,
-                   hda_readl(chip, HDA_CAP_SD + SD_CTL) & ~(1u << 26));
         if ((stream & 0x04u) != 0 && chip->capture != 0 &&
             !chip->shutdown && !chip->period_pending[1]) {
             chip->period_pending[1] = 1;
@@ -701,6 +788,7 @@ static int hda_trigger(struct snd_pcm_substream *substream, int cmd)
     case SNDRV_PCM_TRIGGER_STOP:
     case SNDRV_PCM_TRIGGER_SUSPEND:
     case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+        chip->running[capture] = 0;
         hda_stream_stop(chip, capture);
         break;
     default:
@@ -723,6 +811,9 @@ static snd_pcm_uframes_t hda_pointer(struct snd_pcm_substream *substream)
     lpib = hda_readl(chip, offset + SD_LPIB);
     if (chip->frame_bytes[capture] == 0) {
         return 0;
+    }
+    if (chip->cbl[capture] != 0) {
+        lpib %= chip->cbl[capture];
     }
     return lpib / chip->frame_bytes[capture];
 }
@@ -765,8 +856,13 @@ static int hda_volume_get(struct snd_kcontrol *kcontrol,
                           struct snd_ctl_elem_value *value)
 {
     struct hda_chip *chip = (struct hda_chip *)kcontrol->private_data;
-    value->value.integer.value[0] = (chip->gains[0] * 100) / 127;
-    value->value.integer.value[1] = (chip->gains[0] * 100) / 127;
+    long max_step = chip->out_gain_max ? (long)chip->out_gain_max : 127L;
+    long pct = max_step > 0 ? ((long)chip->gains[0] * 100L + max_step / 2) / max_step : 0;
+    if (pct > 100) {
+        pct = 100;
+    }
+    value->value.integer.value[0] = pct;
+    value->value.integer.value[1] = pct;
     return 0;
 }
 
@@ -774,6 +870,7 @@ static int hda_volume_put(struct snd_kcontrol *kcontrol,
                           struct snd_ctl_elem_value *value)
 {
     struct hda_chip *chip = (struct hda_chip *)kcontrol->private_data;
+    long max_step = chip->out_gain_max ? (long)chip->out_gain_max : 127L;
     long gain = value->value.integer.value[0];
     if (gain < 0) {
         gain = 0;
@@ -781,7 +878,7 @@ static int hda_volume_put(struct snd_kcontrol *kcontrol,
     if (gain > 100) {
         gain = 100;
     }
-    chip->gains[0] = (unsigned char)((gain * 127) / 100);
+    chip->gains[0] = (unsigned char)((gain * max_step + 50L) / 100L);
     hda_verb(chip, chip->dac, AC_VERB_SET_AMP_GAIN_MUTE,
              AC_AMP_OUT_BOTH | chip->gains[0]);
     return 1;
@@ -831,21 +928,29 @@ static int hda_probe(struct spk_pci_device *device)
         spk_kfree(chip);
         return -12;
     }
-    chip->gains[0] = 100;
-    chip->gains[1] = 100;
+    chip->out_gain_max = 0x4au;
+    chip->out_gain_default = 0x4au;
+    chip->in_gain_max = 0x4au;
+    chip->in_gain_default = 0x4au;
+    chip->gains[0] = chip->out_gain_default;
+    chip->gains[1] = chip->in_gain_default;
 
     gctl = hda_readl(chip, HDA_GCTL);
-    hda_writel(chip, HDA_GCTL, gctl & ~HDA_GCTL_RESET);
-    spk_udelay(1000);
-    hda_writel(chip, HDA_GCTL, gctl | HDA_GCTL_RESET);
-    spk_udelay(1000);
     hda_writel(chip, HDA_GCTL, gctl & ~HDA_GCTL_RESET);
     for (timeout = 0; timeout < 1000u; timeout++) {
         if ((hda_readl(chip, HDA_GCTL) & HDA_GCTL_RESET) == 0) {
             break;
         }
-        spk_udelay(1000);
+        spk_udelay(100);
     }
+    hda_writel(chip, HDA_GCTL, gctl | HDA_GCTL_RESET);
+    for (timeout = 0; timeout < 1000u; timeout++) {
+        if ((hda_readl(chip, HDA_GCTL) & HDA_GCTL_RESET) != 0) {
+            break;
+        }
+        spk_udelay(100);
+    }
+    spk_udelay(1000);
     for (timeout = 0; timeout < 1000u; timeout++) {
         statests = hda_readw(chip, HDA_STATESTS);
         if (statests != 0) {

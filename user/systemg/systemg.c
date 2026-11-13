@@ -9,10 +9,13 @@
  */
 
 #include "splibc.h"
+#include "journal.h"
 
 #define MAX_UNITS 32
 #define MAX_DEPS 8
 #define SOCK_PATH "/run/systemg.sock"
+#define JOURNAL_QUEUE_CAP 128
+#define JOURNAL_MSG_MAX   320
 
 enum unit_type { TYPE_SIMPLE, TYPE_EXEC, TYPE_ONESHOT };
 enum restart_policy { RESTART_NO, RESTART_ON_FAILURE, RESTART_ALWAYS };
@@ -73,13 +76,181 @@ static time_t get_uptime_seconds(void) {
     return 0;
 }
 
+static u64 get_realtime_usec(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        return (u64)ts.tv_sec * 1000000ULL + (u64)(ts.tv_nsec / 1000);
+    }
+    return 0;
+}
+
+struct early_journal_entry {
+    u64 mono_us;
+    u64 real_us;
+    int priority;
+    char unit[64];
+    char message[JOURNAL_MSG_MAX];
+};
+
+static struct early_journal_entry journal_queue[JOURNAL_QUEUE_CAP];
+static int journal_q_head;
+static int journal_q_count;
+static int journal_sock_fd = -1;
+
+static void format_unit_name(char *dst, size_t cap, const char *name) {
+    if (cap == 0) {
+        return;
+    }
+    if (name == NULL || *name == 0) {
+        snprintf(dst, cap, "systemg.service");
+    } else if (strchr(name, '.') != NULL) {
+        snprintf(dst, cap, "%s", name);
+    } else {
+        snprintf(dst, cap, "%s.service", name);
+    }
+}
+
+static void sanitize_journal_message(char *dst, size_t cap, const char *src) {
+    size_t d = 0;
+    if (cap == 0) {
+        return;
+    }
+    for (size_t s = 0; src[s] != 0 && d + 1 < cap; s++) {
+        unsigned char c = (unsigned char)src[s];
+        /* Strip ANSI CSI escape sequences (\033[...X) printed to console. */
+        if (c == 0x1b && src[s + 1] == '[') {
+            s += 2;
+            while (src[s] != 0 && ((unsigned char)src[s] < 0x40 || (unsigned char)src[s] > 0x7e)) {
+                s++;
+            }
+            if (src[s] == 0) {
+                break;
+            }
+            continue;
+        }
+        if (c == '\n' || c == '\r') {
+            dst[d++] = ' ';
+            continue;
+        }
+        dst[d++] = (char)c;
+    }
+    while (d > 0 && dst[d - 1] == ' ') {
+        d--;
+    }
+    dst[d] = 0;
+}
+
+static int try_send_journal_entry(const struct early_journal_entry *entry) {
+    if (entry->message[0] == 0) {
+        return 0;
+    }
+    if (journal_sock_fd < 0) {
+        journal_sock_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (journal_sock_fd < 0) {
+            return -1;
+        }
+    }
+
+    char packet[1024];
+    int len = snprintf(packet, sizeof(packet),
+                       "PRIORITY=%d\n"
+                       "SYSLOG_FACILITY=%d\n"
+                       "SYSLOG_IDENTIFIER=systemg\n"
+                       "_COMM=systemg\n"
+                       "_SYSTEMD_UNIT=%s\n"
+                       "_PID=%d\n"
+                       "_UID=0\n"
+                       "_GID=0\n"
+                       "_SOURCE_MONOTONIC_TIMESTAMP=%lu\n"
+                       "_SOURCE_REALTIME_TIMESTAMP=%lu\n"
+                       "MESSAGE=%s\n",
+                       entry->priority & 7,
+                       LOG_DAEMON >> 3,
+                       entry->unit,
+                       (int)getpid(),
+                       (unsigned long)entry->mono_us,
+                       (unsigned long)entry->real_us,
+                       entry->message);
+    if (len <= 0) {
+        return -1;
+    }
+    if ((size_t)len >= sizeof(packet)) {
+        len = (int)strlen(packet);
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", JOURNAL_SOCKET_PATH);
+
+    if (sendto(journal_sock_fd, packet, (size_t)len, 0, &addr, sizeof(addr)) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void flush_journal_queue(void) {
+    while (journal_q_count > 0) {
+        const struct early_journal_entry *entry = &journal_queue[journal_q_head];
+        if (try_send_journal_entry(entry) < 0) {
+            break;
+        }
+        journal_q_head = (journal_q_head + 1) % JOURNAL_QUEUE_CAP;
+        journal_q_count--;
+    }
+}
+
+static void journal_log(int priority, const char *unit_name, const char *format, ...) {
+    char raw[JOURNAL_MSG_MAX];
+    __builtin_va_list args;
+    __builtin_va_start(args, format);
+    vsnprintf(raw, sizeof(raw), format, args);
+    __builtin_va_end(args);
+
+    struct early_journal_entry entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.mono_us = get_monotonic_usec();
+    entry.real_us = get_realtime_usec();
+    entry.priority = priority & 7;
+    format_unit_name(entry.unit, sizeof(entry.unit), unit_name);
+    sanitize_journal_message(entry.message, sizeof(entry.message), raw);
+    if (entry.message[0] == 0) {
+        return;
+    }
+
+    flush_journal_queue();
+    if (journal_q_count == 0 && try_send_journal_entry(&entry) == 0) {
+        return;
+    }
+
+    if (journal_q_count == JOURNAL_QUEUE_CAP) {
+        journal_q_head = (journal_q_head + 1) % JOURNAL_QUEUE_CAP;
+        journal_q_count--;
+    }
+    int tail = (journal_q_head + journal_q_count) % JOURNAL_QUEUE_CAP;
+    journal_queue[tail] = entry;
+    journal_q_count++;
+}
+
 static void print_unit_status(const char *tag, const char *action, const struct unit *unit, const char *suffix) {
+    const char *sfx = suffix ? suffix : ".";
+    int prio = LOG_INFO;
+    if (strstr(action, "Failed") != NULL) {
+        prio = LOG_ERR;
+    } else if (strstr(action, "Dependency") != NULL) {
+        prio = LOG_WARNING;
+    }
+
     if (unit->description[0] != 0) {
         printf("%s %s %s.service \033[90m- %s\033[0m%s\n",
-               tag, action, unit->name, unit->description, suffix ? suffix : ".");
+               tag, action, unit->name, unit->description, sfx);
+        journal_log(prio, unit->name, "%s %s.service - %s%s",
+                    action, unit->name, unit->description, sfx);
     } else {
         printf("%s %s %s.service%s\n",
-               tag, action, unit->name, suffix ? suffix : ".");
+               tag, action, unit->name, sfx);
+        journal_log(prio, unit->name, "%s %s.service%s",
+                    action, unit->name, sfx);
     }
 }
 
@@ -130,15 +301,20 @@ static const char *signal_name(int signal_number) {
 static void log_process_exit(const struct unit *unit, const char *kind, int status) {
     if (WIFEXITED(status)) {
         int code = WEXITSTATUS(status);
+        int prio = (code == 0) ? LOG_INFO : LOG_WARNING;
         printf("systemg[1]: %s: %s exited, code=exited, status=%d/%s%s\n",
                unit->name, kind, code, exit_status_name(code),
                code == 0 ? " (success)" : "");
+        journal_log(prio, unit->name, "%s: %s exited, code=exited, status=%d/%s%s",
+                    unit->name, kind, code, exit_status_name(code),
+                    code == 0 ? " (success)" : "");
     } else if (WIFSIGNALED(status)) {
         int signal_number = WTERMSIG(status);
+        const char *reason = (status & 0x80) != 0 ? "dumped" : "killed";
         printf("systemg[1]: %s: %s exited, code=%s, status=%d/%s\n",
-               unit->name, kind,
-               WIFSIGNALED(status) && (status & 0x80) != 0 ? "dumped" : "killed",
-               signal_number, signal_name(signal_number));
+               unit->name, kind, reason, signal_number, signal_name(signal_number));
+        journal_log(LOG_ERR, unit->name, "%s: %s exited, code=%s, status=%d/%s",
+                    unit->name, kind, reason, signal_number, signal_name(signal_number));
     }
 }
 
@@ -389,6 +565,7 @@ static pid_t start_unit(struct unit *unit) {
     int count = split_arguments(command, arguments, 16);
     if (count == 0) {
         unit->failed = 1;
+        journal_log(LOG_ERR, unit->name, "%s.service has no ExecStart command.", unit->name);
         return -1;
     }
     print_unit_status("        ", "Starting", unit, "...");
@@ -397,6 +574,7 @@ static pid_t start_unit(struct unit *unit) {
         for (int fd = 3; fd < 256; fd++) {
             close(fd);
         }
+        journal_sock_fd = -1;
         /* getty/login creates its own session; a process-group leader cannot
          * call setsid(2).  Other services still get a private process group so
          * systemg can terminate their whole tree. */
@@ -410,11 +588,15 @@ static pid_t start_unit(struct unit *unit) {
         signal(SIGTTOU, SIG_DFL);
         signal(SIGCHLD, SIG_DFL);
         execvp(arguments[0], arguments);
-        fprintf(2, "systemg: exec %s failed: %s\n", arguments[0], strerror(errno));
+        int err = errno;
+        fprintf(2, "systemg: exec %s failed: %s\n", arguments[0], strerror(err));
+        journal_log(LOG_ERR, unit->name, "Failed to execute %s: %s", arguments[0], strerror(err));
         _exit(127);
     }
     if (pid < 0) {
+        int err = errno;
         printf("systemg: fork failed for %s\n", unit->name);
+        journal_log(LOG_ERR, unit->name, "Fork failed for %s: %s", unit->name, strerror(err));
         unit->failed = 1;
         return -1;
     }
@@ -458,6 +640,7 @@ static pid_t start_unit(struct unit *unit) {
         if (unit->failed) {
             print_unit_status("[\033[1;31mFAILED\033[0m]", "Failed to start", unit, ".");
             printf("systemg[1]: %s: Failed with result 'exit-code'.\n", unit->name);
+            journal_log(LOG_ERR, unit->name, "%s: Failed with result 'exit-code'.", unit->name);
         } else {
             print_unit_status("[  \033[1;32mOK\033[0m  ]", "Started", unit, ".");
         }
@@ -471,6 +654,7 @@ static int stop_unit(struct unit *unit) {
     if (unit->pid > 0) {
         kill(unit->pid, SIGTERM);
         printf("systemg[1]: Stopping %s (PID %d)...\n", unit->name, (int)unit->pid);
+        journal_log(LOG_INFO, unit->name, "Stopping %s (PID %d)...", unit->name, (int)unit->pid);
         return 0;
     }
     return 0;
@@ -481,6 +665,7 @@ static int restart_unit(struct unit *unit) {
         unit->pending_restart = 1;
         unit->started = 1;
         printf("systemg[1]: Restarting %s (PID %d)...\n", unit->name, (int)unit->pid);
+        journal_log(LOG_INFO, unit->name, "Restarting %s (PID %d)...", unit->name, (int)unit->pid);
         kill(unit->pid, SIGTERM);
         return 0;
     } else {
@@ -528,8 +713,10 @@ static void start_ready_units(void) {
     }
     if (has_ddm) {
         printf("[  \033[1;32mOK\033[0m  ] Reached target \033[1mGraphical Interface\033[0m \033[90m- graphical.target\033[0m.\n");
+        journal_log(LOG_INFO, "graphical.target", "Reached target Graphical Interface - graphical.target.");
     } else {
         printf("[  \033[1;32mOK\033[0m  ] Reached target \033[1mMulti-User System\033[0m \033[90m- multi-user.target\033[0m.\n");
+        journal_log(LOG_INFO, "multi-user.target", "Reached target Multi-User System - multi-user.target.");
     }
 }
 
@@ -816,6 +1003,7 @@ static void handle_ipc_client(int client_fd) {
         }
     } else if (strcmp(cmd, "RELOAD") == 0) {
         reload_all_units();
+        journal_log(LOG_INFO, "systemg.service", "Reloaded unit configuration.");
         snprintf(resp, sizeof(resp), "OK\n");
     } else {
         snprintf(resp, sizeof(resp), "ERR:unknown command\n");
@@ -851,16 +1039,24 @@ static void load_kernel_modules(void) {
             snprintf(path, sizeof(path), "/lib/modules/%s.ko", name);
             int image = open(path, O_RDONLY | O_CLOEXEC);
             if (image < 0) {
+                int err = errno;
                 printf("systemg[1]: Failed to open kernel module %s: %s\n",
-                       path, strerror(errno));
+                       path, strerror(err));
+                journal_log(LOG_WARNING, "systemg.service",
+                            "Failed to open kernel module %s: %s", path, strerror(err));
             } else {
                 int result = finit_module(image, "", 0);
+                int err = errno;
                 close(image);
                 if (result < 0) {
                     printf("systemg[1]: Failed to load kernel module %s: %s\n",
-                           name, strerror(errno));
+                           name, strerror(err));
+                    journal_log(LOG_ERR, "systemg.service",
+                                "Failed to load kernel module %s: %s", name, strerror(err));
                 } else {
                     printf("systemg[1]: Loaded kernel module %s\n", name);
+                    journal_log(LOG_INFO, "systemg.service",
+                                "Loaded kernel module %s.", name);
                 }
             }
         }
@@ -893,6 +1089,8 @@ int main(int argc, char **argv, char **envp) {
     signal(SIGTTIN, SIG_IGN);
     signal(SIGTTOU, SIG_IGN);
     printf("SYSTEMG_OK pid=%d\n", getpid());
+    journal_log(LOG_INFO, "systemg.service",
+                "SpaceOS systemg PID %d initialized.", (int)getpid());
     load_kernel_modules();
 
     /* Initialize control socket */
@@ -920,8 +1118,10 @@ int main(int argc, char **argv, char **envp) {
     reload_all_units();
     start_ready_units();
     userspace_finish_usec = get_monotonic_usec();
+    flush_journal_queue();
 
     for (;;) {
+        flush_journal_queue();
         int status = 0;
         pid_t pid;
         while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
@@ -940,8 +1140,12 @@ int main(int argc, char **argv, char **envp) {
                 if (unit->failed) {
                     printf("systemg[1]: %s: Failed with result 'exit-code'.\n",
                            unit->name);
+                    journal_log(LOG_ERR, unit->name,
+                                "%s: Failed with result 'exit-code'.", unit->name);
                 } else {
                     printf("systemg[1]: %s: Deactivated successfully.\n", unit->name);
+                    journal_log(LOG_INFO, unit->name,
+                                "%s: Deactivated successfully.", unit->name);
                 }
                 print_unit_status("[  \033[1;32mOK\033[0m  ]", "Stopped", unit, ".");
                 if (should_restart(unit)) {
@@ -955,10 +1159,14 @@ int main(int argc, char **argv, char **envp) {
                 unit->restarts += 1;
                 printf("systemg[1]: %s: Scheduled restart job, restart counter is at %d.\n",
                        unit->name, unit->restarts);
+                journal_log(LOG_NOTICE, unit->name,
+                            "%s: Scheduled restart job, restart counter is at %d.",
+                            unit->name, unit->restarts);
                 sleep((unsigned int)unit->restart_sec);
                 start_unit(unit);
             }
         }
+        flush_journal_queue();
 
         /* Poll IPC server socket with 100ms timeout */
         if (server_fd >= 0) {

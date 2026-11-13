@@ -428,9 +428,12 @@ static void handle_journal_native_input(void) {
         char comm[32] = {0};
         char ident[32] = {0};
         u8 prio = LOG_INFO;
+        u8 fac = LOG_USER >> 3;
         u32 pid = 0;
         u32 uid = 0;
         u32 gid = 0;
+        u64 mono_us = 0;
+        u64 real_us = 0;
 
         char *ptr = buf;
         char *end = buf + n;
@@ -450,6 +453,8 @@ static void handle_journal_native_input(void) {
                     strncpy(message, val, sizeof(message) - 1);
                 } else if (strcmp(key, "PRIORITY") == 0) {
                     prio = (u8)atoi(val) & 7;
+                } else if (strcmp(key, "SYSLOG_FACILITY") == 0) {
+                    fac = (u8)atoi(val);
                 } else if (strcmp(key, "SYSLOG_IDENTIFIER") == 0) {
                     strncpy(ident, val, sizeof(ident) - 1);
                 } else if (strcmp(key, "_COMM") == 0) {
@@ -462,6 +467,10 @@ static void handle_journal_native_input(void) {
                     uid = (u32)atoi(val);
                 } else if (strcmp(key, "_GID") == 0) {
                     gid = (u32)atoi(val);
+                } else if (strcmp(key, "_SOURCE_MONOTONIC_TIMESTAMP") == 0) {
+                    mono_us = (u64)strtol(val, NULL, 10);
+                } else if (strcmp(key, "_SOURCE_REALTIME_TIMESTAMP") == 0) {
+                    real_us = (u64)strtol(val, NULL, 10);
                 }
             }
             ptr = (line_end < end) ? (line_end + 1) : end;
@@ -471,8 +480,9 @@ static void handle_journal_native_input(void) {
             strncpy(ident, comm, sizeof(ident) - 1);
         }
         if (message[0] != 0) {
-            write_entry_record(TRANSPORT_JOURNAL, prio, LOG_USER >> 3,
-                               pid, uid, gid, unit, comm, ident, message, 0, 0);
+            write_entry_record(TRANSPORT_JOURNAL, prio, fac,
+                               pid, uid, gid, unit, comm, ident, message,
+                               mono_us, real_us);
         }
     }
 }
@@ -537,6 +547,47 @@ static void handle_syslog_input(void) {
         write_entry_record(TRANSPORT_SYSLOG, prio, fac, pid, 0, 0,
                            unit, ident, ident, msg, 0, 0);
     }
+}
+
+static int entry_matches_filter(const struct ring_entry *re,
+                                const char *unit_filter, int max_prio) {
+    if (re->hdr.priority > max_prio) {
+        return 0;
+    }
+    if (unit_filter[0] == 0) {
+        return 1;
+    }
+    if (strstr(re->unit, unit_filter) != NULL) {
+        return 1;
+    }
+    if ((strcmp(unit_filter, "systemg") == 0 ||
+         strcmp(unit_filter, "systemg.service") == 0) &&
+        (strcmp(re->comm, "systemg") == 0 || strcmp(re->ident, "systemg") == 0)) {
+        return 1;
+    }
+    return 0;
+}
+
+static void write_query_entry(int cfd, const struct ring_entry *re) {
+    char esc_msg[1200];
+    escape_query_field(esc_msg, sizeof(esc_msg), re->message);
+    char line[1500];
+    int len = snprintf(line, sizeof(line),
+                       "ENTRY|%lu|%lu|%lu|%u|%u|%u|%d|%u|%u|%s|%s|%s|%s\n",
+                       (unsigned long)re->hdr.seq_num,
+                       (unsigned long)re->hdr.realtime_usec,
+                       (unsigned long)re->hdr.monotonic_usec,
+                       re->hdr.priority,
+                       re->hdr.facility,
+                       re->hdr.transport,
+                       re->hdr.pid,
+                       re->hdr.uid,
+                       re->hdr.gid,
+                       re->unit,
+                       re->comm,
+                       re->ident,
+                       esc_msg);
+    write(cfd, line, len);
 }
 
 static void handle_query_request(int cfd, char *cmd) {
@@ -616,62 +667,20 @@ static void handle_query_request(int cfd, char *cmd) {
             for (int i = daemon_state.ring_count - 1; i >= 0 && sent < limit; i--) {
                 int idx = (daemon_state.ring_head + i) % MAX_RING_ENTRIES;
                 const struct ring_entry *re = &daemon_state.ring[idx];
-                if (re->hdr.priority > max_prio) {
+                if (!entry_matches_filter(re, unit_filter, max_prio)) {
                     continue;
                 }
-                if (unit_filter[0] != 0 && strstr(re->unit, unit_filter) == NULL) {
-                    continue;
-                }
-                char esc_msg[1200];
-                escape_query_field(esc_msg, sizeof(esc_msg), re->message);
-                char line[1500];
-                int len = snprintf(line, sizeof(line),
-                                   "ENTRY|%lu|%lu|%lu|%u|%u|%u|%d|%u|%u|%s|%s|%s|%s\n",
-                                   (unsigned long)re->hdr.seq_num,
-                                   (unsigned long)re->hdr.realtime_usec,
-                                   (unsigned long)re->hdr.monotonic_usec,
-                                   re->hdr.priority,
-                                   re->hdr.facility,
-                                   re->hdr.transport,
-                                   re->hdr.pid,
-                                   re->hdr.uid,
-                                   re->hdr.gid,
-                                   re->unit,
-                                   re->comm,
-                                   re->ident,
-                                   esc_msg);
-                write(cfd, line, len);
+                write_query_entry(cfd, re);
                 sent++;
             }
         } else {
             for (int i = 0; i < daemon_state.ring_count && sent < limit; i++) {
                 int idx = (daemon_state.ring_head + i) % MAX_RING_ENTRIES;
                 const struct ring_entry *re = &daemon_state.ring[idx];
-                if (re->hdr.priority > max_prio) {
+                if (!entry_matches_filter(re, unit_filter, max_prio)) {
                     continue;
                 }
-                if (unit_filter[0] != 0 && strstr(re->unit, unit_filter) == NULL) {
-                    continue;
-                }
-                char esc_msg[1200];
-                escape_query_field(esc_msg, sizeof(esc_msg), re->message);
-                char line[1500];
-                int len = snprintf(line, sizeof(line),
-                                   "ENTRY|%lu|%lu|%lu|%u|%u|%u|%d|%u|%u|%s|%s|%s|%s\n",
-                                   (unsigned long)re->hdr.seq_num,
-                                   (unsigned long)re->hdr.realtime_usec,
-                                   (unsigned long)re->hdr.monotonic_usec,
-                                   re->hdr.priority,
-                                   re->hdr.facility,
-                                   re->hdr.transport,
-                                   re->hdr.pid,
-                                   re->hdr.uid,
-                                   re->hdr.gid,
-                                   re->unit,
-                                   re->comm,
-                                   re->ident,
-                                   esc_msg);
-                write(cfd, line, len);
+                write_query_entry(cfd, re);
                 sent++;
             }
         }

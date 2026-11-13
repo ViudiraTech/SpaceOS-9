@@ -105,6 +105,7 @@ pub struct Atoms {
     pub net_wm_pid: Atom,
     pub wm_class: Atom,
     pub spui_window_cmd: Atom,
+    pub spui_icon: Atom,
 }
 
 pub struct X {
@@ -481,6 +482,20 @@ impl X {
         Ok(())
     }
 
+    /// Attach an icon identifier (`_SPUI_ICON`) so the panel always displays the exact app icon.
+    pub fn set_icon_name(&self, window: Window, name: &str) -> Result<()> {
+        self.conn.change_property(
+            PropMode::REPLACE,
+            window,
+            self.atoms.spui_icon,
+            self.atoms.utf8,
+            8,
+            name.len() as u32,
+            name.as_bytes(),
+        )?;
+        Ok(())
+    }
+
     pub fn set_class(&self, window: Window, instance: &str, class: &str) -> Result<()> {
         let mut data = Vec::new();
         data.extend_from_slice(instance.as_bytes());
@@ -667,20 +682,37 @@ impl X {
         None
     }
 
+    fn get_string_property(
+        &self,
+        window: Window,
+        property: Atom,
+        kind: Atom,
+    ) -> Result<Option<String>> {
+        let reply = self
+            .conn
+            .get_property(false, window, property, kind, 0, 1024)?
+            .reply()?;
+        if !reply.value.is_empty() {
+            return Ok(Some(String::from_utf8_lossy(&reply.value).into_owned()));
+        }
+        Ok(None)
+    }
+
     pub fn get_title(&self, window: Window) -> Result<String> {
         for (property, kind) in [
             (self.atoms.net_wm_name, self.atoms.utf8),
             (AtomEnum::WM_NAME.into(), AtomEnum::STRING.into()),
         ] {
-            let reply = self
-                .conn
-                .get_property(false, window, property, kind, 0, 1024)?
-                .reply()?;
-            if !reply.value.is_empty() {
-                return Ok(String::from_utf8_lossy(&reply.value).into_owned());
+            if let Some(title) = self.get_string_property(window, property, kind)? {
+                return Ok(title);
             }
         }
         Ok(String::new())
+    }
+
+    /// Read the window's `_SPUI_ICON` identifier if set.
+    pub fn get_icon_name(&self, window: Window) -> Result<Option<String>> {
+        self.get_string_property(window, self.atoms.spui_icon, self.atoms.utf8)
     }
 
     pub fn put_canvas(&self, window: Window, canvas: &Canvas, area: Rect) -> Result<()> {
@@ -899,6 +931,7 @@ impl Atoms {
             net_wm_pid: get("_NET_WM_PID")?,
             wm_class: get("WM_CLASS")?,
             spui_window_cmd: get("_SPUI_WINDOW_CMD")?,
+            spui_icon: get("_SPUI_ICON")?,
         })
     }
 }

@@ -232,3 +232,15 @@ Makefile 将其映射为 Cargo feature `sound` / `sound-dummy`。禁用 `CONFIG_
 3. `MMAP_COMPLEX`、`AUDIO_TSTAMP` 的 LINK_* 类型目前回退为 DEFAULT 报告；驱动可通过后续 `get_time_info` 扩展精确链路时间。
 4. 多 substream 已支持；同一 substream 的重复 open 仍返回 `EAGAIN`（Linux 也只在有空闲 substream 时成功）。
 5. 后续驱动阶段：QEMU HDA（intel-hda）、AC'97、virtio-sound、USB Audio；每个驱动只需实现 `snd_pcm_ops`/`snd_rawmidi_ops`/`snd_hwdep_ops`，核心与自测无需改动。
+
+
+## 用户态播放器与脚本启动
+
+- `/bin/mp3play` 使用 vendored minimp3（CC0，`user/third_party/minimp3`）解码
+  MP3，通过本内核的 ALSA PCM ioctl 播放；默认曲目为
+  `/usr/share/music/spaceos-theme.mp3`。
+- SPUI 的「音乐播放器」窗口启动该播放器并显示播放状态。
+- 内核支持 `#!` 解释器：`execve` 与 `init=` 都按 Linux 语义展开
+  `[interpreter, optional-arg, script, argv[1..]]`，最多递归 4 层。
+- QEMU 桌面默认启用 `intel-hda`/`hda-duplex`，并同时提供 `sb16` 设备；
+  `AUDIO_BACKEND` 可选 `pa`、`alsa`、`none` 等。

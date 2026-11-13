@@ -175,6 +175,7 @@ impl App {
             | EventMask::LEAVE_WINDOW;
         x.create_window(win, x.root, 0, 0, width, height, false, mask, theme.window)?;
         x.set_title(win, title)?;
+        x.set_icon_name(win, icon.prop_name())?;
         x.set_class(win, "spui", "Spui")?;
         x.set_wm_type(win, x.atoms.net_wm_type_normal)?;
         x.set_pid(win, std::process::id())?;

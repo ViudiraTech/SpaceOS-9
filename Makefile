@@ -214,6 +214,9 @@ iso: kernel limine $(if $(filter 1,$(WITH_ROOTFS)),rootfs-image)
 	@printf 'ISO ready: %s\n' '$(ISO)'
 
 DESKTOP_CMDLINE ?= console=tty0 console=ttyS0 root=/dev/nvme0n1 init=/sbin/systemg
+AUDIO_BACKEND ?= alsa
+AUDIO_CARD ?= 1
+AUDIO_CONFIG := $(OUT)/qemu-asound.conf
 DESKTOP_IMAGE := build/rootfs/ext4.img
 
 desktop-iso:
@@ -228,8 +231,12 @@ desktop-rootfs: desktop-spui modules
 
 desktop: desktop-iso desktop-rootfs
 
-desktop-run: desktop
-	qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -m 4096 -smp $(CPUS) -serial stdio -monitor none -no-reboot -vga none -display gtk,zoom-to-fit=off -device virtio-gpu-pci,xres=1280,yres=800 -device virtio-tablet-pci -device virtio-keyboard-pci -nic $(or $(QEMU_NIC),user,model=e1000e) -drive file=$(DESKTOP_IMAGE),if=none,id=root,format=raw -device nvme,serial=SPROOT,drive=root -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
+$(AUDIO_CONFIG):
+	@mkdir -p $(dir $@)
+	@printf 'pcm.!default {\n    type hw\n    card $(AUDIO_CARD)\n    device 0\n}\nctl.!default {\n    type hw\n    card $(AUDIO_CARD)\n}\n' > $@
+
+desktop-run: desktop $(AUDIO_CONFIG)
+	ALSA_CONFIG_PATH=$(AUDIO_CONFIG) qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -m 4096 -smp $(CPUS) -serial stdio -monitor none -no-reboot -vga none -display gtk,zoom-to-fit=off -device virtio-gpu-pci,xres=1280,yres=800 -device virtio-tablet-pci -device virtio-keyboard-pci -nic $(or $(QEMU_NIC),user,model=e1000e) -drive file=$(DESKTOP_IMAGE),if=none,id=root,format=raw -device nvme,serial=SPROOT,drive=root -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -audiodev $(AUDIO_BACKEND),id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 -device sb16,audiodev=snd0 -cdrom $(ISO)
 
 # Reproducible release candidate requested by the release checklist.  The ISO
 # boots the release kernel; the matching desktop rootfs is build/rootfs/ext4.img.
