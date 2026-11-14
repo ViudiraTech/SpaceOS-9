@@ -277,6 +277,14 @@ impl App {
         }
     }
 
+    /// Apply `(channel, property, value)` in-process only; pair with a later
+    /// `set_config_property` to persist (used for slider-drag previews).
+    pub fn stage_config_property(&mut self, channel: &str, property: &str, value: Value) {
+        if self.config.apply_property(channel, property, &value) {
+            self.sync_config_visuals();
+        }
+    }
+
     /// Reset an entire `channel` back to its schema defaults in `uxconfd`.
     pub fn reset_config_channel(&mut self, channel: &str) {
         if self.uxconf.is_none() {

@@ -359,9 +359,9 @@ impl InputDevice {
     fn deliver(&self, kind: u16, code: u16, value: i32) {
         let (monotonic, realtime, grabbed) = {
             let mut live = self.live.lock();
-            let (monotonic, realtime) = live.frame_time.unwrap_or_else(|| {
-                (crate::time::uptime_micros(), crate::time::realtime_micros())
-            });
+            let (monotonic, realtime) = live
+                .frame_time
+                .unwrap_or_else(|| (crate::time::uptime_micros(), crate::time::realtime_micros()));
             live.frame_time = if kind == EV_SYN && code == SYN_REPORT {
                 None
             } else {

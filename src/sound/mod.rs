@@ -35,6 +35,7 @@ pub mod control;
 #[cfg(feature = "sound-dummy")]
 pub mod dummy;
 pub mod hwdep;
+pub mod mixer;
 pub mod module_api;
 pub mod pcm;
 pub mod procfs;
@@ -83,7 +84,19 @@ pub fn set_string(destination: &mut [u8], text: &str) {
     destination[..length].copy_from_slice(&text.as_bytes()[..length]);
 }
 
+/// ISA DMA ring buffers preallocated for legacy cards (one playback and one
+/// capture stream, as Linux `sb16` preallocates per substream at probe).
+#[cfg(target_arch = "x86_64")]
+const ISA_DMA_PREALLOC_BLOCKS: usize = 2;
+
 pub fn init() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let held = crate::mm::dma::reserve_isa_blocks(ISA_DMA_PREALLOC_BLOCKS);
+        if held < ISA_DMA_PREALLOC_BLOCKS {
+            crate::kwarn!("sound: only {held} ISA DMA buffer(s) reserved below 16 MiB");
+        }
+    }
     timer::init();
     #[cfg(feature = "sound-dummy")]
     dummy::init();

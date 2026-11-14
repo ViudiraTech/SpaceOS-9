@@ -222,8 +222,13 @@ static int write_pcm(int fd, const short *samples, unsigned int frames,
         transfer.result = 0;
         result = ioctl(fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &transfer);
         if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             if (errno == EPIPE) {
-                (void)ioctl(fd, SNDRV_PCM_IOCTL_PREPARE, 0);
+                if (ioctl(fd, SNDRV_PCM_IOCTL_PREPARE, 0) < 0) {
+                    return -1;
+                }
                 continue;
             }
             return -1;
@@ -371,8 +376,8 @@ int main(int argc, char **argv)
     }
 
     frames = pcm_bytes / (channels * 2u);
-    /* Align to period boundary + add ~24 ms silent tail so short SFX never clip. */
-    pad_frames = (sample_rate / 40u);
+    /* Align to period boundary + add ~83 ms silent tail so short SFX drain cleanly through the mixer. */
+    pad_frames = (sample_rate / 12u);
     total_frames = ((frames + pad_frames + period_frames - 1u) / period_frames) * period_frames;
     samples = (short *)malloc((unsigned long)total_frames * channels * sizeof(short));
     if (samples == 0) {

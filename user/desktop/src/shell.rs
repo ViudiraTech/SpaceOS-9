@@ -217,6 +217,7 @@ pub struct Shell {
     vol_canvas: Canvas,
     vol_open: bool,
     vol_dragging: bool,
+    vol_persist_pending: bool,
     toast_window: Window,
     toast_canvas: Canvas,
     toast: Option<Toast>,
@@ -684,6 +685,7 @@ impl Shell {
             vol_canvas,
             vol_open: false,
             vol_dragging: false,
+            vol_persist_pending: false,
             toast_window,
             toast_canvas,
             toast: None,
@@ -1595,6 +1597,7 @@ impl Shell {
             Event::ButtonRelease(e) => {
                 if e.detail == 1 && self.vol_dragging {
                     self.vol_dragging = false;
+                    self.commit_staged_volume();
                     crate::sound::play(&self.config, crate::sound::SystemSound::Volume);
                     if self.vol_open {
                         self.draw_vol_popup();
@@ -2134,15 +2137,45 @@ impl Shell {
         }
     }
 
+    /// Persist a volume staged during a slider drag (one fsync per gesture).
+    fn commit_staged_volume(&mut self) {
+        if !self.vol_persist_pending {
+            return;
+        }
+        self.vol_persist_pending = false;
+        let vol = self.config.sound_master_volume;
+        let muted = self.config.sound_muted;
+        self.set_sound_prop("/master-volume", uxconf::Value::Int(i64::from(vol)));
+        self.set_sound_prop("/muted", uxconf::Value::Bool(muted));
+    }
+
     fn set_master_volume(&mut self, vol: i32, play_sfx: bool) -> Result<()> {
         let clamped = vol.clamp(0, 100);
         let prev_vol = self.config.sound_master_volume;
         let prev_muted = self.config.sound_muted;
+        // While dragging, only stage locally: the uxconfd round trip writes and
+        // fsyncs the channel file and wakes every client, once per motion event.
+        let staged = self.vol_dragging;
         if clamped != prev_vol {
-            self.set_sound_prop("/master-volume", uxconf::Value::Int(i64::from(clamped)));
+            let value = uxconf::Value::Int(i64::from(clamped));
+            if staged {
+                let _ = self
+                    .config
+                    .apply_property("sound", "/master-volume", &value);
+                self.vol_persist_pending = true;
+            } else {
+                self.set_sound_prop("/master-volume", value);
+            }
         }
         if self.config.sound_muted && clamped > 0 {
-            self.set_sound_prop("/muted", uxconf::Value::Bool(false));
+            if staged {
+                let _ = self
+                    .config
+                    .apply_property("sound", "/muted", &uxconf::Value::Bool(false));
+                self.vol_persist_pending = true;
+            } else {
+                self.set_sound_prop("/muted", uxconf::Value::Bool(false));
+            }
         }
         crate::sound::apply_mixer_volume(clamped, self.config.sound_muted && clamped == 0);
         if play_sfx {
@@ -2220,6 +2253,7 @@ impl Shell {
         if self.vol_open {
             self.vol_open = false;
             self.vol_dragging = false;
+            self.commit_staged_volume();
             if matches!(
                 self.hover,
                 Hit::VolMute | Hit::VolSlider | Hit::VolSfx | Hit::VolSettings

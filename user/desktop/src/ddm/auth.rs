@@ -163,7 +163,7 @@ pub fn lookup_shadow(name: &str) -> Option<ShadowRecord> {
     if name.len() > 32 || name.as_bytes().contains(&0) {
         return None;
     }
-    let name = CString::new(name).ok()?;
+    let name_c = CString::new(name).ok()?;
     let mut storage: Vec<u8> = vec![0; SHADOW_BUFFER];
     loop {
         let mut record = Spwd {
@@ -180,7 +180,7 @@ pub fn lookup_shadow(name: &str) -> Option<ShadowRecord> {
         let mut result: *mut Spwd = std::ptr::null_mut();
         let rc = unsafe {
             getspnam_r(
-                name.as_ptr(),
+                name_c.as_ptr(),
                 &mut record,
                 storage.as_mut_ptr() as *mut c_char,
                 storage.len(),
@@ -192,7 +192,9 @@ pub fn lookup_shadow(name: &str) -> Option<ShadowRecord> {
             continue;
         }
         if rc != 0 || result.is_null() {
-            return None;
+            // Fall back to direct /etc/shadow parsing so existing accounts written
+            // with `-1` aging fields (rejected by musl's __parsespent) still work.
+            return lookup_shadow_fallback(name);
         }
         return Some(ShadowRecord {
             hash: unsafe { cstr(record.sp_pwdp) },
@@ -205,6 +207,47 @@ pub fn lookup_shadow(name: &str) -> Option<ShadowRecord> {
             flag: record.sp_flag as u64,
         });
     }
+}
+
+fn parse_shadow_i64(field: &str) -> Option<i64> {
+    let trimmed = field.trim();
+    if trimmed.is_empty() {
+        Some(-1)
+    } else {
+        trimmed.parse::<i64>().ok()
+    }
+}
+
+fn parse_shadow_line(line: &str, username: &str) -> Option<ShadowRecord> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let fields: Vec<&str> = line.split(':').collect();
+    if fields.len() < 8 || fields[0] != username {
+        return None;
+    }
+    let flag_str = fields.get(8).copied().unwrap_or("").trim();
+    let flag = if flag_str.is_empty() {
+        u64::MAX
+    } else {
+        flag_str.parse::<u64>().ok()?
+    };
+    Some(ShadowRecord {
+        hash: fields[1].to_string(),
+        last_change: parse_shadow_i64(fields[2])?,
+        minimum: parse_shadow_i64(fields[3])?,
+        maximum: parse_shadow_i64(fields[4])?,
+        warning: parse_shadow_i64(fields[5])?,
+        inactive: parse_shadow_i64(fields[6])?,
+        expire: parse_shadow_i64(fields[7])?,
+        flag,
+    })
+}
+
+fn lookup_shadow_fallback(name: &str) -> Option<ShadowRecord> {
+    let text = std::fs::read_to_string("/etc/shadow").ok()?;
+    text.lines().find_map(|line| parse_shadow_line(line, name))
 }
 
 /// All human accounts that may appear in the greeter.  System accounts,
@@ -611,5 +654,22 @@ mod tests {
         assert!(is_sequential("123456789"));
         assert!(is_sequential("abcdefgh"));
         assert!(!is_sequential("1a2b3c4d"));
+    }
+
+    #[test]
+    fn shadow_fallback_parses_standard_and_legacy_minus_one_fields() {
+        let standard = "spaceos:$6$salt$hash:20771:0:99999:7:::";
+        let legacy = "spaceos:$6$salt$hash:20771:0:99999:7:-1:-1::";
+        for line in [standard, legacy] {
+            let parsed = parse_shadow_line(line, "spaceos").expect("shadow line");
+            assert_eq!(parsed.hash, "$6$salt$hash");
+            assert_eq!(parsed.last_change, 20771);
+            assert_eq!(parsed.minimum, 0);
+            assert_eq!(parsed.maximum, 99999);
+            assert_eq!(parsed.warning, 7);
+            assert_eq!(parsed.inactive, -1);
+            assert_eq!(parsed.expire, -1);
+        }
+        assert!(parse_shadow_line(standard, "other").is_none());
     }
 }

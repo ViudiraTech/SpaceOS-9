@@ -20,6 +20,8 @@
 //! translation, not the cache policy, is the one place drivers depend on.
 
 use super::{pmm, vmm};
+use crate::sync::SpinLock;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const PAGE_SIZE: usize = 4096;
@@ -37,6 +39,8 @@ pub struct Coherent {
     /// Page count obtained from the PMM, including alignment padding.
     pages: usize,
     size: usize,
+    /// Block borrowed from the ISA DMA reserve; returned there on drop.
+    isa_reserved: bool,
 }
 
 impl Coherent {
@@ -69,8 +73,77 @@ impl Coherent {
 impl Drop for Coherent {
     fn drop(&mut self) {
         COHERENT_BYTES.fetch_sub((self.pages * PAGE_SIZE) as u64, Ordering::AcqRel);
+        if self.isa_reserved {
+            ISA_RESERVE.lock().push(self.physical_base);
+            return;
+        }
         let _ = pmm::free(self.physical_base, self.pages);
     }
+}
+
+/// Size and alignment of one ISA DMA reserve block: the 8237 can address
+/// 16 MiB and a transfer must not cross a 64 KiB (8-bit) / 128 KiB (16-bit)
+/// page, so a 64 KiB-aligned 64 KiB block is valid for every ISA channel.
+const ISA_BLOCK: usize = 64 * 1024;
+const ISA_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Physical bases of free 64 KiB ISA blocks reserved early at boot, the
+/// equivalent of Linux ISA drivers preallocating their DMA buffers at probe
+/// (`snd_pcm_set_managed_buffer_all(..., 64 KiB, 64 KiB)`): by the time a
+/// stream is configured, memory below 16 MiB is too fragmented to find 64 KiB
+/// of aligned contiguous frames reliably.
+static ISA_RESERVE: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+
+/// Reserve up to `blocks` ISA-DMA-capable 64 KiB blocks. Call early, before
+/// low memory fragments. Returns how many blocks are now held in reserve.
+pub fn reserve_isa_blocks(blocks: usize) -> usize {
+    let block_pages = ISA_BLOCK / PAGE_SIZE;
+    let mut reserved = ISA_RESERVE.lock().len();
+    while reserved < blocks {
+        // Over-allocate by one block minus a page, then give back the
+        // unaligned head and tail so exactly one aligned block stays held.
+        let span_pages = block_pages * 2 - 1;
+        let Some(base) = pmm::alloc_below(span_pages, ISA_LIMIT) else {
+            break;
+        };
+        let aligned = (base + ISA_BLOCK as u64 - 1) & !(ISA_BLOCK as u64 - 1);
+        let head_pages = ((aligned - base) / PAGE_SIZE as u64) as usize;
+        let tail_pages = span_pages - head_pages - block_pages;
+        if head_pages > 0 {
+            let _ = pmm::free(base, head_pages);
+        }
+        if tail_pages > 0 {
+            let _ = pmm::free(aligned + ISA_BLOCK as u64, tail_pages);
+        }
+        ISA_RESERVE.lock().push(aligned);
+        reserved += 1;
+    }
+    reserved
+}
+
+fn take_isa_block(size: usize, max_end: u64) -> Option<Coherent> {
+    let physical_base = {
+        let mut reserve = ISA_RESERVE.lock();
+        let index = reserve
+            .iter()
+            .position(|&base| base + ISA_BLOCK as u64 <= max_end)?;
+        reserve.swap_remove(index)
+    };
+    let virtual_base = pmm::phys_to_virt(physical_base);
+    // SAFETY: the reserve exclusively owns this 64 KiB block of frames.
+    unsafe {
+        core::ptr::write_bytes(virtual_base as *mut u8, 0, ISA_BLOCK);
+    }
+    let pages = ISA_BLOCK / PAGE_SIZE;
+    COHERENT_BYTES.fetch_add((pages * PAGE_SIZE) as u64, Ordering::AcqRel);
+    Some(Coherent {
+        physical_base,
+        virtual_base,
+        device_address: physical_base,
+        pages,
+        size,
+        isa_reserved: true,
+    })
 }
 
 static COHERENT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -109,6 +182,7 @@ pub fn alloc_coherent(size: usize, align: usize) -> Option<Coherent> {
         device_address: aligned,
         pages,
         size,
+        isa_reserved: false,
     })
 }
 
@@ -116,6 +190,12 @@ pub fn alloc_coherent(size: usize, align: usize) -> Option<Coherent> {
 /// `max_end`.  Alignment padding is included in the range check.
 pub fn alloc_coherent_below(size: usize, align: usize, max_end: u64) -> Option<Coherent> {
     let align = align.max(PAGE_SIZE).next_power_of_two();
+    // ISA-class requests are served from the boot-time reserve first.
+    if max_end <= ISA_LIMIT && size <= ISA_BLOCK && align <= ISA_BLOCK {
+        if let Some(block) = take_isa_block(size, max_end) {
+            return Some(block);
+        }
+    }
     let pages = pages_for(size, align)?;
     if pages as u64 * PAGE_SIZE as u64 > max_end {
         return None;
@@ -134,6 +214,7 @@ pub fn alloc_coherent_below(size: usize, align: usize, max_end: u64) -> Option<C
         device_address: aligned,
         pages,
         size,
+        isa_reserved: false,
     })
 }
 

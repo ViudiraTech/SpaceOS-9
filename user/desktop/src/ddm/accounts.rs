@@ -69,8 +69,10 @@ pub fn create_user(
         "{}:x:{}:{}:{}:{}:{}\n",
         spec.username, uid, gid, full_name, home, shell
     );
+    // musl's getspnam_r (__parsespent) accepts digits or empty fields for optional
+    // numeric columns; writing literal `-1` makes musl reject the whole line.
     let shadow_line = format!(
-        "{}:{}:{}:0:99999:7:-1:-1::\n",
+        "{}:{}:{}:0:99999:7:::\n",
         spec.username,
         hash,
         days_since_epoch().max(1)

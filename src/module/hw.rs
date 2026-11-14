@@ -29,7 +29,7 @@ use alloc::{
 use core::{
     ffi::{c_char, c_int, c_long, c_void},
     ptr,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 // ---- DMA --------------------------------------------------------------------
@@ -269,6 +269,97 @@ pub unsafe extern "C" fn spk_spin_unlock_irqrestore(lock: *mut CSpinLock, flags:
 
 // ---- Timers and kernel threads -------------------------------------------------
 
+const WORK_RING_CAPACITY: usize = 256;
+
+#[derive(Clone, Copy)]
+struct WorkItem {
+    callback: extern "C" fn(*mut c_void),
+    data: usize,
+}
+
+struct WorkRing {
+    slots: [Option<WorkItem>; WORK_RING_CAPACITY],
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl WorkRing {
+    const fn new() -> Self {
+        Self {
+            slots: [None; WORK_RING_CAPACITY],
+            head: 0,
+            tail: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, item: WorkItem) -> bool {
+        if self.len >= WORK_RING_CAPACITY {
+            return false;
+        }
+        self.slots[self.tail] = Some(item);
+        self.tail = (self.tail + 1) % WORK_RING_CAPACITY;
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<WorkItem> {
+        if self.len == 0 {
+            return None;
+        }
+        let item = self.slots[self.head].take();
+        self.head = (self.head + 1) % WORK_RING_CAPACITY;
+        self.len -= 1;
+        item
+    }
+}
+
+static WORK_RING: SpinLock<WorkRing> = SpinLock::new(WorkRing::new());
+static WORK_WAIT: SpinLock<Option<crate::sched::WaitQueue>> = SpinLock::new(None);
+static WORK_SEQ: AtomicU64 = AtomicU64::new(0);
+static WORK_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Start the dedicated lock-free IRQ workqueue kthread so hardware interrupts
+/// (such as HDA/SB16 period notifications) execute promptly without contending
+/// with network timers or heap-allocating inside hard IRQ context.
+pub fn start_workqueue() {
+    if WORK_STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let queue = crate::sched::WaitQueue::new();
+    {
+        let mut wait = WORK_WAIT.lock();
+        if wait.is_some() {
+            return;
+        }
+        *wait = Some(queue.clone());
+    }
+    WORK_STARTED.store(true, Ordering::Release);
+    if WORK_RING.lock().len != 0 {
+        WORK_SEQ.fetch_add(1, Ordering::AcqRel);
+    }
+    let result = crate::sched::spawn(
+        move || {
+            loop {
+                while let Some(item) = WORK_RING.lock().pop() {
+                    (item.callback)(item.data as *mut c_void);
+                }
+                let seen = WORK_SEQ.load(Ordering::Acquire);
+                if WORK_RING.lock().len != 0 {
+                    continue;
+                }
+                queue.wait_until(|| WORK_SEQ.load(Ordering::Acquire) != seen);
+            }
+        },
+        -10,
+    );
+    if result.is_err() {
+        WORK_STARTED.store(false, Ordering::Release);
+        crate::kwarn!("module: workqueue thread could not start");
+    }
+}
+
 /// # Safety
 /// `callback` must remain valid for the lifetime of the kernel and accept
 /// `data` per the module's own contract.
@@ -294,6 +385,21 @@ pub unsafe extern "C" fn spk_work_schedule(
     callback: extern "C" fn(*mut c_void),
     data: *mut c_void,
 ) -> c_int {
+    if WORK_STARTED.load(Ordering::Acquire) {
+        let queued = WORK_RING.lock().push(WorkItem {
+            callback,
+            data: data as usize,
+        });
+        if queued {
+            WORK_SEQ.fetch_add(1, Ordering::AcqRel);
+            let wait = WORK_WAIT.lock().clone();
+            if let Some(queue) = wait {
+                queue.wake_one();
+            }
+            return 0;
+        }
+    }
+    // Fallback before scheduler start or if the static ring is momentarily full.
     // SAFETY: forwarding the caller's contract.
     let id = unsafe { spk_timer_add(0, callback, data) };
     if id != 0 { 0 } else { -(abi::EAGAIN as c_int) }

@@ -1188,7 +1188,13 @@ impl UserAddressSpace {
     fn raw_map_entries(&self) -> Vec<(u64, u64, u32, bool, Option<Arc<dyn Inode>>)> {
         let mut result: Vec<(u64, u64, u32, bool, Option<Arc<dyn Inode>>)> = Vec::new();
         for (&start, region) in &self.lazy {
-            result.push((start, region.end, region.prot, region.shared, region.file.clone()));
+            result.push((
+                start,
+                region.end,
+                region.prot,
+                region.shared,
+                region.file.clone(),
+            ));
         }
         for (&page, m) in &self.mapped_frames {
             if self.lazy_region(page).is_some() {

@@ -378,7 +378,12 @@ impl Card {
                 let minor = MINORS.lock().alloc().ok_or(VfsError::NoSpace)?;
                 self.minors.lock().push(minor);
                 let name = format!("pcmC{}D{}{}", self.number, pcm.device, direction.suffix());
-                let node: Arc<dyn Inode> = pcm::PcmDeviceNode::new(substreams);
+                let node: Arc<dyn Inode> =
+                    if direction == pcm::Direction::Playback && substreams.len() == 1 {
+                        super::mixer::PcmMixerNode::new(substreams[0].clone())
+                    } else {
+                        pcm::PcmDeviceNode::new(substreams)
+                    };
                 let backend = minor_device(minor, node);
                 match device::register(
                     &name,

@@ -10,6 +10,11 @@
 
 use super::{
     eevdf::{RunQueue, SLICE_NS, nice_to_weight},
+    lb_model::{
+        GroupStats, GroupType, MigrationType, find_busiest_and_imbalance, task_fits_imbalance,
+        wake_affine_check,
+    },
+    pelt::{LOAD_AVG_MAX_SCALED, LoadAvg, PELT_PERIOD_US, decay_load},
     rbtree::{Node, RBTree},
 };
 use alloc::{collections::BTreeMap, vec};
@@ -19,6 +24,8 @@ pub fn run() {
     weighted_service();
     placement();
     current_accounting();
+    pelt_model();
+    load_balancer_model();
 }
 
 fn random(seed: &mut u64) -> u64 {
@@ -180,4 +187,132 @@ fn current_accounting() {
 #[test]
 fn algorithms() {
     run();
+}
+
+fn pelt_model() {
+    // 32 periods (32 * 1024 us) equals one half-life.
+    let v = 1_000_000u64;
+    let half = decay_load(v, 32);
+    assert!(
+        half.abs_diff(v / 2) <= 4,
+        "PELT half-life mismatch: got {half}"
+    );
+    let quarter = decay_load(v, 64);
+    assert!(
+        quarter.abs_diff(v / 4) <= 4,
+        "PELT quarter-life mismatch: got {quarter}"
+    );
+
+    // 100% continuous execution converges to util_avg == 1024, load_avg == weight.
+    let mut avg = LoadAvg::new();
+    let mut t = 10_000u64;
+    avg.update(t, 1024, true, true);
+    for _ in 0..400 {
+        t += PELT_PERIOD_US;
+        avg.update(t, 1024, true, true);
+    }
+    assert!(
+        avg.util_avg >= 1020,
+        "util failed to saturate: {}",
+        avg.util_avg
+    );
+    assert!(
+        avg.load_avg >= 1020,
+        "load failed to saturate: {}",
+        avg.load_avg
+    );
+    assert!(avg.util_sum <= LOAD_AVG_MAX_SCALED);
+
+    // 32ms sleep halves utilization while keeping weight scaling bounded.
+    let before = avg.util_avg;
+    avg.update(t + 32 * PELT_PERIOD_US, 1024, false, false);
+    assert!(
+        avg.util_avg.abs_diff(before / 2) <= 8,
+        "sleep decay failed: before={before}, after={}",
+        avg.util_avg
+    );
+}
+
+fn load_balancer_model() {
+    let mut g_idle = GroupStats {
+        group_idx: 0,
+        sum_nr_running: 0,
+        idle_cpus: 2,
+        group_weight: 2,
+        group_capacity: 2048,
+        sum_load_avg: 0,
+        sum_util_avg: 0,
+        max_cpu_nr: 0,
+        ..GroupStats::default()
+    };
+    let mut g_over = GroupStats {
+        group_idx: 1,
+        sum_nr_running: 4,
+        idle_cpus: 0,
+        group_weight: 2,
+        group_capacity: 2048,
+        sum_load_avg: 4096,
+        sum_util_avg: 2048,
+        max_cpu_nr: 2,
+        ..GroupStats::default()
+    };
+    g_idle.classify(false);
+    g_over.classify(false);
+    assert_eq!(g_idle.group_type, GroupType::HasSpare);
+    assert_eq!(g_over.group_type, GroupType::Overloaded);
+
+    let plan =
+        find_busiest_and_imbalance(&[g_idle, g_over], 0, true, 125).expect("expected imbalance");
+    assert_eq!(plan.busiest_group, 1);
+    assert_eq!(plan.mig_type, MigrationType::MigrateLoad);
+    assert_eq!(plan.amount, 2048);
+
+    // Near-balanced groups within 17% tolerance must not ping-pong.
+    let mut g_a = GroupStats {
+        group_idx: 0,
+        sum_nr_running: 2,
+        idle_cpus: 0,
+        group_weight: 2,
+        group_capacity: 2048,
+        sum_load_avg: 2048,
+        sum_util_avg: 1900,
+        max_cpu_nr: 1,
+        ..GroupStats::default()
+    };
+    let mut g_b = GroupStats {
+        group_idx: 1,
+        sum_nr_running: 2,
+        idle_cpus: 0,
+        group_weight: 2,
+        group_capacity: 2048,
+        sum_load_avg: 2200,
+        sum_util_avg: 1900,
+        max_cpu_nr: 1,
+        ..GroupStats::default()
+    };
+    g_a.classify(false);
+    g_b.classify(false);
+    assert_eq!(find_busiest_and_imbalance(&[g_a, g_b], 0, false, 117), None);
+
+    // Oscillation guard rejects heavy task until failed count relaxes divisor.
+    assert!(!task_fits_imbalance(
+        MigrationType::MigrateLoad,
+        1500,
+        4096,
+        512,
+        false,
+        0
+    ));
+    assert!(task_fits_imbalance(
+        MigrationType::MigrateLoad,
+        1500,
+        4096,
+        512,
+        false,
+        2
+    ));
+
+    // Wake-affine prefers idle waker CPU, refuses overloaded waker CPU.
+    assert!(wake_affine_check(0, 0, 1, 900, 300, false));
+    assert!(!wake_affine_check(2, 950, 1, 400, 300, false));
 }

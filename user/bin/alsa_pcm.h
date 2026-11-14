@@ -122,7 +122,10 @@ struct smp_status {
 #define SNDRV_PCM_IOCTL_STATUS SMP_IOR('A', 0x20, sizeof(struct smp_status))
 #define SNDRV_PCM_IOCTL_PREPARE SMP_IO('A', 0x40)
 #define SNDRV_PCM_IOCTL_START SMP_IO('A', 0x42)
+#define SNDRV_PCM_IOCTL_DROP SMP_IO('A', 0x43)
 #define SNDRV_PCM_IOCTL_DRAIN SMP_IO('A', 0x44)
+#define SNDRV_PCM_IOCTL_PAUSE SMP_IOW('A', 0x45, sizeof(int))
+#define SNDRV_PCM_IOCTL_RESUME SMP_IO('A', 0x47)
 #define SNDRV_PCM_IOCTL_WRITEI_FRAMES SMP_IOW('A', 0x50, sizeof(struct smp_xferi))
 #define SNDRV_PCM_VERSION 0x00020012u
 

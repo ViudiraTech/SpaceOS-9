@@ -99,7 +99,10 @@ pub fn report_fatal_fault(address: u64, ip: u64, sp: u64) {
     };
     let stats = task.stats();
     let comm = task.comm();
-    let length = comm.iter().position(|&byte| byte == 0).unwrap_or(comm.len());
+    let length = comm
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(comm.len());
     crate::kwarn!(
         "fatal fault: comm={} tid={} tgid={} ip={:#x} sp={:#x} address={:#x}",
         core::str::from_utf8(&comm[..length]).unwrap_or("?"),
@@ -131,8 +134,7 @@ pub fn report_fatal_fault(address: u64, ip: u64, sp: u64) {
     }
 }
 
-pub fn current_space() -> Result<alloc::sync::Arc<crate::sync::Mutex<UserAddressSpace>>, VfsError>
-{
+pub fn current_space() -> Result<alloc::sync::Arc<crate::sync::Mutex<UserAddressSpace>>, VfsError> {
     sched::current()
         .and_then(|t| t.lock().address_space())
         .ok_or(VfsError::Fault)

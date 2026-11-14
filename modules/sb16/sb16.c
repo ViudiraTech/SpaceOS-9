@@ -62,6 +62,8 @@ struct sb16_chip {
     volatile unsigned int running;
     volatile unsigned int period_pending;
     volatile unsigned int shutdown;
+    unsigned char master_vol[2];
+    unsigned char master_mute[2];
 };
 
 static struct sb16_chip *g_sb;
@@ -138,13 +140,6 @@ static void mixer_write(struct sb16_chip *chip, unsigned char reg,
     spk_udelay(1);
 }
 
-static unsigned char mixer_read(struct sb16_chip *chip, unsigned char reg)
-{
-    sb_write(chip, 0x04u, reg);
-    spk_udelay(1);
-    return sb_read(chip, 0x05u);
-}
-
 static int dsp_set_rate(struct sb16_chip *chip, int capture, unsigned int rate)
 {
     if (dsp_write(chip, (unsigned char)(capture ? 0x42u : 0x41u)) != 0) {
@@ -212,7 +207,7 @@ static void sb_period_work(void *data)
 {
     struct sb16_chip *chip = (struct sb16_chip *)data;
     unsigned long long position;
-    chip->period_pending = 0;
+    __atomic_store_n(&chip->period_pending, 0u, __ATOMIC_RELEASE);
     if (chip->shutdown || !chip->running || chip->active == 0 ||
         chip->period_frames == 0) {
         return;
@@ -231,10 +226,12 @@ static void sb_irq(int irq, void *data)
     (void)irq;
 
     (void)sb_read(chip, 0x0fu); /* acknowledge the 16-bit IRQ */
-    if (!chip->shutdown && chip->running && chip->active != 0 &&
-        !chip->period_pending) {
-        chip->period_pending = 1;
-        (void)spk_work_schedule(sb_period_work, chip);
+    if (!chip->shutdown && chip->running && chip->active != 0) {
+        if (__atomic_exchange_n(&chip->period_pending, 1u, __ATOMIC_ACQ_REL) == 0u) {
+            if (spk_work_schedule(sb_period_work, chip) != 0) {
+                __atomic_store_n(&chip->period_pending, 0u, __ATOMIC_RELEASE);
+            }
+        }
     }
 }
 
@@ -459,13 +456,21 @@ static int sb_master_info(struct snd_kcontrol *kcontrol,
     return 0;
 }
 
+static void sb_apply_mixer(struct sb16_chip *chip)
+{
+    unsigned int l = chip->master_mute[0] ? 0u : ((unsigned int)chip->master_vol[0] * 15u + 50u) / 100u;
+    unsigned int r = chip->master_mute[1] ? 0u : ((unsigned int)chip->master_vol[1] * 15u + 50u) / 100u;
+    if (l > 15u) l = 15u;
+    if (r > 15u) r = 15u;
+    mixer_write(chip, 0x22u, (unsigned char)((l << 4) | r));
+}
+
 static int sb_master_get(struct snd_kcontrol *kcontrol,
                          struct snd_ctl_elem_value *value)
 {
     struct sb16_chip *chip = (struct sb16_chip *)kcontrol->private_data;
-    unsigned char raw = mixer_read(chip, 0x22u);
-    value->value.integer.value[0] = (raw >> 4) * 100 / 15;
-    value->value.integer.value[1] = (raw & 0x0fu) * 100 / 15;
+    value->value.integer.value[0] = (long)chip->master_vol[0];
+    value->value.integer.value[1] = (long)chip->master_vol[1];
     return 0;
 }
 
@@ -475,14 +480,51 @@ static int sb_master_put(struct snd_kcontrol *kcontrol,
     struct sb16_chip *chip = (struct sb16_chip *)kcontrol->private_data;
     long left = value->value.integer.value[0];
     long right = value->value.integer.value[1];
-    unsigned char encoded;
+    unsigned char changed;
     if (left < 0) left = 0;
     if (left > 100) left = 100;
     if (right < 0) right = 0;
     if (right > 100) right = 100;
-    encoded = (unsigned char)(((left * 15 / 100) << 4) | (right * 15 / 100));
-    mixer_write(chip, 0x22u, encoded);
-    return 1;
+    changed = (chip->master_vol[0] != (unsigned char)left) ||
+              (chip->master_vol[1] != (unsigned char)right);
+    chip->master_vol[0] = (unsigned char)left;
+    chip->master_vol[1] = (unsigned char)right;
+    sb_apply_mixer(chip);
+    return changed ? 1 : 0;
+}
+
+static int sb_switch_info(struct snd_kcontrol *kcontrol,
+                          struct snd_ctl_elem_info *info)
+{
+    (void)kcontrol;
+    info->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+    info->count = 2;
+    info->value.integer.min = 0;
+    info->value.integer.max = 1;
+    info->value.integer.step = 1;
+    return 0;
+}
+
+static int sb_switch_get(struct snd_kcontrol *kcontrol,
+                         struct snd_ctl_elem_value *value)
+{
+    struct sb16_chip *chip = (struct sb16_chip *)kcontrol->private_data;
+    value->value.integer.value[0] = chip->master_mute[0] ? 0L : 1L;
+    value->value.integer.value[1] = chip->master_mute[1] ? 0L : 1L;
+    return 0;
+}
+
+static int sb_switch_put(struct snd_kcontrol *kcontrol,
+                         struct snd_ctl_elem_value *value)
+{
+    struct sb16_chip *chip = (struct sb16_chip *)kcontrol->private_data;
+    unsigned char m0 = value->value.integer.value[0] ? 0u : 1u;
+    unsigned char m1 = value->value.integer.value[1] ? 0u : 1u;
+    unsigned char changed = (chip->master_mute[0] != m0) || (chip->master_mute[1] != m1);
+    chip->master_mute[0] = m0;
+    chip->master_mute[1] = m1;
+    sb_apply_mixer(chip);
+    return changed ? 1 : 0;
 }
 
 static struct snd_kcontrol_new sb_master = {
@@ -493,6 +535,17 @@ static struct snd_kcontrol_new sb_master = {
     .info = sb_master_info,
     .get = sb_master_get,
     .put = sb_master_put,
+    .private_data = 0,
+};
+
+static struct snd_kcontrol_new sb_switch = {
+    .iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+    .name = "Master Playback Switch",
+    .access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+    .count = 2,
+    .info = sb_switch_info,
+    .get = sb_switch_get,
+    .put = sb_switch_put,
     .private_data = 0,
 };
 
@@ -521,6 +574,10 @@ static int sb_init(void)
         spk_kfree(chip);
         return -19;
     }
+    chip->master_vol[0] = 80u;
+    chip->master_vol[1] = 80u;
+    chip->master_mute[0] = 0u;
+    chip->master_mute[1] = 0u;
     mixer_write(chip, 0x22u, 0xccu);
     mixer_write(chip, 0x04u, 0xccu);
     mixer_write(chip, 0x0au, 0x08u);
@@ -549,7 +606,9 @@ static int sb_init(void)
         return -12;
     }
     sb_master.private_data = chip;
-    if (snd_ctl_add(chip->card, snd_ctl_new1(&sb_master, chip)) != 0) {
+    sb_switch.private_data = chip;
+    if (snd_ctl_add(chip->card, snd_ctl_new1(&sb_master, chip)) != 0 ||
+        snd_ctl_add(chip->card, snd_ctl_new1(&sb_switch, chip)) != 0) {
         snd_card_free(chip->card);
         spk_free_isa_irq(SB_IRQ);
         spk_kfree(chip);

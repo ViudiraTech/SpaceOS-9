@@ -147,6 +147,13 @@ impl SettingsHost for ShellConfigHost<'_> {
         }
     }
 
+    fn stage_config_property(&mut self, channel: &str, property: &str, value: Value) {
+        let snapshot = self.config.clone();
+        if self.config.apply_property(channel, property, &value) && self.prev_snapshot.is_none() {
+            self.prev_snapshot = Some(snapshot);
+        }
+    }
+
     fn reset_config_channel(&mut self, channel: &str) {
         if self.ux_client.is_none() {
             *self.ux_client = UxConfClient::connect().ok();

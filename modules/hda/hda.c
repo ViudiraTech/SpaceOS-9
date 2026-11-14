@@ -96,6 +96,8 @@
 #define AC_PINCTL_IN_EN 0x20u
 
 #define AC_AMP_OUT_BOTH 0xb000u
+#define AC_AMP_OUT_LEFT 0xa000u
+#define AC_AMP_OUT_RIGHT 0x9000u
 #define AC_AMP_IN_BOTH 0x7000u
 #define AC_AMP_MUTE 0x0080u
 #define AC_AMP_GAIN_MASK 0x007fu
@@ -132,8 +134,12 @@ struct hda_chip {
     unsigned int running[2];
 
     unsigned char gains[2];
+    unsigned char master_vol[2];
+    unsigned char master_mute[2];
     unsigned char out_gain_max;
     unsigned char out_gain_default;
+    unsigned char out_gain_offset;
+    unsigned char out_gain_qdb;
     unsigned char in_gain_max;
     unsigned char in_gain_default;
     unsigned char pin_out_amp;
@@ -141,7 +147,11 @@ struct hda_chip {
     unsigned char pin_in_amp;
     unsigned char pin_in_gain;
     unsigned char codec_ready;
+    spk_spinlock codec_lock;
+    spk_spinlock reg_lock;
     volatile unsigned int period_pending[2];
+    volatile unsigned int stream_gen[2];
+    volatile unsigned int period_scheduled_gen[2];
     volatile unsigned int shutdown;
 };
 
@@ -181,8 +191,8 @@ static inline void hda_writeb(struct hda_chip *chip, unsigned int offset,
     spk_writeb(value, (volatile void *)((unsigned char *)chip->mmio + offset));
 }
 
-static unsigned int hda_verb(struct hda_chip *chip, unsigned int nid,
-                             unsigned int verb, unsigned int parm)
+static unsigned int hda_verb_unlocked(struct hda_chip *chip, unsigned int nid,
+                                      unsigned int verb, unsigned int parm)
 {
     unsigned int command = ((chip->codec & 0xfu) << 28) | ((nid & 0xffu) << 20) |
                            ((verb & 0xfffu) << 8) | (parm & 0xffffu);
@@ -194,7 +204,7 @@ static unsigned int hda_verb(struct hda_chip *chip, unsigned int nid,
     spk_mb();
     hda_writew(chip, HDA_CORBWP, next_wp);
     chip->corb_wp = next_wp;
-    for (timeout = 0; timeout < 100000u; timeout++) {
+    for (timeout = 0; timeout < 20000u; timeout++) {
         unsigned char current = (unsigned char)(hda_readw(chip, HDA_RIRBWP) & 0xffu);
         if (current != previous) {
             unsigned int response = (unsigned int)chip->rirb[current];
@@ -210,6 +220,16 @@ static unsigned int hda_verb(struct hda_chip *chip, unsigned int nid,
                    nid, verb, parm);
     }
     return 0xffffffffu;
+}
+
+static unsigned int hda_verb(struct hda_chip *chip, unsigned int nid,
+                             unsigned int verb, unsigned int parm)
+{
+    unsigned int response;
+    unsigned long flags = spk_spin_lock_irqsave(&chip->codec_lock);
+    response = hda_verb_unlocked(chip, nid, verb, parm);
+    spk_spin_unlock_irqrestore(&chip->codec_lock, flags);
+    return response;
 }
 
 static void hda_init_rings(struct hda_chip *chip)
@@ -257,24 +277,105 @@ static void hda_init_rings(struct hda_chip *chip)
 
 static void hda_query_amp_caps(struct hda_chip *chip, unsigned int nid,
                                unsigned int param, unsigned char *max_out,
-                               unsigned char *def_out)
+                               unsigned char *def_out,
+                               unsigned char *offset_out,
+                               unsigned char *qdb_out)
 {
     unsigned int amp = hda_verb(chip, nid, AC_VERB_GET_PARAMETERS, param);
     unsigned int steps;
     unsigned int offset;
+    unsigned int qdb;
 
     if (amp == 0xffffffffu || amp == 0u) {
         *max_out = 0x4au;
         *def_out = 0x4au;
+        if (offset_out) {
+            *offset_out = 0x4au;
+        }
+        if (qdb_out) {
+            *qdb_out = 4u;
+        }
         return;
     }
     steps = (amp >> 8) & AC_AMP_GAIN_MASK;
     offset = amp & AC_AMP_GAIN_MASK;
+    qdb = ((amp >> 16) & AC_AMP_GAIN_MASK) + 1u;
     if (offset > steps) {
         offset = steps;
     }
     *max_out = (unsigned char)steps;
     *def_out = (unsigned char)(offset > 0u ? offset : steps);
+    if (offset_out) {
+        *offset_out = (unsigned char)offset;
+    }
+    if (qdb_out) {
+        *qdb_out = (unsigned char)qdb;
+    }
+}
+
+static unsigned int hda_pct_to_step(struct hda_chip *chip, unsigned char pct)
+{
+    /* Piece-wise perceptual dB attenuation curve in 0.25 dB units (0%..100%). */
+    static const unsigned short attn_qdb[21] = {
+        200, 172, 152, 132, 116, 100, 88, 78, 68, 60,
+        52,  44,  38,  32,  26,  20,  16, 12,  8,  4,  0,
+    };
+    unsigned int max_step = chip->out_gain_max ? (unsigned int)chip->out_gain_max : 0x4au;
+    unsigned int ref_step = chip->out_gain_offset ? (unsigned int)chip->out_gain_offset : max_step;
+    unsigned int qdb_step = chip->out_gain_qdb ? (unsigned int)chip->out_gain_qdb : 4u;
+    unsigned int idx;
+    unsigned int rem;
+    unsigned int attn;
+    unsigned int delta_steps;
+
+    if (pct == 0u) {
+        return AC_AMP_MUTE;
+    }
+    if (pct >= 100u) {
+        return ref_step;
+    }
+    if (ref_step == 0u) {
+        unsigned int linear = ((unsigned int)pct * max_step + 50u) / 100u;
+        return linear == 0u ? AC_AMP_MUTE : linear;
+    }
+    idx = (unsigned int)pct / 5u;
+    rem = (unsigned int)pct % 5u;
+    attn = ((unsigned int)attn_qdb[idx] * (5u - rem) +
+            (unsigned int)attn_qdb[idx + 1u] * rem) / 5u;
+    delta_steps = (attn + qdb_step / 2u) / qdb_step;
+    if (delta_steps >= ref_step) {
+        return 1u;
+    }
+    return ref_step - delta_steps;
+}
+
+static void hda_apply_master_amp(struct hda_chip *chip)
+{
+    unsigned int gain_l =
+        (chip->master_mute[0] || chip->master_vol[0] == 0u)
+            ? AC_AMP_MUTE
+            : hda_pct_to_step(chip, chip->master_vol[0]);
+    unsigned int gain_r =
+        (chip->master_mute[1] || chip->master_vol[1] == 0u)
+            ? AC_AMP_MUTE
+            : hda_pct_to_step(chip, chip->master_vol[1]);
+    chip->gains[0] = (unsigned char)((gain_l & AC_AMP_MUTE) ? 0u : (gain_l & AC_AMP_GAIN_MASK));
+    if (gain_l == gain_r) {
+        hda_verb(chip, chip->dac, AC_VERB_SET_AMP_GAIN_MUTE,
+                 AC_AMP_OUT_BOTH | gain_l);
+    } else {
+        hda_verb(chip, chip->dac, AC_VERB_SET_AMP_GAIN_MUTE,
+                 AC_AMP_OUT_LEFT | gain_l);
+        hda_verb(chip, chip->dac, AC_VERB_SET_AMP_GAIN_MUTE,
+                 AC_AMP_OUT_RIGHT | gain_r);
+    }
+    if (chip->pin_out_amp) {
+        unsigned int pin_mute = (chip->master_mute[0] && chip->master_mute[1])
+                                    ? AC_AMP_MUTE
+                                    : (unsigned int)chip->pin_out_gain;
+        hda_verb(chip, chip->pin_out, AC_VERB_SET_AMP_GAIN_MUTE,
+                 AC_AMP_OUT_BOTH | pin_mute);
+    }
 }
 
 static int hda_discover_codec(struct hda_chip *chip)
@@ -355,23 +456,28 @@ static int hda_discover_codec(struct hda_chip *chip)
     (void)dac_cap;
     (void)adc_cap;
     hda_query_amp_caps(chip, chip->dac, AC_PAR_AMP_OUT_CAP,
-                       &chip->out_gain_max, &chip->out_gain_default);
+                       &chip->out_gain_max, &chip->out_gain_default,
+                       &chip->out_gain_offset, &chip->out_gain_qdb);
     hda_query_amp_caps(chip, chip->adc, AC_PAR_AMP_IN_CAP,
-                       &chip->in_gain_max, &chip->in_gain_default);
+                       &chip->in_gain_max, &chip->in_gain_default, 0, 0);
     chip->pin_out_amp = (pin_out_cap & AC_WCAP_OUT_AMP) ? 1u : 0u;
     if (chip->pin_out_amp) {
         unsigned char dummy_max = 0;
         hda_query_amp_caps(chip, chip->pin_out, AC_PAR_AMP_OUT_CAP,
-                           &dummy_max, &chip->pin_out_gain);
+                           &dummy_max, &chip->pin_out_gain, 0, 0);
     }
     chip->pin_in_amp = (pin_in_cap & AC_WCAP_IN_AMP) ? 1u : 0u;
     if (chip->pin_in_amp) {
         unsigned char dummy_max = 0;
         hda_query_amp_caps(chip, chip->pin_in, AC_PAR_AMP_IN_CAP,
-                           &dummy_max, &chip->pin_in_gain);
+                           &dummy_max, &chip->pin_in_gain, 0, 0);
     }
     chip->gains[0] = chip->out_gain_default;
     chip->gains[1] = chip->in_gain_default;
+    chip->master_vol[0] = 100u;
+    chip->master_vol[1] = 100u;
+    chip->master_mute[0] = 0u;
+    chip->master_mute[1] = 0u;
     chip->codec_ready = 1;
     return 0;
 }
@@ -433,15 +539,9 @@ static int hda_configure_codec(struct hda_chip *chip, int capture,
     hda_verb(chip, chip->afg, AC_VERB_SET_POWER_STATE, 0);
     if (!capture) {
         hda_verb(chip, nid, AC_VERB_SET_STREAM_FORMAT, format);
-        hda_verb(chip, nid, AC_VERB_SET_AMP_GAIN_MUTE,
-                 AC_AMP_OUT_BOTH |
-                     (chip->gains[0] ? chip->gains[0] : AC_AMP_MUTE));
         hda_program_converter(chip, nid, HDA_STREAM_TAG);
         hda_verb(chip, pin, AC_VERB_SET_PIN_WIDGET_CONTROL, AC_PINCTL_OUT_EN);
-        if (chip->pin_out_amp) {
-            hda_verb(chip, pin, AC_VERB_SET_AMP_GAIN_MUTE,
-                     AC_AMP_OUT_BOTH | chip->pin_out_gain);
-        }
+        hda_apply_master_amp(chip);
         hda_verb(chip, pin, AC_VERB_SET_EAPD_BTLENABLE, 0x02);
         hda_verb(chip, pin, AC_VERB_SET_POWER_STATE, 0);
     } else {
@@ -471,6 +571,7 @@ static unsigned int hda_int_bit(int capture)
 
 static void hda_stream_stop(struct hda_chip *chip, int capture);
 static void hda_stream_reset(struct hda_chip *chip, int capture);
+static void hda_stream_setup(struct hda_chip *chip, int capture);
 
 static int hda_setup_bdl(struct hda_chip *chip, int capture)
 {
@@ -527,13 +628,10 @@ static int hda_setup_bdl(struct hda_chip *chip, int capture)
         snd_pcm_get_rate(substream), snd_pcm_get_channels(substream),
         snd_pcm_get_format(substream) == 10 ? 32u : 16u);
 
+    (void)offset;
+    (void)bdl_phys;
     hda_stream_reset(chip, capture);
-    hda_writeb(chip, offset + SD_STS, SD_INT_MASK);
-    hda_writel(chip, offset + SD_CBL, chip->cbl[capture]);
-    hda_writew(chip, offset + SD_LVI, (unsigned short)(entries - 1));
-    hda_writew(chip, offset + SD_FORMAT, chip->format[capture]);
-    hda_writel(chip, offset + SD_BDLPL, (unsigned int)bdl_phys);
-    hda_writel(chip, offset + SD_BDLPU, (unsigned int)(bdl_phys >> 32));
+    hda_stream_setup(chip, capture);
     return 0;
 }
 
@@ -560,79 +658,154 @@ static void hda_stream_reset(struct hda_chip *chip, int capture)
     }
 }
 
+/*
+ * Program a freshly reset stream descriptor, mirroring Linux
+ * snd_hdac_stream_setup(): the stream tag (SD_CTL bits 23:20) must be latched
+ * before SD_CTL.RUN goes 0->1, because the controller (and QEMU's
+ * intel_hda_set_st_ctl) samples the tag on the RUN edge to route DMA to the
+ * codec converter programmed with AC_VERB_SET_CHANNEL_STREAMID.
+ */
+static void hda_stream_setup(struct hda_chip *chip, int capture)
+{
+    unsigned int offset = hda_stream_offset(capture);
+    unsigned char ctl2;
+
+    hda_writeb(chip, offset + SD_STS, SD_INT_MASK);
+    ctl2 = hda_readb(chip, offset + SD_CTL + 2u);
+    ctl2 = (unsigned char)((ctl2 & ~0xf8u) |
+                           ((SD_CTL_TAG(HDA_STREAM_TAG) >> 16) & 0xf0u) |
+                           (capture ? ((SD_CTL_DIR >> 16) & 0x08u) : 0u));
+    hda_writeb(chip, offset + SD_CTL + 2u, ctl2);
+    if (chip->bdl_entries[capture] == 0) {
+        return;
+    }
+    hda_writel(chip, offset + SD_CBL, chip->cbl[capture]);
+    hda_writew(chip, offset + SD_LVI,
+               (unsigned short)(chip->bdl_entries[capture] - 1));
+    hda_writew(chip, offset + SD_FORMAT, chip->format[capture]);
+    hda_writel(chip, offset + SD_BDLPL, (unsigned int)chip->bdl_addr[capture]);
+    hda_writel(chip, offset + SD_BDLPU,
+               (unsigned int)(chip->bdl_addr[capture] >> 32));
+}
+
 static void hda_stream_stop(struct hda_chip *chip, int capture)
 {
     unsigned int offset = hda_stream_offset(capture);
-    unsigned int value = hda_readl(chip, offset + SD_CTL);
+    unsigned long flags;
     unsigned int timeout;
+    unsigned char ctl;
 
-    if ((value & SD_CTL_RUN) != 0) {
-        hda_writel(chip, offset + SD_CTL, value & ~SD_CTL_RUN);
-        for (timeout = 0; timeout < 1000u; timeout++) {
-            if ((hda_readl(chip, offset + SD_CTL) & SD_CTL_RUN) == 0) {
+    flags = spk_spin_lock_irqsave(&chip->reg_lock);
+    chip->running[capture] = 0;
+    __atomic_add_fetch(&chip->stream_gen[capture], 1u, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&chip->period_pending[capture], 0u, __ATOMIC_RELEASE);
+    ctl = hda_readb(chip, offset + SD_CTL);
+    if ((ctl & (unsigned char)SD_CTL_RUN) != 0) {
+        hda_writeb(chip, offset + SD_CTL,
+                   ctl & (unsigned char)~(SD_CTL_RUN | SD_CTL_IOCE));
+        for (timeout = 0; timeout < 50u; timeout++) {
+            if ((hda_readb(chip, offset + SD_CTL) & (unsigned char)SD_CTL_RUN) == 0) {
                 break;
             }
-            spk_udelay(10);
+            spk_udelay(1);
         }
+    } else {
+        hda_writeb(chip, offset + SD_CTL, ctl & (unsigned char)~SD_CTL_IOCE);
     }
+    hda_writeb(chip, offset + SD_STS, SD_INT_MASK);
     hda_writel(chip, HDA_INTCTL,
                hda_readl(chip, HDA_INTCTL) & ~hda_int_bit(capture));
-    chip->running[capture] = 0;
+    spk_spin_unlock_irqrestore(&chip->reg_lock, flags);
+}
+
+static void hda_period_dispatch(struct hda_chip *chip, int capture)
+{
+    unsigned int gen = __atomic_load_n(&chip->period_scheduled_gen[capture], __ATOMIC_ACQUIRE);
+    struct snd_pcm_substream *sub = capture ? chip->capture : chip->playback;
+    __atomic_store_n(&chip->period_pending[capture], 0u, __ATOMIC_RELEASE);
+    if (chip->shutdown || !chip->running[capture] || sub == 0) {
+        return;
+    }
+    if (gen != __atomic_load_n(&chip->stream_gen[capture], __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    snd_pcm_period_elapsed(sub);
 }
 
 static void hda_period_play(void *data)
 {
-    struct hda_chip *chip = (struct hda_chip *)data;
-    chip->period_pending[0] = 0;
-    if (chip->shutdown) {
-        return;
-    }
-    if (chip->running[0] && chip->playback != 0) {
-        snd_pcm_period_elapsed(chip->playback);
-    }
+    hda_period_dispatch((struct hda_chip *)data, 0);
 }
 
 static void hda_period_capture(void *data)
 {
-    struct hda_chip *chip = (struct hda_chip *)data;
-    chip->period_pending[1] = 0;
-    if (chip->shutdown) {
-        return;
-    }
-    if (chip->running[1] && chip->capture != 0) {
-        snd_pcm_period_elapsed(chip->capture);
-    }
+    hda_period_dispatch((struct hda_chip *)data, 1);
 }
 
 static void hda_irq(int irq, void *data)
 {
     struct hda_chip *chip = (struct hda_chip *)data;
-    unsigned int status;
+    int schedule_mask = 0;
+    int repeat;
     (void)irq;
 
-    status = hda_readl(chip, HDA_INTSTS);
-    if (status == 0) {
-        return;
-    }
-    if (status & hda_int_bit(0)) {
-        unsigned char stream = hda_readb(chip, HDA_PLAY_SD + SD_STS);
-        hda_writeb(chip, HDA_PLAY_SD + SD_STS, SD_INT_MASK);
-        if ((stream & 0x04u) != 0 && chip->playback != 0 &&
-            !chip->shutdown && !chip->period_pending[0]) {
-            chip->period_pending[0] = 1;
-            (void)spk_work_schedule(hda_period_play, chip);
+    for (repeat = 0; repeat < 8; repeat++) {
+        unsigned long flags = spk_spin_lock_irqsave(&chip->reg_lock);
+        unsigned int status = hda_readl(chip, HDA_INTSTS);
+        unsigned char rirb_sts;
+        int active = 0;
+
+        if (chip->shutdown || status == 0 || status == 0xffffffffu) {
+            spk_spin_unlock_irqrestore(&chip->reg_lock, flags);
+            break;
+        }
+        if (status & hda_int_bit(0)) {
+            unsigned char stream = hda_readb(chip, HDA_PLAY_SD + SD_STS);
+            hda_writeb(chip, HDA_PLAY_SD + SD_STS, SD_INT_MASK);
+            active = 1;
+            if ((stream & 0x04u) != 0 && chip->playback != 0 && chip->running[0]) {
+                if (__atomic_exchange_n(&chip->period_pending[0], 1u, __ATOMIC_ACQ_REL) == 0u) {
+                    __atomic_store_n(&chip->period_scheduled_gen[0],
+                                     __atomic_load_n(&chip->stream_gen[0], __ATOMIC_ACQUIRE),
+                                     __ATOMIC_RELEASE);
+                    schedule_mask |= 1;
+                }
+            }
+        }
+        if (status & hda_int_bit(1)) {
+            unsigned char stream = hda_readb(chip, HDA_CAP_SD + SD_STS);
+            hda_writeb(chip, HDA_CAP_SD + SD_STS, SD_INT_MASK);
+            active = 1;
+            if ((stream & 0x04u) != 0 && chip->capture != 0 && chip->running[1]) {
+                if (__atomic_exchange_n(&chip->period_pending[1], 1u, __ATOMIC_ACQ_REL) == 0u) {
+                    __atomic_store_n(&chip->period_scheduled_gen[1],
+                                     __atomic_load_n(&chip->stream_gen[1], __ATOMIC_ACQUIRE),
+                                     __ATOMIC_RELEASE);
+                    schedule_mask |= 2;
+                }
+            }
+        }
+        rirb_sts = hda_readb(chip, HDA_RIRBSTS);
+        if (rirb_sts & 0x05u) {
+            hda_writeb(chip, HDA_RIRBSTS, 0x05u);
+            active = 1;
+        }
+        spk_spin_unlock_irqrestore(&chip->reg_lock, flags);
+        if (!active) {
+            break;
         }
     }
-    if (status & hda_int_bit(1)) {
-        unsigned char stream = hda_readb(chip, HDA_CAP_SD + SD_STS);
-        hda_writeb(chip, HDA_CAP_SD + SD_STS, SD_INT_MASK);
-        if ((stream & 0x04u) != 0 && chip->capture != 0 &&
-            !chip->shutdown && !chip->period_pending[1]) {
-            chip->period_pending[1] = 1;
-            (void)spk_work_schedule(hda_period_capture, chip);
+
+    if ((schedule_mask & 1) != 0) {
+        if (spk_work_schedule(hda_period_play, chip) != 0) {
+            __atomic_store_n(&chip->period_pending[0], 0u, __ATOMIC_RELEASE);
         }
     }
-    hda_writel(chip, HDA_INTSTS, status);
+    if ((schedule_mask & 2) != 0) {
+        if (spk_work_schedule(hda_period_capture, chip) != 0) {
+            __atomic_store_n(&chip->period_pending[1], 0u, __ATOMIC_RELEASE);
+        }
+    }
 }
 
 static int hda_open_common(struct snd_pcm_substream *substream, int capture)
@@ -746,18 +919,11 @@ static int hda_prepare(struct snd_pcm_substream *substream)
     }
     capture = (substream == chip->capture);
     offset = hda_stream_offset(capture);
+    __atomic_add_fetch(&chip->stream_gen[capture], 1u, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&chip->period_pending[capture], 0u, __ATOMIC_RELEASE);
+    (void)offset;
     hda_stream_reset(chip, capture);
-    hda_writeb(chip, offset + SD_STS, SD_INT_MASK);
-    if (chip->bdl_entries[capture] != 0) {
-        hda_writel(chip, offset + SD_CBL, chip->cbl[capture]);
-        hda_writew(chip, offset + SD_LVI,
-                   (unsigned short)(chip->bdl_entries[capture] - 1));
-        hda_writew(chip, offset + SD_FORMAT, chip->format[capture]);
-        hda_writel(chip, offset + SD_BDLPL,
-                   (unsigned int)chip->bdl_addr[capture]);
-        hda_writel(chip, offset + SD_BDLPU,
-                   (unsigned int)(chip->bdl_addr[capture] >> 32));
-    }
+    hda_stream_setup(chip, capture);
     return 0;
 }
 
@@ -775,17 +941,30 @@ static int hda_trigger(struct snd_pcm_substream *substream, int cmd)
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
     case SNDRV_PCM_TRIGGER_RESUME:
-    case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-        value = SD_CTL_TAG(HDA_STREAM_TAG) | SD_CTL_IOCE | SD_CTL_RUN;
-        if (capture) {
-            value |= SD_CTL_DIR;
-        }
-        hda_writel(chip, offset + SD_CTL, value);
+    case SNDRV_PCM_TRIGGER_PAUSE_RELEASE: {
+        unsigned long flags = spk_spin_lock_irqsave(&chip->reg_lock);
+        __atomic_store_n(&chip->period_pending[capture], 0u, __ATOMIC_RELEASE);
+        hda_writeb(chip, offset + SD_STS, SD_INT_MASK);
+        chip->running[capture] = 1;
         hda_writel(chip, HDA_INTCTL,
                    hda_readl(chip, HDA_INTCTL) | HDA_INT_GLOBAL |
                    hda_int_bit(capture));
-        chip->running[capture] = 1;
+        /*
+         * Re-assert the stream tag first (it must be valid on the RUN edge),
+         * then set RUN|IOCE with a byte write so SD_STS (+0x03, W1C) is never
+         * touched: Linux snd_hdac_stream_start() ->
+         * snd_hdac_stream_updateb(SD_CTL, 0, SD_CTL_DMA_START | SD_INT_MASK).
+         */
+        value = hda_readb(chip, offset + SD_CTL + 2u);
+        value = (value & ~0xf8u) | ((SD_CTL_TAG(HDA_STREAM_TAG) >> 16) & 0xf0u) |
+                (capture ? ((SD_CTL_DIR >> 16) & 0x08u) : 0u);
+        hda_writeb(chip, offset + SD_CTL + 2u, (unsigned char)value);
+        value = hda_readb(chip, offset + SD_CTL);
+        hda_writeb(chip, offset + SD_CTL,
+                   (unsigned char)(value | SD_CTL_RUN | SD_CTL_IOCE));
+        spk_spin_unlock_irqrestore(&chip->reg_lock, flags);
         break;
+    }
     case SNDRV_PCM_TRIGGER_STOP:
     case SNDRV_PCM_TRIGGER_SUSPEND:
     case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
@@ -857,13 +1036,8 @@ static int hda_volume_get(struct snd_kcontrol *kcontrol,
                           struct snd_ctl_elem_value *value)
 {
     struct hda_chip *chip = (struct hda_chip *)kcontrol->private_data;
-    long max_step = chip->out_gain_max ? (long)chip->out_gain_max : 127L;
-    long pct = max_step > 0 ? ((long)chip->gains[0] * 100L + max_step / 2) / max_step : 0;
-    if (pct > 100) {
-        pct = 100;
-    }
-    value->value.integer.value[0] = pct;
-    value->value.integer.value[1] = pct;
+    value->value.integer.value[0] = (long)chip->master_vol[0];
+    value->value.integer.value[1] = (long)chip->master_vol[1];
     return 0;
 }
 
@@ -871,19 +1045,53 @@ static int hda_volume_put(struct snd_kcontrol *kcontrol,
                           struct snd_ctl_elem_value *value)
 {
     struct hda_chip *chip = (struct hda_chip *)kcontrol->private_data;
-    long max_step = chip->out_gain_max ? (long)chip->out_gain_max : 127L;
-    long gain = value->value.integer.value[0];
-    if (gain < 0) {
-        gain = 0;
-    }
-    if (gain > 100) {
-        gain = 100;
-    }
-    chip->gains[0] = (unsigned char)((gain * max_step + 50L) / 100L);
-    hda_verb(chip, chip->dac, AC_VERB_SET_AMP_GAIN_MUTE,
-             AC_AMP_OUT_BOTH |
-                 ((gain == 0 || chip->gains[0] == 0) ? AC_AMP_MUTE : chip->gains[0]));
-    return 1;
+    long left = value->value.integer.value[0];
+    long right = value->value.integer.value[1];
+    unsigned char changed;
+    if (left < 0) left = 0;
+    if (left > 100) left = 100;
+    if (right < 0) right = 0;
+    if (right > 100) right = 100;
+    changed = (chip->master_vol[0] != (unsigned char)left) ||
+              (chip->master_vol[1] != (unsigned char)right);
+    chip->master_vol[0] = (unsigned char)left;
+    chip->master_vol[1] = (unsigned char)right;
+    hda_apply_master_amp(chip);
+    return changed ? 1 : 0;
+}
+
+static int hda_switch_info(struct snd_kcontrol *kcontrol,
+                           struct snd_ctl_elem_info *info)
+{
+    (void)kcontrol;
+    info->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+    info->count = 2;
+    info->value.integer.min = 0;
+    info->value.integer.max = 1;
+    info->value.integer.step = 1;
+    return 0;
+}
+
+static int hda_switch_get(struct snd_kcontrol *kcontrol,
+                          struct snd_ctl_elem_value *value)
+{
+    struct hda_chip *chip = (struct hda_chip *)kcontrol->private_data;
+    value->value.integer.value[0] = chip->master_mute[0] ? 0L : 1L;
+    value->value.integer.value[1] = chip->master_mute[1] ? 0L : 1L;
+    return 0;
+}
+
+static int hda_switch_put(struct snd_kcontrol *kcontrol,
+                          struct snd_ctl_elem_value *value)
+{
+    struct hda_chip *chip = (struct hda_chip *)kcontrol->private_data;
+    unsigned char m0 = value->value.integer.value[0] ? 0u : 1u;
+    unsigned char m1 = value->value.integer.value[1] ? 0u : 1u;
+    unsigned char changed = (chip->master_mute[0] != m0) || (chip->master_mute[1] != m1);
+    chip->master_mute[0] = m0;
+    chip->master_mute[1] = m1;
+    hda_apply_master_amp(chip);
+    return changed ? 1 : 0;
 }
 
 static struct snd_kcontrol_new hda_master_volume = {
@@ -894,6 +1102,17 @@ static struct snd_kcontrol_new hda_master_volume = {
     .info = hda_volume_info,
     .get = hda_volume_get,
     .put = hda_volume_put,
+    .private_data = 0,
+};
+
+static struct snd_kcontrol_new hda_master_switch = {
+    .iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+    .name = "Master Playback Switch",
+    .access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+    .count = 2,
+    .info = hda_switch_info,
+    .get = hda_switch_get,
+    .put = hda_switch_put,
     .private_data = 0,
 };
 
@@ -1000,8 +1219,11 @@ static int hda_probe(struct spk_pci_device *device)
         goto fail_card;
     }
     hda_master_volume.private_data = chip;
+    hda_master_switch.private_data = chip;
     if (snd_ctl_add(chip->card,
-                    snd_ctl_new1(&hda_master_volume, chip)) != 0) {
+                    snd_ctl_new1(&hda_master_volume, chip)) != 0 ||
+        snd_ctl_add(chip->card,
+                    snd_ctl_new1(&hda_master_switch, chip)) != 0) {
         result = -12;
         goto fail_card;
     }

@@ -192,6 +192,8 @@ pub extern "C" fn kmain() -> ! {
     smp::start();
     kinfo!("Scheduler: per-CPU EEVDF ready");
     vfs::start_services();
+    #[cfg(feature = "modules")]
+    module::hw::start_workqueue();
     net::start();
     match boot::init_path() {
         Some(path) => match user::spawn_init(&path) {

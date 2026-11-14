@@ -13,6 +13,7 @@
 //! Nodes are allocated before admission and returned intact on removal. Rotations,
 //! selection and deletion neither allocate nor destroy a task on an IRQ stack.
 
+use super::pelt::LoadAvg;
 use alloc::boxed::Box;
 
 pub type Key = (i128, u64);
@@ -28,6 +29,7 @@ pub struct Node<V> {
     pub remainder: u64,
     pub lag: i128,
     pub last_run_us: u64,
+    pub pelt: LoadAvg,
     red: bool,
     left: Link<V>,
     right: Link<V>,
@@ -49,6 +51,7 @@ impl<V> Node<V> {
             remainder: 0,
             lag: 0,
             last_run_us: 0,
+            pelt: LoadAvg::new(),
             red: true,
             left: None,
             right: None,

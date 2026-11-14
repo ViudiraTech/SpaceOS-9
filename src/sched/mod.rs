@@ -15,9 +15,11 @@
 //! stack pointer are saved. No ordinary spinlock guard survives a switch.
 
 mod eevdf;
+mod lb_model;
 mod loadbalance;
 #[cfg(feature = "boot-self-test")]
 mod model_tests;
+mod pelt;
 mod rbtree;
 #[cfg(feature = "boot-self-test")]
 pub mod sched_test;
@@ -30,7 +32,7 @@ use crate::{
     time,
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 pub use eevdf::{NICE_0_WEIGHT, nice_to_weight};
 use rbtree::{Node, RBTree};
 use task::Task;
@@ -117,8 +119,12 @@ struct Cpu {
     active: AtomicBool,
     ticks: AtomicU64,
     load: AtomicU64,
+    load_avg: AtomicU64,
+    util_avg: AtomicU64,
+    runnable_avg: AtomicU64,
     runnable: AtomicUsize,
     last_balance: AtomicU64,
+    active_balance: AtomicIsize,
     domains: SpinLock<loadbalance::Domains>,
 }
 struct CpuQueue {
@@ -128,20 +134,59 @@ struct CpuQueue {
     retired: Option<Entity>,
     clock_us: u64,
     cpu: usize,
+    cpu_util: pelt::LoadAvg,
+    sum_load_avg: i64,
+    sum_runnable_avg: i64,
+    sum_util_avg: i64,
 }
 impl CpuQueue {
     fn fair_current(&self) -> Option<&Node<TaskRef>> {
         self.current.as_deref().filter(|node| node.weight != 0)
     }
+    fn apply_pelt_delta(&mut self, delta: pelt::LoadDelta) {
+        self.sum_load_avg = (self.sum_load_avg + delta.load_avg).max(0);
+        self.sum_runnable_avg = (self.sum_runnable_avg + delta.runnable_avg).max(0);
+        self.sum_util_avg = (self.sum_util_avg + delta.util_avg).max(0);
+    }
+    fn subtract_node_pelt(&mut self, node: &Node<TaskRef>) {
+        self.sum_load_avg = (self.sum_load_avg - node.pelt.load_avg as i64).max(0);
+        self.sum_runnable_avg = (self.sum_runnable_avg - i64::from(node.pelt.runnable_avg)).max(0);
+        self.sum_util_avg = (self.sum_util_avg - i64::from(node.pelt.util_avg)).max(0);
+    }
+    pub(super) fn detach_pelt(&mut self, node: &mut Entity, now_us: u64, runnable: bool) {
+        let delta = node.pelt.update(now_us, node.weight, runnable, false);
+        self.apply_pelt_delta(delta);
+        self.subtract_node_pelt(node);
+    }
+    fn sync_empty_ready_pelt(&mut self) {
+        if self.fair.ready.len() == 0 {
+            if let Some(cur) = self.fair_current() {
+                let load_avg = cur.pelt.load_avg as i64;
+                let runnable_avg = i64::from(cur.pelt.runnable_avg);
+                let util_avg = i64::from(cur.pelt.util_avg);
+                self.sum_load_avg = load_avg;
+                self.sum_runnable_avg = runnable_avg;
+                self.sum_util_avg = util_avg;
+            } else {
+                self.sum_load_avg = 0;
+                self.sum_runnable_avg = 0;
+                self.sum_util_avg = 0;
+            }
+        }
+    }
     fn account(&mut self) -> bool {
         let now = time::uptime_micros();
         let elapsed = now.saturating_sub(self.clock_us).saturating_mul(1000);
         self.clock_us = now;
+        let busy = self.fair_current().is_some();
+        let _ = self.cpu_util.update(now, eevdf::NICE_0_WEIGHT, busy, busy);
         let mut expired = false;
+        let mut delta = pelt::LoadDelta::default();
         if let Some(node) = self.current.as_mut() {
             if node.weight != 0 {
                 expired = elapsed >= node.remaining_ns;
                 eevdf::RunQueue::account(node, elapsed);
+                delta = node.pelt.update(now, node.weight, true, true);
                 let mut task = node.value.lock();
                 task.runtime_ns = task.runtime_ns.saturating_add(elapsed);
                 if task.address_space.is_some() {
@@ -157,14 +202,22 @@ impl CpuQueue {
             }
             node.last_run_us = now;
         }
+        self.apply_pelt_delta(delta);
+        self.sync_empty_ready_pelt();
         let current = self.current.as_deref().filter(|n| n.weight != 0);
         self.fair.update_minimum(current);
         expired
     }
     fn publish(&self) {
         let cpu = &scheduler().cpus[self.cpu];
-        cpu.load
-            .store(self.fair.weight(self.fair_current()), Ordering::Relaxed);
+        let inst_weight = self.fair.weight(self.fair_current());
+        cpu.load.store(inst_weight, Ordering::Relaxed);
+        cpu.load_avg
+            .store(self.sum_load_avg.max(0) as u64, Ordering::Relaxed);
+        cpu.runnable_avg
+            .store(self.sum_runnable_avg.max(0) as u64, Ordering::Relaxed);
+        let util = (self.sum_util_avg.clamp(0, 1024) as u64).max(u64::from(self.cpu_util.util_avg));
+        cpu.util_avg.store(util, Ordering::Relaxed);
         cpu.runnable.store(
             self.fair.ready.len() + usize::from(self.fair_current().is_some()),
             Ordering::Release,
@@ -172,6 +225,16 @@ impl CpuQueue {
     }
     fn admit(&mut self, mut entity: Entity, fresh: bool) {
         self.account();
+        if fresh {
+            entity.pelt.seed_new(entity.weight, self.clock_us);
+        } else {
+            let _ = entity
+                .pelt
+                .update(self.clock_us, entity.weight, false, false);
+        }
+        self.sum_load_avg += entity.pelt.load_avg as i64;
+        self.sum_runnable_avg += i64::from(entity.pelt.runnable_avg);
+        self.sum_util_avg += i64::from(entity.pelt.util_avg);
         self.fair.place(&mut entity, self.fair_current(), fresh);
         {
             let mut task = entity.value.lock();
@@ -217,13 +280,21 @@ pub fn init(num_cpus: usize) {
                 retired: None,
                 clock_us: 0,
                 cpu,
+                cpu_util: pelt::LoadAvg::new(),
+                sum_load_avg: 0,
+                sum_runnable_avg: 0,
+                sum_util_avg: 0,
             }),
             reschedule: AtomicBool::new(false),
             active: AtomicBool::new(false),
             ticks: AtomicU64::new(0),
             load: AtomicU64::new(0),
+            load_avg: AtomicU64::new(0),
+            util_avg: AtomicU64::new(0),
+            runnable_avg: AtomicU64::new(0),
             runnable: AtomicUsize::new(0),
             last_balance: AtomicU64::new(0),
+            active_balance: AtomicIsize::new(-1),
             domains: SpinLock::new(loadbalance::Domains::system(cpu)),
         });
     }
@@ -536,6 +607,7 @@ fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, volu
         }
         Disposition::Sleep(wake) => {
             assert_ne!(previous.weight, 0, "idle cannot sleep");
+            rq.subtract_node_pelt(&previous);
             rq.fair.save_lag(&mut previous, None);
             previous.value.lock().state = TaskState::Blocked;
             previous.key.0 = i128::from(wake);
@@ -543,6 +615,7 @@ fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, volu
         }
         Disposition::Wait(mut queue) => {
             assert_ne!(previous.weight, 0, "idle cannot wait");
+            rq.subtract_node_pelt(&previous);
             rq.fair.save_lag(&mut previous, None);
             previous.value.lock().state = TaskState::Blocked;
             previous.key.0 = i128::from(queue.sequence);
@@ -551,9 +624,11 @@ fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, volu
                 .checked_add(1)
                 .expect("wait sequence overflow");
             queue.tree.insert(previous);
+            drop(queue);
         }
         Disposition::Exit(code) => {
             assert_ne!(previous.weight, 0, "idle cannot exit");
+            rq.subtract_node_pelt(&previous);
             let mut task = previous.value.lock();
             if task.user {
                 task.become_zombie(code);
@@ -566,11 +641,17 @@ fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, volu
             rq.retired = Some(previous);
         }
     }
-    let next = rq
-        .fair
-        .pick_next()
+    let mut picked = rq.fair.pick_next();
+    if picked.is_none() && loadbalance::newidle_pull(&mut rq, scheduler()) {
+        picked = rq.fair.pick_next();
+    }
+    let mut next = picked
         .or_else(|| rq.idle.take())
         .expect("missing idle context");
+    if next.weight != 0 {
+        let delta = next.pelt.update(rq.clock_us, next.weight, true, false);
+        rq.apply_pelt_delta(delta);
+    }
     let next_tid = next.key.1;
     let next_context;
     let next_fpu;
@@ -620,6 +701,7 @@ pub(crate) fn finish_switch() {
     unsafe {
         queue.unlock_handoff();
     }
+    loadbalance::finish_active_balance(scheduler(), cpu);
     if let Some(current_task) = current() {
         let task = current_task.lock();
         if let Some(space) = &task.address_space {
@@ -695,8 +777,16 @@ pub(crate) fn wake_entity(entity: Entity) {
         let _source = scheduler().cpus[source].queue.lock();
         assert_eq!(entity.value.lock().state, TaskState::Blocked);
     }
-    let cpu = loadbalance::select_cpu(scheduler(), affinity, source)
-        .expect("blocked task has no online CPU");
+    let waker = smp::current_cpu();
+    let task_util = u64::from(entity.pelt.util_avg);
+    let cpu = loadbalance::select_task_rq_fair(
+        scheduler(),
+        affinity,
+        source,
+        Some((waker, task_util)),
+        false,
+    )
+    .expect("blocked task has no online CPU");
     if cpu != source {
         entity.value.lock().migrations += 1;
     }
@@ -793,6 +883,9 @@ pub(crate) fn irq_exit() {
         return;
     }
     loadbalance::balance(sched, cpu, false);
+    if sched.cpus[cpu].active_balance.load(Ordering::Relaxed) >= 0 {
+        sched.cpus[cpu].reschedule.store(true, Ordering::Release);
+    }
     if sched.cpus[cpu].reschedule.load(Ordering::Acquire) {
         let rq = sched.cpus[cpu].queue.lock();
         dispatch(rq, Disposition::Runnable, false);

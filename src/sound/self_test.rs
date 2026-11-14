@@ -539,6 +539,10 @@ pub fn run_late() -> &'static str {
         "sound: PCM streaming self-test failed"
     );
     assert!(
+        super::mixer::self_test_late(),
+        "sound: PCM mixer self-test failed"
+    );
+    assert!(
         timer::self_test_late(),
         "sound: timer tick self-test failed"
     );

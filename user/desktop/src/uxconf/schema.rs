@@ -58,7 +58,10 @@ pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {
             ("/size", Value::Int(46)),
             ("/show-pinned", Value::Bool(true)),
             ("/start-fullscreen", Value::Bool(true)),
-            ("/start-tiles", Value::String(DEFAULT_START_TILES.to_string())),
+            (
+                "/start-tiles",
+                Value::String(DEFAULT_START_TILES.to_string()),
+            ),
         ],
         "wm" => vec![
             ("/button-layout", Value::String("right".to_string())),

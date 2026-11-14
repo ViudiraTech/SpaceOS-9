@@ -37,6 +37,7 @@ pub fn run() {
     fpu_isolation();
     migration();
     migration_with_live_state();
+    load_balance_convergence();
     stress();
     sched_log!("scheduler self-test passed");
 }
@@ -409,4 +410,52 @@ fn stress() {
     until(|| super::completed_count() >= baseline + 64);
     assert_eq!(count.load(Ordering::Acquire), 64 * 128);
     sched_log!("sched test: 64 tasks / 8192 yields / off-stack retirement passed");
+}
+
+fn load_balance_convergence() {
+    let ncpus = super::cpu_count();
+    if ncpus < 2 {
+        return;
+    }
+    let done = Arc::new(AtomicUsize::new(0));
+    let seen_cpus = Arc::new(
+        (0..ncpus)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let n_workers = ncpus * 3;
+    for _ in 0..n_workers {
+        let (done, seen_cpus, stop) = (done.clone(), seen_cpus.clone(), stop.clone());
+        super::spawn_placed(
+            0,
+            move || {
+                while !stop.load(Ordering::Acquire) {
+                    let c = smp::current_cpu();
+                    if c < seen_cpus.len() {
+                        seen_cpus[c].store(true, Ordering::Release);
+                    }
+                    core::hint::spin_loop();
+                }
+                done.fetch_add(1, Ordering::Release);
+            },
+            0,
+            CpuMask::all(),
+        )
+        .unwrap();
+    }
+    sleep_micros(60_000);
+    stop.store(true, Ordering::Release);
+    until(|| done.load(Ordering::Acquire) == n_workers);
+    let active_cpus = seen_cpus
+        .iter()
+        .filter(|flag| flag.load(Ordering::Acquire))
+        .count();
+    assert!(
+        active_cpus >= 2,
+        "load balancer did not spread saturated CPU 0 burst across CPUs ({active_cpus}/{ncpus})"
+    );
+    sched_log!(
+        "sched test: industrial PELT load balancer converged across {active_cpus}/{ncpus} CPUs"
+    );
 }

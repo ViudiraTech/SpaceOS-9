@@ -51,6 +51,10 @@ pub trait SettingsHost {
     fn config(&self) -> &DesktopConfig;
     fn root_resolution(&self) -> (u16, u16);
     fn set_config_property(&mut self, channel: &str, property: &str, value: Value);
+    /// Apply a property in-process only, without the `uxconfd` round trip
+    /// (atomic write + fsync + broadcast). Used for high-rate previews such as
+    /// slider drags; the final value is committed with `set_config_property`.
+    fn stage_config_property(&mut self, channel: &str, property: &str, value: Value);
     fn reset_config_channel(&mut self, channel: &str);
     fn factory_reset(&mut self) -> Option<std::result::Result<(), ConfError>>;
 }
@@ -71,6 +75,10 @@ impl SettingsHost for App {
 
     fn set_config_property(&mut self, channel: &str, property: &str, value: Value) {
         App::set_config_property(self, channel, property, value);
+    }
+
+    fn stage_config_property(&mut self, channel: &str, property: &str, value: Value) {
+        App::stage_config_property(self, channel, property, value);
     }
 
     fn reset_config_channel(&mut self, channel: &str) {
@@ -1057,16 +1065,37 @@ fn volume_from_slider_x(rect: Rect, x: i32) -> i32 {
     (frac * 100.0).round() as i32
 }
 
-fn apply_master_volume(host: &mut impl SettingsHost, vol: i32) {
+/// Apply the master volume to the hardware mixer immediately. While a slider
+/// drag is in progress (`persist == false`) the value is only staged locally;
+/// `commit_master_volume` persists it once on release so dragging does not
+/// fsync the config file and broadcast to every client per motion event.
+fn apply_master_volume(host: &mut impl SettingsHost, vol: i32, persist: bool) {
     let clamped = vol.clamp(0, 100);
     if clamped != host.config().sound_master_volume {
-        host.set_config_property("sound", "/master-volume", Value::Int(i64::from(clamped)));
+        let value = Value::Int(i64::from(clamped));
+        if persist {
+            host.set_config_property("sound", "/master-volume", value);
+        } else {
+            host.stage_config_property("sound", "/master-volume", value);
+        }
     }
     if host.config().sound_muted && clamped > 0 {
-        host.set_config_property("sound", "/muted", Value::Bool(false));
+        if persist {
+            host.set_config_property("sound", "/muted", Value::Bool(false));
+        } else {
+            host.stage_config_property("sound", "/muted", Value::Bool(false));
+        }
     }
     let muted_effective = host.config().sound_muted && clamped == 0;
     crate::sound::apply_mixer_volume(clamped, muted_effective);
+}
+
+/// Persist the staged drag value (volume and the implied unmute) to `uxconfd`.
+fn commit_master_volume(host: &mut impl SettingsHost) {
+    let vol = host.config().sound_master_volume;
+    let muted = host.config().sound_muted;
+    host.set_config_property("sound", "/master-volume", Value::Int(i64::from(vol)));
+    host.set_config_property("sound", "/muted", Value::Bool(muted));
 }
 
 /// Reusable System Settings UI state shared between `spui settings` and Start Screen `设置中心`.
@@ -1193,7 +1222,7 @@ impl SettingsState {
                 let vol = volume_from_slider_x(sr, x);
                 let mut changed = false;
                 if vol != host.config().sound_master_volume || host.config().sound_muted {
-                    apply_master_volume(host, vol);
+                    apply_master_volume(host, vol, false);
                     changed = true;
                 }
                 return (changed, CursorKind::Pointer);
@@ -1233,6 +1262,7 @@ impl SettingsState {
         let mut action = SettingsAction::default();
         if button == 1 && !down && self.dragging_volume {
             self.dragging_volume = false;
+            commit_master_volume(host);
             crate::sound::play(host.config(), crate::sound::SystemSound::Volume);
             action.redraw = true;
             return action;
@@ -1255,7 +1285,7 @@ impl SettingsState {
             if matches!(hit, Some(HitTarget::SoundMasterSlider)) {
                 if let Some(sr) = self.vol_slider_rect {
                     self.dragging_volume = true;
-                    apply_master_volume(host, volume_from_slider_x(sr, x));
+                    apply_master_volume(host, volume_from_slider_x(sr, x), false);
                     action.cursor = Some(CursorKind::Pointer);
                     action.redraw = true;
                 }
@@ -1882,7 +1912,7 @@ impl SettingsState {
                 play_click = false;
             }
             HitTarget::SoundVolumePreset(i) => {
-                apply_master_volume(host, VOLUME_PRESETS[i].0 as i32);
+                apply_master_volume(host, VOLUME_PRESETS[i].0 as i32, true);
                 crate::sound::play(host.config(), crate::sound::SystemSound::Volume);
                 play_click = false;
             }

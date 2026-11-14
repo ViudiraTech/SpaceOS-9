@@ -1303,9 +1303,13 @@ mod tests {
     #[test]
     fn start_tiles_parse_and_encode_roundtrip() {
         let parsed = parse_start_tiles(crate::schema::DEFAULT_START_TILES);
-        assert_eq!(encode_start_tiles(&parsed), crate::schema::DEFAULT_START_TILES);
+        assert_eq!(
+            encode_start_tiles(&parsed),
+            crate::schema::DEFAULT_START_TILES
+        );
 
-        let sanitized = parse_start_tiles("status-clock:wide, bad/id:small, status-clock:small, app-term:l");
+        let sanitized =
+            parse_start_tiles("status-clock:wide, bad/id:small, status-clock:small, app-term:l");
         assert_eq!(sanitized.len(), 2);
         assert_eq!(sanitized[0].id, "status-clock");
         assert_eq!(sanitized[0].size, StartTileSize::Wide);

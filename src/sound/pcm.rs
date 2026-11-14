@@ -47,7 +47,7 @@ pub const POLLHUP: u32 = 16;
 const PAGE_SIZE: usize = 4096;
 const MAX_RW_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Playback,
     Capture,
@@ -127,7 +127,7 @@ pub struct RingBuffer {
 }
 
 impl RingBuffer {
-    fn pointer(&self) -> *mut u8 {
+    pub(crate) fn pointer(&self) -> *mut u8 {
         self.coherent.as_ptr::<u8>()
     }
     fn dma_address(&self) -> u64 {
@@ -172,6 +172,7 @@ pub struct Runtime {
     pub suspended_state: i32,
     pub trigger_tstamp: uapi::timespec,
     pub tstamp: uapi::timespec,
+    pub last_elapsed_us: u64,
     pub avail_max: u64,
     pub overrange: u64,
     pub user_pversion: u32,
@@ -194,6 +195,7 @@ impl Runtime {
             suspended_state: 0,
             trigger_tstamp: uapi::timespec::zero(),
             tstamp: uapi::timespec::zero(),
+            last_elapsed_us: 0,
             avail_max: 0,
             overrange: 0,
             user_pversion: 0,
@@ -244,8 +246,10 @@ pub struct Substream {
     pub opened: AtomicBool,
     pub generation: AtomicU64,
     pub avail: AtomicU64,
+    pub avail_min: AtomicU64,
     pub state: AtomicI32,
     pub isa_dma: AtomicBool,
+    pub(crate) forward_wake: SpinLock<Option<(WaitQueue, Option<Arc<AtomicU64>>)>>,
     self_reference: SpinLock<Weak<Substream>>,
     siblings: Mutex<Vec<Weak<Substream>>>,
     group: Mutex<Vec<Weak<Substream>>>,
@@ -276,8 +280,10 @@ impl Substream {
             opened: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             avail: AtomicU64::new(0),
+            avail_min: AtomicU64::new(1),
             state: AtomicI32::new(uapi::SNDRV_PCM_STATE_OPEN),
             isa_dma: AtomicBool::new(false),
+            forward_wake: SpinLock::new(None),
             self_reference: SpinLock::new(weak.clone()),
             siblings: Mutex::new(Vec::new()),
             group: Mutex::new(Vec::new()),
@@ -388,11 +394,11 @@ impl Substream {
     }
 }
 
-fn now() -> uapi::timespec {
+pub(crate) fn now() -> uapi::timespec {
     uapi::timespec::from_micros(time::uptime_micros())
 }
 
-fn avail_locked(runtime: &Runtime, direction: Direction) -> u64 {
+pub(crate) fn avail_locked(runtime: &Runtime, direction: Direction) -> u64 {
     let Some(hw) = runtime.hw else {
         return 0;
     };
@@ -458,86 +464,149 @@ fn refresh_control(runtime: &mut Runtime) {
     }
 }
 
-fn publish(substream: &Substream, runtime: &mut Runtime) {
+pub(crate) fn publish(substream: &Substream, runtime: &mut Runtime) {
     let avail = avail_locked(runtime, substream.direction);
     runtime.avail_max = runtime.avail_max.max(avail);
+    let min_thresh = runtime
+        .hw
+        .map_or(1, |hw| runtime.sw.avail_min.min(hw.buffer_size).max(1));
     substream.avail.store(avail, Ordering::Release);
+    substream.avail_min.store(min_thresh, Ordering::Release);
     substream.state.store(runtime.state, Ordering::Release);
     substream.generation.fetch_add(1, Ordering::AcqRel);
     sync_pages(runtime);
 }
 
-fn wake(substream: &Substream) {
+pub(crate) fn wake(substream: &Substream) {
+    wake_inner(substream, true);
+}
+
+fn wake_inner(substream: &Substream, notify_forward: bool) {
     pollwait::wake_object(substream as *const Substream);
     substream.wait.wake_all();
+    if notify_forward {
+        let forward = substream.forward_wake.lock().clone();
+        if let Some((queue, counter)) = forward {
+            if let Some(seq) = counter {
+                seq.fetch_add(1, Ordering::AcqRel);
+            }
+            queue.wake_all();
+        }
+    }
 }
 
 /// Re-read the hardware pointer and publish a new state.  Driver period
 /// interrupts call this; `status`, `hwsync`, `delay` and blocking reads call it
 /// before sampling the runtime.
 pub fn period_elapsed(substream: &Substream) {
+    period_elapsed_inner(substream, true, false);
+}
+
+/// Refresh hardware pointer from inside an owning software mixer without
+/// re-notifying the mixer's own `forward_wake` counter on no-op polls.
+pub(crate) fn period_elapsed_direct(substream: &Substream) {
+    period_elapsed_inner(substream, false, false);
+}
+
+/// Completion notification used by hardware drivers after a period IRQ.
+pub fn snd_pcm_period_elapsed(substream: &Substream) {
+    period_elapsed_inner(substream, true, true);
+}
+
+fn period_elapsed_inner(substream: &Substream, notify_forward: bool, in_interrupt: bool) {
     let Some(ops) = substream.ops.lock().clone() else {
         return;
     };
-    let (boundary, buffer_size) = {
-        let runtime = substream.runtime.lock();
-        (runtime.boundary, runtime.hw.map_or(0, |hw| hw.buffer_size))
-    };
-    if boundary == 0 || buffer_size == 0 {
-        return;
-    }
-    // Drivers report a position in 0..buffer_size, so convert the wrapped
-    // value into a monotonic offset inside `boundary`; otherwise the first
-    // ring wrap looks like the hardware pointer moving backwards.
-    let raw = ops.pointer(substream) % buffer_size;
-    let mut runtime = substream.runtime.lock();
-    if runtime.state != uapi::SNDRV_PCM_STATE_RUNNING
-        && runtime.state != uapi::SNDRV_PCM_STATE_DRAINING
-    {
-        return;
-    }
-    let Some(hw) = runtime.hw else {
-        return;
-    };
-    let delta = (raw + buffer_size - runtime.raw_hw_ptr) % buffer_size;
-    runtime.raw_hw_ptr = raw;
-    runtime.hw_ptr = (runtime.hw_ptr + delta) % boundary;
-    runtime.tstamp = now();
-    let queued = match substream.direction {
-        Direction::Playback => {
-            (runtime.appl_ptr + runtime.boundary - runtime.hw_ptr) % runtime.boundary
-        }
-        Direction::Capture => {
-            (runtime.hw_ptr + runtime.boundary - runtime.appl_ptr) % runtime.boundary
-        }
-    };
     let mut stop = false;
-    if runtime.state == uapi::SNDRV_PCM_STATE_DRAINING && substream.direction == Direction::Playback
+    let mut changed = false;
     {
-        if queued == 0 || queued > hw.buffer_size {
-            runtime.hw_ptr = runtime.appl_ptr;
-            runtime.state = uapi::SNDRV_PCM_STATE_SETUP;
-            stop = true;
+        // Hold `runtime` across `ops.pointer()` so concurrent `STATUS`/`DELAY`
+        // callers and IRQ work cannot interleave an older `raw` sample after a
+        // newer one and fabricate a nearly full-buffer wrap jump.
+        let mut runtime = substream.runtime.lock();
+        if runtime.state != uapi::SNDRV_PCM_STATE_RUNNING
+            && runtime.state != uapi::SNDRV_PCM_STATE_DRAINING
+        {
+            return;
         }
-    } else if queued > hw.buffer_size {
-        stop = true;
-        runtime.state = uapi::SNDRV_PCM_STATE_XRUN;
-        runtime.hw_ptr = match substream.direction {
-            Direction::Playback => runtime.appl_ptr,
-            Direction::Capture => (runtime.appl_ptr + hw.buffer_size) % runtime.boundary,
+        let prev_state = runtime.state;
+        let Some(hw) = runtime.hw else {
+            return;
         };
+        let boundary = runtime.boundary;
+        let buffer_size = hw.buffer_size;
+        if boundary == 0 || buffer_size == 0 {
+            return;
+        }
+
+        let raw = ops.pointer(substream) % buffer_size;
+        let raw_delta = (raw + buffer_size - runtime.raw_hw_ptr) % buffer_size;
+        let now_us = time::uptime_micros();
+        let buffer_us = (buffer_size as u128 * 1_000_000 / u128::from(hw.rate.max(1))) as u64;
+        let dt_us = if runtime.last_elapsed_us == 0 {
+            0
+        } else {
+            now_us.saturating_sub(runtime.last_elapsed_us)
+        };
+
+        // Guard against tiny hardware/emulation LPIB read-back jitter going
+        // slightly backwards without an actual wrap-around (Linux snd_pcm_update_hw_ptr0).
+        let backwards_jitter = raw < runtime.raw_hw_ptr
+            && (runtime.raw_hw_ptr - raw) <= (hw.period_size / 2).max(16)
+            && buffer_us > 0
+            && dt_us < buffer_us / 2;
+
+        // Follow Linux `snd_pcm_update_hw_ptr0`: never extrapolate synthetic
+        // wall-clock XRUN laps during normal operation (`xrun_debug` off), since
+        // virtualized HDA / scheduler stalls pause DMA rather than lapping silently.
+        let delta = if backwards_jitter { 0 } else { raw_delta };
+
+        if !backwards_jitter {
+            runtime.raw_hw_ptr = raw;
+            if delta > 0 {
+                runtime.hw_ptr = (runtime.hw_ptr + delta) % boundary;
+                runtime.last_elapsed_us = now_us;
+                changed = true;
+            }
+        }
+        runtime.tstamp = uapi::timespec::from_micros(now_us);
+        let queued = match substream.direction {
+            Direction::Playback => {
+                (runtime.appl_ptr + runtime.boundary - runtime.hw_ptr) % runtime.boundary
+            }
+            Direction::Capture => {
+                (runtime.hw_ptr + runtime.boundary - runtime.appl_ptr) % runtime.boundary
+            }
+        };
+        if runtime.state == uapi::SNDRV_PCM_STATE_DRAINING
+            && substream.direction == Direction::Playback
+        {
+            if queued == 0 || delta > buffer_size || queued > hw.buffer_size {
+                runtime.hw_ptr = runtime.appl_ptr;
+                runtime.state = uapi::SNDRV_PCM_STATE_SETUP;
+                stop = true;
+            }
+        } else if delta > buffer_size || queued > hw.buffer_size {
+            stop = true;
+            runtime.state = uapi::SNDRV_PCM_STATE_XRUN;
+            runtime.hw_ptr = match substream.direction {
+                Direction::Playback => runtime.appl_ptr,
+                Direction::Capture => (runtime.appl_ptr + hw.buffer_size) % runtime.boundary,
+            };
+        }
+        if stop || runtime.state != prev_state {
+            changed = true;
+        }
+        if changed || in_interrupt {
+            publish(substream, &mut runtime);
+        }
     }
-    publish(substream, &mut runtime);
-    drop(runtime);
-    wake(substream);
+    if changed || in_interrupt {
+        wake_inner(substream, notify_forward);
+    }
     if stop {
         let _ = ops.trigger(substream, uapi::SNDRV_PCM_TRIGGER_STOP);
     }
-}
-
-/// Completion notification used by drivers after a period has been consumed.
-pub fn snd_pcm_period_elapsed(substream: &Substream) {
-    period_elapsed(substream);
 }
 
 fn timespec_micros(value: uapi::timespec) -> u64 {
@@ -957,6 +1026,15 @@ fn write_hw_params(params: &mut uapi::snd_pcm_hw_params, hw: &HardwareParams, in
     params.fifo_size = 0;
 }
 
+/// Compute Linux ALSA default ring boundary (largest power-of-two multiple of `buffer_size` <= INT_MAX).
+pub(crate) fn default_boundary(buffer_size: u64) -> u64 {
+    let mut boundary = buffer_size.max(1);
+    while boundary.saturating_mul(2) <= 0x7fff_ffffu64.saturating_sub(buffer_size) {
+        boundary *= 2;
+    }
+    boundary
+}
+
 fn default_sw_params(hw: &HardwareParams, direction: Direction) -> uapi::snd_pcm_sw_params {
     let mut sw = uapi::snd_pcm_sw_params::zeroed();
     sw.proto = uapi::SNDRV_PCM_VERSION;
@@ -967,7 +1045,7 @@ fn default_sw_params(hw: &HardwareParams, direction: Direction) -> uapi::snd_pcm
         Direction::Capture => 1,
     };
     sw.stop_threshold = hw.buffer_size;
-    sw.boundary = hw.buffer_size.saturating_mul(2);
+    sw.boundary = default_boundary(hw.buffer_size);
     sw
 }
 
@@ -980,7 +1058,7 @@ fn configure(
     uaccess::write_value(arg, &params)
 }
 
-fn apply_hw_params(
+pub(crate) fn apply_hw_params(
     substream: &Arc<Substream>,
     params: &mut uapi::snd_pcm_hw_params,
 ) -> Result<(), VfsError> {
@@ -1035,6 +1113,7 @@ fn apply_hw_params(
         runtime.state = uapi::SNDRV_PCM_STATE_SETUP;
         runtime.trigger_tstamp = now();
         runtime.tstamp = now();
+        runtime.last_elapsed_us = 0;
         runtime.avail_max = 0;
         runtime.no_period_wakeup = params.flags & uapi::SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP != 0;
         publish(substream, &mut runtime);
@@ -1053,7 +1132,7 @@ fn apply_hw_params(
     Ok(())
 }
 
-fn release_buffer(substream: &Arc<Substream>) {
+pub(crate) fn release_buffer(substream: &Arc<Substream>) {
     let mut runtime = substream.runtime.lock();
     runtime.hw = None;
     runtime.pages = None;
@@ -1061,11 +1140,12 @@ fn release_buffer(substream: &Arc<Substream>) {
     runtime.hw_ptr = 0;
     runtime.raw_hw_ptr = 0;
     runtime.appl_ptr = 0;
+    runtime.last_elapsed_us = 0;
     runtime.state = uapi::SNDRV_PCM_STATE_OPEN;
     publish(substream, &mut runtime);
 }
 
-fn prepare_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
+pub(crate) fn prepare_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     {
         let mut runtime = substream.runtime.lock();
         if runtime.hw.is_none() {
@@ -1079,6 +1159,7 @@ fn prepare_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
         runtime.appl_ptr = 0;
         runtime.avail_max = 0;
         runtime.overrange = 0;
+        runtime.last_elapsed_us = 0;
         runtime.state = uapi::SNDRV_PCM_STATE_PREPARED;
         runtime.trigger_tstamp = now();
         runtime.tstamp = now();
@@ -1090,7 +1171,7 @@ fn prepare_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     Ok(())
 }
 
-fn trigger_one(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
+pub(crate) fn trigger_one(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
     let (new_state, allowed): (i32, &'static [i32]) = match cmd {
         uapi::SNDRV_PCM_TRIGGER_START => (
             uapi::SNDRV_PCM_STATE_RUNNING,
@@ -1139,8 +1220,14 @@ fn trigger_one(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
             runtime.suspended_state = runtime.state;
         }
         runtime.state = new_state;
-        runtime.trigger_tstamp = now();
+        let now_us = time::uptime_micros();
+        runtime.trigger_tstamp = uapi::timespec::from_micros(now_us);
         runtime.tstamp = runtime.trigger_tstamp;
+        if new_state == uapi::SNDRV_PCM_STATE_RUNNING {
+            runtime.last_elapsed_us = now_us;
+        } else if new_state == uapi::SNDRV_PCM_STATE_SETUP {
+            runtime.last_elapsed_us = 0;
+        }
         publish(substream, &mut runtime);
     }
     if let Some(ops) = substream.ops.lock().clone()
@@ -1148,6 +1235,7 @@ fn trigger_one(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
     {
         let mut runtime = substream.runtime.lock();
         runtime.state = uapi::SNDRV_PCM_STATE_SETUP;
+        runtime.last_elapsed_us = 0;
         publish(substream, &mut runtime);
         return Err(from_errno(error));
     }
@@ -1175,7 +1263,7 @@ fn group_members(substream: &Arc<Substream>) -> Vec<Arc<Substream>> {
     }
 }
 
-fn trigger(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
+pub(crate) fn trigger(substream: &Arc<Substream>, cmd: i32) -> Result<(), VfsError> {
     for member in group_members(substream) {
         trigger_one(&member, cmd)?;
     }
@@ -1234,7 +1322,7 @@ fn reset(substream: &Arc<Substream>) -> Result<(), VfsError> {
     Ok(())
 }
 
-fn reset_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
+pub(crate) fn reset_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     {
         let runtime = substream.runtime.lock();
         if runtime.hw.is_none() {
@@ -1249,6 +1337,7 @@ fn reset_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     runtime.raw_hw_ptr = 0;
     runtime.appl_ptr = 0;
     runtime.avail_max = 0;
+    runtime.last_elapsed_us = 0;
     runtime.state = uapi::SNDRV_PCM_STATE_SETUP;
     publish(substream, &mut runtime);
     drop(runtime);
@@ -1256,7 +1345,7 @@ fn reset_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     Ok(())
 }
 
-fn start_if_threshold(substream: &Arc<Substream>) {
+pub(crate) fn start_if_threshold(substream: &Arc<Substream>) {
     let (state, queued, threshold) = {
         let runtime = substream.runtime.lock();
         let (queued, limit) = match runtime.hw {
@@ -1283,7 +1372,43 @@ fn start_if_threshold(substream: &Arc<Substream>) {
     }
 }
 
-fn wait_for_io(substream: &Substream, nonblock: bool) -> Result<(), VfsError> {
+fn partial_or_err(err: VfsError, done: u64) -> Result<u64, VfsError> {
+    // Linux `snd_pcm_lib_write1()`/`read1()` report a short transfer instead
+    // of the error once any frame moved (`xfer > 0`), including on a signal.
+    if matches!(
+        err,
+        VfsError::WouldBlock | VfsError::BrokenPipe | VfsError::Interrupted
+    ) && done != 0
+    {
+        Ok(done)
+    } else {
+        Err(err)
+    }
+}
+
+enum IoScratch {
+    Stack([u8; 4096]),
+    Heap(Vec<u8>),
+}
+
+impl IoScratch {
+    fn with_capacity(bytes: usize) -> Self {
+        if bytes <= 4096 {
+            Self::Stack([0u8; 4096])
+        } else {
+            Self::Heap(vec![0u8; bytes])
+        }
+    }
+
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        match self {
+            Self::Stack(buf) => &mut buf[..len],
+            Self::Heap(buf) => &mut buf[..len],
+        }
+    }
+}
+
+fn wait_for_io(substream: &Substream, nonblock: bool, remaining: u64) -> Result<(), VfsError> {
     loop {
         let state = substream.state.load(Ordering::Acquire);
         if state == uapi::SNDRV_PCM_STATE_XRUN {
@@ -1298,15 +1423,34 @@ fn wait_for_io(substream: &Substream, nonblock: bool) -> Result<(), VfsError> {
         if nonblock {
             return Err(VfsError::WouldBlock);
         }
-        substream.wait.wait_until(|| {
-            substream.avail.load(Ordering::Acquire) != 0
+        // Linux `wait_for_avail()`: sleep until `twake = min(avail_min, size)`
+        // frames are available, the stream leaves a runnable state, or a
+        // signal is pending (-ERESTARTSYS there, EINTR here). `PollWait` is
+        // used instead of `substream.wait` because signal delivery kicks every
+        // poll waiter, so SIGTERM/SIGKILL/SIGUSR1 end a blocked write promptly.
+        let target = substream
+            .avail_min
+            .load(Ordering::Acquire)
+            .min(remaining)
+            .max(1);
+        let mut wait = pollwait::PollWait::new();
+        loop {
+            wait.arm_object(substream as *const Substream);
+            if substream.avail.load(Ordering::Acquire) >= target
                 || !matches!(
                     substream.state.load(Ordering::Acquire),
                     uapi::SNDRV_PCM_STATE_RUNNING
                         | uapi::SNDRV_PCM_STATE_PREPARED
                         | uapi::SNDRV_PCM_STATE_PAUSED
                 )
-        });
+            {
+                break;
+            }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
+            }
+            wait.sleep();
+        }
     }
 }
 
@@ -1324,28 +1468,27 @@ fn write_frames(
     if frames == 0 {
         return Ok(0);
     }
+    let max_chunk = frames
+        .min((MAX_RW_BYTES / frame_bytes.max(1)) as u64)
+        .min(ring_frames)
+        .max(1) as usize;
+    let mut scratch = IoScratch::with_capacity(max_chunk * frame_bytes.max(1));
     let mut done = 0u64;
     while done < frames {
+        let remaining = frames - done;
         // Wait for space using only atomics; the runtime mutex is not valid in a
         // wait predicate.
-        if let Err(err) = wait_for_io(substream, nonblock) {
-            return if matches!(err, VfsError::WouldBlock) && done != 0 {
-                Ok(done)
-            } else {
-                Err(err)
-            };
+        if let Err(err) = wait_for_io(substream, nonblock, remaining) {
+            return partial_or_err(err, done);
         }
 
-        let remaining = frames - done;
-        let chunk = (remaining)
-            .min((MAX_RW_BYTES / frame_bytes.max(1)) as u64)
-            .min(ring_frames)
-            .max(1);
-        let mut temporary = vec![0u8; chunk as usize * frame_bytes];
+        let avail_hint = substream.avail.load(Ordering::Acquire).max(1);
+        let chunk = remaining.min(avail_hint).min(max_chunk as u64).max(1);
+        let temporary = scratch.as_mut_slice(chunk as usize * frame_bytes);
         let user = buffer
             .checked_add(done.saturating_mul(frame_bytes as u64))
             .ok_or(VfsError::Fault)?;
-        uaccess::read(user, &mut temporary)?;
+        uaccess::read(user, temporary)?;
 
         let mut runtime = substream.runtime.lock();
         refresh_control(&mut runtime);
@@ -1363,7 +1506,7 @@ fn write_frames(
         let bytes = take * ring.frame_bytes;
         let first = bytes.min(ring.bytes - start);
         // SAFETY: `start` is inside the ring and `first` stays within it; the
-        // source is a temporary kernel buffer of exactly `bytes` bytes.
+        // source is a temporary kernel buffer of at least `bytes` bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(temporary.as_ptr(), ring.pointer().add(start), first);
             if bytes > first {
@@ -1402,23 +1545,22 @@ fn read_frames(
     if substream.state.load(Ordering::Acquire) == uapi::SNDRV_PCM_STATE_PREPARED {
         let _ = trigger(substream, uapi::SNDRV_PCM_TRIGGER_START);
     }
+    let max_chunk = frames
+        .min((MAX_RW_BYTES / frame_bytes.max(1)) as u64)
+        .min(ring_frames)
+        .max(1) as usize;
+    let mut scratch = IoScratch::with_capacity(max_chunk * frame_bytes.max(1));
     let mut done = 0u64;
     while done < frames {
         period_elapsed(substream);
-        if let Err(err) = wait_for_io(substream, nonblock) {
-            return if matches!(err, VfsError::WouldBlock) && done != 0 {
-                Ok(done)
-            } else {
-                Err(err)
-            };
+        let remaining = frames - done;
+        if let Err(err) = wait_for_io(substream, nonblock, remaining) {
+            return partial_or_err(err, done);
         }
 
-        let remaining = frames - done;
-        let chunk = (remaining)
-            .min((MAX_RW_BYTES / frame_bytes.max(1)) as u64)
-            .min(ring_frames)
-            .max(1);
-        let mut temporary = vec![0u8; chunk as usize * frame_bytes];
+        let avail_hint = substream.avail.load(Ordering::Acquire).max(1);
+        let chunk = remaining.min(avail_hint).min(max_chunk as u64).max(1);
+        let temporary = scratch.as_mut_slice(chunk as usize * frame_bytes);
         let mut runtime = substream.runtime.lock();
         refresh_control(&mut runtime);
         let avail = avail_locked(&runtime, Direction::Capture);
@@ -1494,15 +1636,11 @@ fn write_frames_planar(
     let pointers = channel_pointers(bufs, channels)?;
     let mut done = 0u64;
     while done < frames {
-        if let Err(err) = wait_for_io(substream, nonblock) {
-            return if matches!(err, VfsError::WouldBlock) && done != 0 {
-                Ok(done)
-            } else {
-                Err(err)
-            };
+        let remaining = frames - done;
+        if let Err(err) = wait_for_io(substream, nonblock, remaining) {
+            return partial_or_err(err, done);
         }
 
-        let remaining = frames - done;
         let chunk = remaining
             .min((MAX_RW_BYTES / frame_bytes.max(1)) as u64)
             .min(ring_frames)
@@ -1586,15 +1724,11 @@ fn read_frames_planar(
     let mut done = 0u64;
     while done < frames {
         period_elapsed(substream);
-        if let Err(err) = wait_for_io(substream, nonblock) {
-            return if matches!(err, VfsError::WouldBlock) && done != 0 {
-                Ok(done)
-            } else {
-                Err(err)
-            };
+        let remaining = frames - done;
+        if let Err(err) = wait_for_io(substream, nonblock, remaining) {
+            return partial_or_err(err, done);
         }
 
-        let remaining = frames - done;
         let chunk = remaining
             .min((MAX_RW_BYTES / frame_bytes.max(1)) as u64)
             .min(ring_frames)
@@ -1672,6 +1806,7 @@ fn drain_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
                     runtime.hw_ptr = 0;
                     runtime.appl_ptr = 0;
                     runtime.raw_hw_ptr = 0;
+                    runtime.last_elapsed_us = 0;
                     publish(substream, &mut runtime);
                     drop(runtime);
                     wake(substream);
@@ -1682,6 +1817,8 @@ fn drain_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
             uapi::SNDRV_PCM_STATE_RUNNING | uapi::SNDRV_PCM_STATE_DRAINING => {
                 runtime.state = uapi::SNDRV_PCM_STATE_DRAINING;
                 publish(substream, &mut runtime);
+                drop(runtime);
+                wake(substream);
                 (hw.buffer_size, false)
             }
             _ => return Ok(()),
@@ -1693,6 +1830,8 @@ fn drain_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
         if runtime.state == uapi::SNDRV_PCM_STATE_RUNNING {
             runtime.state = uapi::SNDRV_PCM_STATE_DRAINING;
             publish(substream, &mut runtime);
+            drop(runtime);
+            wake(substream);
         }
     }
     loop {
@@ -1705,11 +1844,22 @@ fn drain_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
         {
             break;
         }
-        substream.wait.wait_until(|| {
+        // Linux `snd_pcm_drain()` returns -ERESTARTSYS on a pending signal and
+        // leaves the stream DRAINING; the period path finishes it to SETUP.
+        let mut wait = pollwait::PollWait::new();
+        loop {
+            wait.arm_object(Arc::as_ptr(substream));
             let state = substream.state.load(Ordering::Acquire);
-            state != uapi::SNDRV_PCM_STATE_DRAINING
+            if state != uapi::SNDRV_PCM_STATE_DRAINING
                 || substream.avail.load(Ordering::Acquire) >= buffer_size
-        });
+            {
+                break;
+            }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
+            }
+            wait.sleep();
+        }
     }
     if let Some(ops) = substream.ops.lock().clone() {
         let _ = ops.trigger(substream, uapi::SNDRV_PCM_TRIGGER_DRAIN);
@@ -1720,6 +1870,7 @@ fn drain_one(substream: &Arc<Substream>) -> Result<(), VfsError> {
     runtime.hw_ptr = 0;
     runtime.appl_ptr = 0;
     runtime.raw_hw_ptr = 0;
+    runtime.last_elapsed_us = 0;
     publish(substream, &mut runtime);
     drop(runtime);
     wake(substream);
@@ -1807,7 +1958,7 @@ pub fn ioctl(
             let mut runtime = substream.runtime.lock();
             let hw = runtime.hw.ok_or(VfsError::InvalidArgument)?;
             if params.boundary == 0 {
-                params.boundary = hw.buffer_size.saturating_mul(2);
+                params.boundary = default_boundary(hw.buffer_size);
             }
             if params.boundary <= hw.buffer_size {
                 return Err(VfsError::InvalidArgument);
@@ -2229,7 +2380,8 @@ fn module_driver_direction(substream: &Arc<Substream>) -> bool {
     }
     substream.opened.store(true, Ordering::Release);
     let mut params = test_params();
-    let configured = apply_hw_params(substream, &mut params).is_ok();
+    let configure_result = apply_hw_params(substream, &mut params);
+    let configured = configure_result.is_ok();
     let prepared = configured && prepare(substream).is_ok();
     if prepared && substream.direction == Direction::Playback {
         let mut runtime = substream.runtime.lock();
@@ -2239,14 +2391,45 @@ fn module_driver_direction(substream: &Arc<Substream>) -> bool {
         }
     }
     let started = prepared && trigger(substream, uapi::SNDRV_PCM_TRIGGER_START).is_ok();
+    // Sample progress while the stream is still RUNNING. A single sample after
+    // a fixed sleep is racy: emulated codecs (QEMU audio backends) pull their
+    // first bursts faster than real time, so the one prefilled buffer can be
+    // fully consumed and the stream correctly enters XRUN (Linux semantics:
+    // avail >= stop_threshold) before the sample is taken.
+    let mut running = false;
+    let mut pointer = 0;
+    let mut last_state = -1;
+    let mut polls = 0;
     if started {
-        crate::sched::sleep_micros(80_000);
+        for _ in 0..60 {
+            crate::sched::sleep_micros(5_000);
+            polls += 1;
+            let runtime = substream.runtime.lock();
+            let status = fill_status(substream, &runtime, None);
+            last_state = status.state;
+            pointer = status.hw_ptr;
+            if status.state == uapi::SNDRV_PCM_STATE_RUNNING && status.hw_ptr > 0 {
+                running = true;
+                break;
+            }
+            if status.state != uapi::SNDRV_PCM_STATE_RUNNING {
+                break;
+            }
+        }
     }
-    let (running, pointer) = {
-        let runtime = substream.runtime.lock();
-        let status = fill_status(substream, &runtime, None);
-        (status.state == uapi::SNDRV_PCM_STATE_RUNNING, status.hw_ptr)
-    };
+    if !running {
+        crate::kinfo!(
+            "sound: acceptance {:?}: configured={:?} prepared={} started={} state={} hw_ptr={} raw={} polls={}",
+            substream.direction,
+            configure_result.err(),
+            prepared,
+            started,
+            last_state,
+            pointer,
+            ops.pointer(substream),
+            polls
+        );
+    }
     let _ = trigger(substream, uapi::SNDRV_PCM_TRIGGER_STOP);
     let _ = prepare(substream);
     release_buffer(substream);
@@ -2314,13 +2497,22 @@ pub fn self_test_late() -> bool {
         runtime.appl_ptr = (runtime.hw_ptr + hw.buffer_size) % runtime.boundary;
         publish(&playback, &mut runtime);
     }
-    crate::sched::sleep_micros(10_000);
-    period_elapsed(&playback);
-    let playing = {
+    // Poll for progress rather than sampling once after a fixed sleep: an
+    // oversleep past the one prefilled buffer is a legitimate XRUN.
+    let mut playing = false;
+    for _ in 0..50 {
+        crate::sched::sleep_micros(1_000);
+        period_elapsed(&playback);
         let runtime = playback.runtime.lock();
         let status = fill_status(&playback, &runtime, None);
-        status.state == uapi::SNDRV_PCM_STATE_RUNNING && status.hw_ptr > 0
-    };
+        if status.state == uapi::SNDRV_PCM_STATE_RUNNING && status.hw_ptr > 0 {
+            playing = true;
+            break;
+        }
+        if status.state != uapi::SNDRV_PCM_STATE_RUNNING {
+            break;
+        }
+    }
     let paused = trigger(&playback, uapi::SNDRV_PCM_TRIGGER_PAUSE_PUSH).is_ok()
         && playback.state.load(Ordering::Acquire) == uapi::SNDRV_PCM_STATE_PAUSED;
     let resumed = trigger(&playback, uapi::SNDRV_PCM_TRIGGER_PAUSE_RELEASE).is_ok()
@@ -2333,12 +2525,21 @@ pub fn self_test_late() -> bool {
         capture_ok =
             prepare(&capture).is_ok() && trigger(&capture, uapi::SNDRV_PCM_TRIGGER_START).is_ok();
         if capture_ok {
-            crate::sched::sleep_micros(10_000);
-            period_elapsed(&capture);
-            let runtime = capture.runtime.lock();
-            capture_ok = runtime.state == uapi::SNDRV_PCM_STATE_RUNNING
-                && avail_locked(&runtime, Direction::Capture) > 0;
-            drop(runtime);
+            capture_ok = false;
+            for _ in 0..50 {
+                crate::sched::sleep_micros(1_000);
+                period_elapsed(&capture);
+                let runtime = capture.runtime.lock();
+                if runtime.state == uapi::SNDRV_PCM_STATE_RUNNING
+                    && avail_locked(&runtime, Direction::Capture) > 0
+                {
+                    capture_ok = true;
+                    break;
+                }
+                if runtime.state != uapi::SNDRV_PCM_STATE_RUNNING {
+                    break;
+                }
+            }
             let _ = trigger(&capture, uapi::SNDRV_PCM_TRIGGER_STOP);
             let _ = prepare(&capture);
         }
@@ -2356,7 +2557,7 @@ pub struct PcmSession {
 }
 
 impl PcmSession {
-    fn session(substream: Arc<Substream>, nonblock: bool) -> Arc<Self> {
+    pub(crate) fn session(substream: Arc<Substream>, nonblock: bool) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             substream,
             nonblock: AtomicBool::new(nonblock),
