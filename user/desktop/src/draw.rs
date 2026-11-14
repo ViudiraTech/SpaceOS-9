@@ -628,8 +628,14 @@ impl Canvas {
         }
         self.fill(Rect::new(rect.x, rect.y, rect.w - 1, 1), top_left);
         self.fill(Rect::new(rect.x, rect.y + 1, 1, rect.h - 2), top_left);
-        self.fill(Rect::new(rect.x, rect.bottom() - 1, rect.w, 1), bottom_right);
-        self.fill(Rect::new(rect.right() - 1, rect.y, 1, rect.h - 1), bottom_right);
+        self.fill(
+            Rect::new(rect.x, rect.bottom() - 1, rect.w, 1),
+            bottom_right,
+        );
+        self.fill(
+            Rect::new(rect.right() - 1, rect.y, 1, rect.h - 1),
+            bottom_right,
+        );
     }
 
     /// Paint a classic 2px-per-side Win98 4-color 3D bevel strictly inside `rect`.
@@ -645,6 +651,67 @@ impl Canvas {
         let inner = rect.inset(1);
         if inner.w >= 2 && inner.h >= 2 {
             self.bevel_1px(inner, top_inner, bottom_inner);
+        }
+    }
+
+    /// Paint a classic Windows 98 1px alternating-pixel dotted focus outline strictly inside `rect`.
+    pub fn dotted_border_1px(&mut self, rect: Rect, color: u32) {
+        if rect.w < 2 || rect.h < 2 {
+            return;
+        }
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let color = color & 0x00ff_ffff;
+        let width = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        let top_y = rect.y;
+        let bot_y = rect.bottom() - 1;
+        let left_x = rect.x;
+        let right_x = rect.right() - 1;
+
+        for x in clip.x..clip.right() {
+            if top_y >= clip.y && top_y < clip.bottom() && ((x - rect.x) & 1 == 0) {
+                pixels[top_y as usize * width + x as usize] = color;
+            }
+            if bot_y >= clip.y
+                && bot_y < clip.bottom()
+                && ((x - rect.x + (bot_y - rect.y)) & 1 == 0)
+            {
+                pixels[bot_y as usize * width + x as usize] = color;
+            }
+        }
+        for y in clip.y..clip.bottom() {
+            if left_x >= clip.x && left_x < clip.right() && ((y - rect.y) & 1 == 0) {
+                pixels[y as usize * width + left_x as usize] = color;
+            }
+            if right_x >= clip.x
+                && right_x < clip.right()
+                && (((right_x - rect.x) + (y - rect.y)) & 1 == 0)
+            {
+                pixels[y as usize * width + right_x as usize] = color;
+            }
+        }
+    }
+
+    /// Fill `rect` with a classic Windows 98 1-bit checkerboard dither pattern (`(x + y) & 1`).
+    pub fn dither_checkerboard(&mut self, rect: Rect, even_color: u32, odd_color: u32) {
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let c0 = even_color & 0x00ff_ffff;
+        let c1 = odd_color & 0x00ff_ffff;
+        let width = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        for y in clip.y..clip.bottom() {
+            let row = y as usize * width;
+            for x in clip.x..clip.right() {
+                pixels[row + x as usize] = if (x + y) & 1 == 0 { c0 } else { c1 };
+            }
         }
     }
 
@@ -1173,7 +1240,13 @@ mod tests {
     #[test]
     fn bevel_and_horizontal_gradient_stay_within_rect() {
         let mut canvas = Canvas::new(40, 20, 0x111111);
-        canvas.bevel(Rect::new(4, 2, 20, 10), 0xffffff, 0xdfdfdf, 0x0a0a0a, 0x808080);
+        canvas.bevel(
+            Rect::new(4, 2, 20, 10),
+            0xffffff,
+            0xdfdfdf,
+            0x0a0a0a,
+            0x808080,
+        );
         let px = canvas.pixels();
         assert_eq!(px[2 * 40 + 4], 0xffffff);
         assert_eq!(px[3 * 40 + 5], 0xdfdfdf);

@@ -136,6 +136,7 @@ pub struct App {
     saved_geom: Option<(i16, i16, u16, u16)>,
     drag: Option<DragState>,
     caption_hover: CaptionHit,
+    caption_pressed: CaptionHit,
     current_cursor: CursorKind,
     content_cursor: CursorKind,
     last_title_click: Option<Instant>,
@@ -217,6 +218,7 @@ impl App {
             saved_geom: None,
             drag: None,
             caption_hover: CaptionHit::None,
+            caption_pressed: CaptionHit::None,
             current_cursor: CursorKind::Default,
             content_cursor: CursorKind::Default,
             last_title_click: None,
@@ -508,7 +510,7 @@ impl App {
             self.translate(ev, &mut events)?;
         }
         let now_animating = ui::has_active_animations() || self.anim_active;
-        if now_animating {
+        if anim_active || now_animating {
             self.needs_redraw = true;
         }
         Ok((events, extra_ready))
@@ -576,7 +578,10 @@ impl App {
                 }
             }
             Event::LeaveNotify(e) if e.event == self.win => {
-                if self.caption_hover != CaptionHit::None {
+                ui::notify_pointer_leave();
+                if self.caption_hover != CaptionHit::None
+                    || self.caption_pressed != CaptionHit::None
+                {
                     self.caption_hover = CaptionHit::None;
                     self.needs_redraw = true;
                 }
@@ -617,21 +622,20 @@ impl App {
 
                 let _ = self.x.focus(self.win);
                 let _ = self.x.set_active_window(self.win);
+                ui::notify_pointer_button(x, y, e.detail, true);
 
                 if e.detail == 1 {
-                    let cap = ui::hit_caption_for(&self.theme, self.width as i32, x, y, self.buttons_left());
+                    self.needs_redraw = true;
+                    let cap = ui::hit_caption_for(
+                        &self.theme,
+                        self.width as i32,
+                        x,
+                        y,
+                        self.buttons_left(),
+                    );
                     if cap != CaptionHit::None {
-                        match cap {
-                            CaptionHit::Close => events.push(UiEvent::Close),
-                            CaptionHit::Minimize => {
-                                let _ = self.x.send_window_cmd(self.win, 1);
-                                let _ = self.x.flush();
-                            }
-                            CaptionHit::Maximize => {
-                                self.toggle_maximize()?;
-                            }
-                            CaptionHit::None => {}
-                        }
+                        self.caption_pressed = cap;
+                        self.caption_hover = cap;
                         return Ok(());
                     }
                     if let Some(dir) = self.hit_resize(x, y) {
@@ -697,12 +701,43 @@ impl App {
                 });
             }
             Event::ButtonRelease(e) if e.event == self.win => {
+                let (x, y) = (e.event_x as i32, e.event_y as i32);
+                ui::notify_pointer_button(x, y, e.detail, false);
+                if e.detail == 1 {
+                    self.needs_redraw = true;
+                    let pressed_cap = self.caption_pressed;
+                    self.caption_pressed = CaptionHit::None;
+                    if pressed_cap != CaptionHit::None {
+                        let cap = ui::hit_caption_for(
+                            &self.theme,
+                            self.width as i32,
+                            x,
+                            y,
+                            self.buttons_left(),
+                        );
+                        self.caption_hover = cap;
+                        if cap == pressed_cap {
+                            match cap {
+                                CaptionHit::Close => events.push(UiEvent::Close),
+                                CaptionHit::Minimize => {
+                                    let _ = self.x.send_window_cmd(self.win, 1);
+                                    let _ = self.x.flush();
+                                }
+                                CaptionHit::Maximize => {
+                                    self.toggle_maximize()?;
+                                }
+                                CaptionHit::None => {}
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
                 if self.drag.take().is_some() {
                     self.apply_cursor(CursorKind::Default);
                 }
                 events.push(UiEvent::Button {
-                    x: e.event_x as i32,
-                    y: e.event_y as i32,
+                    x,
+                    y,
                     button: e.detail,
                     down: false,
                     state: e.state.into(),
@@ -711,6 +746,11 @@ impl App {
             Event::MotionNotify(e) if e.event == self.win => {
                 let (x, y) = (e.event_x as i32, e.event_y as i32);
                 let btn1_held = u16::from(e.state) & (1 << 8) != 0;
+                ui::notify_pointer_motion(x, y, btn1_held);
+                if self.caption_pressed != CaptionHit::None && !btn1_held {
+                    self.caption_pressed = CaptionHit::None;
+                    self.needs_redraw = true;
+                }
                 if let Some(drag) = self.drag {
                     if btn1_held {
                         let min_y = if self.config.panel_position == PanelPosition::Top {
@@ -791,7 +831,8 @@ impl App {
                     }
                 }
 
-                let cap = ui::hit_caption_for(&self.theme, self.width as i32, x, y, self.buttons_left());
+                let cap =
+                    ui::hit_caption_for(&self.theme, self.width as i32, x, y, self.buttons_left());
                 if cap != self.caption_hover {
                     self.caption_hover = cap;
                     self.needs_redraw = true;

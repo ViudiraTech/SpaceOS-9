@@ -18,10 +18,16 @@
 #define HDA_GCAP 0x00
 #define HDA_GCTL 0x08
 #define HDA_GCTL_RESET 0x00000001u
+#define HDA_GCTL_FCNTRL 0x00000002u
+#define HDA_GCTL_UNSOL 0x00000100u
+#define HDA_WAKEEN 0x0c
 #define HDA_STATESTS 0x0e
+#define HDA_STATESTS_MASK 0x7fffu
 #define HDA_INTCTL 0x20
 #define HDA_INTSTS 0x24
+#define HDA_INT_CTRL 0x40000000u
 #define HDA_INT_GLOBAL 0x80000000u
+#define HDA_INT_ALL_STREAM 0x3fffffffu
 #define HDA_CORBLBASE 0x40
 #define HDA_CORBUBASE 0x44
 #define HDA_CORBWP 0x48
@@ -39,7 +45,13 @@
 #define HDA_CORBRP_RST 0x8000
 #define HDA_RIRBWP_RST 0x8000
 #define HDA_CORBCTL_RUN 0x02
-#define HDA_RIRBCTL_DMA 0x02
+#define HDA_CORBSTS_CMEI 0x01u
+#define HDA_RIRBCTL_IRQ 0x01u
+#define HDA_RIRBCTL_DMA 0x02u
+#define HDA_RIRBSTS_IRQ 0x01u
+#define HDA_RIRBSTS_OVERRUN 0x04u
+#define HDA_RIRBSTS_MASK (HDA_RIRBSTS_IRQ | HDA_RIRBSTS_OVERRUN)
+#define HDA_PCIREG_TCSEL 0x44
 
 /* Stream descriptor registers, relative to the stream base. */
 #define SD_CTL 0x00
@@ -67,6 +79,7 @@
 #define HDA_STREAM_TAG 1
 
 #define AC_VERB_GET_PARAMETERS 0x0f00u
+#define AC_VERB_GET_CONFIG_DEFAULT 0x0f1cu
 #define AC_VERB_SET_STREAM_FORMAT 0x0200u
 #define AC_VERB_SET_AMP_GAIN_MUTE 0x0300u
 #define AC_VERB_SET_CONNECT_SEL 0x0701u
@@ -88,9 +101,11 @@
 
 #define AC_WCAP_IN_AMP 0x00000002u
 #define AC_WCAP_OUT_AMP 0x00000004u
+#define AC_WCAP_DIGITAL 0x00000200u
 
 #define AC_PINCAP_OUT 0x10u
 #define AC_PINCAP_IN 0x20u
+#define AC_JACK_PORT_NONE 0x1u
 
 #define AC_PINCTL_OUT_EN 0x40u
 #define AC_PINCTL_IN_EN 0x20u
@@ -120,6 +135,8 @@ struct hda_chip {
 
     volatile unsigned int *corb;
     volatile unsigned long long *rirb;
+    unsigned int corb_entries;
+    unsigned int rirb_entries;
     unsigned short corb_wp;
     unsigned char rirb_wp;
     unsigned char rirb_seen;
@@ -191,41 +208,64 @@ static inline void hda_writeb(struct hda_chip *chip, unsigned int offset,
     spk_writeb(value, (volatile void *)((unsigned char *)chip->mmio + offset));
 }
 
+static void hda_ack_rirb_sts(struct hda_chip *chip)
+{
+    spk_spin_lock(&chip->reg_lock);
+    if (hda_readb(chip, HDA_RIRBSTS) & HDA_RIRBSTS_MASK) {
+        hda_writeb(chip, HDA_RIRBSTS, HDA_RIRBSTS_MASK);
+    }
+    spk_spin_unlock(&chip->reg_lock);
+}
+
 static unsigned int hda_verb_unlocked(struct hda_chip *chip, unsigned int nid,
                                       unsigned int verb, unsigned int parm)
 {
     unsigned int command = ((chip->codec & 0xfu) << 28) | ((nid & 0xffu) << 20) |
                            ((verb & 0xfffu) << 8) | (parm & 0xffffu);
+    unsigned int corb_mask = (chip->corb_entries ? chip->corb_entries : 256u) - 1u;
+    unsigned int rirb_mask = (chip->rirb_entries ? chip->rirb_entries : 256u) - 1u;
     unsigned int timeout;
-    unsigned short next_wp = (unsigned short)((chip->corb_wp + 1u) & 0xffu);
-    unsigned char previous;
+    unsigned short next_wp = (unsigned short)((chip->corb_wp + 1u) & corb_mask);
+    unsigned int previous;
 
-    /* Acknowledge any prior RIRB status and re-sync RIRBWP before issuing CORBWP
-     * so QEMU's d->rirb_count == d->rirb_cnt threshold never stalls CORB DMA. */
-    if (hda_readb(chip, HDA_RIRBSTS) & 0x05u) {
-        hda_writeb(chip, HDA_RIRBSTS, 0x05u);
+    /* Clear any prior RIRB/CORB status and sync RIRBWP before issuing CORBWP
+     * so RINTCNT throttling never stalls subsequent commands. */
+    hda_ack_rirb_sts(chip);
+    if (hda_readb(chip, HDA_CORBSTS) & HDA_CORBSTS_CMEI) {
+        hda_writeb(chip, HDA_CORBSTS, HDA_CORBSTS_CMEI);
     }
-    previous = (unsigned char)(hda_readw(chip, HDA_RIRBWP) & 0xffu);
-    chip->rirb_wp = previous;
+    previous = hda_readw(chip, HDA_RIRBWP) & rirb_mask;
+    chip->rirb_wp = (unsigned char)previous;
 
     chip->corb[next_wp] = command;
     spk_mb();
     hda_writew(chip, HDA_CORBWP, next_wp);
     chip->corb_wp = next_wp;
-    for (timeout = 0; timeout < 20000u; timeout++) {
-        unsigned char current = (unsigned char)(hda_readw(chip, HDA_RIRBWP) & 0xffu);
-        if (current != previous) {
-            unsigned int response = (unsigned int)chip->rirb[current];
-            chip->rirb_wp = current;
-            chip->rirb_seen = 1;
-            hda_writeb(chip, HDA_RIRBSTS, 0x05u);
-            return response;
+    for (timeout = 0; timeout < 10000u; timeout++) {
+        unsigned int current = hda_readw(chip, HDA_RIRBWP) & rirb_mask;
+        while (previous != current) {
+            unsigned long long entry;
+            unsigned int response;
+            unsigned int res_ex;
+
+            previous = (previous + 1u) & rirb_mask;
+            spk_mb();
+            entry = chip->rirb[previous];
+            response = (unsigned int)entry;
+            res_ex = (unsigned int)(entry >> 32);
+            chip->rirb_wp = (unsigned char)previous;
+            /* Ignore unsolicited events and responses from other codec addresses. */
+            if ((res_ex & 0x10u) == 0u &&
+                (res_ex & 0x0fu) == (chip->codec & 0x0fu)) {
+                chip->rirb_seen = 1;
+                hda_ack_rirb_sts(chip);
+                return response;
+            }
         }
-        spk_udelay(1);
+        hda_ack_rirb_sts(chip);
+        spk_udelay(10);
     }
-    if (hda_readb(chip, HDA_RIRBSTS) & 0x05u) {
-        hda_writeb(chip, HDA_RIRBSTS, 0x05u);
-    }
+    hda_ack_rirb_sts(chip);
     hda_verb_timeouts++;
     if (hda_verb_timeouts <= 16u) {
         spk_printk("hda: verb timeout nid=%x verb=%x parm=%x\n",
@@ -244,47 +284,91 @@ static unsigned int hda_verb(struct hda_chip *chip, unsigned int nid,
     return response;
 }
 
+static unsigned int hda_ring_size(unsigned char reg_val, unsigned char *sel_out)
+{
+    if ((reg_val & 0x40u) != 0u || (reg_val & 0x70u) == 0u) {
+        *sel_out = 0x02u;
+        return 256u;
+    }
+    if ((reg_val & 0x20u) != 0u) {
+        *sel_out = 0x01u;
+        return 16u;
+    }
+    *sel_out = 0x00u;
+    return 2u;
+}
+
+static void hda_stop_rings(struct hda_chip *chip)
+{
+    unsigned int timeout;
+
+    hda_writeb(chip, HDA_CORBCTL, 0);
+    hda_writeb(chip, HDA_RIRBCTL, 0);
+    for (timeout = 0; timeout < 1000u; timeout++) {
+        if ((hda_readb(chip, HDA_CORBCTL) & HDA_CORBCTL_RUN) == 0u &&
+            (hda_readb(chip, HDA_RIRBCTL) & HDA_RIRBCTL_DMA) == 0u) {
+            break;
+        }
+        spk_udelay(1);
+    }
+}
+
 static void hda_init_rings(struct hda_chip *chip)
 {
     unsigned long long corb_phys = 0;
     unsigned long long rirb_phys = 0;
-    void *corb = spk_dma_alloc_coherent(256u * 4u, 128u, &corb_phys);
-    void *rirb = spk_dma_alloc_coherent(256u * 8u, 128u, &rirb_phys);
+    unsigned char corb_sz_reg = 0x02u;
+    unsigned char rirb_sz_reg = 0x02u;
+    unsigned int corb_entries = hda_ring_size(hda_readb(chip, HDA_CORBSIZE), &corb_sz_reg);
+    unsigned int rirb_entries = hda_ring_size(hda_readb(chip, HDA_RIRBSIZE), &rirb_sz_reg);
+    void *corb = spk_dma_alloc_coherent(corb_entries * 4u, 128u, &corb_phys);
+    void *rirb = spk_dma_alloc_coherent(rirb_entries * 8u, 128u, &rirb_phys);
     unsigned int timeout;
 
     if (corb == 0 || rirb == 0) {
+        spk_dma_free_coherent(corb, corb_entries * 4u);
+        spk_dma_free_coherent(rirb, rirb_entries * 8u);
         return;
     }
+    hda_stop_rings(chip);
+
     chip->corb = (volatile unsigned int *)corb;
     chip->rirb = (volatile unsigned long long *)rirb;
+    chip->corb_entries = corb_entries;
+    chip->rirb_entries = rirb_entries;
+
+    /* CORB set up matching Linux snd_hdac_bus_init_cmd_io(): base, size, WP=0, RP reset, run. */
     hda_writel(chip, HDA_CORBLBASE, (unsigned int)corb_phys);
     hda_writel(chip, HDA_CORBUBASE, (unsigned int)(corb_phys >> 32));
-    hda_writel(chip, HDA_RIRBLBASE, (unsigned int)rirb_phys);
-    hda_writel(chip, HDA_RIRBUBASE, (unsigned int)(rirb_phys >> 32));
-    hda_writeb(chip, HDA_CORBSIZE, 0x02); /* 256 entries */
-    hda_writeb(chip, HDA_RIRBSIZE, 0x02);
+    hda_writeb(chip, HDA_CORBSIZE, corb_sz_reg);
+    hda_writew(chip, HDA_CORBWP, 0);
     hda_writew(chip, HDA_CORBRP, HDA_CORBRP_RST);
     for (timeout = 0; timeout < 1000u; timeout++) {
         if (hda_readw(chip, HDA_CORBRP) & HDA_CORBRP_RST) {
             break;
         }
-        spk_udelay(10);
+        spk_udelay(1);
     }
     hda_writew(chip, HDA_CORBRP, 0);
     for (timeout = 0; timeout < 1000u; timeout++) {
         if ((hda_readw(chip, HDA_CORBRP) & HDA_CORBRP_RST) == 0) {
             break;
         }
-        spk_udelay(10);
+        spk_udelay(1);
     }
-    hda_writew(chip, HDA_CORBWP, 0);
-    hda_writew(chip, HDA_RIRBWP, HDA_RIRBWP_RST);
-    hda_writeb(chip, HDA_RIRBSTS, 0x05u);
-    hda_writew(chip, HDA_RINTCNT, 1);
+    hda_writeb(chip, HDA_CORBSTS, HDA_CORBSTS_CMEI);
     hda_writeb(chip, HDA_CORBCTL, HDA_CORBCTL_RUN);
-    hda_writeb(chip, HDA_RIRBCTL, HDA_RIRBCTL_DMA);
+
+    /* RIRB set up: RINTCNT=1 requires RIRBCTL IRQ bit so RIRBSTS updates and clears RIRB count. */
+    hda_writel(chip, HDA_RIRBLBASE, (unsigned int)rirb_phys);
+    hda_writel(chip, HDA_RIRBUBASE, (unsigned int)(rirb_phys >> 32));
+    hda_writeb(chip, HDA_RIRBSIZE, rirb_sz_reg);
+    hda_writew(chip, HDA_RIRBWP, HDA_RIRBWP_RST);
+    hda_writeb(chip, HDA_RIRBSTS, HDA_RIRBSTS_MASK);
+    hda_writew(chip, HDA_RINTCNT, 1);
+    hda_writeb(chip, HDA_RIRBCTL, (unsigned char)(HDA_RIRBCTL_DMA | HDA_RIRBCTL_IRQ));
     chip->corb_wp = 0;
-    chip->rirb_wp = (unsigned char)(hda_readw(chip, HDA_RIRBWP) & 0xffu);
+    chip->rirb_wp = (unsigned char)(hda_readw(chip, HDA_RIRBWP) & (rirb_entries - 1u));
     chip->rirb_seen = 0;
 }
 
@@ -391,59 +475,133 @@ static void hda_apply_master_amp(struct hda_chip *chip)
     }
 }
 
+static int hda_sub_nodes(struct hda_chip *chip, unsigned int nid,
+                         unsigned int *start_out, unsigned int *count_out)
+{
+    unsigned int val = hda_verb(chip, nid, AC_VERB_GET_PARAMETERS, AC_PAR_NODE_COUNT);
+    if (val == 0xffffffffu) {
+        *start_out = 0u;
+        *count_out = 0u;
+        return -1;
+    }
+    *start_out = (val >> 16) & 0xffu;
+    *count_out = val & 0xffu;
+    return 0;
+}
+
 static int hda_discover_codec(struct hda_chip *chip)
 {
-    unsigned int nodes = hda_verb(chip, 0, AC_VERB_GET_PARAMETERS,
-                                  AC_PAR_NODE_COUNT);
-    unsigned int start = nodes & 0xffu;
-    unsigned int count = (nodes >> 8) & 0xffu;
+    unsigned int fg_start = 0;
+    unsigned int fg_count = 0;
+    unsigned int start = 0;
+    unsigned int count = 0;
     unsigned int index;
     unsigned int dac_cap = 0;
     unsigned int adc_cap = 0;
     unsigned int pin_out_cap = 0;
     unsigned int pin_in_cap = 0;
+    unsigned int fallback_dac = 0, fallback_dac_cap = 0;
+    unsigned int fallback_adc = 0, fallback_adc_cap = 0;
+    unsigned int fallback_pin_out = 0, fallback_pin_out_cap = 0;
+    unsigned int fallback_pin_in = 0, fallback_pin_in_cap = 0;
 
     chip->afg = 0;
     chip->dac = 0;
     chip->adc = 0;
     chip->pin_out = 0;
     chip->pin_in = 0;
-    if (start == 0 || count == 0 || start + count > 256u) {
-        start = 1;
-        count = 8;
+    if (hda_sub_nodes(chip, 0u, &fg_start, &fg_count) != 0 ||
+        fg_start == 0u || fg_count == 0u || fg_start + fg_count > 256u) {
+        fg_start = 1u;
+        fg_count = 8u;
     }
-    for (index = start; index < start + count; index++) {
+    for (index = fg_start; index < fg_start + fg_count; index++) {
         unsigned int type = hda_verb(chip, index, AC_VERB_GET_PARAMETERS,
-                                     AC_PAR_FUNCTION_TYPE) & 0xffu;
-        if (type == 0x01u && chip->afg == 0) {
+                                     AC_PAR_FUNCTION_TYPE);
+        if (type != 0xffffffffu && (type & 0xffu) == 0x01u && chip->afg == 0u) {
             chip->afg = index;
+            break;
         }
     }
-    if (chip->afg == 0) {
-        chip->afg = 1;
+    if (chip->afg == 0u) {
+        return -19;
     }
-    for (index = chip->afg + 1; index < start + count; index++) {
+    hda_verb(chip, chip->afg, AC_VERB_SET_POWER_STATE, 0);
+    if (hda_sub_nodes(chip, chip->afg, &start, &count) != 0 ||
+        start == 0u || count == 0u || start + count > 256u) {
+        start = chip->afg + 1u;
+        count = 8u;
+    }
+    for (index = start; index < start + count; index++) {
         unsigned int cap = hda_verb(chip, index, AC_VERB_GET_PARAMETERS,
                                     AC_PAR_AUDIO_WIDGET_CAP);
-        unsigned int type = (cap >> 20) & 0xfu;
-        if (type == AC_WID_AUD_OUT && chip->dac == 0) {
-            chip->dac = index;
-            dac_cap = cap;
-        } else if (type == AC_WID_AUD_IN && chip->adc == 0) {
-            chip->adc = index;
-            adc_cap = cap;
+        unsigned int type;
+        unsigned int is_digital;
+        if (cap == 0xffffffffu) {
+            continue;
+        }
+        type = (cap >> 20) & 0xfu;
+        is_digital = (cap & AC_WCAP_DIGITAL) ? 1u : 0u;
+        if (type == AC_WID_AUD_OUT) {
+            if (!is_digital && chip->dac == 0u) {
+                chip->dac = index;
+                dac_cap = cap;
+            } else if (fallback_dac == 0u) {
+                fallback_dac = index;
+                fallback_dac_cap = cap;
+            }
+        } else if (type == AC_WID_AUD_IN) {
+            if (!is_digital && chip->adc == 0u) {
+                chip->adc = index;
+                adc_cap = cap;
+            } else if (fallback_adc == 0u) {
+                fallback_adc = index;
+                fallback_adc_cap = cap;
+            }
         } else if (type == AC_WID_PIN) {
             unsigned int pincap = hda_verb(chip, index, AC_VERB_GET_PARAMETERS,
                                            AC_PAR_PIN_CAP);
-            if ((pincap & AC_PINCAP_OUT) && chip->pin_out == 0) {
-                chip->pin_out = index;
-                pin_out_cap = cap;
+            unsigned int defcfg = hda_verb(chip, index, AC_VERB_GET_CONFIG_DEFAULT, 0);
+            unsigned int conn = (defcfg != 0xffffffffu) ? ((defcfg >> 30) & 0x3u) : 0u;
+            unsigned int connected = (!is_digital && conn != AC_JACK_PORT_NONE) ? 1u : 0u;
+            if (pincap == 0xffffffffu) {
+                continue;
             }
-            if ((pincap & AC_PINCAP_IN) && chip->pin_in == 0) {
-                chip->pin_in = index;
-                pin_in_cap = cap;
+            if ((pincap & AC_PINCAP_OUT) != 0u) {
+                if (connected && chip->pin_out == 0u) {
+                    chip->pin_out = index;
+                    pin_out_cap = cap;
+                } else if (fallback_pin_out == 0u) {
+                    fallback_pin_out = index;
+                    fallback_pin_out_cap = cap;
+                }
+            }
+            if ((pincap & AC_PINCAP_IN) != 0u) {
+                if (connected && chip->pin_in == 0u) {
+                    chip->pin_in = index;
+                    pin_in_cap = cap;
+                } else if (fallback_pin_in == 0u) {
+                    fallback_pin_in = index;
+                    fallback_pin_in_cap = cap;
+                }
             }
         }
+    }
+    if (chip->dac == 0u && fallback_dac != 0u) {
+        chip->dac = fallback_dac;
+        dac_cap = fallback_dac_cap;
+    }
+    if (chip->adc == 0u && fallback_adc != 0u) {
+        chip->adc = fallback_adc;
+        adc_cap = fallback_adc_cap;
+    }
+    if (chip->pin_out == 0u && fallback_pin_out != 0u) {
+        chip->pin_out = fallback_pin_out;
+        pin_out_cap = fallback_pin_out_cap;
+    }
+    if (chip->pin_in == 0u && fallback_pin_in != 0u) {
+        chip->pin_in = fallback_pin_in;
+        pin_in_cap = fallback_pin_in_cap;
     }
     /* QEMU hda-duplex: AFG 1, DAC 2, line-out 3, ADC 4, line-in 5. */
     if (chip->dac == 0) {
@@ -1157,6 +1315,15 @@ static int hda_probe(struct spk_pci_device *device)
         return -5;
     }
     spk_pci_set_master(device);
+    /* Mirror Linux azx_init_pci(): clear TCSEL bits 0..2 on Intel controllers
+     * so isochronous traffic maps cleanly to TC0 on real chipsets. */
+    if ((spk_pci_read_config_word(device, 0x00) & 0xffffu) == 0x8086u) {
+        int tcsel = spk_pci_read_config_byte(device, HDA_PCIREG_TCSEL);
+        if (tcsel >= 0) {
+            (void)spk_pci_write_config_byte(device, HDA_PCIREG_TCSEL,
+                                            (unsigned int)(tcsel & ~0x07));
+        }
+    }
     chip = (struct hda_chip *)spk_kzalloc(sizeof(*chip));
     if (chip == 0) {
         return -12;
@@ -1175,7 +1342,15 @@ static int hda_probe(struct spk_pci_device *device)
     chip->gains[0] = chip->out_gain_default;
     chip->gains[1] = chip->in_gain_default;
 
+    /* Reset sequence matching Linux snd_hdac_bus_reset_link(): clear STATESTS
+     * only if not already in reset, hold reset low >= 521 us, then bring link
+     * up and wait for codecs to assert STATESTS. */
     gctl = hda_readl(chip, HDA_GCTL);
+    hda_writel(chip, HDA_INTCTL, 0);
+    hda_writew(chip, HDA_WAKEEN, 0);
+    if (gctl & HDA_GCTL_RESET) {
+        hda_writew(chip, HDA_STATESTS, HDA_STATESTS_MASK);
+    }
     hda_writel(chip, HDA_GCTL, gctl & ~HDA_GCTL_RESET);
     for (timeout = 0; timeout < 1000u; timeout++) {
         if ((hda_readl(chip, HDA_GCTL) & HDA_GCTL_RESET) == 0) {
@@ -1183,7 +1358,8 @@ static int hda_probe(struct spk_pci_device *device)
         }
         spk_udelay(100);
     }
-    hda_writel(chip, HDA_GCTL, gctl | HDA_GCTL_RESET);
+    spk_udelay(1000);
+    hda_writel(chip, HDA_GCTL, HDA_GCTL_RESET);
     for (timeout = 0; timeout < 1000u; timeout++) {
         if ((hda_readl(chip, HDA_GCTL) & HDA_GCTL_RESET) != 0) {
             break;
@@ -1191,8 +1367,8 @@ static int hda_probe(struct spk_pci_device *device)
         spk_udelay(100);
     }
     spk_udelay(1000);
-    for (timeout = 0; timeout < 1000u; timeout++) {
-        statests = hda_readw(chip, HDA_STATESTS);
+    for (timeout = 0; timeout < 200u; timeout++) {
+        statests = hda_readw(chip, HDA_STATESTS) & HDA_STATESTS_MASK;
         if (statests != 0) {
             break;
         }
@@ -1202,23 +1378,31 @@ static int hda_probe(struct spk_pci_device *device)
         result = -19;
         goto fail_mmio;
     }
-    chip->codec = 0;
-    while (chip->codec < 16u && (statests & (1u << chip->codec)) == 0) {
-        chip->codec++;
-    }
+    hda_writew(chip, HDA_STATESTS, HDA_STATESTS_MASK);
+    hda_writeb(chip, HDA_RIRBSTS, HDA_RIRBSTS_MASK);
+    hda_writeb(chip, HDA_CORBSTS, HDA_CORBSTS_CMEI);
+    hda_writel(chip, HDA_INTSTS, HDA_INT_GLOBAL | HDA_INT_CTRL | HDA_INT_ALL_STREAM);
+
     hda_init_rings(chip);
     if (chip->corb == 0 || chip->rirb == 0) {
         result = -12;
         goto fail_mmio;
     }
-    if (hda_discover_codec(chip) != 0) {
-        result = -19;
-        goto fail_mmio;
+    result = -19;
+    for (chip->codec = 0; chip->codec < 15u; chip->codec++) {
+        if ((statests & (1u << chip->codec)) != 0u &&
+            hda_discover_codec(chip) == 0) {
+            result = 0;
+            break;
+        }
+    }
+    if (result != 0) {
+        goto fail_rings;
     }
     if (spk_pci_enable_msi(device, hda_irq, chip, 0, 0) != 0) {
         if (spk_request_irq(device, hda_irq, chip) != 0) {
             result = -19;
-            goto fail_mmio;
+            goto fail_rings;
         }
     }
     if (snd_card_new(-1, "HDA", "HDA", "Intel HDA",
@@ -1259,9 +1443,13 @@ fail_card:
     snd_card_free(chip->card);
 fail_irq:
     spk_free_irq(device);
+fail_rings:
+    hda_stop_rings(chip);
 fail_mmio:
-    spk_dma_free_coherent((void *)chip->corb, 256u * 4u);
-    spk_dma_free_coherent((void *)chip->rirb, 256u * 8u);
+    spk_dma_free_coherent((void *)chip->corb,
+                          (chip->corb_entries ? chip->corb_entries : 256u) * 4u);
+    spk_dma_free_coherent((void *)chip->rirb,
+                          (chip->rirb_entries ? chip->rirb_entries : 256u) * 8u);
     spk_iounmap(chip->mmio, chip->mmio_len);
     spk_kfree(chip);
     return result;
@@ -1275,16 +1463,21 @@ static void hda_remove(struct spk_pci_device *device)
         return;
     }
     chip->shutdown = 1;
+    hda_writel(chip, HDA_INTCTL, 0);
+    hda_writew(chip, HDA_WAKEEN, 0);
     hda_stream_stop(chip, 0);
     hda_stream_stop(chip, 1);
+    hda_stop_rings(chip);
     g_hda = 0;
     snd_card_free(chip->card);
     spk_free_irq(chip->pci);
     spk_msleep(20);
     spk_dma_free_coherent(chip->bdl[0], chip->bdl_entries[0] * 16u);
     spk_dma_free_coherent(chip->bdl[1], chip->bdl_entries[1] * 16u);
-    spk_dma_free_coherent((void *)chip->corb, 256u * 4u);
-    spk_dma_free_coherent((void *)chip->rirb, 256u * 8u);
+    spk_dma_free_coherent((void *)chip->corb,
+                          (chip->corb_entries ? chip->corb_entries : 256u) * 4u);
+    spk_dma_free_coherent((void *)chip->rirb,
+                          (chip->rirb_entries ? chip->rirb_entries : 256u) * 8u);
     spk_iounmap(chip->mmio, chip->mmio_len);
     spk_kfree(chip);
 }

@@ -26,6 +26,7 @@ pub const MOTION_INDICATOR: f32 = 0.22;
 pub const MOTION_SCROLL: f32 = 0.17;
 #[allow(dead_code)]
 pub const MOTION_HOVER: f32 = 0.12;
+pub const MOTION_PRESS: f32 = 0.095;
 pub const SCROLLBAR_HIT_W: i32 = 12;
 
 /// Material/iOS-style decelerating curve: fast response, gentle settle.
@@ -170,6 +171,10 @@ pub struct AnimationManager {
     rects: HashMap<WidgetId, RectTween>,
     floats: HashMap<WidgetId, FloatTween>,
     scroll_deadlines: HashMap<WidgetId, Instant>,
+    pointer_down: bool,
+    press_origin: (i32, i32),
+    pointer_pos: (i32, i32),
+    press_until: Option<Instant>,
 }
 
 impl AnimationManager {
@@ -215,12 +220,51 @@ impl AnimationManager {
         }
     }
 
+    pub fn notify_pointer_button(&mut self, x: i32, y: i32, button: u8, down: bool) {
+        if button != 1 {
+            return;
+        }
+        self.pointer_pos = (x, y);
+        if down {
+            self.pointer_down = true;
+            self.press_origin = (x, y);
+            self.press_until = Some(Instant::now() + Duration::from_secs_f32(MOTION_PRESS));
+        } else {
+            self.pointer_down = false;
+        }
+    }
+
+    pub fn notify_pointer_motion(&mut self, x: i32, y: i32, button1_held: bool) {
+        self.pointer_pos = (x, y);
+        if !button1_held {
+            self.pointer_down = false;
+        }
+    }
+
+    pub fn notify_pointer_leave(&mut self) {
+        self.pointer_down = false;
+    }
+
+    pub fn is_rect_pressed(&self, rect: Rect) -> bool {
+        if rect.is_empty() || !rect.contains(self.press_origin.0, self.press_origin.1) {
+            return false;
+        }
+        if !rect.contains(self.pointer_pos.0, self.pointer_pos.1) {
+            return false;
+        }
+        if self.pointer_down {
+            return true;
+        }
+        self.press_until.is_some_and(|until| Instant::now() < until)
+    }
+
     pub fn has_active(&self) -> bool {
         let now = Instant::now();
         self.toggles.values().any(|t| t.active(now))
             || self.rects.values().any(|t| t.active(now))
             || self.floats.values().any(|t| t.active(now))
             || self.scroll_deadlines.values().any(|&until| now < until)
+            || self.press_until.is_some_and(|until| now < until)
     }
 }
 
@@ -241,6 +285,22 @@ pub fn animate_rect(id: impl IntoWidgetId, target: Rect, duration: f32) -> Rect 
 pub fn animate_float(id: impl IntoWidgetId, target: f32, duration: f32) -> f32 {
     let wid = id.into_widget_id();
     ANIM_MGR.with(|m| m.borrow_mut().animate_float(wid, target, duration))
+}
+
+pub fn notify_pointer_button(x: i32, y: i32, button: u8, down: bool) {
+    ANIM_MGR.with(|m| m.borrow_mut().notify_pointer_button(x, y, button, down));
+}
+
+pub fn notify_pointer_motion(x: i32, y: i32, button1_held: bool) {
+    ANIM_MGR.with(|m| m.borrow_mut().notify_pointer_motion(x, y, button1_held));
+}
+
+pub fn notify_pointer_leave() {
+    ANIM_MGR.with(|m| m.borrow_mut().notify_pointer_leave());
+}
+
+pub fn is_rect_pressed(rect: Rect) -> bool {
+    ANIM_MGR.with(|m| m.borrow().is_rect_pressed(rect))
 }
 
 pub fn has_active_animations() -> bool {
@@ -474,18 +534,14 @@ pub fn titlebar(
         canvas.horizontal_gradient(bar, left_c, right_c);
 
         let (icon_x, title_x) = if buttons_left {
-            (bar.x + WIN98_CAPTION_BTN_W * 3 + 10, (bar.x + WIN98_CAPTION_BTN_W * 3 + 30) as f32)
+            (
+                bar.x + WIN98_CAPTION_BTN_W * 3 + 10,
+                (bar.x + WIN98_CAPTION_BTN_W * 3 + 30) as f32,
+            )
         } else {
             (bar.x + 4, (bar.x + 24) as f32)
         };
-        icons::draw(
-            canvas,
-            app_icon,
-            icon_x,
-            bar.y + (bar.h - 16) / 2,
-            16,
-            None,
-        );
+        icons::draw(canvas, app_icon, icon_x, bar.y + (bar.h - 16) / 2, 16, None);
         let max_title_w = (bar.w - WIN98_CAPTION_BTN_W * 3 - 36).max(32) as f32;
         let shown = text.truncate(title, max_title_w, 12.0, Face::Bold);
         let fg = if active {
@@ -504,10 +560,17 @@ pub fn titlebar(
         );
 
         let glyph_fg = theme.text;
-        for kind in [CaptionHit::Minimize, CaptionHit::Maximize, CaptionHit::Close] {
+        for kind in [
+            CaptionHit::Minimize,
+            CaptionHit::Maximize,
+            CaptionHit::Close,
+        ] {
             let btn = caption_button_rect_for(theme, width, kind, buttons_left);
             let is_hov = hover == kind;
-            let fill = if is_hov {
+            let is_pressed = is_rect_pressed(btn);
+            let fill = if is_pressed {
+                mix(theme.panel, theme.bevel_shadow, 0.16)
+            } else if is_hov {
                 if kind == CaptionHit::Close {
                     mix(theme.panel, theme.danger, 0.20)
                 } else {
@@ -517,8 +580,13 @@ pub fn titlebar(
                 theme.panel
             };
             canvas.fill(btn, fill);
-            raised_bevel(canvas, theme, btn);
-            draw_win98_caption_glyph(canvas, btn, kind, maximized, glyph_fg);
+            if is_pressed {
+                sunken_bevel(canvas, theme, btn);
+                draw_win98_caption_glyph(canvas, btn.offset(1, 1), kind, maximized, glyph_fg);
+            } else {
+                raised_bevel(canvas, theme, btn);
+                draw_win98_caption_glyph(canvas, btn, kind, maximized, glyph_fg);
+            }
         }
         return;
     }
@@ -698,7 +766,9 @@ pub fn button_anim(
     pressed: bool,
 ) {
     if theme.is_win98() {
-        let base = if hover_t > 0.001 {
+        let base = if pressed {
+            mix(theme.panel, theme.bevel_shadow, 0.14)
+        } else if hover_t > 0.001 {
             mix(theme.panel, theme.panel_hover, hover_t.clamp(0.0, 1.0))
         } else {
             theme.panel
@@ -714,6 +784,9 @@ pub fn button_anim(
             sunken_bevel(canvas, theme, bevel_r);
         } else {
             raised_bevel(canvas, theme, bevel_r);
+        }
+        if (pressed || primary) && rect.w >= 14 && rect.h >= 12 {
+            canvas.dotted_border_1px(rect.inset(4), theme.text);
         }
         let fg = theme.text;
         let shift = i32::from(pressed);
@@ -818,6 +891,7 @@ pub fn button(
     hover: bool,
 ) {
     let hover_t = animate_bool(rect, hover, MOTION_HOVER);
+    let pressed = is_rect_pressed(rect);
     button_anim(
         canvas,
         text,
@@ -827,7 +901,7 @@ pub fn button(
         leading_icon,
         primary,
         hover_t,
-        false,
+        pressed,
     );
 }
 
@@ -845,6 +919,7 @@ pub fn button_with_id(
     pressed: bool,
 ) {
     let hover_t = animate_bool(id, hover, MOTION_HOVER);
+    let pressed = pressed || is_rect_pressed(rect);
     button_anim(
         canvas,
         text,
@@ -868,6 +943,7 @@ pub fn toggle_switch_anim(
 ) {
     let p = progress.clamp(0.0, 1.0);
     if theme.is_win98() {
+        let pressed = is_rect_pressed(rect);
         let track_bg = if p > 0.5 {
             mix(theme.window_alt, theme.accent, 0.28)
         } else {
@@ -888,9 +964,19 @@ pub fn toggle_switch_anim(
         }
         canvas.fill(
             knob,
-            if hover { theme.panel_hover } else { theme.panel },
+            if pressed {
+                mix(theme.panel, theme.bevel_shadow, 0.16)
+            } else if hover {
+                theme.panel_hover
+            } else {
+                theme.panel
+            },
         );
-        raised_bevel(canvas, theme, knob);
+        if pressed {
+            sunken_bevel(canvas, theme, knob);
+        } else {
+            raised_bevel(canvas, theme, knob);
+        }
         return;
     }
 
@@ -1030,22 +1116,32 @@ pub fn slider(
         sunken_bevel(canvas, theme, track_rect);
         let active_w = ((rect.w - 4).max(0) as f32 * p).round() as i32;
         if active_w > 0 {
-            canvas.fill(Rect::new(rect.x + 2, track_y + 1, active_w, 2), theme.accent);
+            canvas.fill(
+                Rect::new(rect.x + 2, track_y + 1, active_w, 2),
+                theme.accent,
+            );
         }
         let thumb_w = 10;
         let thumb_h = rect.h.clamp(14, 18);
         let thumb_x = (rect.x as f32 + (rect.w as f32) * p).round() as i32 - thumb_w / 2;
         let thumb_y = rect.y + (rect.h - thumb_h) / 2;
         let thumb_r = Rect::new(thumb_x, thumb_y, thumb_w, thumb_h);
+        let pressed = dragging || is_rect_pressed(thumb_r) || is_rect_pressed(rect);
         canvas.fill(
             thumb_r,
-            if hover || dragging {
+            if pressed {
+                mix(theme.panel, theme.bevel_shadow, 0.16)
+            } else if hover {
                 theme.panel_hover
             } else {
                 theme.panel
             },
         );
-        raised_bevel(canvas, theme, thumb_r);
+        if pressed {
+            sunken_bevel(canvas, theme, thumb_r);
+        } else {
+            raised_bevel(canvas, theme, thumb_r);
+        }
         return;
     }
 
@@ -1107,8 +1203,12 @@ pub fn segmented_control_anim(
         for (i, label) in labels.iter().enumerate() {
             let seg = segmented_item_rect(rect, labels.len(), i);
             let is_sel = i == selected;
+            let is_pressed = is_rect_pressed(seg);
             if is_sel {
                 canvas.fill(seg, theme.accent);
+                sunken_bevel(canvas, theme, seg);
+            } else if is_pressed {
+                canvas.fill(seg, mix(theme.panel, theme.bevel_shadow, 0.16));
                 sunken_bevel(canvas, theme, seg);
             } else {
                 canvas.fill(
@@ -1121,6 +1221,7 @@ pub fn segmented_control_anim(
                 );
                 raised_bevel(canvas, theme, seg);
             }
+            let shift = i32::from(is_sel || is_pressed) as f32;
             let fg = if is_sel {
                 theme.selection_text
             } else {
@@ -1130,8 +1231,8 @@ pub fn segmented_control_anim(
             text.draw_centered(
                 canvas,
                 label,
-                seg.x as f32 + seg.w as f32 * 0.5,
-                baseline,
+                seg.x as f32 + seg.w as f32 * 0.5 + shift,
+                baseline + shift,
                 12.0,
                 fg,
                 face,
@@ -1261,40 +1362,61 @@ pub fn icon_button(
     enabled: bool,
     hover: bool,
 ) {
+    let pressed = enabled && is_rect_pressed(rect);
     if theme.is_win98() {
-        if hover && enabled {
+        if pressed {
+            canvas.fill(rect, mix(theme.panel, theme.bevel_shadow, 0.16));
+            sunken_bevel(canvas, theme, rect);
+        } else if hover && enabled {
             canvas.fill(rect, theme.panel_hover);
             raised_bevel(canvas, theme, rect);
         }
-        let tint = if enabled { theme.text } else { theme.text_muted };
+        let shift = i32::from(pressed);
+        let tint = if enabled {
+            theme.text
+        } else {
+            theme.text_muted
+        };
         icons::draw(
             canvas,
             icon,
-            rect.x + (rect.w - 16) / 2,
-            rect.y + (rect.h - 16) / 2,
+            rect.x + (rect.w - 16) / 2 + shift,
+            rect.y + (rect.h - 16) / 2 + shift,
             16,
             Some(tint),
         );
         return;
     }
     let hover_t = animate_bool(rect, hover && enabled, MOTION_HOVER);
-    if hover_t > 0.001 {
+    if pressed {
+        canvas.rounded_rect(
+            rect,
+            RADIUS_CONTROL,
+            mix(theme.panel_hover, 0x000000, 0.15),
+            1.0,
+        );
+    } else if hover_t > 0.001 {
         canvas.rounded_rect(rect, RADIUS_CONTROL, theme.panel_hover, hover_t);
     }
     let tint = if enabled {
-        if hover_t > 0.001 {
-            mix(theme.text_dim, theme.text, hover_t)
+        if hover_t > 0.001 || pressed {
+            mix(
+                theme.text_dim,
+                theme.text,
+                hover_t.max(f32::from(u8::from(pressed))),
+            )
         } else {
             theme.text_dim
         }
     } else {
         theme.text_muted
     };
+    let shift_y = i32::from(pressed);
     icons::draw(
         canvas,
         icon,
         rect.x + (rect.w - 16) / 2,
-        rect.y + (rect.h - 16) / 2,
+        rect.y + (rect.h - 16) / 2 + shift_y,
         16,
         Some(tint),
     );
@@ -1635,20 +1757,32 @@ pub fn scrollbar_v_animated(
     if theme.is_win98() {
         let bar_w = track.w.clamp(10, 14);
         let bar_x = track.right() - bar_w;
-        canvas.fill(
+        canvas.dither_checkerboard(
             Rect::new(bar_x, track.y, bar_w, track.h),
             theme.scrollbar_track,
+            theme.bevel_light,
         );
-        let thumb = Rect::new(bar_x, base_thumb.y, bar_w, base_thumb.h.max(18).min(track.h));
+        let thumb = Rect::new(
+            bar_x,
+            base_thumb.y,
+            bar_w,
+            base_thumb.h.max(18).min(track.h),
+        );
         canvas.fill(
             thumb,
-            if hovered || dragging {
+            if dragging {
+                mix(theme.scrollbar_thumb, theme.bevel_shadow, 0.16)
+            } else if hovered {
                 theme.panel_hover
             } else {
                 theme.scrollbar_thumb
             },
         );
-        raised_bevel(canvas, theme, thumb);
+        if dragging {
+            sunken_bevel(canvas, theme, thumb);
+        } else {
+            raised_bevel(canvas, theme, thumb);
+        }
         return;
     }
     let expand_t = animate_bool(id, hovered || dragging || scrolling, 0.14);
@@ -1786,5 +1920,43 @@ mod tests {
         assert!(!s.is_animating());
         assert!(s.handle_button(160, drag_to_y, 1, false));
         assert!(!s.is_dragging());
+    }
+
+    #[test]
+    fn test_pointer_press_and_win98_dotted_dither() {
+        let btn = Rect::new(20, 30, 80, 28);
+        assert!(!is_rect_pressed(btn));
+
+        // Pressing inside `btn` activates pressed state and animation keep-alive.
+        notify_pointer_button(40, 42, 1, true);
+        assert!(is_rect_pressed(btn));
+        assert!(has_active_animations());
+
+        // Dragging outside while held temporarily un-presses the button (Win32 behavior).
+        notify_pointer_motion(5, 5, true);
+        assert!(!is_rect_pressed(btn));
+
+        // Dragging back inside re-presses the button.
+        notify_pointer_motion(45, 44, true);
+        assert!(is_rect_pressed(btn));
+
+        // Releasing inside keeps the short press-flash alive briefly, while releasing outside clears.
+        notify_pointer_button(45, 44, 1, false);
+        assert!(is_rect_pressed(btn));
+        notify_pointer_motion(5, 5, false);
+        assert!(!is_rect_pressed(btn));
+
+        // Verify Win98 dotted focus border & checkerboard dither primitives.
+        let mut canvas = Canvas::new(32, 32, 0xc0c0c0);
+        canvas.dither_checkerboard(Rect::new(4, 4, 8, 8), 0xc0c0c0, 0xffffff);
+        assert_eq!(canvas.pixels()[4 * 32 + 4], 0xc0c0c0);
+        assert_eq!(canvas.pixels()[4 * 32 + 5], 0xffffff);
+        assert_eq!(canvas.pixels()[5 * 32 + 4], 0xffffff);
+        assert_eq!(canvas.pixels()[5 * 32 + 5], 0xc0c0c0);
+
+        canvas.dotted_border_1px(Rect::new(14, 14, 12, 10), 0x000000);
+        assert_eq!(canvas.pixels()[14 * 32 + 14], 0x000000);
+        assert_eq!(canvas.pixels()[14 * 32 + 15], 0xc0c0c0);
+        assert_eq!(canvas.pixels()[14 * 32 + 16], 0x000000);
     }
 }
