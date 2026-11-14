@@ -23,6 +23,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 const ICON_DIR: &str = "/usr/share/spui/icons/breeze";
 const LOGO_PATH: &str = "/usr/share/spui/logo.png";
 
+const MINESWEEPER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <rect x="3" y="3" width="42" height="42" rx="4" fill="#c0c0c0"/>
+  <path d="M5 5 H41 L39 7 H7 V39 L5 41 Z" fill="#ffffff"/>
+  <path d="M43 43 H7 L9 41 H41 V9 L43 7 Z" fill="#6b7280"/>
+  <rect x="8" y="8" width="32" height="32" fill="#d1d5db"/>
+  <line x1="24" y1="9" x2="24" y2="39" stroke="#111827" stroke-width="3.2" stroke-linecap="round"/>
+  <line x1="9" y1="24" x2="39" y2="24" stroke="#111827" stroke-width="3.2" stroke-linecap="round"/>
+  <line x1="13" y1="13" x2="35" y2="35" stroke="#111827" stroke-width="2.8" stroke-linecap="round"/>
+  <line x1="35" y1="13" x2="13" y2="35" stroke="#111827" stroke-width="2.8" stroke-linecap="round"/>
+  <circle cx="24" cy="24" r="10.5" fill="#111827"/>
+  <rect x="19" y="19" width="4" height="4" rx="1" fill="#ffffff"/>
+  <rect x="30" y="7" width="2.2" height="11" fill="#111827"/>
+  <polygon points="32,7 41,10.5 32,14" fill="#ef4444"/>
+</svg>"##;
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Icon {
@@ -33,6 +48,7 @@ pub enum Icon {
     Settings,
     Monitor,
     Calculator,
+    Minesweeper,
     ImageViewer,
     Music,
     Help,
@@ -118,6 +134,7 @@ define_svg_icons! {
     Settings => "settings.svg",
     Monitor => "monitor.svg",
     Calculator => "calculator.svg",
+    Minesweeper => "minesweeper.svg",
     ImageViewer => "image-viewer.svg",
     Music => "music.svg",
     Help => "help.svg",
@@ -301,7 +318,11 @@ impl IconStore {
         let file = icon.svg_name()?;
         if !self.svg_sources.contains_key(&icon) {
             let path = format!("{ICON_DIR}/{file}");
-            let xml = fs::read_to_string(path).ok()?;
+            let xml = match fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(_) if icon == Icon::Minesweeper => String::from(MINESWEEPER_SVG),
+                Err(_) => return None,
+            };
             self.svg_sources.insert(icon, xml);
         }
         let source = self.svg_sources.get(&icon)?;
@@ -478,5 +499,20 @@ pub fn decode_jpeg(path: &Path) -> Option<Sprite> {
         Some(Sprite::from_rgb(w, h, &rgb))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minesweeper_builtin_svg_renders_cleanly() {
+        let mut store = IconStore::new();
+        let sprite = store
+            .render_svg(Icon::Minesweeper, 48, None)
+            .expect("embedded minesweeper SVG must render");
+        assert_eq!((sprite.width, sprite.height), (48, 48));
+        assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
     }
 }

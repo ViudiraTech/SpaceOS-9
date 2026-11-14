@@ -59,15 +59,17 @@ pub enum AppCabinetFilter {
     System,
     Productivity,
     Media,
+    Games,
 }
 
 impl AppCabinetFilter {
-    const ALL: [(Self, &'static str, Icon); 5] = [
+    const ALL: [(Self, &'static str, Icon); 6] = [
         (Self::All, "全部应用", Icon::Applications),
         (Self::Pinned, "已固定磁贴", Icon::Appearance),
         (Self::System, "系统与控制", Icon::Settings),
         (Self::Productivity, "办公与工具", Icon::Editor),
         (Self::Media, "影音与图像", Icon::Music),
+        (Self::Games, "益智与游戏", Icon::Minesweeper),
     ];
 
     fn matches(self, mode: &str, cat: AppCategory, pinned: &[StartTileSpec]) -> bool {
@@ -77,6 +79,7 @@ impl AppCabinetFilter {
             Self::System => cat == AppCategory::System,
             Self::Productivity => cat == AppCategory::Productivity,
             Self::Media => cat == AppCategory::Media,
+            Self::Games => cat == AppCategory::Games,
         }
     }
 }
@@ -2924,6 +2927,7 @@ fn tile_accent_color(tile_id: &str, theme_accent: u32) -> u32 {
         "app-term" => 0x64748b,
         "app-edit" => 0x6366f1,
         "app-calc" => 0xf59e0b,
+        "app-mines" => 0x16a34a,
         "app-music" => 0xe11d48,
         "app-help" => 0x14b8a6,
         _ => theme_accent,

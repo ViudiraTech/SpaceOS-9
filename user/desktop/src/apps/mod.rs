@@ -16,6 +16,7 @@ pub mod files;
 pub mod greeter;
 pub mod help;
 pub mod login;
+pub mod mines;
 pub mod monitor;
 pub mod music;
 pub mod notify;

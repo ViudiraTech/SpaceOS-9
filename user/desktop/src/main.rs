@@ -39,6 +39,7 @@ fn main() -> ExitCode {
         "edit" => apps::edit::run(arguments.get(2).map(String::as_str)),
         "settings" => apps::settings::run(arguments.get(2).map(String::as_str)),
         "calc" | "calculator" => apps::calc::run(),
+        "mines" | "minesweeper" => apps::mines::run(),
         "monitor" | "taskmgr" => apps::monitor::run(),
         "music" | "player" => apps::music::run(),
         "view" | "image" => apps::view::run(arguments.get(2).map(String::as_str)),

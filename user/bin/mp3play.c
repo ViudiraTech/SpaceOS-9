@@ -332,11 +332,14 @@ static int recover_pcm(int fd, int error)
 static int handle_pause(int fd)
 {
     int value = 1;
-    int hw_paused = ioctl(fd, SNDRV_PCM_IOCTL_PAUSE, &value) == 0;
-    unsigned int seen = g_pause_requests;
+    int hw_paused = 0;
 
+    if ((g_pause_requests & 1u) == 0) {
+        return 0;
+    }
+    hw_paused = ioctl(fd, SNDRV_PCM_IOCTL_PAUSE, &value) == 0;
     printf("mp3play: paused\n");
-    while (!g_quit && g_pause_requests == seen) {
+    while (!g_quit && (g_pause_requests & 1u) != 0) {
         sleep_ms(20);
     }
     if (g_quit) {
@@ -357,7 +360,7 @@ static int handle_pause(int fd)
 /* Returns 0 when every frame was queued, 1 when a stop was requested, -1 on
  * an unrecoverable device error. */
 static int write_pcm(int fd, const short *samples, unsigned int frames,
-                     unsigned int channels, unsigned int *pause_seen)
+                     unsigned int channels)
 {
     unsigned int written = 0;
     while (written < frames) {
@@ -366,12 +369,10 @@ static int write_pcm(int fd, const short *samples, unsigned int frames,
         if (g_quit) {
             return 1;
         }
-        if (g_pause_requests != *pause_seen) {
-            *pause_seen = g_pause_requests;
+        if ((g_pause_requests & 1u) != 0) {
             if (handle_pause(fd) != 0) {
                 return 1;
             }
-            *pause_seen = g_pause_requests;
             continue;
         }
         transfer.buf = (void *)(samples + written * channels);
@@ -496,11 +497,14 @@ int main(int argc, char **argv)
     int pcm_fd = -1;
     unsigned int configured_rate = 0;
     unsigned int configured_channels = 0;
-    unsigned int pause_seen = 0;
     unsigned long decoded_frames = 0;
     unsigned long last_report = 0;
     int status = 0;
     int stopped = 0;
+
+    /* Install handlers before loading the track so an early SIGUSR1/SIGTERM
+     * arriving right after exec cannot hit default signal disposition. */
+    install_signal_handlers();
 
     while (argument < argc) {
         if (strcmp(argv[argument], "--decode") == 0) {
@@ -514,8 +518,14 @@ int main(int argc, char **argv)
         }
         argument++;
     }
+    if (g_quit) {
+        return 0;
+    }
     data = read_track(path, &size);
     if (data == 0) {
+        if (g_quit) {
+            return 0;
+        }
         printf("mp3play: cannot read %s\n", path);
         return 1;
     }
@@ -525,7 +535,6 @@ int main(int argc, char **argv)
         free(data);
         return status;
     }
-    install_signal_handlers();
     mp3dec_init(&decoder);
     if (!decode_only) {
         pcm_fd = open_playback();
@@ -617,7 +626,7 @@ int main(int argc, char **argv)
         }
         if (!decode_only) {
             int written_result = write_pcm(pcm_fd, frame_pcm, (unsigned int)samples,
-                                           configured_channels, &pause_seen);
+                                           configured_channels);
             if (written_result > 0) {
                 stopped = 1;
                 break;
@@ -648,12 +657,9 @@ int main(int argc, char **argv)
                 if (ioctl(pcm_fd, SNDRV_PCM_IOCTL_DRAIN, 0) == 0) {
                     drained = 1;
                 } else if (errno == EINTR && !g_quit) {
-                    if (g_pause_requests != pause_seen) {
-                        pause_seen = g_pause_requests;
-                        if (handle_pause(pcm_fd) != 0) {
-                            break;
-                        }
-                        pause_seen = g_pause_requests;
+                    if ((g_pause_requests & 1u) != 0 && handle_pause(pcm_fd) != 0) {
+                        stopped = 1;
+                        break;
                     }
                 } else {
                     break;

@@ -51,6 +51,7 @@ pub enum AppCategory {
     System,
     Productivity,
     Media,
+    Games,
 }
 
 pub struct AppEntry {
@@ -62,7 +63,7 @@ pub struct AppEntry {
     pub category: AppCategory,
 }
 
-pub const APPS: [AppEntry; 9] = [
+pub const APPS: [AppEntry; 10] = [
     AppEntry {
         name: "文件管理器",
         subtitle: "浏览目录与系统文件",
@@ -102,6 +103,14 @@ pub const APPS: [AppEntry; 9] = [
         icon: Icon::Calculator,
         mode: "calc",
         category: AppCategory::Productivity,
+    },
+    AppEntry {
+        name: "扫雷",
+        subtitle: "经典 XP 扫雷 · AI 约束推演与概率预测",
+        keywords: "mines minesweeper game ai xp 扫雷 排雷 游戏 益智",
+        icon: Icon::Minesweeper,
+        mode: "mines",
+        category: AppCategory::Games,
     },
     AppEntry {
         name: "看图工具",
@@ -359,6 +368,8 @@ fn infer_window_icon(title: &str) -> Icon {
         Icon::Monitor
     } else if title.contains("计算器") || lower.contains("calc") {
         Icon::Calculator
+    } else if title.contains("扫雷") || lower.contains("mine") {
+        Icon::Minesweeper
     } else if title.contains("看图") || lower.contains("view") || lower.contains("image") {
         Icon::ImageViewer
     } else if title.contains("音乐")
@@ -3366,6 +3377,7 @@ mod tests {
         assert_eq!(infer_window_icon("文本编辑器"), Icon::Editor);
         assert_eq!(infer_window_icon("系统监视器"), Icon::Monitor);
         assert_eq!(infer_window_icon("计算器"), Icon::Calculator);
+        assert_eq!(infer_window_icon("扫雷"), Icon::Minesweeper);
         assert_eq!(infer_window_icon("看图工具"), Icon::ImageViewer);
         assert_eq!(infer_window_icon("音乐播放器"), Icon::Music);
         assert_eq!(infer_window_icon("系统设置"), Icon::Settings);

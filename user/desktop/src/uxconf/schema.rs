@@ -30,7 +30,7 @@ pub const BUILTIN_CHANNELS: [&str; 12] = [
 ];
 
 /// Default ordered Win8/8.1 Start Screen tile list (`id:size`, comma-separated).
-pub const DEFAULT_START_TILES: &str = "status-clock:wide,status-net:wide,status-audio:wide,status-sys:wide,app-settings:wide,app-files:medium,app-term:medium,app-monitor:medium,app-music:medium,app-edit:small,app-calc:small,app-view:small,app-help:small";
+pub const DEFAULT_START_TILES: &str = "status-clock:wide,status-net:wide,status-audio:wide,status-sys:wide,app-settings:wide,app-files:medium,app-term:medium,app-monitor:medium,app-music:medium,app-edit:small,app-calc:small,app-mines:small,app-view:small,app-help:small";
 
 /// Return all default `(property, Value)` entries for a built-in `channel`.
 pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {

@@ -17,6 +17,9 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::path::Path;
+use std::sync::Mutex;
+
+static CRYPT_LOCK: Mutex<()> = Mutex::new(());
 
 const CRYPT_ALPHABET: &[u8] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const SHADOW_BUFFER: usize = 4096;
@@ -361,6 +364,21 @@ pub fn dummy_verify(password: &[u8], hash: &str) {
     let _ = verify_password(password, hash);
 }
 
+fn crypt_compute(password: &[u8], setting: &str) -> Result<String, &'static str> {
+    let password_c = CString::new(password).map_err(|_| "密码包含 NUL 字符")?;
+    let setting_c = CString::new(setting).map_err(|_| "salt NUL")?;
+    // POSIX crypt(3) returns a pointer to a process-global static buffer; hold
+    // CRYPT_LOCK until the output bytes are copied out into an owned String.
+    let _guard = CRYPT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let result = unsafe { crypt(password_c.as_ptr(), setting_c.as_ptr()) };
+    if result.is_null() {
+        return Err("crypt(3) 失败");
+    }
+    Ok(unsafe { CStr::from_ptr(result) }
+        .to_string_lossy()
+        .into_owned())
+}
+
 pub fn verify_password(password: &[u8], hash: &str) -> bool {
     if hash.starts_with('!') || hash.starts_with('*') {
         return false;
@@ -368,18 +386,10 @@ pub fn verify_password(password: &[u8], hash: &str) -> bool {
     if hash.is_empty() {
         return password.is_empty();
     }
-    let Ok(password) = CString::new(password) else {
+    let Ok(computed) = crypt_compute(password, hash) else {
         return false;
     };
-    let Ok(hash_c) = CString::new(hash) else {
-        return false;
-    };
-    let result = unsafe { crypt(password.as_ptr(), hash_c.as_ptr()) };
-    if result.is_null() {
-        return false;
-    }
-    let result = unsafe { CStr::from_ptr(result) }.to_bytes();
-    constant_time_eq(result, hash.as_bytes())
+    constant_time_eq(computed.as_bytes(), hash.as_bytes())
 }
 
 fn verify_against_shadow(username: &str, password: &[u8]) -> bool {
@@ -390,15 +400,7 @@ fn verify_against_shadow(username: &str, password: &[u8]) -> bool {
 
 pub fn hash_password(password: &[u8]) -> Result<String, String> {
     let salt = random_salt();
-    let salt_c = CString::new(format!("$6${salt}$")).map_err(|_| "salt NUL".to_string())?;
-    let password_c = CString::new(password).map_err(|_| "密码包含 NUL 字符".to_string())?;
-    let result = unsafe { crypt(password_c.as_ptr(), salt_c.as_ptr()) };
-    if result.is_null() {
-        return Err("crypt(3) 失败".to_string());
-    }
-    let hash = unsafe { CStr::from_ptr(result) }
-        .to_string_lossy()
-        .into_owned();
+    let hash = crypt_compute(password, &format!("$6${salt}$")).map_err(str::to_string)?;
     if !hash.starts_with("$6$") {
         return Err("系统 crypt 未生成 SHA-512 哈希".to_string());
     }
