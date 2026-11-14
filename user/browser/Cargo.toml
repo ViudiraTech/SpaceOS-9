@@ -1,0 +1,41 @@
+#
+#       user/browser/Cargo.toml
+#       Space Browser powered by LiteHTML + QuickJS-NG + SPUI 4.0
+#
+#       2026/11/14 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+[package]
+name = "space_browser"
+version = "1.0.0"
+edition = "2021"
+description = "SpaceOS-9 graphical web browser powered by LiteHTML + QuickJS-NG on SPUI 4.0"
+license = "LicenseRef-Proprietary"
+
+[lib]
+name = "space_browser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "space-browser"
+path = "src/main.rs"
+
+[dependencies]
+spui_ui = { path = "../spui_ui" }
+uxconf = { package = "spui", path = "../desktop" }
+x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "render", "shape", "randr"] }
+png = "0.17"
+zune-jpeg = "0.4"
+resvg = { version = "0.45", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0"
+httparse = "1.10"
+url = "2.5"
+flate2 = "1.1"
+brotli = "8.0"
+base64 = "0.22"
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.2"

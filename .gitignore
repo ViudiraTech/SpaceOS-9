@@ -5,6 +5,8 @@
 # Rust objects and generated bootable ISO trees.
 /target/
 /user/desktop/target/
+/user/browser/target/
+/user/spui_ui/target/
 /build/
 
 # Local demos / unmerged scratch demos.

@@ -64,7 +64,7 @@ pub struct AppEntry {
     pub category: AppCategory,
 }
 
-pub const APPS: [AppEntry; 10] = [
+pub const APPS: [AppEntry; 11] = [
     AppEntry {
         name: "文件管理器",
         subtitle: "浏览目录与系统文件",
@@ -145,6 +145,14 @@ pub const APPS: [AppEntry; 10] = [
         icon: Icon::Help,
         mode: "help",
         category: AppCategory::System,
+    },
+    AppEntry {
+        name: "Space 浏览器",
+        subtitle: "网页浏览与 QuickJS 交互引擎",
+        keywords: "browser web html internet js space 浏览器 网页 上网",
+        icon: Icon::Browser,
+        mode: "browser",
+        category: AppCategory::Productivity,
     },
 ];
 
@@ -545,6 +553,8 @@ fn infer_window_icon(title: &str) -> Icon {
         || lower.contains("mp3")
     {
         Icon::Music
+    } else if title.contains("浏览器") || lower.contains("browser") {
+        Icon::Browser
     } else if title.contains("设置") || lower.contains("setting") {
         Icon::Settings
     } else if title.contains("帮助") || lower.contains("help") || title.contains("手册") {
@@ -2923,11 +2933,24 @@ impl Shell {
             }
         }
         self.last_launch = Some((mode, now));
-        let Ok(path) = std::env::current_exe() else {
-            return;
+        let mut cmd = if mode == "browser" {
+            let sibling = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("space-browser")))
+                .filter(|p| p.is_file());
+            if let Some(bin) = sibling {
+                Command::new(bin)
+            } else {
+                Command::new("/usr/bin/space-browser")
+            }
+        } else {
+            let Ok(path) = std::env::current_exe() else {
+                return;
+            };
+            let mut c = Command::new(path);
+            c.arg(mode);
+            c
         };
-        let mut cmd = Command::new(path);
-        cmd.arg(mode);
         if let Some(arg) = extra_arg {
             cmd.arg(arg);
         }
@@ -3934,6 +3957,7 @@ mod tests {
         assert_eq!(infer_window_icon("看图工具"), Icon::ImageViewer);
         assert_eq!(infer_window_icon("音乐播放器"), Icon::Music);
         assert_eq!(infer_window_icon("系统设置"), Icon::Settings);
+        assert_eq!(infer_window_icon("Space 浏览器"), Icon::Browser);
         assert_eq!(infer_window_icon("帮助手册"), Icon::Help);
         assert_eq!(infer_window_icon("系统通知"), Icon::Notify);
         assert_eq!(infer_window_icon("会话账户"), Icon::Login);

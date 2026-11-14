@@ -221,6 +221,19 @@ impl BrowserState {
             }
             return;
         }
+        if is_html_file(&entry.path) {
+            let url = format!("file://{}", entry.path.display());
+            let bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("space-browser")))
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| PathBuf::from("/usr/bin/space-browser"));
+            match Command::new(bin).arg(&url).spawn() {
+                Ok(_) => self.status = format!("已在 Space 浏览器中打开 {}", entry.name),
+                Err(e) => self.status = format!("启动浏览器失败: {e}"),
+            }
+            return;
+        }
         if is_editable_text(&entry.path, entry.size) {
             match std::env::current_exe() {
                 Ok(exe) => match Command::new(exe).arg("edit").arg(&entry.path).spawn() {
@@ -943,6 +956,16 @@ fn is_image_file(path: &Path) -> bool {
             .map(str::to_ascii_lowercase)
             .as_deref(),
         Some("png" | "jpg" | "jpeg" | "bmp" | "webp" | "gif" | "pnm" | "tga")
+    )
+}
+
+fn is_html_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("html" | "htm")
     )
 }
 

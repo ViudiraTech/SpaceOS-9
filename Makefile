@@ -137,7 +137,7 @@ ROOTFS_SELFTEST ?= 0
 ROOTFS_IMG := build/rootfs/fat32.img
 ROOTFS_MODULE := $(if $(filter 1,$(WITH_ROOTFS)),module_path: boot():/rootfs.img,)
 
-.PHONY: desktop desktop-iso desktop-spui desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
+.PHONY: desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
 all: release-try
 
 defconfig:
@@ -225,7 +225,18 @@ desktop-iso:
 desktop-spui:
 	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/desktop/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
 
-desktop-rootfs: desktop-spui modules
+musl-sysroot:
+	python3 tools/ensure_musl_sysroot.py
+
+desktop-browser: musl-sysroot
+	cd /tmp && \
+	CC_x86_64_unknown_linux_musl=clang \
+	AR_x86_64_unknown_linux_musl=ar \
+	CFLAGS_x86_64_unknown_linux_musl="--target=x86_64-linux-musl --sysroot=$(CURDIR)/build/musl-sysroot -isystem $(CURDIR)/build/musl-sysroot/usr/include -fPIC" \
+	RUSTUP_TOOLCHAIN=nightly-2026-05-24 \
+	cargo build --manifest-path "$(CURDIR)/user/browser/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
+
+desktop-rootfs: desktop-spui desktop-browser modules
 	tools/build_userland.sh
 	python3 tools/build_desktop_rootfs.py
 

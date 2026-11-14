@@ -1,0 +1,24 @@
+#
+#       user/spui_ui/Cargo.toml
+#       Shared SPUI 4.0 X11, canvas, typography, theme and immediate-mode UI toolkit
+#
+#       2026/11/14 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+[package]
+name = "spui_ui"
+version = "4.0.0"
+edition = "2021"
+description = "Shared SPUI windowing, Canvas, TTF text, SVG/PNG/JPEG, Theme and UI toolkit"
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+uxconf = { package = "spui", path = "../desktop" }
+x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "render", "shape", "randr"] }
+ttf-parser = "0.25"
+ab_glyph_rasterizer = "0.1"
+resvg = { version = "0.45", default-features = false }
+png = "0.17"
+zune-jpeg = "0.4"
+libc = "0.2"

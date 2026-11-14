@@ -23,6 +23,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 const ICON_DIR: &str = "/usr/share/spui/icons/breeze";
 const LOGO_PATH: &str = "/usr/share/spui/logo.png";
 
+const BROWSER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="55%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1e3a8a"/>
+    </linearGradient>
+  </defs>
+  <circle cx="24" cy="24" r="20" fill="url(#bg)"/>
+  <ellipse cx="24" cy="24" rx="9" ry="20" fill="none" stroke="#e0f2fe" stroke-width="2" opacity="0.85"/>
+  <path d="M5 18 H43 M5 30 H43" stroke="#e0f2fe" stroke-width="2" opacity="0.8"/>
+  <ellipse cx="24" cy="24" rx="22" ry="7" transform="rotate(-24 24 24)" fill="none" stroke="#7dd3fc" stroke-width="2.4"/>
+  <circle cx="38" cy="14" r="3" fill="#ffffff"/>
+</svg>
+"##;
+
 const MINESWEEPER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
   <rect x="3" y="3" width="42" height="42" rx="4" fill="#c0c0c0"/>
   <path d="M5 5 H41 L39 7 H7 V39 L5 41 Z" fill="#ffffff"/>
@@ -51,6 +67,7 @@ pub enum Icon {
     Minesweeper,
     ImageViewer,
     Music,
+    Browser,
     Help,
     Login,
     Notify,
@@ -137,6 +154,7 @@ define_svg_icons! {
     Minesweeper => "minesweeper.svg",
     ImageViewer => "image-viewer.svg",
     Music => "music.svg",
+    Browser => "browser.svg",
     Help => "help.svg",
     Login => "login.svg",
     Notify => "notify.svg",
@@ -321,6 +339,7 @@ impl IconStore {
             let xml = match fs::read_to_string(path) {
                 Ok(text) => text,
                 Err(_) if icon == Icon::Minesweeper => String::from(MINESWEEPER_SVG),
+                Err(_) if icon == Icon::Browser => String::from(BROWSER_SVG),
                 Err(_) => return None,
             };
             self.svg_sources.insert(icon, xml);
@@ -512,6 +531,16 @@ mod tests {
         let sprite = store
             .render_svg(Icon::Minesweeper, 48, None)
             .expect("embedded minesweeper SVG must render");
+        assert_eq!((sprite.width, sprite.height), (48, 48));
+        assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
+    }
+
+    #[test]
+    fn browser_builtin_svg_renders_cleanly() {
+        let mut store = IconStore::new();
+        let sprite = store
+            .render_svg(Icon::Browser, 48, None)
+            .expect("embedded browser SVG must render");
         assert_eq!((sprite.width, sprite.height), (48, 48));
         assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
     }

@@ -818,7 +818,7 @@ EndSection
     if spui.is_dir():
         for path in sorted(spui.iterdir()):
             if path.is_file() and os.access(path, os.X_OK) and path.name in (
-                "spui", "uxconfd", "uxconf-query", "NetworkManager", "nmcli"
+                "spui", "space-browser", "uxconfd", "uxconf-query", "NetworkManager", "nmcli"
             ):
                 install_binary(path, f"/usr/bin/{path.name}")
         if (STAGE / "usr/bin/NetworkManager").exists():
