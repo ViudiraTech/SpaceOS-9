@@ -570,7 +570,9 @@ def configure() -> None:
             '# uxconf channel: appearance\n'
             '/font/scale = int:100\n'
             '/theme/accent = string:"#3b82f6"\n'
+            '/theme/id = string:"spui-4"\n'
             '/theme/mode = string:"dark"\n'
+            '/theme/style = string:"spui"\n'
         ),
         "desktop": (
             '# uxconf channel: desktop\n'

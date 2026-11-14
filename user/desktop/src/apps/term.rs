@@ -17,7 +17,7 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{CursorKind, Key, Result};
 use std::collections::VecDeque;
@@ -1267,6 +1267,12 @@ fn compute_metrics(text: &mut TextRenderer, font_size: i32) -> TermMetrics {
     }
 }
 
+fn content_rect(theme: &Theme, win_w: i32, win_h: i32) -> Rect {
+    let bw = theme.window_border_width();
+    let th = theme.titlebar_height();
+    Rect::new(bw, th, (win_w - bw * 2).max(1), (win_h - th - bw).max(1))
+}
+
 fn calc_grid(content: Rect, cell_w: i32, cell_h: i32) -> (usize, usize) {
     let usable_w = (content.w - PAD_X * 2 - SCROLLBAR_W).max(cell_w * 10);
     let usable_h = (content.h - PAD_Y * 2).max(cell_h * 3);
@@ -1275,12 +1281,12 @@ fn calc_grid(content: Rect, cell_w: i32, cell_h: i32) -> (usize, usize) {
     (cols, rows)
 }
 
-fn term_scrollbar_track(win_w: i32, win_h: i32) -> Rect {
+fn term_scrollbar_track(content: Rect) -> Rect {
     Rect::new(
-        win_w - SCROLLBAR_W - 2,
-        TITLEBAR_HEIGHT + 2,
+        content.right() - SCROLLBAR_W - 2,
+        content.y + 2,
         SCROLLBAR_W,
-        (win_h - TITLEBAR_HEIGHT - 4).max(8),
+        (content.h - 4).max(8),
     )
 }
 
@@ -1292,8 +1298,7 @@ fn term_is_at_bottom(vt: &VtTerm, scroll: &ui::SmoothScroll, cell_h: i32) -> boo
 fn sync_term_scroll(
     vt: &mut VtTerm,
     scroll: &mut ui::SmoothScroll,
-    win_w: i32,
-    win_h: i32,
+    content: Rect,
     cell_h: i32,
     snap_bottom: bool,
 ) {
@@ -1301,7 +1306,7 @@ fn sync_term_scroll(
     let vp_h = (vt.rows as i32 * ch).max(ch) as f32;
     let total_h = ((vt.scrollback.len() + vt.rows) as i32 * ch) as f32;
     let max_off = (total_h - vp_h).max(0.0);
-    scroll.set_bounds(vp_h, total_h, term_scrollbar_track(win_w, win_h));
+    scroll.set_bounds(vp_h, total_h, term_scrollbar_track(content));
     if snap_bottom {
         scroll.snap_to(max_off);
         vt.scroll_offset = 0;
@@ -1344,8 +1349,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     sync_term_scroll(
         &mut vt,
         &mut term_scroll,
-        app.width as i32,
-        app.height as i32,
+        app.content(),
         metrics.cell_h,
         true,
     );
@@ -1360,8 +1364,6 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         let (events, pty_ready) = app.pump_with_fd(extra_fd, 60)?;
 
         if pty_ready || pty.is_some() {
-            let win_w = app.width as i32;
-            let win_h = app.height as i32;
             let was_at_bottom = term_is_at_bottom(&vt, &term_scroll, metrics.cell_h);
             let mut fed_bytes = false;
             let mut eof = false;
@@ -1394,8 +1396,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 sync_term_scroll(
                     &mut vt,
                     &mut term_scroll,
-                    win_w,
-                    win_h,
+                    app.content(),
                     metrics.cell_h,
                     was_at_bottom,
                 );
@@ -1416,8 +1417,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         }
 
         for event in events {
-            let win_w = app.width as i32;
-            let win_h = app.height as i32;
+            let content = app.content();
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose => app.needs_redraw = true,
@@ -1425,7 +1425,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                     let was_at_bottom = term_is_at_bottom(&vt, &term_scroll, metrics.cell_h);
                     metrics = compute_metrics(&mut app.text, app.config.term_font_size);
                     vt.set_max_scrollback(app.config.term_scrollback_lines);
-                    let (cols, rows) = calc_grid(app.content(), metrics.cell_w, metrics.cell_h);
+                    let (cols, rows) = calc_grid(content, metrics.cell_w, metrics.cell_h);
                     if cols != vt.cols || rows != vt.rows {
                         vt.resize(cols, rows);
                         if let Some(p) = &pty {
@@ -1440,8 +1440,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                     sync_term_scroll(
                         &mut vt,
                         &mut term_scroll,
-                        win_w,
-                        win_h,
+                        content,
                         metrics.cell_h,
                         was_at_bottom,
                     );
@@ -1449,7 +1448,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 }
                 UiEvent::Configure { .. } => {
                     let was_at_bottom = term_is_at_bottom(&vt, &term_scroll, metrics.cell_h);
-                    let (cols, rows) = calc_grid(app.content(), metrics.cell_w, metrics.cell_h);
+                    let (cols, rows) = calc_grid(content, metrics.cell_w, metrics.cell_h);
                     if cols != vt.cols || rows != vt.rows {
                         vt.resize(cols, rows);
                         if let Some(p) = &pty {
@@ -1464,8 +1463,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                     sync_term_scroll(
                         &mut vt,
                         &mut term_scroll,
-                        win_w,
-                        win_h,
+                        content,
                         metrics.cell_h,
                         was_at_bottom,
                     );
@@ -1498,41 +1496,20 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                     }
                 }
                 UiEvent::Wheel { delta, .. } => {
-                    sync_term_scroll(
-                        &mut vt,
-                        &mut term_scroll,
-                        win_w,
-                        win_h,
-                        metrics.cell_h,
-                        false,
-                    );
+                    sync_term_scroll(&mut vt, &mut term_scroll, content, metrics.cell_h, false);
                     if term_scroll.wheel(delta as f32 * metrics.cell_h as f32) {
                         app.needs_redraw = true;
                     }
                 }
                 UiEvent::Key(key) => {
                     if key.shift() && key.is_page_up() {
-                        sync_term_scroll(
-                            &mut vt,
-                            &mut term_scroll,
-                            win_w,
-                            win_h,
-                            metrics.cell_h,
-                            false,
-                        );
+                        sync_term_scroll(&mut vt, &mut term_scroll, content, metrics.cell_h, false);
                         let step =
                             (vt.rows.saturating_sub(2).max(1) as i32 * metrics.cell_h) as f32;
                         term_scroll.animate_to(term_scroll.target() - step, ui::MOTION_SCROLL);
                         app.needs_redraw = true;
                     } else if key.shift() && key.is_page_down() {
-                        sync_term_scroll(
-                            &mut vt,
-                            &mut term_scroll,
-                            win_w,
-                            win_h,
-                            metrics.cell_h,
-                            false,
-                        );
+                        sync_term_scroll(&mut vt, &mut term_scroll, content, metrics.cell_h, false);
                         let step =
                             (vt.rows.saturating_sub(2).max(1) as i32 * metrics.cell_h) as f32;
                         term_scroll.animate_to(term_scroll.target() + step, ui::MOTION_SCROLL);
@@ -1544,8 +1521,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                             sync_term_scroll(
                                 &mut vt,
                                 &mut term_scroll,
-                                win_w,
-                                win_h,
+                                content,
                                 metrics.cell_h,
                                 true,
                             );
@@ -1594,30 +1570,33 @@ fn draw_terminal(
     let w = canvas.width as i32;
     let h = canvas.height as i32;
     let default_bg = ColorSpec::DefaultBg.resolve(theme, false);
-    let body = Rect::new(0, TITLEBAR_HEIGHT, w, (h - TITLEBAR_HEIGHT).max(0));
+    let body = content_rect(theme, w, h);
     canvas.fill(body, default_bg);
+    if theme.is_win98() {
+        ui::sunken_bevel(canvas, theme, body);
+    }
 
-    let origin_x = PAD_X;
-    let origin_y = TITLEBAR_HEIGHT + PAD_Y;
+    let origin_x = body.x + PAD_X;
+    let origin_y = body.y + PAD_Y;
     let total_sb = vt.scrollback.len();
     let total_rows = total_sb + vt.rows;
     let vp_h = (vt.rows as i32 * cell_h).max(cell_h) as f32;
     let total_h = (total_rows as i32 * cell_h) as f32;
-    let track = term_scrollbar_track(w, h);
+    let track = term_scrollbar_track(body);
     scroll.set_bounds(vp_h, total_h, track);
 
     let scroll_px = scroll
         .offset_i32()
         .clamp(0, (total_sb as i32 * cell_h).max(0));
     let first_row = (scroll_px / cell_h).clamp(0, total_rows.saturating_sub(1) as i32) as usize;
-    let content_clip = Rect::new(0, TITLEBAR_HEIGHT, (w - SCROLLBAR_W - 2).max(1), body.h);
+    let content_clip = Rect::new(body.x, body.y, (body.w - SCROLLBAR_W - 2).max(1), body.h);
     let vis_span = ((content_clip.h + cell_h - 1) / cell_h + 2).max(2) as usize;
 
     canvas.with_clip(content_clip, |c| {
         for row_idx in first_row..(first_row + vis_span).min(total_rows) {
             let line = vt.global_row(row_idx);
             let row_y = origin_y + row_idx as i32 * cell_h - scroll_px;
-            if row_y >= h {
+            if row_y >= body.bottom() {
                 break;
             }
 
@@ -1698,7 +1677,7 @@ fn draw_terminal(
             };
             let cx = origin_x + vt.cur_col as i32 * cell_w;
             let cy = origin_y + (total_sb + vt.cur_row) as i32 * cell_h - scroll_px;
-            if cy + cell_h > TITLEBAR_HEIGHT && cy < h {
+            if cy + cell_h > body.y && cy < body.bottom() {
                 let cursor_color = theme.accent;
                 match cursor_style {
                     CursorStyle::Beam => {

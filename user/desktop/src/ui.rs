@@ -252,6 +252,8 @@ fn keep_scroll_alive(id: WidgetId, duration: f32) {
 }
 
 pub const CAPTION_BTN_W: i32 = 42;
+const WIN98_CAPTION_BTN_W: i32 = 18;
+const WIN98_CAPTION_BTN_H: i32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptionHit {
@@ -259,6 +261,67 @@ pub enum CaptionHit {
     Minimize,
     Maximize,
     Close,
+}
+
+#[inline]
+pub fn raised_bevel(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    canvas.bevel(
+        rect,
+        theme.bevel_light,
+        theme.bevel_hi,
+        theme.bevel_dark,
+        theme.bevel_shadow,
+    );
+}
+
+#[inline]
+pub fn sunken_bevel(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    canvas.bevel(
+        rect,
+        theme.bevel_shadow,
+        theme.bevel_dark,
+        theme.bevel_light,
+        theme.bevel_hi,
+    );
+}
+
+#[inline]
+pub fn window_outer_bevel(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    canvas.bevel(
+        rect,
+        theme.bevel_hi,
+        theme.bevel_light,
+        theme.bevel_dark,
+        theme.bevel_shadow,
+    );
+}
+
+/// Fill a list/navigation row background and return the high-contrast foreground color.
+pub fn list_item_bg(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    selected: bool,
+    hovered: bool,
+) -> u32 {
+    if theme.is_win98() {
+        if selected {
+            canvas.fill(rect, theme.selection_bg);
+            theme.selection_text
+        } else {
+            if hovered {
+                canvas.fill(rect, theme.panel_hover);
+            }
+            theme.text
+        }
+    } else {
+        if selected {
+            canvas.rounded_rect(rect, RADIUS_CONTROL, theme.accent_soft, 1.0);
+        } else if hovered {
+            canvas.rounded_rect(rect, RADIUS_CONTROL, theme.panel_hover, 1.0);
+        }
+        theme.text
+    }
 }
 
 pub fn caption_button_rect(window_width: i32, kind: CaptionHit, buttons_left: bool) -> Rect {
@@ -294,8 +357,47 @@ pub fn caption_button_rect(window_width: i32, kind: CaptionHit, buttons_left: bo
     }
 }
 
-pub fn hit_caption(window_width: i32, x: i32, y: i32, buttons_left: bool) -> CaptionHit {
-    if y < 0 || y >= TITLEBAR_HEIGHT {
+pub fn caption_button_rect_for(
+    theme: &Theme,
+    window_width: i32,
+    kind: CaptionHit,
+    buttons_left: bool,
+) -> Rect {
+    if !theme.is_win98() {
+        return caption_button_rect(window_width, kind, buttons_left);
+    }
+    let th = theme.titlebar_height();
+    let bar_h = (th - 4).max(WIN98_CAPTION_BTN_H);
+    let y = 3 + (bar_h - WIN98_CAPTION_BTN_H) / 2;
+    let bw = WIN98_CAPTION_BTN_W;
+    let bh = WIN98_CAPTION_BTN_H;
+    if buttons_left {
+        match kind {
+            CaptionHit::Close => Rect::new(5, y, bw, bh),
+            CaptionHit::Maximize => Rect::new(5 + bw + 2, y, bw, bh),
+            CaptionHit::Minimize => Rect::new(5 + bw * 2 + 2, y, bw, bh),
+            CaptionHit::None => Rect::default(),
+        }
+    } else {
+        let right = (window_width - 5).max(bw * 3 + 12);
+        match kind {
+            CaptionHit::Close => Rect::new(right - bw, y, bw, bh),
+            CaptionHit::Maximize => Rect::new(right - bw * 2 - 2, y, bw, bh),
+            CaptionHit::Minimize => Rect::new(right - bw * 3 - 2, y, bw, bh),
+            CaptionHit::None => Rect::default(),
+        }
+    }
+}
+
+pub fn hit_caption_for(
+    theme: &Theme,
+    window_width: i32,
+    x: i32,
+    y: i32,
+    buttons_left: bool,
+) -> CaptionHit {
+    let th = theme.titlebar_height();
+    if y < 0 || y >= th {
         return CaptionHit::None;
     }
     for kind in [
@@ -303,11 +405,48 @@ pub fn hit_caption(window_width: i32, x: i32, y: i32, buttons_left: bool) -> Cap
         CaptionHit::Maximize,
         CaptionHit::Minimize,
     ] {
-        if caption_button_rect(window_width, kind, buttons_left).contains(x, y) {
+        if caption_button_rect_for(theme, window_width, kind, buttons_left).contains(x, y) {
             return kind;
         }
     }
     CaptionHit::None
+}
+
+fn draw_win98_caption_glyph(
+    canvas: &mut Canvas,
+    rect: Rect,
+    kind: CaptionHit,
+    maximized: bool,
+    fg: u32,
+) {
+    match kind {
+        CaptionHit::Minimize => {
+            canvas.fill(Rect::new(rect.x + 4, rect.bottom() - 5, 7, 2), fg);
+        }
+        CaptionHit::Maximize => {
+            if maximized {
+                let bx = rect.x + 4;
+                let by = rect.y + 3;
+                canvas.border_1px(Rect::new(bx + 2, by, 7, 7), fg);
+                canvas.fill(Rect::new(bx + 2, by + 1, 7, 1), fg);
+                canvas.border_1px(Rect::new(bx, by + 3, 7, 7), fg);
+                canvas.fill(Rect::new(bx, by + 4, 7, 1), fg);
+            } else {
+                let sq = Rect::new(rect.x + 4, rect.y + 3, 10, 9);
+                canvas.border_1px(sq, fg);
+                canvas.fill(Rect::new(sq.x, sq.y + 1, sq.w, 1), fg);
+            }
+        }
+        CaptionHit::Close => {
+            let cx = rect.x + 5;
+            let cy = rect.y + 4;
+            canvas.line(cx, cy, cx + 7, cy + 7, fg, 1.0);
+            canvas.line(cx + 1, cy, cx + 7, cy + 6, fg, 1.0);
+            canvas.line(cx + 7, cy, cx, cy + 7, fg, 1.0);
+            canvas.line(cx + 6, cy, cx, cy + 6, fg, 1.0);
+        }
+        CaptionHit::None => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -323,6 +462,67 @@ pub fn titlebar(
     buttons_left: bool,
     hover: CaptionHit,
 ) {
+    if theme.is_win98() {
+        let th = theme.titlebar_height();
+        canvas.fill(Rect::new(0, 0, width, th), theme.panel);
+        let bar = Rect::new(3, 3, (width - 6).max(1), (th - 4).max(1));
+        let (left_c, right_c) = if active {
+            (theme.titlebar, theme.titlebar_hi)
+        } else {
+            (theme.titlebar_inactive, theme.titlebar_inactive_hi)
+        };
+        canvas.horizontal_gradient(bar, left_c, right_c);
+
+        let (icon_x, title_x) = if buttons_left {
+            (bar.x + WIN98_CAPTION_BTN_W * 3 + 10, (bar.x + WIN98_CAPTION_BTN_W * 3 + 30) as f32)
+        } else {
+            (bar.x + 4, (bar.x + 24) as f32)
+        };
+        icons::draw(
+            canvas,
+            app_icon,
+            icon_x,
+            bar.y + (bar.h - 16) / 2,
+            16,
+            None,
+        );
+        let max_title_w = (bar.w - WIN98_CAPTION_BTN_W * 3 - 36).max(32) as f32;
+        let shown = text.truncate(title, max_title_w, 12.0, Face::Bold);
+        let fg = if active {
+            theme.titlebar_text
+        } else {
+            theme.titlebar_inactive_text
+        };
+        text.draw(
+            canvas,
+            &shown,
+            title_x,
+            bar.y as f32 + bar.h as f32 * 0.5 + 4.3,
+            12.0,
+            fg,
+            Face::Bold,
+        );
+
+        let glyph_fg = theme.text;
+        for kind in [CaptionHit::Minimize, CaptionHit::Maximize, CaptionHit::Close] {
+            let btn = caption_button_rect_for(theme, width, kind, buttons_left);
+            let is_hov = hover == kind;
+            let fill = if is_hov {
+                if kind == CaptionHit::Close {
+                    mix(theme.panel, theme.danger, 0.20)
+                } else {
+                    theme.panel_hover
+                }
+            } else {
+                theme.panel
+            };
+            canvas.fill(btn, fill);
+            raised_bevel(canvas, theme, btn);
+            draw_win98_caption_glyph(canvas, btn, kind, maximized, glyph_fg);
+        }
+        return;
+    }
+
     let bg = if active {
         theme.titlebar
     } else {
@@ -434,21 +634,53 @@ pub fn window_border(canvas: &mut Canvas, theme: &Theme, active: bool, maximized
     if maximized {
         return;
     }
+    let bounds = canvas.bounds();
+    if theme.is_win98() {
+        let bw = theme.window_border_width();
+        let th = theme.titlebar_height();
+        let body_h = (bounds.h - th).max(0);
+        if body_h > 0 {
+            canvas.fill(Rect::new(0, th, bw, body_h), theme.panel);
+            canvas.fill(Rect::new(bounds.w - bw, th, bw, body_h), theme.panel);
+            canvas.fill(Rect::new(0, bounds.h - bw, bounds.w, bw), theme.panel);
+        }
+        window_outer_bevel(canvas, theme, bounds);
+        return;
+    }
     let color = if active {
         theme.window_border_active
     } else {
         theme.window_border
     };
-    let bounds = canvas.bounds();
     canvas.border_1px(bounds, color);
 }
 
 pub fn popup_surface(canvas: &mut Canvas, theme: &Theme, rect: Rect, radius: i32) {
+    if theme.is_win98() {
+        canvas.fill(rect, theme.panel);
+        window_outer_bevel(canvas, theme, rect);
+        return;
+    }
     canvas.rounded_rect(rect, radius, theme.panel, 1.0);
     canvas.rounded_border(rect, radius, theme.panel_border, 1.0, 1);
 }
 
 pub fn card(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    if theme.is_win98() {
+        canvas.fill(rect, theme.window);
+        // Classic Win98 GroupBox etched border strictly inside `rect`.
+        if rect.w >= 4 && rect.h >= 4 {
+            canvas.border_1px(
+                Rect::new(rect.x + 1, rect.y + 1, rect.w - 1, rect.h - 1),
+                theme.bevel_light,
+            );
+            canvas.border_1px(
+                Rect::new(rect.x, rect.y, rect.w - 1, rect.h - 1),
+                theme.bevel_shadow,
+            );
+        }
+        return;
+    }
     canvas.rounded_rect(rect, 6, theme.window_high, 1.0);
     canvas.rounded_border(rect, 6, theme.window_border, 1.0, 1);
 }
@@ -465,6 +697,56 @@ pub fn button_anim(
     hover_t: f32,
     pressed: bool,
 ) {
+    if theme.is_win98() {
+        let base = if hover_t > 0.001 {
+            mix(theme.panel, theme.panel_hover, hover_t.clamp(0.0, 1.0))
+        } else {
+            theme.panel
+        };
+        canvas.fill(rect, base);
+        let bevel_r = if primary {
+            canvas.border_1px(rect, theme.bevel_dark);
+            rect.inset(1)
+        } else {
+            rect
+        };
+        if pressed {
+            sunken_bevel(canvas, theme, bevel_r);
+        } else {
+            raised_bevel(canvas, theme, bevel_r);
+        }
+        let fg = theme.text;
+        let shift = i32::from(pressed);
+        let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.5 + shift as f32;
+        if let Some(ic) = leading_icon {
+            let label_w = text.measure(label, 12.5, Face::Ui);
+            let total_w = 16.0 + if label.is_empty() { 0.0 } else { 6.0 + label_w };
+            let start_x = rect.x as f32 + (rect.w as f32 - total_w) * 0.5 + shift as f32;
+            icons::draw(
+                canvas,
+                ic,
+                start_x.round() as i32,
+                rect.y + (rect.h - 16) / 2 + shift,
+                16,
+                Some(fg),
+            );
+            if !label.is_empty() {
+                text.draw(canvas, label, start_x + 22.0, baseline, 12.5, fg, Face::Ui);
+            }
+        } else {
+            text.draw_centered(
+                canvas,
+                label,
+                rect.x as f32 + rect.w as f32 * 0.5 + shift as f32,
+                baseline,
+                12.5,
+                fg,
+                Face::Ui,
+            );
+        }
+        return;
+    }
+
     let base = if primary {
         theme.accent
     } else {
@@ -584,8 +866,35 @@ pub fn toggle_switch_anim(
     progress: f32,
     hover: bool,
 ) {
-    let radius = (rect.h / 2).max(1);
     let p = progress.clamp(0.0, 1.0);
+    if theme.is_win98() {
+        let track_bg = if p > 0.5 {
+            mix(theme.window_alt, theme.accent, 0.28)
+        } else {
+            theme.input_bg
+        };
+        canvas.fill(rect, track_bg);
+        sunken_bevel(canvas, theme, rect);
+        let inner = rect.inset(2);
+        let knob_w = (inner.w / 2).max(10);
+        let travel = (inner.w - knob_w).max(0);
+        let knob_x = inner.x + ((travel as f32) * p).round() as i32;
+        let knob = Rect::new(knob_x, inner.y, knob_w, inner.h);
+        if p > 0.25 && inner.w > 8 {
+            canvas.fill(
+                Rect::new(inner.x, inner.y, (knob_x - inner.x + 2).max(0), inner.h),
+                theme.accent,
+            );
+        }
+        canvas.fill(
+            knob,
+            if hover { theme.panel_hover } else { theme.panel },
+        );
+        raised_bevel(canvas, theme, knob);
+        return;
+    }
+
+    let radius = (rect.h / 2).max(1);
     let off_color = if theme.is_dark() { 0x36363e } else { 0xd4d4dc };
     let mut base = mix(off_color, theme.accent, p);
     if hover {
@@ -637,6 +946,44 @@ pub fn toggle_switch_with_id(
     toggle_switch_anim(canvas, theme, rect, p, hover);
 }
 
+fn draw_progress_bar_impl(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    p: f32,
+    color: Option<u32>,
+) {
+    let fg = color.unwrap_or(theme.accent);
+    if theme.is_win98() {
+        canvas.fill(rect, theme.panel);
+        sunken_bevel(canvas, theme, rect);
+        let inner = rect.inset(2);
+        if inner.w > 2 && inner.h > 2 && p > 0.001 {
+            let max_w = ((inner.w as f32) * p).round() as i32;
+            let mut bx = inner.x;
+            let block_w = 8;
+            let step = 10;
+            while bx < inner.x + max_w {
+                let w = block_w.min(inner.x + max_w - bx).min(inner.right() - bx);
+                if w <= 0 {
+                    break;
+                }
+                canvas.fill(Rect::new(bx, inner.y, w, inner.h), fg);
+                bx += step;
+            }
+        }
+        return;
+    }
+    let radius = (rect.h / 2).max(1);
+    canvas.rounded_rect(rect, radius, theme.window_alt, 1.0);
+    canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
+    let fill_w = ((rect.w as f32) * p).round() as i32;
+    if fill_w > 0 {
+        let fill_rect = Rect::new(rect.x, rect.y, fill_w.min(rect.w), rect.h);
+        canvas.rounded_rect(fill_rect, radius, fg, 1.0);
+    }
+}
+
 /// Linear horizontal progress bar with rounded caps and automatic smooth animation.
 pub fn progress_bar(
     canvas: &mut Canvas,
@@ -647,15 +994,7 @@ pub fn progress_bar(
 ) {
     let p_target = progress.clamp(0.0, 1.0);
     let p = animate_float(rect, p_target, 0.22);
-    let radius = (rect.h / 2).max(1);
-    canvas.rounded_rect(rect, radius, theme.window_alt, 1.0);
-    canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
-    let fill_w = ((rect.w as f32) * p).round() as i32;
-    if fill_w > 0 {
-        let fg = color.unwrap_or(theme.accent);
-        let fill_rect = Rect::new(rect.x, rect.y, fill_w.min(rect.w), rect.h);
-        canvas.rounded_rect(fill_rect, radius, fg, 1.0);
-    }
+    draw_progress_bar_impl(canvas, theme, rect, p, color);
 }
 
 #[allow(dead_code)]
@@ -669,15 +1008,7 @@ pub fn progress_bar_with_id(
 ) {
     let p_target = progress.clamp(0.0, 1.0);
     let p = animate_float(id, p_target, 0.22);
-    let radius = (rect.h / 2).max(1);
-    canvas.rounded_rect(rect, radius, theme.window_alt, 1.0);
-    canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
-    let fill_w = ((rect.w as f32) * p).round() as i32;
-    if fill_w > 0 {
-        let fg = color.unwrap_or(theme.accent);
-        let fill_rect = Rect::new(rect.x, rect.y, fill_w.min(rect.w), rect.h);
-        canvas.rounded_rect(fill_rect, radius, fg, 1.0);
-    }
+    draw_progress_bar_impl(canvas, theme, rect, p, color);
 }
 
 /// Smooth horizontal slider with filled track, animated expandable thumb and glow.
@@ -691,6 +1022,33 @@ pub fn slider(
     dragging: bool,
 ) {
     let p = progress.clamp(0.0, 1.0);
+    if theme.is_win98() {
+        let track_h = 4;
+        let track_y = rect.y + (rect.h - track_h) / 2;
+        let track_rect = Rect::new(rect.x, track_y, rect.w, track_h);
+        canvas.fill(track_rect, theme.input_bg);
+        sunken_bevel(canvas, theme, track_rect);
+        let active_w = ((rect.w - 4).max(0) as f32 * p).round() as i32;
+        if active_w > 0 {
+            canvas.fill(Rect::new(rect.x + 2, track_y + 1, active_w, 2), theme.accent);
+        }
+        let thumb_w = 10;
+        let thumb_h = rect.h.clamp(14, 18);
+        let thumb_x = (rect.x as f32 + (rect.w as f32) * p).round() as i32 - thumb_w / 2;
+        let thumb_y = rect.y + (rect.h - thumb_h) / 2;
+        let thumb_r = Rect::new(thumb_x, thumb_y, thumb_w, thumb_h);
+        canvas.fill(
+            thumb_r,
+            if hover || dragging {
+                theme.panel_hover
+            } else {
+                theme.panel
+            },
+        );
+        raised_bevel(canvas, theme, thumb_r);
+        return;
+    }
+
     let hover_t = animate_bool(rect, hover || dragging, 0.12);
     let track_h = 4;
     let track_y = rect.y + (rect.h - track_h) / 2;
@@ -742,6 +1100,46 @@ pub fn segmented_control_anim(
     selected: usize,
     hover_idx: Option<usize>,
 ) {
+    if theme.is_win98() {
+        canvas.fill(rect, theme.panel);
+        sunken_bevel(canvas, theme, rect);
+        let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.3;
+        for (i, label) in labels.iter().enumerate() {
+            let seg = segmented_item_rect(rect, labels.len(), i);
+            let is_sel = i == selected;
+            if is_sel {
+                canvas.fill(seg, theme.accent);
+                sunken_bevel(canvas, theme, seg);
+            } else {
+                canvas.fill(
+                    seg,
+                    if hover_idx == Some(i) {
+                        theme.panel_hover
+                    } else {
+                        theme.panel
+                    },
+                );
+                raised_bevel(canvas, theme, seg);
+            }
+            let fg = if is_sel {
+                theme.selection_text
+            } else {
+                theme.text
+            };
+            let face = if is_sel { Face::Bold } else { Face::Ui };
+            text.draw_centered(
+                canvas,
+                label,
+                seg.x as f32 + seg.w as f32 * 0.5,
+                baseline,
+                12.0,
+                fg,
+                face,
+            );
+        }
+        return;
+    }
+
     canvas.rounded_rect(rect, RADIUS_CONTROL + 1, theme.window_alt, 1.0);
     canvas.rounded_border(rect, RADIUS_CONTROL + 1, theme.window_border, 1.0, 1);
     if !indicator_rect.is_empty() {
@@ -814,6 +1212,18 @@ pub fn color_swatch(
     selected: bool,
     hover: bool,
 ) {
+    if theme.is_win98() {
+        let box_r = rect.inset(2);
+        canvas.fill(box_r, color);
+        sunken_bevel(canvas, theme, box_r);
+        if selected {
+            canvas.border_1px(rect, theme.text);
+            canvas.border_1px(rect.inset(1), theme.bevel_light);
+        } else if hover {
+            canvas.border_1px(rect, theme.bevel_shadow);
+        }
+        return;
+    }
     let sel_t = animate_bool(rect, selected, 0.18);
     let hov_t = animate_bool(rect.offset(1, 1), hover, 0.12);
     let cx = rect.x as f32 + rect.w as f32 * 0.5;
@@ -851,6 +1261,22 @@ pub fn icon_button(
     enabled: bool,
     hover: bool,
 ) {
+    if theme.is_win98() {
+        if hover && enabled {
+            canvas.fill(rect, theme.panel_hover);
+            raised_bevel(canvas, theme, rect);
+        }
+        let tint = if enabled { theme.text } else { theme.text_muted };
+        icons::draw(
+            canvas,
+            icon,
+            rect.x + (rect.w - 16) / 2,
+            rect.y + (rect.h - 16) / 2,
+            16,
+            Some(tint),
+        );
+        return;
+    }
     let hover_t = animate_bool(rect, hover && enabled, MOTION_HOVER);
     if hover_t > 0.001 {
         canvas.rounded_rect(rect, RADIUS_CONTROL, theme.panel_hover, hover_t);
@@ -885,22 +1311,27 @@ pub fn text_input(
     focused: bool,
     leading_icon: Option<Icon>,
 ) {
-    let focus_t = animate_bool(rect, focused, 0.15);
-    canvas.rounded_rect(rect, RADIUS_CONTROL, theme.input_bg, 1.0);
-    let border = if focus_t > 0.001 {
-        mix(theme.panel_border, theme.accent, focus_t)
+    if theme.is_win98() {
+        canvas.fill(rect, theme.input_bg);
+        sunken_bevel(canvas, theme, rect);
     } else {
-        theme.panel_border
-    };
-    canvas.rounded_border(rect, RADIUS_CONTROL, border, 1.0, 1);
-    if focus_t > 0.001 {
-        canvas.rounded_border(
-            rect.inset(-2),
-            RADIUS_CONTROL + 2,
-            theme.accent,
-            0.28 * focus_t,
-            2,
-        );
+        let focus_t = animate_bool(rect, focused, 0.15);
+        canvas.rounded_rect(rect, RADIUS_CONTROL, theme.input_bg, 1.0);
+        let border = if focus_t > 0.001 {
+            mix(theme.panel_border, theme.accent, focus_t)
+        } else {
+            theme.panel_border
+        };
+        canvas.rounded_border(rect, RADIUS_CONTROL, border, 1.0, 1);
+        if focus_t > 0.001 {
+            canvas.rounded_border(
+                rect.inset(-2),
+                RADIUS_CONTROL + 2,
+                theme.accent,
+                0.28 * focus_t,
+                2,
+            );
+        }
     }
 
     let mut text_x = rect.x + 10;
@@ -1008,6 +1439,7 @@ impl SmoothScroll {
         self.tween.to.clamp(0.0, self.max_offset)
     }
 
+    #[allow(dead_code)]
     pub fn max_offset(&self) -> f32 {
         self.max_offset
     }
@@ -1200,6 +1632,25 @@ pub fn scrollbar_v_animated(
     let Some(base_thumb) = scrollbar_thumb_rect_f32(track, total, visible, offset) else {
         return;
     };
+    if theme.is_win98() {
+        let bar_w = track.w.clamp(10, 14);
+        let bar_x = track.right() - bar_w;
+        canvas.fill(
+            Rect::new(bar_x, track.y, bar_w, track.h),
+            theme.scrollbar_track,
+        );
+        let thumb = Rect::new(bar_x, base_thumb.y, bar_w, base_thumb.h.max(18).min(track.h));
+        canvas.fill(
+            thumb,
+            if hovered || dragging {
+                theme.panel_hover
+            } else {
+                theme.scrollbar_thumb
+            },
+        );
+        raised_bevel(canvas, theme, thumb);
+        return;
+    }
     let expand_t = animate_bool(id, hovered || dragging || scrolling, 0.14);
     let track_alpha = 0.20 + 0.65 * expand_t;
     let track_pill = Rect::new(

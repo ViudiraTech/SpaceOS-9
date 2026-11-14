@@ -442,6 +442,11 @@ impl Screen {
         let x = X::connect()?;
         let width = i32::from(x.width);
         let height = i32::from(x.height);
+
+        let config = uxconf::storage::load_desktop_config_readonly();
+        let theme = Theme::from_config(&config);
+        let init_bg = if theme.is_win98() { theme.bg_top } else { 0x101014 };
+
         let win = x.generate_id()?;
         x.create_window(
             win,
@@ -452,7 +457,7 @@ impl Screen {
             height as u16,
             true,
             x11_event_mask(),
-            0x101014,
+            init_bg,
         )?;
         x.set_title(win, "SpaceOS Login")?;
         x.set_class(win, "spui", "SpuiGreeter")?;
@@ -461,10 +466,9 @@ impl Screen {
 
         let mut text =
             TextRenderer::load().map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-        text.set_ui_scale(1.0);
-        let theme = Theme::dark_with_accent(0x3b82f6);
-        let background = wallpaper(wallpaper_path, width as usize, height as usize);
-        let mut canvas = x.create_canvas(width as usize, height as usize, 0x101014);
+        text.set_ui_scale(theme.ui_scale());
+        let background = session_backdrop(&theme, wallpaper_path, width as usize, height as usize);
+        let mut canvas = x.create_canvas(width as usize, height as usize, init_bg);
         canvas.copy_background(&background);
         let backing = x.create_backing(win, width as u16, height as u16)?;
         x.put_canvas(backing, &canvas, canvas.bounds())?;
@@ -532,9 +536,14 @@ impl Screen {
         let _ = self.x.release_canvas(&self.canvas);
         self.width = width;
         self.height = height;
+        let init_bg = if self.theme.is_win98() {
+            self.theme.bg_top
+        } else {
+            0x101014
+        };
         self.canvas = self
             .x
-            .create_canvas(width as usize, height as usize, 0x101014);
+            .create_canvas(width as usize, height as usize, init_bg);
         if let Ok(backing) = self
             .x
             .create_backing(self.window, width as u16, height as u16)
@@ -542,7 +551,8 @@ impl Screen {
             self.backing = backing;
             let _ = self.x.set_background_pixmap(self.window, backing);
         }
-        self.background = wallpaper(&self.wallpaper_path, width as usize, height as usize);
+        self.background =
+            session_backdrop(&self.theme, &self.wallpaper_path, width as usize, height as usize);
         self.needs_redraw = true;
     }
 
@@ -577,6 +587,14 @@ fn x11_event_mask() -> x11rb::protocol::xproto::EventMask {
         | EventMask::POINTER_MOTION
         | EventMask::LEAVE_WINDOW
         | EventMask::FOCUS_CHANGE
+}
+
+fn session_backdrop(theme: &Theme, path: &str, width: usize, height: usize) -> Vec<u32> {
+    if theme.is_win98() {
+        vec![theme.bg_top; width.saturating_mul(height)]
+    } else {
+        wallpaper(path, width, height)
+    }
 }
 
 fn wallpaper(path: &str, width: usize, height: usize) -> Vec<u32> {

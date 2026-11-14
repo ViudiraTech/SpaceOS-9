@@ -16,7 +16,7 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{CursorKind, Result};
 use std::collections::HashMap;
@@ -295,9 +295,20 @@ const PROC_TH_H: i32 = 28;
 const PROC_ROW_H: i32 = 30;
 const PROC_SCROLLBAR_W: i32 = ui::SCROLLBAR_HIT_W;
 
-fn proc_table_rect(w: i32, h: i32) -> Rect {
-    let top = TITLEBAR_HEIGHT + 58;
-    Rect::new(14, top + 26, w - 28, h - (top + 26) - 56)
+fn content_rect(theme: &Theme, w: i32, h: i32) -> Rect {
+    let bw = theme.window_border_width();
+    let th = theme.titlebar_height();
+    Rect::new(bw, th, (w - bw * 2).max(1), (h - th - bw).max(1))
+}
+
+fn proc_table_rect(content: Rect) -> Rect {
+    let top = content.y + 58;
+    Rect::new(
+        content.x + 14,
+        top + 26,
+        (content.w - 28).max(1),
+        (content.bottom() - (top + 26) - 56).max(1),
+    )
 }
 
 fn proc_rows_clip(table_r: Rect) -> Rect {
@@ -329,10 +340,9 @@ fn sync_proc_scroll(
     data: &SystemMonitorData,
     query: &str,
     scroll: &mut ui::SmoothScroll,
-    w: i32,
-    h: i32,
+    content: Rect,
 ) {
-    let table_r = proc_table_rect(w, h);
+    let table_r = proc_table_rect(content);
     let rows_r = proc_rows_clip(table_r);
     let track = proc_scrollbar_track(table_r);
     let total_h = (filtered_proc_count(data, query) as i32 * PROC_ROW_H) as f32;
@@ -350,13 +360,7 @@ pub fn run() -> Result<()> {
     let mut proc_scroll = ui::SmoothScroll::new("monitor_proc_scroll");
     let query = String::new();
     let mut last_sample = Instant::now();
-    sync_proc_scroll(
-        &data,
-        &query,
-        &mut proc_scroll,
-        app.width as i32,
-        app.height as i32,
-    );
+    sync_proc_scroll(&data, &query, &mut proc_scroll, app.content());
 
     loop {
         if app.close {
@@ -365,18 +369,13 @@ pub fn run() -> Result<()> {
 
         if last_sample.elapsed().as_millis() >= 1000 {
             data.sample();
-            sync_proc_scroll(
-                &data,
-                &query,
-                &mut proc_scroll,
-                app.width as i32,
-                app.height as i32,
-            );
+            sync_proc_scroll(&data, &query, &mut proc_scroll, app.content());
             last_sample = Instant::now();
             app.needs_redraw = true;
         }
 
         if app.needs_redraw {
+            let content = app.content();
             draw_monitor(
                 &mut app.canvas,
                 &mut app.text,
@@ -386,8 +385,7 @@ pub fn run() -> Result<()> {
                 selected_pid,
                 &mut proc_scroll,
                 &query,
-                app.width as i32,
-                app.height as i32,
+                content,
             );
             app.draw_chrome();
             app.present()?;
@@ -399,14 +397,17 @@ pub fn run() -> Result<()> {
             (1000 - last_sample.elapsed().as_millis() as i32).clamp(20, 100)
         };
         for event in app.pump_with_fd(None, timeout)?.0 {
-            let (win_w, win_h) = (app.width as i32, app.height as i32);
+            let content = app.content();
             match event {
                 UiEvent::Close => app.request_close(),
-                UiEvent::Expose | UiEvent::ConfigChanged => {
+                UiEvent::Expose => app.needs_redraw = true,
+                UiEvent::ConfigChanged => {
+                    sync_proc_scroll(&data, &query, &mut proc_scroll, app.content());
                     app.needs_redraw = true;
                 }
                 UiEvent::Configure { width, height } => {
-                    sync_proc_scroll(&data, &query, &mut proc_scroll, width as i32, height as i32);
+                    let resized = content_rect(&app.theme, width as i32, height as i32);
+                    sync_proc_scroll(&data, &query, &mut proc_scroll, resized);
                     app.needs_redraw = true;
                 }
                 UiEvent::Motion { x, y, .. } => {
@@ -427,7 +428,7 @@ pub fn run() -> Result<()> {
                 }
                 UiEvent::Wheel { delta, .. } => {
                     if tab == Tab::Processes {
-                        sync_proc_scroll(&data, &query, &mut proc_scroll, win_w, win_h);
+                        sync_proc_scroll(&data, &query, &mut proc_scroll, content);
                         if proc_scroll.wheel(delta as f32 * 22.0) {
                             app.needs_redraw = true;
                         }
@@ -447,16 +448,16 @@ pub fn run() -> Result<()> {
                         app.needs_redraw = true;
                         continue;
                     }
-                    if button == 1 && down && y >= TITLEBAR_HEIGHT {
+                    if button == 1 && down && content.contains(x, y) {
                         // Check tab bar
                         let tab_w = 200;
-                        let tab_r = Rect::new(win_w - 16 - tab_w, TITLEBAR_HEIGHT + 10, tab_w, 28);
+                        let tab_r = Rect::new(content.right() - 16 - tab_w, content.y + 10, tab_w, 28);
                         if tab_r.contains(x, y) {
                             let seg0 = ui::segmented_item_rect(tab_r, 2, 0);
                             tab = if seg0.contains(x, y) {
                                 Tab::Performance
                             } else {
-                                sync_proc_scroll(&data, &query, &mut proc_scroll, win_w, win_h);
+                                sync_proc_scroll(&data, &query, &mut proc_scroll, content);
                                 Tab::Processes
                             };
                             crate::sound::play(&app.config, crate::sound::SystemSound::Click);
@@ -465,7 +466,8 @@ pub fn run() -> Result<()> {
                         }
 
                         if tab == Tab::Processes {
-                            let kill_btn = Rect::new(win_w - 16 - 100, win_h - 16 - 30, 100, 30);
+                            let kill_btn =
+                                Rect::new(content.right() - 18 - 100, content.bottom() - 44, 100, 30);
                             if kill_btn.contains(x, y) {
                                 if let Some(pid) = selected_pid {
                                     // SAFETY: Standard POSIX kill signal sent to designated PID.
@@ -473,7 +475,7 @@ pub fn run() -> Result<()> {
                                         libc::kill(pid, libc::SIGTERM);
                                     }
                                     data.sample();
-                                    sync_proc_scroll(&data, &query, &mut proc_scroll, win_w, win_h);
+                                    sync_proc_scroll(&data, &query, &mut proc_scroll, content);
                                     crate::sound::play(
                                         &app.config,
                                         crate::sound::SystemSound::Click,
@@ -483,7 +485,7 @@ pub fn run() -> Result<()> {
                                 continue;
                             }
 
-                            let table_r = proc_table_rect(win_w, win_h);
+                            let table_r = proc_table_rect(content);
                             let rows_clip = proc_rows_clip(table_r);
                             if rows_clip.contains(x, y) {
                                 let scroll_px = proc_scroll.offset_i32().max(0);
@@ -526,8 +528,7 @@ fn draw_monitor(
     selected_pid: Option<i32>,
     proc_scroll: &mut ui::SmoothScroll,
     query: &str,
-    w: i32,
-    h: i32,
+    content: Rect,
 ) {
     canvas.clear(theme.window);
 
@@ -535,15 +536,15 @@ fn draw_monitor(
     text.draw(
         canvas,
         "系统监视器",
-        18.0,
-        (TITLEBAR_HEIGHT + 31) as f32,
+        (content.x + 18) as f32,
+        (content.y + 31) as f32,
         16.0,
         theme.text,
         Face::Bold,
     );
 
     let tab_w = 200;
-    let tab_r = Rect::new(w - 18 - tab_w, TITLEBAR_HEIGHT + 12, tab_w, 28);
+    let tab_r = Rect::new(content.right() - 18 - tab_w, content.y + 12, tab_w, 28);
     let selected_tab = match tab {
         Tab::Performance => 0,
         Tab::Processes => 1,
@@ -559,13 +560,13 @@ fn draw_monitor(
     );
 
     canvas.fill(
-        Rect::new(0, TITLEBAR_HEIGHT + 48, w, 1),
+        Rect::new(content.x, content.y + 48, content.w, 1),
         theme.window_border,
     );
 
     match tab {
         Tab::Performance => {
-            draw_performance_tab(canvas, text, theme, data, w, h);
+            draw_performance_tab(canvas, text, theme, data, content);
         }
         Tab::Processes => {
             draw_processes_tab(
@@ -576,8 +577,7 @@ fn draw_monitor(
                 selected_pid,
                 proc_scroll,
                 query,
-                w,
-                h,
+                content,
             );
         }
     }
@@ -588,15 +588,14 @@ fn draw_performance_tab(
     text: &mut TextRenderer,
     theme: &Theme,
     data: &SystemMonitorData,
-    w: i32,
-    h: i32,
+    content: Rect,
 ) {
-    let top = TITLEBAR_HEIGHT + 62;
-    let card_w = (w - 36) / 2;
-    let card_h = (h - top - 18).max(300);
+    let top = content.y + 62;
+    let card_w = (content.w - 36) / 2;
+    let card_h = (content.bottom() - top - 18).max(300);
 
     // 1. Left Card: CPU Dashboard
-    let cpu_card = Rect::new(14, top, card_w, card_h);
+    let cpu_card = Rect::new(content.x + 14, top, card_w, card_h);
     ui::card(canvas, theme, cpu_card);
 
     let cpu_pct_text = format!("{:.0}%", data.current_cpu_pct * 100.0);
@@ -623,8 +622,13 @@ fn draw_performance_tab(
     // CPU Sparkline
     let spark_h = (cpu_card.h - 160).max(80);
     let spark_r = Rect::new(cpu_card.x + 16, cpu_card.y + 44, cpu_card.w - 32, spark_h);
-    canvas.rounded_rect(spark_r, 4, theme.window_alt, 1.0);
-    canvas.rounded_border(spark_r, 4, theme.window_border, 1.0, 1);
+    if theme.is_win98() {
+        canvas.fill(spark_r, theme.input_bg);
+        ui::sunken_bevel(canvas, theme, spark_r);
+    } else {
+        canvas.rounded_rect(spark_r, 4, theme.window_alt, 1.0);
+        canvas.rounded_border(spark_r, 4, theme.window_border, 1.0, 1);
+    }
 
     // Grid lines (25%, 50%, 75%)
     for pct in [0.25, 0.50, 0.75] {
@@ -715,8 +719,13 @@ fn draw_performance_tab(
 
     // Memory Sparkline
     let m_spark_r = Rect::new(mem_card.x + 16, mem_card.y + 44, mem_card.w - 32, spark_h);
-    canvas.rounded_rect(m_spark_r, 4, theme.window_alt, 1.0);
-    canvas.rounded_border(m_spark_r, 4, theme.window_border, 1.0, 1);
+    if theme.is_win98() {
+        canvas.fill(m_spark_r, theme.input_bg);
+        ui::sunken_bevel(canvas, theme, m_spark_r);
+    } else {
+        canvas.rounded_rect(m_spark_r, 4, theme.window_alt, 1.0);
+        canvas.rounded_border(m_spark_r, 4, theme.window_border, 1.0, 1);
+    }
     for pct in [0.25, 0.50, 0.75] {
         let gy = m_spark_r.bottom() - (m_spark_r.h as f32 * pct).round() as i32;
         canvas.fill(
@@ -765,10 +774,10 @@ fn draw_processes_tab(
     selected_pid: Option<i32>,
     proc_scroll: &mut ui::SmoothScroll,
     query: &str,
-    w: i32,
-    h: i32,
+    content: Rect,
 ) {
-    let top = TITLEBAR_HEIGHT + 58;
+    let top = content.y + 58;
+    let is_win98 = theme.is_win98();
 
     // Search bar & count
     let filtered: Vec<&ProcessInfo> = data
@@ -781,7 +790,7 @@ fn draw_processes_tab(
     text.draw(
         canvas,
         &count_lbl,
-        18.0,
+        (content.x + 18) as f32,
         (top + 18) as f32,
         12.5,
         theme.text_muted,
@@ -789,7 +798,7 @@ fn draw_processes_tab(
     );
 
     // Kill button
-    let kill_rect = Rect::new(w - 18 - 100, h - 14 - 30, 100, 30);
+    let kill_rect = Rect::new(content.right() - 18 - 100, content.bottom() - 14 - 30, 100, 30);
     let has_selection = selected_pid.is_some();
     ui::button(
         canvas,
@@ -803,7 +812,7 @@ fn draw_processes_tab(
     );
 
     // Table Header
-    let table_r = proc_table_rect(w, h);
+    let table_r = proc_table_rect(content);
     ui::card(canvas, theme, table_r);
 
     canvas.fill(
@@ -885,8 +894,15 @@ fn draw_processes_tab(
             }
             let is_sel = selected_pid == Some(proc.pid);
             let row_r = Rect::new(rows_clip.x + 2, ry, rows_clip.w - 4, PROC_ROW_H);
+            let win98_sel = is_win98 && is_sel;
 
-            if is_sel {
+            if is_win98 {
+                if is_sel {
+                    let _ = ui::list_item_bg(c, theme, row_r, true, false);
+                } else if idx % 2 == 1 {
+                    c.fill(row_r, theme.window_alt);
+                }
+            } else if is_sel {
                 c.rounded_rect(row_r, 4, theme.accent_soft, 1.0);
                 c.fill(
                     Rect::new(row_r.x, row_r.y + 4, 3, row_r.h - 8),
@@ -905,7 +921,13 @@ fn draw_processes_tab(
                 col_name as f32,
                 baseline,
                 12.0,
-                if is_sel { theme.accent } else { theme.text },
+                if win98_sel {
+                    theme.selection_text
+                } else if is_sel {
+                    theme.accent
+                } else {
+                    theme.text
+                },
                 if is_sel { Face::Bold } else { Face::Ui },
             );
 
@@ -915,7 +937,11 @@ fn draw_processes_tab(
                 col_pid as f32,
                 baseline,
                 12.0,
-                theme.text_dim,
+                if win98_sel {
+                    theme.selection_text
+                } else {
+                    theme.text_dim
+                },
                 Face::Ui,
             );
 
@@ -926,7 +952,9 @@ fn draw_processes_tab(
                 col_cpu as f32,
                 baseline,
                 12.0,
-                if proc.cpu_percent > 10.0 {
+                if win98_sel {
+                    theme.selection_text
+                } else if proc.cpu_percent > 10.0 {
                     theme.accent
                 } else {
                     theme.text_dim
@@ -945,7 +973,11 @@ fn draw_processes_tab(
                 col_rss as f32,
                 baseline,
                 12.0,
-                theme.text_dim,
+                if win98_sel {
+                    theme.selection_text
+                } else {
+                    theme.text_dim
+                },
                 Face::Ui,
             );
 
@@ -956,7 +988,11 @@ fn draw_processes_tab(
                 col_st as f32,
                 baseline,
                 12.0,
-                theme.text_muted,
+                if win98_sel {
+                    theme.selection_text
+                } else {
+                    theme.text_muted
+                },
                 Face::Ui,
             );
         }

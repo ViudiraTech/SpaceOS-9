@@ -198,7 +198,15 @@ static unsigned int hda_verb_unlocked(struct hda_chip *chip, unsigned int nid,
                            ((verb & 0xfffu) << 8) | (parm & 0xffffu);
     unsigned int timeout;
     unsigned short next_wp = (unsigned short)((chip->corb_wp + 1u) & 0xffu);
-    unsigned char previous = chip->rirb_wp;
+    unsigned char previous;
+
+    /* Acknowledge any prior RIRB status and re-sync RIRBWP before issuing CORBWP
+     * so QEMU's d->rirb_count == d->rirb_cnt threshold never stalls CORB DMA. */
+    if (hda_readb(chip, HDA_RIRBSTS) & 0x05u) {
+        hda_writeb(chip, HDA_RIRBSTS, 0x05u);
+    }
+    previous = (unsigned char)(hda_readw(chip, HDA_RIRBWP) & 0xffu);
+    chip->rirb_wp = previous;
 
     chip->corb[next_wp] = command;
     spk_mb();
@@ -210,9 +218,13 @@ static unsigned int hda_verb_unlocked(struct hda_chip *chip, unsigned int nid,
             unsigned int response = (unsigned int)chip->rirb[current];
             chip->rirb_wp = current;
             chip->rirb_seen = 1;
+            hda_writeb(chip, HDA_RIRBSTS, 0x05u);
             return response;
         }
         spk_udelay(1);
+    }
+    if (hda_readb(chip, HDA_RIRBSTS) & 0x05u) {
+        hda_writeb(chip, HDA_RIRBSTS, 0x05u);
     }
     hda_verb_timeouts++;
     if (hda_verb_timeouts <= 16u) {
@@ -267,7 +279,8 @@ static void hda_init_rings(struct hda_chip *chip)
     }
     hda_writew(chip, HDA_CORBWP, 0);
     hda_writew(chip, HDA_RIRBWP, HDA_RIRBWP_RST);
-    hda_writew(chip, HDA_RINTCNT, 0xff);
+    hda_writeb(chip, HDA_RIRBSTS, 0x05u);
+    hda_writew(chip, HDA_RINTCNT, 1);
     hda_writeb(chip, HDA_CORBCTL, HDA_CORBCTL_RUN);
     hda_writeb(chip, HDA_RIRBCTL, HDA_RIRBCTL_DMA);
     chip->corb_wp = 0;
@@ -1054,10 +1067,13 @@ static int hda_volume_put(struct snd_kcontrol *kcontrol,
     if (right > 100) right = 100;
     changed = (chip->master_vol[0] != (unsigned char)left) ||
               (chip->master_vol[1] != (unsigned char)right);
+    if (!changed) {
+        return 0;
+    }
     chip->master_vol[0] = (unsigned char)left;
     chip->master_vol[1] = (unsigned char)right;
     hda_apply_master_amp(chip);
-    return changed ? 1 : 0;
+    return 1;
 }
 
 static int hda_switch_info(struct snd_kcontrol *kcontrol,
@@ -1088,10 +1104,13 @@ static int hda_switch_put(struct snd_kcontrol *kcontrol,
     unsigned char m0 = value->value.integer.value[0] ? 0u : 1u;
     unsigned char m1 = value->value.integer.value[1] ? 0u : 1u;
     unsigned char changed = (chip->master_mute[0] != m0) || (chip->master_mute[1] != m1);
+    if (!changed) {
+        return 0;
+    }
     chip->master_mute[0] = m0;
     chip->master_mute[1] = m1;
     hda_apply_master_amp(chip);
-    return changed ? 1 : 0;
+    return 1;
 }
 
 static struct snd_kcontrol_new hda_master_volume = {

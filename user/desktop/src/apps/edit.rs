@@ -16,7 +16,7 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect};
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{CursorKind, Result};
 use std::fs;
@@ -234,17 +234,16 @@ impl Editor {
         self.cur_col = self.preferred_col.min(self.line_char_len(self.cur_line));
     }
 
-    fn sync_scroll_bounds(&mut self, win_w: i32, win_h: i32, line_h: i32) {
-        let body = editor_body_rect(win_w, win_h);
+    fn sync_scroll_bounds(&mut self, content: Rect, line_h: i32) {
+        let body = editor_body_rect(content);
         let vp_h = (body.h - TEXT_PAD_Y * 2).max(line_h) as f32;
         let total_h = (self.lines.len() as i32 * line_h) as f32;
-        self.scroll
-            .set_bounds(vp_h, total_h, scrollbar_track(win_w, win_h));
+        self.scroll.set_bounds(vp_h, total_h, scrollbar_track(content));
     }
 
-    fn ensure_cursor_visible(&mut self, win_w: i32, win_h: i32, line_h: i32) {
-        self.sync_scroll_bounds(win_w, win_h, line_h);
-        let body = editor_body_rect(win_w, win_h);
+    fn ensure_cursor_visible(&mut self, content: Rect, line_h: i32) {
+        self.sync_scroll_bounds(content, line_h);
+        let body = editor_body_rect(content);
         let vp_h = (body.h - TEXT_PAD_Y * 2).max(line_h) as f32;
         let line_top = (self.cur_line as i32 * line_h) as f32;
         let line_bot = ((self.cur_line + 1) as i32 * line_h) as f32;
@@ -257,28 +256,34 @@ impl Editor {
     }
 }
 
-fn save_btn_rect() -> Rect {
-    Rect::new(10, TITLEBAR_HEIGHT + 5, 76, 28)
+fn content_rect(theme: &Theme, win_w: i32, win_h: i32) -> Rect {
+    let bw = theme.window_border_width();
+    let th = theme.titlebar_height();
+    Rect::new(bw, th, (win_w - bw * 2).max(1), (win_h - th - bw).max(1))
 }
 
-fn editor_body_rect(win_w: i32, win_h: i32) -> Rect {
-    let top = TITLEBAR_HEIGHT + TOOLBAR_H;
-    let bottom = (win_h - STATUS_H).max(top);
-    Rect::new(0, top, win_w, bottom - top)
+fn save_btn_rect(content: Rect) -> Rect {
+    Rect::new(content.x + 10, content.y + 5, 76, 28)
 }
 
-fn scrollbar_track(win_w: i32, win_h: i32) -> Rect {
-    let body = editor_body_rect(win_w, win_h);
+fn editor_body_rect(content: Rect) -> Rect {
+    let top = content.y + TOOLBAR_H;
+    let bottom = (content.bottom() - STATUS_H).max(top);
+    Rect::new(content.x, top, content.w, bottom - top)
+}
+
+fn scrollbar_track(content: Rect) -> Rect {
+    let body = editor_body_rect(content);
     Rect::new(
-        win_w - SCROLLBAR_W - 2,
+        content.right() - SCROLLBAR_W - 2,
         body.y + 2,
         SCROLLBAR_W,
         (body.h - 4).max(8),
     )
 }
 
-fn visible_line_count(win_h: i32, line_h: i32) -> usize {
-    let h = (win_h - TITLEBAR_HEIGHT - TOOLBAR_H - STATUS_H - TEXT_PAD_Y * 2).max(line_h);
+fn visible_line_count(content: Rect, line_h: i32) -> usize {
+    let h = (content.h - TOOLBAR_H - STATUS_H - TEXT_PAD_Y * 2).max(line_h);
     (h / line_h).max(1) as usize
 }
 
@@ -286,20 +291,19 @@ fn hit_text_cursor(
     editor: &Editor,
     text: &mut TextRenderer,
     prefs: EditorPrefs,
-    win_w: i32,
-    win_h: i32,
+    content: Rect,
     mx: i32,
     my: i32,
 ) -> Option<(usize, usize)> {
-    let body = editor_body_rect(win_w, win_h);
-    if my < body.y || my >= body.bottom() || mx >= win_w - SCROLLBAR_W - 2 {
+    let body = editor_body_rect(content);
+    if my < body.y || my >= body.bottom() || mx < content.x || mx >= content.right() - SCROLLBAR_W - 2 {
         return None;
     }
     let scroll_px = editor.scroll.offset_i32().max(0);
     let rel_y = (my - body.y - TEXT_PAD_Y + scroll_px).max(0);
     let line_idx = ((rel_y / prefs.line_h) as usize).min(editor.lines.len() - 1);
     let line = &editor.lines[line_idx];
-    let rel_x = (mx - (prefs.gutter_w + TEXT_PAD_X)) as f32;
+    let rel_x = (mx - (content.x + prefs.gutter_w + TEXT_PAD_X)) as f32;
     if rel_x <= 0.0 {
         return Some((line_idx, 0));
     }
@@ -331,7 +335,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
 
     let mut prefs = EditorPrefs::from_config(&app.config);
     let mut editor = Editor::open(path, prefs.tab_width);
-    editor.sync_scroll_bounds(app.width as i32, app.height as i32, prefs.line_h);
+    editor.sync_scroll_bounds(app.content(), prefs.line_h);
     app.title = editor.window_title();
     let _ = app.x.set_title(app.win, &app.title);
 
@@ -342,19 +346,19 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         let prev_saved = editor.saved;
 
         for event in app.pump()? {
-            let win_w = app.width as i32;
-            let win_h = app.height as i32;
-            let vis = visible_line_count(win_h, prefs.line_h);
+            let content = app.content();
+            let vis = visible_line_count(content, prefs.line_h);
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose => app.needs_redraw = true,
                 UiEvent::ConfigChanged => {
                     prefs = EditorPrefs::from_config(&app.config);
-                    editor.sync_scroll_bounds(win_w, win_h, prefs.line_h);
+                    editor.sync_scroll_bounds(app.content(), prefs.line_h);
                     app.needs_redraw = true;
                 }
                 UiEvent::Configure { width, height } => {
-                    editor.sync_scroll_bounds(width as i32, height as i32, prefs.line_h);
+                    let resized = content_rect(&app.theme, width as i32, height as i32);
+                    editor.sync_scroll_bounds(resized, prefs.line_h);
                     app.needs_redraw = true;
                 }
                 UiEvent::Motion { x, y, .. } => {
@@ -362,19 +366,19 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         app.needs_redraw = true;
                     }
                     if !editor.scroll.is_dragging() {
-                        let hover = save_btn_rect().contains(x, y);
+                        let hover = save_btn_rect(content).contains(x, y);
                         if hover != editor.save_hover {
                             editor.save_hover = hover;
                             app.needs_redraw = true;
                         }
                     }
-                    let body = editor_body_rect(win_w, win_h);
+                    let body = editor_body_rect(content);
                     app.set_content_cursor(
                         if editor.scroll.is_hovered() || editor.scroll.is_dragging() {
                             CursorKind::Pointer
                         } else if body.contains(x, y)
-                            && x >= prefs.gutter_w
-                            && x < win_w - SCROLLBAR_W - 2
+                            && x >= content.x + prefs.gutter_w
+                            && x < content.right() - SCROLLBAR_W - 2
                         {
                             CursorKind::Text
                         } else {
@@ -383,7 +387,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                     );
                 }
                 UiEvent::Wheel { delta, .. } => {
-                    editor.sync_scroll_bounds(win_w, win_h, prefs.line_h);
+                    editor.sync_scroll_bounds(content, prefs.line_h);
                     if editor.scroll.wheel(delta as f32 * 20.0) {
                         app.needs_redraw = true;
                     }
@@ -400,8 +404,8 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                             },
                         );
                         app.needs_redraw = true;
-                    } else if button == 1 && down && y >= TITLEBAR_HEIGHT {
-                        if save_btn_rect().contains(x, y) {
+                    } else if button == 1 && down && content.contains(x, y) {
+                        if save_btn_rect(content).contains(x, y) {
                             let sfx = if editor.save() {
                                 crate::sound::SystemSound::Click
                             } else {
@@ -410,7 +414,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                             crate::sound::play(&app.config, sfx);
                             app.needs_redraw = true;
                         } else if let Some((line, col)) =
-                            hit_text_cursor(&editor, &mut app.text, prefs, win_w, win_h, x, y)
+                            hit_text_cursor(&editor, &mut app.text, prefs, content, x, y)
                         {
                             editor.cur_line = line;
                             editor.cur_col = col;
@@ -433,31 +437,31 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                             editor.cur_line = 0;
                             editor.cur_col = 0;
                             editor.preferred_col = 0;
-                            editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                            editor.ensure_cursor_visible(content, prefs.line_h);
                             app.needs_redraw = true;
                         } else if key.is_end() {
                             editor.cur_line = editor.lines.len() - 1;
                             editor.cur_col = editor.line_char_len(editor.cur_line);
                             editor.preferred_col = editor.cur_col;
-                            editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                            editor.ensure_cursor_visible(content, prefs.line_h);
                             app.needs_redraw = true;
                         }
                     } else if key.is_enter() {
                         editor.insert_newline();
-                        editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                        editor.ensure_cursor_visible(content, prefs.line_h);
                         app.needs_redraw = true;
                     } else if key.is_tab() {
                         let spaces = " ".repeat(prefs.tab_width);
                         editor.insert_str(&spaces);
-                        editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                        editor.ensure_cursor_visible(content, prefs.line_h);
                         app.needs_redraw = true;
                     } else if key.is_backspace() {
                         editor.backspace();
-                        editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                        editor.ensure_cursor_visible(content, prefs.line_h);
                         app.needs_redraw = true;
                     } else if key.is_delete() {
                         editor.delete_forward();
-                        editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                        editor.ensure_cursor_visible(content, prefs.line_h);
                         app.needs_redraw = true;
                     } else if key.is_home() {
                         editor.cur_col = 0;
@@ -469,11 +473,11 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         app.needs_redraw = true;
                     } else if key.is_page_up() {
                         editor.move_up(vis);
-                        editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                        editor.ensure_cursor_visible(content, prefs.line_h);
                         app.needs_redraw = true;
                     } else if key.is_page_down() {
                         editor.move_down(vis);
-                        editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                        editor.ensure_cursor_visible(content, prefs.line_h);
                         app.needs_redraw = true;
                     } else if let Some(dir) = key.arrow() {
                         match dir {
@@ -482,12 +486,12 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                             2 => editor.move_right(),
                             _ => editor.move_down(1),
                         }
-                        editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                        editor.ensure_cursor_visible(content, prefs.line_h);
                         app.needs_redraw = true;
                     } else if let Some(ch) = key.text().filter(|c| !c.is_control()) {
                         let mut buf = [0u8; 4];
                         editor.insert_str(ch.encode_utf8(&mut buf));
-                        editor.ensure_cursor_visible(win_w, win_h, prefs.line_h);
+                        editor.ensure_cursor_visible(content, prefs.line_h);
                         app.needs_redraw = true;
                     }
                 }
@@ -526,23 +530,36 @@ fn draw_editor(
 ) {
     let w = canvas.width as i32;
     let h = canvas.height as i32;
+    let content = content_rect(theme, w, h);
     let gutter_w = prefs.gutter_w;
     let line_h = prefs.line_h;
     let font_px = prefs.font_px;
+    let is_win98 = theme.is_win98();
     canvas.clear(theme.window);
 
     // Top toolbar
-    canvas.fill(Rect::new(0, TITLEBAR_HEIGHT, w, TOOLBAR_H), theme.panel);
-    canvas.fill(
-        Rect::new(0, TITLEBAR_HEIGHT + TOOLBAR_H - 1, w, 1),
-        theme.window_border,
-    );
+    canvas.fill(Rect::new(content.x, content.y, content.w, TOOLBAR_H), theme.panel);
+    if is_win98 {
+        canvas.fill(
+            Rect::new(content.x, content.y + TOOLBAR_H - 2, content.w, 1),
+            theme.bevel_shadow,
+        );
+        canvas.fill(
+            Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
+            theme.bevel_hi,
+        );
+    } else {
+        canvas.fill(
+            Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
+            theme.window_border,
+        );
+    }
 
     ui::button(
         canvas,
         text,
         theme,
-        save_btn_rect(),
+        save_btn_rect(content),
         "保存",
         Some(Icon::Save),
         !editor.saved,
@@ -550,14 +567,14 @@ fn draw_editor(
     );
 
     let file_icon = Icon::for_file(Path::new(&editor.path), false);
-    icons::draw(canvas, file_icon, 98, TITLEBAR_HEIGHT + 11, 16, None);
+    icons::draw(canvas, file_icon, content.x + 98, content.y + 11, 16, None);
     let path_str = editor.path.to_string_lossy();
-    let shown_path = text.truncate(&path_str, (w - 230).max(60) as f32, 12.0, Face::Ui);
+    let shown_path = text.truncate(&path_str, (content.w - 230).max(60) as f32, 12.0, Face::Ui);
     text.draw(
         canvas,
         &shown_path,
-        120.0,
-        (TITLEBAR_HEIGHT + 24) as f32,
+        (content.x + 120) as f32,
+        (content.y + 24) as f32,
         12.0,
         theme.text_dim,
         Face::Ui,
@@ -576,19 +593,36 @@ fn draw_editor(
     text.draw_right(
         canvas,
         state_label,
-        (w - 14) as f32,
-        (TITLEBAR_HEIGHT + 24) as f32,
+        (content.right() - 14) as f32,
+        (content.y + 24) as f32,
         11.5,
         state_color,
         Face::Ui,
     );
 
     // Editor body: optional gutter + uniform-color monospace text canvas
-    let body = editor_body_rect(w, h);
+    let body = editor_body_rect(content);
+    let paper_bg = if is_win98 {
+        theme.input_bg
+    } else {
+        theme.window
+    };
+    if is_win98 {
+        canvas.fill(body, paper_bg);
+        ui::sunken_bevel(canvas, theme, body);
+    }
+    let gx = content.x + gutter_w;
+    let bpad = if is_win98 { 2 } else { 0 };
     if gutter_w > 0 {
-        canvas.fill(Rect::new(0, body.y, gutter_w, body.h), theme.window_alt);
+        let g_rect = Rect::new(
+            content.x + bpad,
+            body.y + bpad,
+            (gutter_w - bpad).max(1),
+            (body.h - bpad * 2).max(1),
+        );
+        canvas.fill(g_rect, theme.window_alt);
         canvas.fill(
-            Rect::new(gutter_w - 1, body.y, 1, body.h),
+            Rect::new(gx - 1, g_rect.y, 1, g_rect.h),
             theme.window_border,
         );
     }
@@ -596,28 +630,33 @@ fn draw_editor(
     let scroll_px = editor.scroll.offset_i32().max(0);
     let first_line = ((scroll_px - TEXT_PAD_Y).max(0) / line_h) as usize;
     let vis_span = ((body.h + line_h - 1) / line_h + 2).max(2) as usize;
-    let text_x = (gutter_w + TEXT_PAD_X) as f32;
+    let text_x = (gx + TEXT_PAD_X) as f32;
     let text_clip = Rect::new(
-        gutter_w,
-        body.y,
-        (w - gutter_w - SCROLLBAR_W - 2).max(1),
-        body.h,
+        gx,
+        body.y + bpad,
+        (content.w - gutter_w - SCROLLBAR_W - 2).max(1),
+        (body.h - bpad * 2).max(1),
     );
 
     // Subtle active-line highlight (clipped cleanly to text viewport)
     if prefs.highlight_active {
         let ay = body.y + TEXT_PAD_Y + editor.cur_line as i32 * line_h - scroll_px;
-        if ay + line_h > body.y && ay < body.bottom() {
-            let hl = crate::draw::mix(theme.window, theme.panel_hover, 0.45);
+        if ay + line_h > body.y + bpad && ay < body.bottom() - bpad {
+            let hl = crate::draw::mix(paper_bg, theme.panel_hover, 0.45);
             canvas.with_clip(text_clip, |c| {
-                c.fill(Rect::new(gutter_w, ay, text_clip.w, line_h), hl);
+                c.fill(Rect::new(gx, ay, text_clip.w, line_h), hl);
             });
         }
     }
 
     // Gutter line numbers
     if gutter_w > 0 {
-        let gutter_clip = Rect::new(0, body.y, (gutter_w - 1).max(1), body.h);
+        let gutter_clip = Rect::new(
+            content.x + bpad,
+            body.y + bpad,
+            (gutter_w - bpad - 1).max(1),
+            (body.h - bpad * 2).max(1),
+        );
         canvas.with_clip(gutter_clip, |c| {
             for (line_idx, _) in editor
                 .lines
@@ -638,7 +677,7 @@ fn draw_editor(
                 text.draw_right(
                     c,
                     &(line_idx + 1).to_string(),
-                    (gutter_w - 10) as f32,
+                    (gx - 10) as f32,
                     ly as f32 + prefs.baseline_off,
                     11.5,
                     num_fg,
@@ -676,15 +715,21 @@ fn draw_editor(
         }
     });
 
-    let sb_track = scrollbar_track(w, h);
+    let sb_track = scrollbar_track(content);
     let vp_h = (body.h - TEXT_PAD_Y * 2).max(line_h) as f32;
     let total_h = (editor.lines.len() as i32 * line_h) as f32;
     editor.scroll.draw_v(canvas, theme, sb_track, vp_h, total_h);
 
     // Bottom status bar
-    let status_y = h - STATUS_H;
-    canvas.fill(Rect::new(0, status_y, w, STATUS_H), theme.panel);
-    canvas.fill(Rect::new(0, status_y, w, 1), theme.window_border);
+    let status_y = content.bottom() - STATUS_H;
+    canvas.fill(
+        Rect::new(content.x, status_y, content.w, STATUS_H),
+        theme.panel,
+    );
+    canvas.fill(
+        Rect::new(content.x, status_y, content.w, 1),
+        theme.window_border,
+    );
 
     let pos_info = format!(
         "行 {}, 列 {}  |  共 {} 行  |  缩进 {} 空格  |  UTF-8",
@@ -697,19 +742,19 @@ fn draw_editor(
     text.draw_right(
         canvas,
         &pos_info,
-        (w - 12) as f32,
+        (content.right() - 12) as f32,
         (status_y + 16) as f32,
         11.5,
         theme.text_muted,
         Face::Ui,
     );
 
-    let max_status_w = (w as f32 - pos_w - 36.0).max(60.0);
+    let max_status_w = (content.w as f32 - pos_w - 36.0).max(60.0);
     let shown_status = text.truncate(&editor.status, max_status_w, 11.5, Face::Ui);
     text.draw(
         canvas,
         &shown_status,
-        12.0,
+        (content.x + 12) as f32,
         (status_y + 16) as f32,
         11.5,
         theme.text_muted,

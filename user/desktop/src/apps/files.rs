@@ -16,7 +16,7 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect};
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{CursorKind, Result};
 use std::fs::{self, File};
@@ -122,9 +122,9 @@ impl BrowserState {
         }
     }
 
-    fn sync_scroll_bounds(&mut self, win_w: i32, win_h: i32) {
-        let rows_area = table_rows_rect(win_w, win_h);
-        let track = scrollbar_track(win_w, win_h);
+    fn sync_scroll_bounds(&mut self, content: Rect) {
+        let rows_area = table_rows_rect(content);
+        let track = scrollbar_track(content);
         let total_h = (self.entries.len() as i32 * ROW_H) as f32;
         self.scroll.set_bounds(rows_area.h as f32, total_h, track);
     }
@@ -163,18 +163,18 @@ impl BrowserState {
         false
     }
 
-    fn refresh(&mut self, win_w: i32, win_h: i32) {
+    fn refresh(&mut self, content: Rect) {
         self.entries = scan(&self.current, self.show_hidden, self.folders_first);
         if let Some(sel) = self.selected {
             if sel >= self.entries.len() {
                 self.selected = self.entries.len().checked_sub(1);
             }
         }
-        self.sync_scroll_bounds(win_w, win_h);
+        self.sync_scroll_bounds(content);
         self.status = format!("已刷新 · {}", summarize_entries(&self.entries));
     }
 
-    fn apply_prefs(&mut self, show_hidden: bool, folders_first: bool, win_w: i32, win_h: i32) {
+    fn apply_prefs(&mut self, show_hidden: bool, folders_first: bool, content: Rect) {
         if self.show_hidden != show_hidden || self.folders_first != folders_first {
             self.show_hidden = show_hidden;
             self.folders_first = folders_first;
@@ -184,15 +184,15 @@ impl BrowserState {
                     self.selected = self.entries.len().checked_sub(1);
                 }
             }
-            self.sync_scroll_bounds(win_w, win_h);
+            self.sync_scroll_bounds(content);
             self.status = summarize_entries(&self.entries);
         }
     }
 
-    fn ensure_selected_visible(&mut self, win_w: i32, win_h: i32) {
-        self.sync_scroll_bounds(win_w, win_h);
+    fn ensure_selected_visible(&mut self, content: Rect) {
+        self.sync_scroll_bounds(content);
         let Some(sel) = self.selected else { return };
-        let vp_h = table_rows_rect(win_w, win_h).h.max(ROW_H) as f32;
+        let vp_h = table_rows_rect(content).h.max(ROW_H) as f32;
         let sel_top = (sel as i32 * ROW_H) as f32;
         let sel_bot = ((sel + 1) as i32 * ROW_H) as f32;
         let cur = self.scroll.target();
@@ -249,88 +249,94 @@ impl BrowserState {
     }
 }
 
-fn btn_back_rect() -> Rect {
-    Rect::new(10, TITLEBAR_HEIGHT + 6, 28, 28)
+fn content_rect(theme: &Theme, win_w: i32, win_h: i32) -> Rect {
+    let bw = theme.window_border_width();
+    let th = theme.titlebar_height();
+    Rect::new(bw, th, (win_w - bw * 2).max(1), (win_h - th - bw).max(1))
 }
 
-fn btn_up_rect() -> Rect {
-    Rect::new(42, TITLEBAR_HEIGHT + 6, 28, 28)
+fn btn_back_rect(content: Rect) -> Rect {
+    Rect::new(content.x + 10, content.y + 6, 28, 28)
 }
 
-fn btn_home_rect() -> Rect {
-    Rect::new(74, TITLEBAR_HEIGHT + 6, 28, 28)
+fn btn_up_rect(content: Rect) -> Rect {
+    Rect::new(content.x + 42, content.y + 6, 28, 28)
 }
 
-fn btn_refresh_rect() -> Rect {
-    Rect::new(106, TITLEBAR_HEIGHT + 6, 28, 28)
+fn btn_home_rect(content: Rect) -> Rect {
+    Rect::new(content.x + 74, content.y + 6, 28, 28)
 }
 
-fn btn_term_rect(win_w: i32) -> Rect {
-    Rect::new(win_w - 92, TITLEBAR_HEIGHT + 6, 82, 28)
+fn btn_refresh_rect(content: Rect) -> Rect {
+    Rect::new(content.x + 106, content.y + 6, 28, 28)
 }
 
-fn place_rect(index: usize) -> Rect {
+fn btn_term_rect(content: Rect) -> Rect {
+    Rect::new(content.right() - 92, content.y + 6, 82, 28)
+}
+
+fn place_rect(content: Rect, index: usize) -> Rect {
     Rect::new(
-        8,
-        TITLEBAR_HEIGHT + TOOLBAR_H + 30 + index as i32 * 34,
+        content.x + 8,
+        content.y + TOOLBAR_H + 30 + index as i32 * 34,
         SIDEBAR_W - 16,
         30,
     )
 }
 
-fn scrollbar_track(win_w: i32, win_h: i32) -> Rect {
-    let top = TITLEBAR_HEIGHT + TOOLBAR_H + HEADER_H;
-    let bottom = (win_h - STATUS_H).max(top);
+fn scrollbar_track(content: Rect) -> Rect {
+    let top = content.y + TOOLBAR_H + HEADER_H;
+    let bottom = (content.bottom() - STATUS_H).max(top);
     Rect::new(
-        win_w - SCROLLBAR_W - 2,
+        content.right() - SCROLLBAR_W - 2,
         top + 2,
         SCROLLBAR_W,
         (bottom - top - 4).max(8),
     )
 }
 
-fn table_rows_rect(win_w: i32, win_h: i32) -> Rect {
-    let top = TITLEBAR_HEIGHT + TOOLBAR_H + HEADER_H;
-    let bottom = (win_h - STATUS_H).max(top);
+fn table_rows_rect(content: Rect) -> Rect {
+    let top = content.y + TOOLBAR_H + HEADER_H;
+    let bottom = (content.bottom() - STATUS_H).max(top);
     Rect::new(
-        SIDEBAR_W,
+        content.x + SIDEBAR_W,
         top,
-        (win_w - SIDEBAR_W - SCROLLBAR_W - 2).max(1),
+        (content.w - SIDEBAR_W - SCROLLBAR_W - 2).max(1),
         (bottom - top).max(0),
     )
 }
 
-fn visible_row_count(win_h: i32) -> usize {
-    let top = TITLEBAR_HEIGHT + TOOLBAR_H + HEADER_H;
-    let h = (win_h - STATUS_H - top).max(ROW_H);
+fn visible_row_count(content: Rect) -> usize {
+    let top = content.y + TOOLBAR_H + HEADER_H;
+    let h = (content.bottom() - STATUS_H - top).max(ROW_H);
     (h / ROW_H).max(1) as usize
 }
 
-fn hit_test(state: &BrowserState, win_w: i32, win_h: i32, x: i32, y: i32) -> HoverTarget {
-    if y < TITLEBAR_HEIGHT {
+fn hit_test(state: &BrowserState, content: Rect, x: i32, y: i32) -> HoverTarget {
+    if !content.contains(x, y) {
         return HoverTarget::None;
     }
-    if btn_back_rect().contains(x, y) {
+    if btn_back_rect(content).contains(x, y) {
         return HoverTarget::Back;
     }
-    if btn_up_rect().contains(x, y) {
+    if btn_up_rect(content).contains(x, y) {
         return HoverTarget::Up;
     }
-    if btn_home_rect().contains(x, y) {
+    if btn_home_rect(content).contains(x, y) {
         return HoverTarget::Home;
     }
-    if btn_refresh_rect().contains(x, y) {
+    if btn_refresh_rect(content).contains(x, y) {
         return HoverTarget::Refresh;
     }
-    if btn_term_rect(win_w).contains(x, y) {
+    if btn_term_rect(content).contains(x, y) {
         return HoverTarget::OpenTerm;
     }
     for i in 0..state.places.len() {
-        if place_rect(i).contains(x, y) {
+        if place_rect(content, i).contains(x, y) {
             return HoverTarget::Place(i);
         }
     }
-    let rows_area = table_rows_rect(win_w, win_h);
+    let rows_area = table_rows_rect(content);
     if rows_area.contains(x, y) {
         let scroll_px = state.scroll.offset_i32().max(0);
         let idx = ((y - rows_area.y + scroll_px) / ROW_H) as usize;
@@ -361,16 +367,15 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         app.config.files_show_hidden,
         app.config.files_folders_first,
     );
-    state.sync_scroll_bounds(app.width as i32, app.height as i32);
+    state.sync_scroll_bounds(app.content());
 
     loop {
         if app.close {
             break;
         }
         for event in app.pump()? {
-            let win_w = app.width as i32;
-            let win_h = app.height as i32;
-            let vis = visible_row_count(win_h);
+            let content = app.content();
+            let vis = visible_row_count(content);
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose => app.needs_redraw = true,
@@ -378,13 +383,12 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                     state.apply_prefs(
                         app.config.files_show_hidden,
                         app.config.files_folders_first,
-                        win_w,
-                        win_h,
+                        content,
                     );
                     app.needs_redraw = true;
                 }
                 UiEvent::Configure { width, height } => {
-                    state.sync_scroll_bounds(width as i32, height as i32);
+                    state.sync_scroll_bounds(content_rect(&app.theme, width as i32, height as i32));
                     app.needs_redraw = true;
                 }
                 UiEvent::Motion { x, y, .. } => {
@@ -399,7 +403,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         },
                     );
                     if !state.scroll.is_dragging() {
-                        let target = hit_test(&state, win_w, win_h, x, y);
+                        let target = hit_test(&state, content, x, y);
                         if target != state.hover {
                             state.hover = target;
                             app.needs_redraw = true;
@@ -407,7 +411,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                     }
                 }
                 UiEvent::Wheel { delta, .. } => {
-                    state.sync_scroll_bounds(win_w, win_h);
+                    state.sync_scroll_bounds(content);
                     if state.scroll.wheel(delta as f32 * 22.0) {
                         app.needs_redraw = true;
                     }
@@ -424,15 +428,15 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                             },
                         );
                         app.needs_redraw = true;
-                    } else if button == 1 && down && y >= TITLEBAR_HEIGHT {
-                        match hit_test(&state, win_w, win_h, x, y) {
+                    } else if button == 1 && down && content.contains(x, y) {
+                        match hit_test(&state, content, x, y) {
                             HoverTarget::Back => {
                                 if state.go_back() {
                                     crate::sound::play(
                                         &app.config,
                                         crate::sound::SystemSound::Click,
                                     );
-                                    state.sync_scroll_bounds(win_w, win_h);
+                                    state.sync_scroll_bounds(content);
                                 }
                                 app.needs_redraw = true;
                             }
@@ -442,19 +446,19 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                                         &app.config,
                                         crate::sound::SystemSound::Click,
                                     );
-                                    state.sync_scroll_bounds(win_w, win_h);
+                                    state.sync_scroll_bounds(content);
                                 }
                                 app.needs_redraw = true;
                             }
                             HoverTarget::Home => {
                                 let h = state.home.clone();
                                 state.navigate_to(h, true);
-                                state.sync_scroll_bounds(win_w, win_h);
+                                state.sync_scroll_bounds(content);
                                 crate::sound::play(&app.config, crate::sound::SystemSound::Click);
                                 app.needs_redraw = true;
                             }
                             HoverTarget::Refresh => {
-                                state.refresh(win_w, win_h);
+                                state.refresh(content);
                                 crate::sound::play(&app.config, crate::sound::SystemSound::Click);
                                 app.needs_redraw = true;
                             }
@@ -466,7 +470,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                             HoverTarget::Place(i) => {
                                 let p = state.places[i].path.clone();
                                 state.navigate_to(p, true);
-                                state.sync_scroll_bounds(win_w, win_h);
+                                state.sync_scroll_bounds(content);
                                 crate::sound::play(&app.config, crate::sound::SystemSound::Click);
                                 app.needs_redraw = true;
                             }
@@ -483,7 +487,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                                 if app.config.files_single_click || is_double {
                                     state.last_row_click = None;
                                     state.activate_entry(idx);
-                                    state.sync_scroll_bounds(win_w, win_h);
+                                    state.sync_scroll_bounds(content);
                                     crate::sound::play(
                                         &app.config,
                                         crate::sound::SystemSound::Click,
@@ -516,44 +520,44 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 UiEvent::Key(key) => {
                     if key.is_backspace() {
                         if state.go_up() {
-                            state.sync_scroll_bounds(win_w, win_h);
+                            state.sync_scroll_bounds(content);
                         }
                         app.needs_redraw = true;
                     } else if key.is_enter() {
                         if let Some(idx) = state.selected {
                             state.activate_entry(idx);
-                            state.sync_scroll_bounds(win_w, win_h);
+                            state.sync_scroll_bounds(content);
                             app.needs_redraw = true;
                         }
                     } else if key.arrow() == Some(1) && !state.entries.is_empty() {
                         let next = state.selected.map_or(0, |s| s.saturating_sub(1));
                         state.selected = Some(next);
-                        state.ensure_selected_visible(win_w, win_h);
+                        state.ensure_selected_visible(content);
                         app.needs_redraw = true;
                     } else if key.arrow() == Some(3) && !state.entries.is_empty() {
                         let next = state
                             .selected
                             .map_or(0, |s| (s + 1).min(state.entries.len() - 1));
                         state.selected = Some(next);
-                        state.ensure_selected_visible(win_w, win_h);
+                        state.ensure_selected_visible(content);
                         app.needs_redraw = true;
                     } else if key.is_page_up() && !state.entries.is_empty() {
                         let next = state.selected.unwrap_or(0).saturating_sub(vis);
                         state.selected = Some(next);
-                        state.ensure_selected_visible(win_w, win_h);
+                        state.ensure_selected_visible(content);
                         app.needs_redraw = true;
                     } else if key.is_page_down() && !state.entries.is_empty() {
                         let next = (state.selected.unwrap_or(0) + vis).min(state.entries.len() - 1);
                         state.selected = Some(next);
-                        state.ensure_selected_visible(win_w, win_h);
+                        state.ensure_selected_visible(content);
                         app.needs_redraw = true;
                     } else if key.is_home() && !state.entries.is_empty() {
                         state.selected = Some(0);
-                        state.ensure_selected_visible(win_w, win_h);
+                        state.ensure_selected_visible(content);
                         app.needs_redraw = true;
                     } else if key.is_end() && !state.entries.is_empty() {
                         state.selected = Some(state.entries.len() - 1);
-                        state.ensure_selected_visible(win_w, win_h);
+                        state.ensure_selected_visible(content);
                         app.needs_redraw = true;
                     }
                 }
@@ -577,21 +581,35 @@ fn draw_browser(
 ) {
     let w = canvas.width as i32;
     let h = canvas.height as i32;
+    let content = content_rect(theme, w, h);
+    let is_win98 = theme.is_win98();
+    let ctrl_r = theme.radius_control();
     canvas.clear(theme.window);
 
     // Top toolbar
-    canvas.fill(Rect::new(0, TITLEBAR_HEIGHT, w, TOOLBAR_H), theme.panel);
-    canvas.fill(
-        Rect::new(0, TITLEBAR_HEIGHT + TOOLBAR_H - 1, w, 1),
-        theme.window_border,
-    );
+    canvas.fill(Rect::new(content.x, content.y, content.w, TOOLBAR_H), theme.panel);
+    if is_win98 {
+        canvas.fill(
+            Rect::new(content.x, content.y + TOOLBAR_H - 2, content.w, 1),
+            theme.bevel_shadow,
+        );
+        canvas.fill(
+            Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
+            theme.bevel_hi,
+        );
+    } else {
+        canvas.fill(
+            Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
+            theme.window_border,
+        );
+    }
 
     let can_back = !state.history.is_empty();
     let can_up = state.current.parent().is_some_and(|p| p != state.current);
     ui::icon_button(
         canvas,
         theme,
-        btn_back_rect(),
+        btn_back_rect(content),
         Icon::GoBack,
         can_back,
         state.hover == HoverTarget::Back,
@@ -599,7 +617,7 @@ fn draw_browser(
     ui::icon_button(
         canvas,
         theme,
-        btn_up_rect(),
+        btn_up_rect(content),
         Icon::GoUp,
         can_up,
         state.hover == HoverTarget::Up,
@@ -607,7 +625,7 @@ fn draw_browser(
     ui::icon_button(
         canvas,
         theme,
-        btn_home_rect(),
+        btn_home_rect(content),
         Icon::GoHome,
         true,
         state.hover == HoverTarget::Home,
@@ -615,13 +633,13 @@ fn draw_browser(
     ui::icon_button(
         canvas,
         theme,
-        btn_refresh_rect(),
+        btn_refresh_rect(content),
         Icon::Refresh,
         true,
         state.hover == HoverTarget::Refresh,
     );
 
-    let term_btn = btn_term_rect(w);
+    let term_btn = btn_term_rect(content);
     ui::button(
         canvas,
         text,
@@ -633,9 +651,19 @@ fn draw_browser(
         state.hover == HoverTarget::OpenTerm,
     );
 
-    let path_box = Rect::new(142, TITLEBAR_HEIGHT + 6, (term_btn.x - 150).max(80), 28);
-    canvas.rounded_rect(path_box, RADIUS_CONTROL, theme.input_bg, 1.0);
-    canvas.rounded_border(path_box, RADIUS_CONTROL, theme.panel_border, 1.0, 1);
+    let path_box = Rect::new(
+        content.x + 142,
+        content.y + 6,
+        (term_btn.x - (content.x + 150)).max(80),
+        28,
+    );
+    if is_win98 {
+        canvas.fill(path_box, theme.input_bg);
+        ui::sunken_bevel(canvas, theme, path_box);
+    } else {
+        canvas.rounded_rect(path_box, ctrl_r, theme.input_bg, 1.0);
+        canvas.rounded_border(path_box, ctrl_r, theme.panel_border, 1.0, 1);
+    }
     icons::draw(
         canvas,
         Icon::Folder,
@@ -657,18 +685,21 @@ fn draw_browser(
     );
 
     // Left Places sidebar
-    let body_top = TITLEBAR_HEIGHT + TOOLBAR_H;
-    let body_bottom = (h - STATUS_H).max(body_top);
+    let body_top = content.y + TOOLBAR_H;
+    let body_bottom = (content.bottom() - STATUS_H).max(body_top);
     let body_h = body_bottom - body_top;
-    canvas.fill(Rect::new(0, body_top, SIDEBAR_W, body_h), theme.window_alt);
     canvas.fill(
-        Rect::new(SIDEBAR_W - 1, body_top, 1, body_h),
+        Rect::new(content.x, body_top, SIDEBAR_W, body_h),
+        theme.window_alt,
+    );
+    canvas.fill(
+        Rect::new(content.x + SIDEBAR_W - 1, body_top, 1, body_h),
         theme.window_border,
     );
     text.draw(
         canvas,
         "位置",
-        16.0,
+        (content.x + 16) as f32,
         (body_top + 20) as f32,
         11.0,
         theme.text_muted,
@@ -676,16 +707,20 @@ fn draw_browser(
     );
 
     for (i, place) in state.places.iter().enumerate() {
-        let r = place_rect(i);
+        let r = place_rect(content, i);
         let active = state.current == place.path;
-        if active {
-            canvas.rounded_rect(r, RADIUS_CONTROL, theme.accent_soft, 1.0);
-            canvas.fill(Rect::new(r.x, r.y + 6, 3, r.h - 12), theme.accent);
-        } else if state.hover == HoverTarget::Place(i) {
-            canvas.rounded_rect(r, RADIUS_CONTROL, theme.panel_hover, 1.0);
-        }
+        let fg = if is_win98 {
+            ui::list_item_bg(canvas, theme, r, active, state.hover == HoverTarget::Place(i))
+        } else {
+            if active {
+                canvas.rounded_rect(r, ctrl_r, theme.accent_soft, 1.0);
+                canvas.fill(Rect::new(r.x, r.y + 6, 3, r.h - 12), theme.accent);
+            } else if state.hover == HoverTarget::Place(i) {
+                canvas.rounded_rect(r, ctrl_r, theme.panel_hover, 1.0);
+            }
+            if active { theme.text } else { theme.text_dim }
+        };
         icons::draw(canvas, place.icon, r.x + 10, r.y + 7, 16, None);
-        let fg = if active { theme.text } else { theme.text_dim };
         text.draw(
             canvas,
             place.label,
@@ -698,16 +733,16 @@ fn draw_browser(
     }
 
     // Table header
-    let table_x = SIDEBAR_W;
-    let table_w = (w - SIDEBAR_W).max(1);
+    let table_x = content.x + SIDEBAR_W;
+    let table_w = (content.w - SIDEBAR_W).max(1);
     canvas.fill(Rect::new(table_x, body_top, table_w, HEADER_H), theme.panel);
     canvas.fill(
         Rect::new(table_x, body_top + HEADER_H - 1, table_w, 1),
         theme.window_border,
     );
     let hdr_y = (body_top + 19) as f32;
-    let col_type_x = (w - 170).max(table_x + 160);
-    let col_size_right = (w - SCROLLBAR_W - 14) as f32;
+    let col_type_x = (content.right() - 170).max(table_x + 160);
+    let col_size_right = (content.right() - SCROLLBAR_W - 14) as f32;
     text.draw(
         canvas,
         "名称",
@@ -744,7 +779,13 @@ fn draw_browser(
         (table_w - SCROLLBAR_W - 2).max(1),
         (body_bottom - rows_top).max(0),
     );
-    let sb_track = scrollbar_track(w, h);
+    if is_win98 {
+        canvas.fill(
+            Rect::new(table_x, rows_top, table_w, (body_bottom - rows_top).max(0)),
+            theme.input_bg,
+        );
+    }
+    let sb_track = scrollbar_track(content);
     let total_rows_h = (state.entries.len() as i32 * ROW_H) as f32;
 
     if state.entries.is_empty() {
@@ -776,13 +817,25 @@ fn draw_browser(
                 if ry >= body_bottom {
                     break;
                 }
+                let is_sel = state.selected == Some(slot);
+                let is_hov = state.hover == HoverTarget::Row(slot);
                 let row_rect = Rect::new(table_x + 4, ry + 1, rows_clip.w - 6, ROW_H - 2);
-                if state.selected == Some(slot) {
-                    c.rounded_rect(row_rect, 4, theme.accent_soft, 1.0);
-                    c.rounded_border(row_rect, 4, theme.accent, 0.55, 1);
-                } else if state.hover == HoverTarget::Row(slot) {
-                    c.rounded_rect(row_rect, 4, theme.panel_hover, 0.75);
-                }
+                let row_fg = if is_win98 {
+                    ui::list_item_bg(c, theme, row_rect, is_sel, is_hov)
+                } else {
+                    if is_sel {
+                        c.rounded_rect(row_rect, 4, theme.accent_soft, 1.0);
+                        c.rounded_border(row_rect, 4, theme.accent, 0.55, 1);
+                    } else if is_hov {
+                        c.rounded_rect(row_rect, 4, theme.panel_hover, 0.75);
+                    }
+                    theme.text
+                };
+                let sub_fg = if is_win98 && is_sel {
+                    theme.selection_text
+                } else {
+                    theme.text_muted
+                };
 
                 icons::draw(c, entry.icon, table_x + 12, ry + (ROW_H - 16) / 2, 16, None);
                 let max_name_w = (col_type_x - (table_x + 42)).max(48) as f32;
@@ -794,7 +847,7 @@ fn draw_browser(
                     (table_x + 36) as f32,
                     baseline,
                     12.5,
-                    theme.text,
+                    row_fg,
                     Face::Ui,
                 );
                 text.draw(
@@ -803,7 +856,7 @@ fn draw_browser(
                     col_type_x as f32,
                     baseline,
                     11.5,
-                    theme.text_muted,
+                    sub_fg,
                     Face::Ui,
                 );
                 let size_str = if entry.directory {
@@ -817,7 +870,7 @@ fn draw_browser(
                     col_size_right,
                     baseline,
                     11.5,
-                    theme.text_muted,
+                    sub_fg,
                     Face::Ui,
                 );
             }
@@ -828,14 +881,20 @@ fn draw_browser(
         .draw_v(canvas, theme, sb_track, rows_clip.h as f32, total_rows_h);
 
     // Bottom status bar
-    let status_y = h - STATUS_H;
-    canvas.fill(Rect::new(0, status_y, w, STATUS_H), theme.panel);
-    canvas.fill(Rect::new(0, status_y, w, 1), theme.window_border);
-    let shown_status = text.truncate(&state.status, (w - 28) as f32, 11.5, Face::Ui);
+    let status_y = content.bottom() - STATUS_H;
+    canvas.fill(
+        Rect::new(content.x, status_y, content.w, STATUS_H),
+        theme.panel,
+    );
+    canvas.fill(
+        Rect::new(content.x, status_y, content.w, 1),
+        theme.window_border,
+    );
+    let shown_status = text.truncate(&state.status, (content.w - 28) as f32, 11.5, Face::Ui);
     text.draw(
         canvas,
         &shown_status,
-        12.0,
+        (content.x + 12) as f32,
         (status_y + 17) as f32,
         11.5,
         theme.text_muted,

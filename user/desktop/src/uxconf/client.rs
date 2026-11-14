@@ -24,7 +24,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_millis(1500);
 
 fn connect_with_autospawn(socket_path: &Path) -> Result<UnixStream, ConfError> {
     if let Ok(stream) = UnixStream::connect(socket_path) {
@@ -35,18 +37,22 @@ fn connect_with_autospawn(socket_path: &Path) -> Result<UnixStream, ConfError> {
         .ok()
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
+    let mut spawned = false;
     if !autospawn_disabled && Path::new("/usr/bin/uxconfd").exists() {
-        let _ = Command::new("/usr/bin/uxconfd")
+        spawned = Command::new("/usr/bin/uxconfd")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .spawn()
+            .is_ok();
     }
 
-    for _ in 0..25 {
-        thread::sleep(Duration::from_millis(20));
-        if let Ok(stream) = UnixStream::connect(socket_path) {
-            return Ok(stream);
+    if spawned {
+        for _ in 0..25 {
+            thread::sleep(Duration::from_millis(20));
+            if let Ok(stream) = UnixStream::connect(socket_path) {
+                return Ok(stream);
+            }
         }
     }
     Err(ConfError::Io(format!(
@@ -55,25 +61,144 @@ fn connect_with_autospawn(socket_path: &Path) -> Result<UnixStream, ConfError> {
     )))
 }
 
-fn read_bounded_line(reader: &mut BufReader<UnixStream>) -> Result<String, ConfError> {
-    let mut buf = Vec::new();
+enum TransportError {
+    TimedOut(ConfError),
+    Disconnected(ConfError),
+    Other(ConfError),
+}
+
+impl TransportError {
+    fn into_conf(self) -> ConfError {
+        match self {
+            Self::TimedOut(e) | Self::Disconnected(e) | Self::Other(e) => e,
+        }
+    }
+}
+
+/// Wait until `fd` is ready for `events` (or hung up / errored) before `deadline`.
+/// SpaceKernel's AF_UNIX sockets ignore `SO_RCVTIMEO`/`SO_SNDTIMEO`, so explicit
+/// `poll(2)` bounds are required to guarantee RPC calls never block indefinitely.
+fn poll_fd_deadline(fd: i32, events: i16, deadline: Instant) -> Result<(), TransportError> {
     loop {
-        let available = reader
-            .fill_buf()
-            .map_err(|e| ConfError::Io(e.to_string()))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TransportError::TimedOut(ConfError::Io(
+                "uxconfd IPC timed out".to_string(),
+            )));
+        }
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc > 0 {
+            if (pfd.revents & libc::POLLNVAL) != 0 {
+                return Err(TransportError::Disconnected(ConfError::Io(
+                    "uxconfd socket fd invalid".to_string(),
+                )));
+            }
+            if (pfd.revents & (events | libc::POLLERR | libc::POLLHUP)) != 0 {
+                return Ok(());
+            }
+        } else if rc == 0 {
+            return Err(TransportError::TimedOut(ConfError::Io(
+                "uxconfd IPC timed out".to_string(),
+            )));
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(TransportError::Disconnected(ConfError::Io(err.to_string())));
+        }
+    }
+}
+
+fn is_disconnect_io_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+    )
+}
+
+fn write_all_deadline(
+    stream: &mut UnixStream,
+    mut data: &[u8],
+    deadline: Instant,
+) -> Result<(), TransportError> {
+    let fd = stream.as_raw_fd();
+    while !data.is_empty() {
+        match stream.write(data) {
+            Ok(0) => {
+                return Err(TransportError::Disconnected(ConfError::Io(
+                    "uxconfd write returned 0".to_string(),
+                )));
+            }
+            Ok(n) => data = &data[n..],
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                poll_fd_deadline(fd, libc::POLLOUT, deadline)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if is_disconnect_io_error(&e) => {
+                return Err(TransportError::Disconnected(ConfError::Io(e.to_string())));
+            }
+            Err(e) => {
+                return Err(TransportError::Other(ConfError::Io(e.to_string())));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_bounded_line_deadline(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Instant,
+) -> Result<String, TransportError> {
+    let mut buf = Vec::new();
+    let fd = reader.get_ref().as_raw_fd();
+    loop {
+        if reader.buffer().is_empty() {
+            poll_fd_deadline(fd, libc::POLLIN, deadline)?;
+        }
+        let available = match reader.fill_buf() {
+            Ok(avail) => avail,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                poll_fd_deadline(fd, libc::POLLIN, deadline)?;
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if is_disconnect_io_error(&e) => {
+                return Err(TransportError::Disconnected(ConfError::Io(e.to_string())));
+            }
+            Err(e) => {
+                return Err(TransportError::Other(ConfError::Io(e.to_string())));
+            }
+        };
         if available.is_empty() {
-            return Err(ConfError::Io("uxconfd closed connection".to_string()));
+            return Err(TransportError::Disconnected(ConfError::Io(
+                "uxconfd closed connection".to_string(),
+            )));
         }
         if let Some(pos) = available.iter().position(|&b| b == b'\n') {
             if buf.len() + pos > MAX_LINE_BYTES {
-                return Err(ConfError::Protocol("response frame exceeds limit".into()));
+                return Err(TransportError::Other(ConfError::Protocol(
+                    "response frame exceeds limit".into(),
+                )));
             }
             buf.extend_from_slice(&available[..pos]);
             reader.consume(pos + 1);
             break;
         }
         if buf.len() + available.len() > MAX_LINE_BYTES {
-            return Err(ConfError::Protocol("response frame exceeds limit".into()));
+            return Err(TransportError::Other(ConfError::Protocol(
+                "response frame exceeds limit".into(),
+            )));
         }
         let len = available.len();
         buf.extend_from_slice(available);
@@ -82,7 +207,8 @@ fn read_bounded_line(reader: &mut BufReader<UnixStream>) -> Result<String, ConfE
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
-    String::from_utf8(buf).map_err(|_| ConfError::Protocol("invalid UTF-8 from daemon".into()))
+    String::from_utf8(buf)
+        .map_err(|_| TransportError::Other(ConfError::Protocol("invalid UTF-8 from daemon".into())))
 }
 
 fn parse_err_line(line: &str) -> ConfError {
@@ -100,11 +226,21 @@ fn parse_err_line(line: &str) -> ConfError {
     }
 }
 
+fn configure_client_stream(stream: &UnixStream, timeout: Duration) -> Result<(), ConfError> {
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| ConfError::Io(e.to_string()))
+}
+
 /// Synchronous request/response client for `uxconfd`.
 pub struct UxConfClient {
     socket_path: PathBuf,
     writer: UnixStream,
     reader: BufReader<UnixStream>,
+    timeout: Duration,
+    needs_reconnect: bool,
 }
 
 impl UxConfClient {
@@ -113,9 +249,9 @@ impl UxConfClient {
     }
 
     pub fn connect_path(socket_path: &Path) -> Result<Self, ConfError> {
+        let timeout = DEFAULT_RPC_TIMEOUT;
         let stream = connect_with_autospawn(socket_path)?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        configure_client_stream(&stream, timeout)?;
         let reader_stream = stream
             .try_clone()
             .map_err(|e| ConfError::Io(e.to_string()))?;
@@ -123,41 +259,73 @@ impl UxConfClient {
             socket_path: socket_path.to_path_buf(),
             writer: stream,
             reader: BufReader::new(reader_stream),
+            timeout,
+            needs_reconnect: false,
         })
+    }
+
+    /// Override the bounded RPC deadline used for request writes and reply reads.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout.max(Duration::from_millis(10));
+        let _ = self.writer.set_read_timeout(Some(self.timeout));
+        let _ = self.writer.set_write_timeout(Some(self.timeout));
     }
 
     fn reconnect(&mut self) -> Result<(), ConfError> {
         let stream = connect_with_autospawn(&self.socket_path)?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        configure_client_stream(&stream, self.timeout)?;
         let reader_stream = stream
             .try_clone()
             .map_err(|e| ConfError::Io(e.to_string()))?;
         self.writer = stream;
         self.reader = BufReader::new(reader_stream);
+        self.needs_reconnect = false;
         Ok(())
     }
 
-    fn send_and_read_header(&mut self, req: &Request) -> Result<String, ConfError> {
-        let frame = req.encode();
-        if self.writer.write_all(frame.as_bytes()).is_err() || self.writer.flush().is_err() {
+    fn roundtrip_header(
+        &mut self,
+        frame: &[u8],
+        deadline: Instant,
+    ) -> Result<String, TransportError> {
+        write_all_deadline(&mut self.writer, frame, deadline)?;
+        read_bounded_line_deadline(&mut self.reader, deadline)
+    }
+
+    fn send_and_read_header_with_deadline(
+        &mut self,
+        req: &Request,
+    ) -> Result<(String, Instant), ConfError> {
+        if self.needs_reconnect {
             self.reconnect()?;
-            self.writer
-                .write_all(frame.as_bytes())
-                .and_then(|_| self.writer.flush())
-                .map_err(|e| ConfError::Io(e.to_string()))?;
         }
-        match read_bounded_line(&mut self.reader) {
-            Ok(line) => Ok(line),
-            Err(_) => {
+        let frame = req.encode();
+        let deadline = Instant::now() + self.timeout;
+        match self.roundtrip_header(frame.as_bytes(), deadline) {
+            Ok(line) => Ok((line, deadline)),
+            Err(TransportError::Disconnected(_)) => {
+                // Only auto-reconnect when the prior socket cleanly died (EOF /
+                // BrokenPipe). Never wait a second timeout when uxconfd stalled.
                 self.reconnect()?;
-                self.writer
-                    .write_all(frame.as_bytes())
-                    .and_then(|_| self.writer.flush())
-                    .map_err(|e| ConfError::Io(e.to_string()))?;
-                read_bounded_line(&mut self.reader)
+                let retry_deadline = Instant::now() + self.timeout;
+                match self.roundtrip_header(frame.as_bytes(), retry_deadline) {
+                    Ok(line) => Ok((line, retry_deadline)),
+                    Err(err) => {
+                        self.needs_reconnect = true;
+                        Err(err.into_conf())
+                    }
+                }
+            }
+            Err(err) => {
+                self.needs_reconnect = true;
+                Err(err.into_conf())
             }
         }
+    }
+
+    fn send_and_read_header(&mut self, req: &Request) -> Result<String, ConfError> {
+        self.send_and_read_header_with_deadline(req)
+            .map(|(line, _)| line)
     }
 
     pub fn ping(&mut self) -> Result<(), ConfError> {
@@ -170,7 +338,7 @@ impl UxConfClient {
     }
 
     pub fn list_channels(&mut self) -> Result<Vec<String>, ConfError> {
-        let line = self.send_and_read_header(&Request::ListChannels)?;
+        let (line, deadline) = self.send_and_read_header_with_deadline(&Request::ListChannels)?;
         let Some(count_str) = line.strip_prefix("OK ") else {
             return Err(parse_err_line(&line));
         };
@@ -180,7 +348,11 @@ impl UxConfClient {
             .map_err(|_| ConfError::Protocol(format!("bad channel count in {line:?}")))?;
         let mut out = Vec::with_capacity(count.min(256));
         for _ in 0..count {
-            out.push(read_bounded_line(&mut self.reader)?);
+            let entry = read_bounded_line_deadline(&mut self.reader, deadline).map_err(|e| {
+                self.needs_reconnect = true;
+                e.into_conf()
+            })?;
+            out.push(entry);
         }
         Ok(out)
     }
@@ -207,7 +379,7 @@ impl UxConfClient {
             channel: channel.to_string(),
             prefix: prefix.to_string(),
         };
-        let line = self.send_and_read_header(&req)?;
+        let (line, deadline) = self.send_and_read_header_with_deadline(&req)?;
         let Some(count_str) = line.strip_prefix("OK ") else {
             return Err(parse_err_line(&line));
         };
@@ -217,8 +389,12 @@ impl UxConfClient {
             .map_err(|_| ConfError::Protocol(format!("bad property count in {line:?}")))?;
         let mut map = BTreeMap::new();
         for _ in 0..count {
-            let entry = read_bounded_line(&mut self.reader)?;
+            let entry = read_bounded_line_deadline(&mut self.reader, deadline).map_err(|e| {
+                self.needs_reconnect = true;
+                e.into_conf()
+            })?;
             let Some((prop, val_raw)) = entry.split_once('\t') else {
+                self.needs_reconnect = true;
                 return Err(ConfError::Protocol(format!("bad GET_ALL entry {entry:?}")));
             };
             map.insert(prop.to_string(), Value::decode_typed(val_raw)?);
@@ -296,31 +472,28 @@ impl UxConfWatch {
 
     pub fn subscribe_path(socket_path: &Path, filter: Option<&str>) -> Result<Self, ConfError> {
         let mut stream = connect_with_autospawn(socket_path)?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        stream
+            .set_nonblocking(true)
+            .map_err(|e| ConfError::Io(e.to_string()))?;
+        let deadline = Instant::now() + DEFAULT_RPC_TIMEOUT;
         let req = Request::Subscribe {
             filter: filter.map(str::to_string),
         };
-        stream
-            .write_all(req.encode().as_bytes())
-            .and_then(|_| stream.flush())
-            .map_err(|e| ConfError::Io(e.to_string()))?;
+        write_all_deadline(&mut stream, req.encode().as_bytes(), deadline)
+            .map_err(TransportError::into_conf)?;
 
         let cloned = stream
             .try_clone()
             .map_err(|e| ConfError::Io(e.to_string()))?;
         let mut reader = BufReader::new(cloned);
-        let reply = read_bounded_line(&mut reader)?;
+        let reply = read_bounded_line_deadline(&mut reader, deadline)
+            .map_err(TransportError::into_conf)?;
         if !reply.starts_with("OK") {
             return Err(parse_err_line(&reply));
         }
 
         // Preserve any bytes already buffered right after the OK handshake line.
         let buffered = reader.buffer().to_vec();
-        let _ = stream.set_read_timeout(None);
-        stream
-            .set_nonblocking(true)
-            .map_err(|e| ConfError::Io(e.to_string()))?;
-
         Ok(Self {
             stream,
             rx_buf: buffered,
@@ -386,5 +559,92 @@ impl UxConfWatch {
             }
         }
         (changed, events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_sock_path(tag: &str) -> PathBuf {
+        let n = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "spui_uxconf_client_{tag}_{}_{}.sock",
+            std::process::id(),
+            n
+        ))
+    }
+
+    #[test]
+    fn unresponsive_server_times_out_once_and_resyncs_on_next_call() {
+        let sock_path = temp_sock_path("timeout");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind unix listener");
+
+        let server = thread::spawn(move || {
+            // Connection 1: accept and hold open silently without writing a reply.
+            let (stalled, _) = listener.accept().expect("accept stalled");
+            // Connection 2: accept after client marks stream stale, read PING, reply OK.
+            let (mut healthy, _) = listener.accept().expect("accept healthy");
+            let mut r = BufReader::new(healthy.try_clone().expect("clone"));
+            let mut line = String::new();
+            r.read_line(&mut line).expect("read ping");
+            assert_eq!(line.trim_end(), "PING");
+            healthy.write_all(b"OK PONG\n").expect("write pong");
+            drop(stalled);
+        });
+
+        let mut client = UxConfClient::connect_path(&sock_path).expect("connect");
+        client.set_timeout(Duration::from_millis(80));
+
+        let start = Instant::now();
+        let err = client.ping().expect_err("stalled server must time out");
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, ConfError::Io(ref msg) if msg.contains("timed out")),
+            "unexpected error: {err:?}"
+        );
+        // Should return after ~1x timeout (not reconnect+double-wait).
+        assert!(
+            elapsed < Duration::from_millis(240),
+            "elapsed too long (double wait?): {elapsed:?}"
+        );
+
+        // Next call should transparently open a fresh socket instead of reading stale state.
+        client.ping().expect("fresh reconnect should succeed");
+        server.join().expect("server thread");
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn dead_connection_auto_reconnects_and_retries() {
+        let sock_path = temp_sock_path("reconnect");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind unix listener");
+
+        let server = thread::spawn(move || {
+            // Connection 1: immediately drop to simulate daemon restart while idle.
+            let (dead, _) = listener.accept().expect("accept dead");
+            drop(dead);
+            // Connection 2: reply cleanly to retried PING.
+            let (mut healthy, _) = listener.accept().expect("accept healthy");
+            let mut r = BufReader::new(healthy.try_clone().expect("clone"));
+            let mut line = String::new();
+            r.read_line(&mut line).expect("read ping");
+            assert_eq!(line.trim_end(), "PING");
+            healthy.write_all(b"OK PONG\n").expect("write pong");
+        });
+
+        let mut client = UxConfClient::connect_path(&sock_path).expect("connect");
+        client.set_timeout(Duration::from_millis(200));
+        // Give the server thread a brief moment to drop connection 1 cleanly.
+        thread::sleep(Duration::from_millis(20));
+        client.ping().expect("auto reconnect on EOF/EPIPE should succeed");
+        server.join().expect("server thread");
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

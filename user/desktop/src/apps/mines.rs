@@ -29,7 +29,7 @@ use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
 use crate::sound::{play as play_sound, SystemSound};
 use crate::text::{Face, TextRenderer};
-use crate::theme::TITLEBAR_HEIGHT;
+use crate::theme::Theme;
 use crate::x11::{CursorKind, Result};
 use std::collections::{BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -1644,42 +1644,50 @@ struct MinesLayout {
     status_bar: Rect,
 }
 
+fn content_rect(theme: &Theme, win_w: i32, win_h: i32) -> Rect {
+    let bw = theme.window_border_width();
+    let th = theme.titlebar_height();
+    Rect::new(bw, th, (win_w - bw * 2).max(1), (win_h - th - bw).max(1))
+}
+
 impl MinesLayout {
-    fn preferred_window_size(diff: Difficulty, show_custom: bool) -> (u16, u16) {
+    fn preferred_window_size(theme: &Theme, diff: Difficulty, show_custom: bool) -> (u16, u16) {
         let (cols, rows, _) = diff.dims();
         let cell = diff.preferred_cell_size();
         let board_w = cols as i32 * cell;
         let board_h = rows as i32 * cell;
         let custom_h = if show_custom { 34 } else { 0 };
-        let win_w = (board_w + 46).max(480) as u16;
-        let win_h = (TITLEBAR_HEIGHT + 28 + 30 + custom_h + 18 + 46 + 12 + board_h + 20 + 26)
+        let bw = theme.window_border_width();
+        let th = theme.titlebar_height();
+        let win_w = (board_w + 46 + bw * 2).max(480) as u16;
+        let win_h = (th + bw + 28 + 30 + custom_h + 18 + 46 + 12 + board_h + 20 + 26)
             .max(360) as u16;
         (win_w, win_h)
     }
 
-    fn compute(win_w: i32, win_h: i32, cols: usize, rows: usize, show_custom: bool) -> Self {
-        let menu_bar = Rect::new(0, TITLEBAR_HEIGHT, win_w, 28);
-        let btn_beg = Rect::new(8, TITLEBAR_HEIGHT + 4, 48, 20);
-        let btn_int = Rect::new(btn_beg.right() + 4, TITLEBAR_HEIGHT + 4, 48, 20);
-        let btn_exp = Rect::new(btn_int.right() + 4, TITLEBAR_HEIGHT + 4, 48, 20);
-        let btn_cust = Rect::new(btn_exp.right() + 4, TITLEBAR_HEIGHT + 4, 58, 20);
+    fn compute(content: Rect, cols: usize, rows: usize, show_custom: bool) -> Self {
+        let menu_bar = Rect::new(content.x, content.y, content.w, 28);
+        let btn_beg = Rect::new(content.x + 8, content.y + 4, 48, 20);
+        let btn_int = Rect::new(btn_beg.right() + 4, content.y + 4, 48, 20);
+        let btn_exp = Rect::new(btn_int.right() + 4, content.y + 4, 48, 20);
+        let btn_cust = Rect::new(btn_exp.right() + 4, content.y + 4, 58, 20);
         let btn_zeroguess = Rect::new(
-            (win_w - 116).max(btn_cust.right() + 8),
-            TITLEBAR_HEIGHT + 4,
+            (content.right() - 116).max(btn_cust.right() + 8),
+            content.y + 4,
             108,
             20,
         );
 
-        let ai_bar = Rect::new(0, menu_bar.bottom(), win_w, 30);
-        let btn_heatmap = Rect::new(8, ai_bar.y + 4, 104, 22);
+        let ai_bar = Rect::new(content.x, menu_bar.bottom(), content.w, 30);
+        let btn_heatmap = Rect::new(content.x + 8, ai_bar.y + 4, 104, 22);
         let btn_step = Rect::new(btn_heatmap.right() + 6, ai_bar.y + 4, 108, 22);
         let btn_auto = Rect::new(btn_step.right() + 6, ai_bar.y + 4, 106, 22);
 
         let mut y_cursor = ai_bar.bottom();
         let mut custom_btns = [Rect::new(0, 0, 0, 0); 7];
         let custom_bar = if show_custom {
-            let cb = Rect::new(0, y_cursor, win_w, 34);
-            let mut cx = 12;
+            let cb = Rect::new(content.x, y_cursor, content.w, 34);
+            let mut cx = content.x + 12;
             let by = cb.y + 6;
             // Width (-/+)
             cx += 26;
@@ -1698,7 +1706,7 @@ impl MinesLayout {
             custom_btns[4] = Rect::new(cx, by, 20, 22);
             cx += 54;
             custom_btns[5] = Rect::new(cx, by, 20, 22);
-            custom_btns[6] = Rect::new((win_w - 64).max(cx + 28), by, 54, 22);
+            custom_btns[6] = Rect::new((content.right() - 64).max(cx + 28), by, 54, 22);
             y_cursor = cb.bottom();
             Some(cb)
         } else {
@@ -1706,11 +1714,16 @@ impl MinesLayout {
         };
 
         let status_h = 26;
-        let status_bar = Rect::new(0, (win_h - status_h).max(y_cursor + 100), win_w, status_h);
+        let status_bar = Rect::new(
+            content.x,
+            (content.bottom() - status_h).max(y_cursor + 100),
+            content.w,
+            status_h,
+        );
         let chassis = Rect::new(
-            6,
+            content.x + 6,
             y_cursor + 4,
-            (win_w - 12).max(160),
+            (content.w - 12).max(160),
             (status_bar.y - (y_cursor + 8)).max(120),
         );
 
@@ -1821,7 +1834,9 @@ impl MinesLayout {
 
 pub fn run() -> Result<()> {
     let mut diff = Difficulty::Beginner;
-    let (init_w, init_h) = MinesLayout::preferred_window_size(diff, false);
+    let init_cfg = uxconf::storage::load_desktop_config_readonly();
+    let init_theme = Theme::from_config(&init_cfg);
+    let (init_w, init_h) = MinesLayout::preferred_window_size(&init_theme, diff, false);
     let mut app = App::new("扫雷", Icon::Minesweeper, init_w, init_h)?;
     app.min_width = 460;
     app.min_height = 350;
@@ -1891,8 +1906,7 @@ pub fn run() -> Result<()> {
         }
 
         let layout = MinesLayout::compute(
-            app.width as i32,
-            app.height as i32,
+            app.content(),
             board.cols,
             board.rows,
             show_custom,
@@ -1913,6 +1927,7 @@ pub fn run() -> Result<()> {
             draw_mines(
                 &mut app.canvas,
                 &mut app.text,
+                &app.theme,
                 &board,
                 &ai,
                 &layout,
@@ -2224,7 +2239,7 @@ fn reset_game(board: &mut MinesBoard, diff: Difficulty, auto_play: &mut bool) {
 }
 
 fn resize_for_difficulty(app: &mut App, diff: Difficulty, show_custom: bool) {
-    let (w, h) = MinesLayout::preferred_window_size(diff, show_custom);
+    let (w, h) = MinesLayout::preferred_window_size(&app.theme, diff, show_custom);
     let _ = app.x.conn.configure_window(
         app.win,
         &x11rb::protocol::xproto::ConfigureWindowAux::new()
@@ -2270,6 +2285,7 @@ fn collect_pressed_preview(
 fn draw_mines(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
+    theme: &Theme,
     board: &MinesBoard,
     ai: &AiSnapshot,
     layout: &MinesLayout,
@@ -2284,14 +2300,9 @@ fn draw_mines(
     smiley: SmileyFace,
     smiley_pressed: bool,
 ) {
-    // Classic XP outer client fill
+    // Classic Win98/XP outer client fill bounded cleanly inside window content rect
     canvas.fill(
-        Rect::new(
-            0,
-            TITLEBAR_HEIGHT,
-            canvas.width as i32,
-            canvas.height as i32,
-        ),
+        content_rect(theme, canvas.width as i32, canvas.height as i32),
         XP_FACE,
     );
 
@@ -2509,7 +2520,7 @@ fn draw_custom_bar(
     canvas.fill(Rect::new(bar.x, bar.bottom() - 1, bar.w, 1), XP_SHADOW);
     let y_base = bar.y as f32 + 21.0;
 
-    text.draw(canvas, "宽", 10.0, y_base, 11.5, XP_BLACK, Face::Ui);
+    text.draw(canvas, "宽", (bar.x + 10) as f32, y_base, 11.5, XP_BLACK, Face::Ui);
     draw_xp_tab(
         canvas,
         text,

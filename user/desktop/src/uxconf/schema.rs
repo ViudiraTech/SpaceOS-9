@@ -36,6 +36,8 @@ pub const DEFAULT_START_TILES: &str = "status-clock:wide,status-net:wide,status-
 pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {
     match channel {
         "appearance" => vec![
+            ("/theme/id", Value::String("spui-4".to_string())),
+            ("/theme/style", Value::String("spui".to_string())),
             ("/theme/mode", Value::String("dark".to_string())),
             ("/theme/accent", Value::String("#3b82f6".to_string())),
             ("/font/scale", Value::Int(100)),

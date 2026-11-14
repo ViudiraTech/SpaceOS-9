@@ -661,22 +661,50 @@ impl Oobe {
 
     fn draw(&mut self) {
         let theme = self.screen.theme;
+        let is_win98 = theme.is_win98();
         let layout = self.layout();
         self.screen.draw_background();
-        self.screen
-            .canvas
-            .rounded_rect(layout.card, 12, theme.window, 0.97);
-        self.screen
-            .canvas
-            .rounded_border(layout.card, 12, theme.window_border, 1.0, 1);
         let rail = Rect::new(layout.card.x, layout.card.y, RAIL_WIDTH, layout.card.h);
-        self.screen
-            .canvas
-            .rounded_rect(rail, 12, theme.window_alt, 0.96);
-        self.screen.canvas.fill(
-            Rect::new(rail.right() - 1, rail.y + 1, 1, rail.h - 2),
-            theme.window_border,
-        );
+        if is_win98 {
+            self.screen.canvas.fill(layout.card, theme.panel);
+            ui::window_outer_bevel(&mut self.screen.canvas, &theme, layout.card);
+            let tb = Rect::new(layout.card.x + 3, layout.card.y + 3, layout.card.w - 6, 22);
+            self.screen
+                .canvas
+                .horizontal_gradient(tb, theme.titlebar, theme.titlebar_hi);
+            self.screen.text.draw(
+                &mut self.screen.canvas,
+                "SpaceOS 安装向导",
+                (tb.x + 8) as f32,
+                (tb.y + 15) as f32,
+                11.5,
+                theme.titlebar_text,
+                Face::Bold,
+            );
+            let sep_x = rail.right() - 1;
+            self.screen.canvas.fill(
+                Rect::new(sep_x, tb.bottom() + 6, 1, layout.card.h - 36),
+                theme.bevel_shadow,
+            );
+            self.screen.canvas.fill(
+                Rect::new(sep_x + 1, tb.bottom() + 6, 1, layout.card.h - 36),
+                theme.bevel_light,
+            );
+        } else {
+            self.screen
+                .canvas
+                .rounded_rect(layout.card, 12, theme.window, 0.97);
+            self.screen
+                .canvas
+                .rounded_border(layout.card, 12, theme.window_border, 1.0, 1);
+            self.screen
+                .canvas
+                .rounded_rect(rail, 12, theme.window_alt, 0.96);
+            self.screen.canvas.fill(
+                Rect::new(rail.right() - 1, rail.y + 1, 1, rail.h - 2),
+                theme.window_border,
+            );
+        }
 
         draw_logo(&mut self.screen, rail.x + 28, rail.y + 30, 40);
         self.screen.text.draw(
@@ -711,29 +739,49 @@ impl Oobe {
             let row = layout.step_rows[index];
             let active = index == self.step;
             let done = index < self.step;
-            if active || self.hover == Focus::Step(index) {
-                self.screen.canvas.rounded_rect(
-                    row,
-                    8,
-                    if active {
-                        theme.accent_soft
+            let hovered = self.hover == Focus::Step(index);
+            let win98_act = is_win98 && active;
+            let row_fg = if is_win98 {
+                ui::list_item_bg(&mut self.screen.canvas, &theme, row, active, hovered)
+            } else {
+                if active || hovered {
+                    self.screen.canvas.rounded_rect(
+                        row,
+                        8,
+                        if active {
+                            theme.accent_soft
+                        } else {
+                            theme.panel_hover
+                        },
+                        1.0,
+                    );
+                }
+                if active { theme.text } else { theme.text_dim }
+            };
+            if is_win98 {
+                let b = Rect::new(row.x + 11, row.y + 14, 22, 22);
+                self.screen.canvas.fill(
+                    b,
+                    if active || done {
+                        theme.accent
                     } else {
-                        theme.panel_hover
+                        theme.panel
+                    },
+                );
+                ui::raised_bevel(&mut self.screen.canvas, &theme, b);
+            } else {
+                self.screen.canvas.circle(
+                    (row.x + 22) as f32,
+                    (row.y + 25) as f32,
+                    15.0,
+                    if active || done {
+                        theme.accent
+                    } else {
+                        theme.panel_high
                     },
                     1.0,
                 );
             }
-            self.screen.canvas.circle(
-                (row.x + 22) as f32,
-                (row.y + 25) as f32,
-                15.0,
-                if active || done {
-                    theme.accent
-                } else {
-                    theme.panel_high
-                },
-                1.0,
-            );
             self.screen.text.draw_centered(
                 &mut self.screen.canvas,
                 &format!("{}", index + 1),
@@ -753,7 +801,7 @@ impl Oobe {
                 (row.x + 46) as f32,
                 (row.y + 21) as f32,
                 12.0,
-                if active { theme.text } else { theme.text_dim },
+                row_fg,
                 Face::Bold,
             );
             self.screen.text.draw(
@@ -762,7 +810,7 @@ impl Oobe {
                 (row.x + 46) as f32,
                 (row.y + 37) as f32,
                 9.5,
-                theme.text_muted,
+                if win98_act { row_fg } else { theme.text_muted },
                 Face::Ui,
             );
         }
@@ -1073,7 +1121,7 @@ impl Oobe {
         if self.hover == Focus::AutoLogin || self.focus == Focus::AutoLogin {
             self.screen
                 .canvas
-                .rounded_rect(auto, 8, theme.panel_hover, 0.8);
+                .rounded_rect(auto, theme.radius_control(), theme.panel_hover, 0.8);
         }
         ui::toggle_switch(
             &mut self.screen.canvas,
@@ -1210,21 +1258,42 @@ impl Oobe {
 
 fn choice(screen: &mut Screen, rect: Rect, label: &str, active: bool, hover: bool) {
     let theme = screen.theme;
-    screen.canvas.rounded_rect(
-        rect,
-        6,
+    let fg = if theme.is_win98() {
+        screen.canvas.fill(
+            rect,
+            if active {
+                theme.selection_bg
+            } else if hover {
+                theme.panel_hover
+            } else {
+                theme.panel
+            },
+        );
         if active {
-            theme.accent_soft
-        } else if hover {
-            theme.panel_hover
+            ui::sunken_bevel(&mut screen.canvas, &theme, rect);
+            theme.selection_text
         } else {
-            theme.panel_high
-        },
-        1.0,
-    );
-    if active {
-        screen.canvas.rounded_border(rect, 6, theme.accent, 0.9, 1);
-    }
+            ui::raised_bevel(&mut screen.canvas, &theme, rect);
+            theme.text
+        }
+    } else {
+        screen.canvas.rounded_rect(
+            rect,
+            6,
+            if active {
+                theme.accent_soft
+            } else if hover {
+                theme.panel_hover
+            } else {
+                theme.panel_high
+            },
+            1.0,
+        );
+        if active {
+            screen.canvas.rounded_border(rect, 6, theme.accent, 0.9, 1);
+        }
+        if active { theme.text } else { theme.text_dim }
+    };
     let shown = screen
         .text
         .truncate(label, (rect.w - 16) as f32, 10.5, Face::Ui);
@@ -1234,7 +1303,7 @@ fn choice(screen: &mut Screen, rect: Rect, label: &str, active: bool, hover: boo
         (rect.x + 8) as f32,
         (rect.y + 22) as f32,
         10.5,
-        if active { theme.text } else { theme.text_dim },
+        fg,
         Face::Ui,
     );
 }

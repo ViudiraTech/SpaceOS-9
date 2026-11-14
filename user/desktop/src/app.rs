@@ -17,7 +17,7 @@
 use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
 use crate::text::TextRenderer;
-use crate::theme::{Theme, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui::{self, CaptionHit};
 use crate::x11::{CursorKind, Key, Result, X};
 use std::collections::HashMap;
@@ -312,7 +312,7 @@ impl App {
         if self.maximized {
             if let Ok(cookie) = self.x.conn.get_geometry(self.x.root) {
                 if let Ok(root_geom) = cookie.reply() {
-                    let panel_h = self.config.panel_size.clamp(34, 60) as u16;
+                    let panel_h = self.panel_height() as u16;
                     let max_y = if self.config.panel_position == PanelPosition::Top {
                         panel_h as i16
                     } else {
@@ -329,12 +329,18 @@ impl App {
         self.needs_redraw = true;
     }
 
+    pub fn panel_height(&self) -> i32 {
+        self.theme.panel_height(&self.config)
+    }
+
     pub fn content(&self) -> Rect {
+        let bw = self.theme.window_border_width();
+        let th = self.theme.titlebar_height();
         Rect::new(
-            1,
-            TITLEBAR_HEIGHT,
-            (self.width as i32 - 2).max(1),
-            (self.height as i32 - TITLEBAR_HEIGHT - 1).max(1),
+            bw,
+            th,
+            (self.width as i32 - bw * 2).max(1),
+            (self.height as i32 - th - bw).max(1),
         )
     }
 
@@ -393,7 +399,7 @@ impl App {
             let root_geom = self.x.conn.get_geometry(self.x.root)?.reply()?;
             self.saved_geom = Some((geom.x, geom.y, self.width, self.height));
             self.maximized = true;
-            let panel_h = self.config.panel_size.clamp(34, 60) as u16;
+            let panel_h = self.panel_height() as u16;
             let max_y = if self.config.panel_position == PanelPosition::Top {
                 panel_h as i16
             } else {
@@ -613,7 +619,7 @@ impl App {
                 let _ = self.x.set_active_window(self.win);
 
                 if e.detail == 1 {
-                    let cap = ui::hit_caption(self.width as i32, x, y, self.buttons_left());
+                    let cap = ui::hit_caption_for(&self.theme, self.width as i32, x, y, self.buttons_left());
                     if cap != CaptionHit::None {
                         match cap {
                             CaptionHit::Close => events.push(UiEvent::Close),
@@ -642,7 +648,7 @@ impl App {
                         self.apply_cursor(dir.cursor());
                         return Ok(());
                     }
-                    if y < TITLEBAR_HEIGHT {
+                    if y < self.theme.titlebar_height() {
                         let now = Instant::now();
                         let dc_limit = Duration::from_millis(self.config.mouse_double_click_ms);
                         if self.config.wm_double_click != DoubleClickAction::None
@@ -667,7 +673,7 @@ impl App {
                         if !self.maximized {
                             let geom = self.x.conn.get_geometry(self.win)?.reply()?;
                             let min_y = if self.config.panel_position == PanelPosition::Top {
-                                self.config.panel_size.clamp(34, 60) as i16
+                                self.panel_height() as i16
                             } else {
                                 0
                             };
@@ -708,7 +714,7 @@ impl App {
                 if let Some(drag) = self.drag {
                     if btn1_held {
                         let min_y = if self.config.panel_position == PanelPosition::Top {
-                            self.config.panel_size.clamp(34, 60)
+                            self.panel_height()
                         } else {
                             0
                         };
@@ -785,7 +791,7 @@ impl App {
                     }
                 }
 
-                let cap = ui::hit_caption(self.width as i32, x, y, self.buttons_left());
+                let cap = ui::hit_caption_for(&self.theme, self.width as i32, x, y, self.buttons_left());
                 if cap != self.caption_hover {
                     self.caption_hover = cap;
                     self.needs_redraw = true;
@@ -795,7 +801,7 @@ impl App {
                     CursorKind::Default
                 } else if let Some(dir) = self.hit_resize(x, y) {
                     dir.cursor()
-                } else if y < TITLEBAR_HEIGHT {
+                } else if y < self.theme.titlebar_height() {
                     CursorKind::Default
                 } else {
                     self.content_cursor

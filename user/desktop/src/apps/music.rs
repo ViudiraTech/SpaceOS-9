@@ -21,7 +21,7 @@ use crate::draw::{mix, Canvas, Rect};
 use crate::icons::Icon;
 use crate::sound::{apply_mixer_volume, play as play_sound, SystemSound};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{CursorKind, Result};
 use std::fs;
@@ -116,11 +116,17 @@ struct Layout {
     playlist_sb: Rect,
 }
 
+fn content_rect(theme: &Theme, width: i32, height: i32) -> Rect {
+    let bw = theme.window_border_width();
+    let th = theme.titlebar_height();
+    Rect::new(bw, th, (width - bw * 2).max(1), (height - th - bw).max(1))
+}
+
 impl Layout {
-    fn compute(width: i32, height: i32) -> Self {
+    fn compute(content: Rect) -> Self {
         let margin = 18;
-        let card_w = (width - margin * 2).max(260);
-        let album = Rect::new(margin, TITLEBAR_HEIGHT + 14, card_w, 192);
+        let card_w = (content.w - margin * 2).max(260);
+        let album = Rect::new(content.x + margin, content.y + 14, card_w, 192);
         let art = Rect::new(album.x + 16, album.y + 16, 128, 128);
         let info_x = art.right() + 18;
         let info_w = (album.right() - 16 - info_x).max(80);
@@ -135,13 +141,13 @@ impl Layout {
         );
 
         let tr_y = album.bottom() + 12;
-        let prev = Rect::new(margin, tr_y + 3, 34, 34);
+        let prev = Rect::new(content.x + margin, tr_y + 3, 34, 34);
         let play_pause = Rect::new(prev.right() + 8, tr_y, 42, 40);
         let stop = Rect::new(play_pause.right() + 8, tr_y + 3, 34, 34);
         let next = Rect::new(stop.right() + 8, tr_y + 3, 34, 34);
         let repeat = Rect::new(next.right() + 10, tr_y + 4, 74, 32);
 
-        let right_edge = width - margin;
+        let right_edge = content.right() - margin;
         let vol_text_w = 34;
         let vol_text_x = right_edge - vol_text_w;
         let vol_slider_w = (right_edge - repeat.right() - 12 - vol_text_w - 32).clamp(64, 116);
@@ -149,8 +155,8 @@ impl Layout {
         let mute = Rect::new(vol_slider.x - 30, tr_y + 6, 28, 28);
 
         let pl_y = tr_y + 52;
-        let pl_h = (height - 26 - pl_y).max(96);
-        let playlist_card = Rect::new(margin, pl_y, card_w, pl_h);
+        let pl_h = (content.bottom() - 26 - pl_y).max(96);
+        let playlist_card = Rect::new(content.x + margin, pl_y, card_w, pl_h);
         let playlist_vp = Rect::new(
             playlist_card.x + 8,
             playlist_card.y + 32,
@@ -701,7 +707,7 @@ pub fn run() -> Result<()> {
         }
         let width = app.width as i32;
         let height = app.height as i32;
-        let layout = Layout::compute(width, height);
+        let layout = Layout::compute(app.content());
         scroll.set_bounds(
             layout.playlist_vp.h as f32,
             (state.tracks.len() as i32 * PLAYLIST_ROW_H) as f32,
@@ -984,18 +990,25 @@ fn draw_player(
     height: i32,
 ) {
     canvas.clear(theme.window);
+    let content = content_rect(theme, width, height);
+    let is_win98 = theme.is_win98();
 
     // Top Now-Playing Card
     ui::card(canvas, theme, layout.album);
     let art = layout.art;
-    canvas.rounded_rect(art, 8, theme.accent, 1.0);
-    canvas.circle(
-        art.x as f32 + art.w as f32 * 0.5,
-        art.y as f32 + art.h as f32 * 0.5,
-        40.0,
-        theme.window_high,
-        0.24,
-    );
+    if is_win98 {
+        canvas.fill(art, theme.accent);
+        ui::sunken_bevel(canvas, theme, art);
+    } else {
+        canvas.rounded_rect(art, theme.radius_card(), theme.accent, 1.0);
+        canvas.circle(
+            art.x as f32 + art.w as f32 * 0.5,
+            art.y as f32 + art.h as f32 * 0.5,
+            40.0,
+            theme.window_high,
+            0.24,
+        );
+    }
     text.draw_centered(
         canvas,
         "♪",
@@ -1179,12 +1192,18 @@ fn draw_player(
             }
             let selected = idx == state.current;
             let is_hover = hover == Some(HitTarget::TrackRow(idx));
-            if selected {
-                cv.rounded_rect(row, 5, theme.accent_soft, 1.0);
-                cv.rounded_border(row, 5, theme.accent, 0.55, 1);
-            } else if is_hover {
-                cv.rounded_rect(row, 5, theme.panel_hover, 0.85);
-            }
+            let win98_sel = is_win98 && selected;
+            let row_fg = if is_win98 {
+                ui::list_item_bg(cv, theme, row, selected, is_hover)
+            } else {
+                if selected {
+                    cv.rounded_rect(row, 5, theme.accent_soft, 1.0);
+                    cv.rounded_border(row, 5, theme.accent, 0.55, 1);
+                } else if is_hover {
+                    cv.rounded_rect(row, 5, theme.panel_hover, 0.85);
+                }
+                theme.text
+            };
 
             let badge = if selected && state.play_state == PlayState::Playing {
                 "▶"
@@ -1201,7 +1220,7 @@ fn draw_player(
                     row.x as f32 + 10.0,
                     row.y as f32 + 23.0,
                     11.5,
-                    theme.text_muted,
+                    if win98_sel { row_fg } else { theme.text_muted },
                     Face::Mono,
                 );
             } else {
@@ -1211,7 +1230,7 @@ fn draw_player(
                     row.x as f32 + 10.0,
                     row.y as f32 + 23.0,
                     12.0,
-                    theme.accent,
+                    if win98_sel { row_fg } else { theme.accent },
                     Face::Bold,
                 );
             }
@@ -1226,7 +1245,7 @@ fn draw_player(
                 row.right() as f32 - 12.0,
                 row.y as f32 + 23.0,
                 11.5,
-                theme.text_muted,
+                if win98_sel { row_fg } else { theme.text_muted },
                 Face::Mono,
             );
 
@@ -1239,7 +1258,13 @@ fn draw_player(
                 text_left as f32,
                 row.y as f32 + 17.0,
                 12.5,
-                if selected { theme.text } else { theme.text_dim },
+                if win98_sel {
+                    row_fg
+                } else if selected {
+                    theme.text
+                } else {
+                    theme.text_dim
+                },
                 Face::Bold,
             );
             let row_sub = text.truncate(&item.subtitle, text_max, 10.5, Face::Ui);
@@ -1249,7 +1274,7 @@ fn draw_player(
                 text_left as f32,
                 row.y as f32 + 31.0,
                 10.5,
-                theme.text_muted,
+                if win98_sel { row_fg } else { theme.text_muted },
                 Face::Ui,
             );
         }
@@ -1265,15 +1290,15 @@ fn draw_player(
     // Footer hints
     let hint = text.truncate(
         "空格 播放/暂停 · ←/→ 跳转 5s · M 静音 · 点击进度条拖动定位",
-        (width - 36).max(80) as f32,
+        (content.w - 36).max(80) as f32,
         11.0,
         Face::Ui,
     );
     text.draw(
         canvas,
         &hint,
-        18.0,
-        height as f32 - 10.0,
+        (content.x + 18) as f32,
+        (content.bottom() - 8) as f32,
         11.0,
         theme.text_muted,
         Face::Ui,
@@ -1328,7 +1353,12 @@ fn draw_spectrum(
             } else {
                 0.28
             };
-            cv.rounded_rect(bar, 2, theme.accent, alpha);
+            cv.rounded_rect(
+                bar,
+                if theme.is_win98() { 0 } else { 2 },
+                theme.accent,
+                alpha,
+            );
         }
     });
 }
@@ -1377,28 +1407,51 @@ fn draw_progress_row(
     );
 
     let bar = layout.progress_bar;
-    let track_h = 5;
+    let is_win98 = theme.is_win98();
+    let track_h = if is_win98 { 8 } else { 5 };
     let track = Rect::new(bar.x, bar.y + (bar.h - track_h) / 2, bar.w, track_h);
-    canvas.rounded_rect(track, 2, theme.window_alt, 1.0);
-    canvas.rounded_border(track, 2, theme.window_border, 1.0, 1);
+    if is_win98 {
+        canvas.fill(track, theme.input_bg);
+        ui::sunken_bevel(canvas, theme, track);
+    } else {
+        canvas.rounded_rect(track, 2, theme.window_alt, 1.0);
+        canvas.rounded_border(track, 2, theme.window_border, 1.0, 1);
+    }
 
     let fill_w = ((track.w as f32) * frac).round() as i32;
     if fill_w > 0 {
-        let filled = Rect::new(track.x, track.y, fill_w.min(track.w), track_h);
-        canvas.rounded_rect(filled, 2, theme.accent, 1.0);
+        if is_win98 {
+            let inner_w = (fill_w - 2).min(track.w - 2).max(0);
+            if inner_w > 0 {
+                canvas.fill(
+                    Rect::new(track.x + 1, track.y + 1, inner_w, (track_h - 2).max(1)),
+                    theme.accent,
+                );
+            }
+        } else {
+            let filled = Rect::new(track.x, track.y, fill_w.min(track.w), track_h);
+            canvas.rounded_rect(filled, 2, theme.accent, 1.0);
+        }
     }
     if hot || state.play_state != PlayState::Stopped {
-        let knob_d = if hot { 12 } else { 9 };
-        let kx = (track.x + fill_w).clamp(track.x, track.right()) - knob_d / 2;
-        let ky = track.y + track_h / 2 - knob_d / 2;
-        canvas.rounded_rect(Rect::new(kx, ky, knob_d, knob_d), knob_d / 2, 0xffffff, 1.0);
-        canvas.rounded_border(
-            Rect::new(kx, ky, knob_d, knob_d),
-            knob_d / 2,
-            theme.accent,
-            if hot { 0.9 } else { 0.5 },
-            1,
-        );
+        if is_win98 {
+            let kx = (track.x + fill_w).clamp(track.x, track.right()) - 5;
+            let thumb = Rect::new(kx, track.y - 3, 10, track_h + 6);
+            canvas.fill(thumb, theme.panel);
+            ui::raised_bevel(canvas, theme, thumb);
+        } else {
+            let knob_d = if hot { 12 } else { 9 };
+            let kx = (track.x + fill_w).clamp(track.x, track.right()) - knob_d / 2;
+            let ky = track.y + track_h / 2 - knob_d / 2;
+            canvas.rounded_rect(Rect::new(kx, ky, knob_d, knob_d), knob_d / 2, 0xffffff, 1.0);
+            canvas.rounded_border(
+                Rect::new(kx, ky, knob_d, knob_d),
+                knob_d / 2,
+                theme.accent,
+                if hot { 0.9 } else { 0.5 },
+                1,
+            );
+        }
     }
 }
 
@@ -1419,26 +1472,40 @@ fn draw_transport_button(
     primary: bool,
     hover: bool,
 ) {
-    let base = if primary {
-        theme.accent
-    } else {
-        theme.panel_high
-    };
-    let bg = if hover {
-        if theme.is_dark() {
-            mix(base, 0xffffff, 0.14)
+    let is_win98 = theme.is_win98();
+    let fg = if is_win98 {
+        let bg = if hover {
+            theme.panel_hover
+        } else if primary {
+            theme.panel_high
         } else {
-            mix(base, 0x000000, 0.08)
-        }
+            theme.panel
+        };
+        canvas.fill(rect, bg);
+        ui::raised_bevel(canvas, theme, rect);
+        if primary { theme.accent } else { theme.text }
     } else {
-        base
+        let base = if primary {
+            theme.accent
+        } else {
+            theme.panel_high
+        };
+        let bg = if hover {
+            if theme.is_dark() {
+                mix(base, 0xffffff, 0.14)
+            } else {
+                mix(base, 0x000000, 0.08)
+            }
+        } else {
+            base
+        };
+        let radius = if primary { rect.h / 2 } else { 6 };
+        canvas.rounded_rect(rect, radius, bg, 1.0);
+        if !primary {
+            canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
+        }
+        if primary { 0xffffff } else { theme.text }
     };
-    let radius = if primary { rect.h / 2 } else { 6 };
-    canvas.rounded_rect(rect, radius, bg, 1.0);
-    if !primary {
-        canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
-    }
-    let fg = if primary { 0xffffff } else { theme.text };
     let cx = rect.x + rect.w / 2;
     let cy = rect.y + rect.h / 2;
     match kind {
@@ -1476,13 +1543,29 @@ fn draw_transport_button(
 }
 
 fn draw_mute_button(canvas: &mut Canvas, theme: &Theme, rect: Rect, muted: bool, hover: bool) {
-    let bg = if hover {
-        theme.panel_hover
+    if theme.is_win98() {
+        let bg = if hover {
+            theme.panel_hover
+        } else if muted {
+            theme.panel_high
+        } else {
+            theme.panel
+        };
+        canvas.fill(rect, bg);
+        if muted {
+            ui::sunken_bevel(canvas, theme, rect);
+        } else {
+            ui::raised_bevel(canvas, theme, rect);
+        }
     } else {
-        theme.panel_high
-    };
-    canvas.rounded_rect(rect, 5, bg, 1.0);
-    canvas.rounded_border(rect, 5, theme.window_border, 1.0, 1);
+        let bg = if hover {
+            theme.panel_hover
+        } else {
+            theme.panel_high
+        };
+        canvas.rounded_rect(rect, 5, bg, 1.0);
+        canvas.rounded_border(rect, 5, theme.window_border, 1.0, 1);
+    }
     let fg = if muted { theme.danger } else { theme.text };
     let cx = rect.x + rect.w / 2;
     let cy = rect.y + rect.h / 2;

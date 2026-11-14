@@ -595,6 +595,59 @@ impl Canvas {
         }
     }
 
+    pub fn horizontal_gradient(&mut self, rect: Rect, left: u32, right: u32) {
+        if left == right {
+            self.fill(rect, left);
+            return;
+        }
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let span = (rect.w - 1).max(1) as u32;
+        let width = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        let first_start = clip.y as usize * width + clip.x as usize;
+        for dx in 0..clip.w {
+            let x = clip.x + dx;
+            let t = (((x - rect.x).max(0) as u32 * 255) / span).min(255) as u8;
+            pixels[first_start + dx as usize] = blend_u8(left, right, t);
+        }
+        let row_len = clip.w as usize;
+        for y in (clip.y + 1)..clip.bottom() {
+            let dst_start = y as usize * width + clip.x as usize;
+            pixels.copy_within(first_start..(first_start + row_len), dst_start);
+        }
+    }
+
+    /// Paint a single-pixel 3D bevel frame strictly inside `rect`.
+    pub fn bevel_1px(&mut self, rect: Rect, top_left: u32, bottom_right: u32) {
+        if rect.w < 2 || rect.h < 2 {
+            return;
+        }
+        self.fill(Rect::new(rect.x, rect.y, rect.w - 1, 1), top_left);
+        self.fill(Rect::new(rect.x, rect.y + 1, 1, rect.h - 2), top_left);
+        self.fill(Rect::new(rect.x, rect.bottom() - 1, rect.w, 1), bottom_right);
+        self.fill(Rect::new(rect.right() - 1, rect.y, 1, rect.h - 1), bottom_right);
+    }
+
+    /// Paint a classic 2px-per-side Win98 4-color 3D bevel strictly inside `rect`.
+    pub fn bevel(
+        &mut self,
+        rect: Rect,
+        top_outer: u32,
+        top_inner: u32,
+        bottom_outer: u32,
+        bottom_inner: u32,
+    ) {
+        self.bevel_1px(rect, top_outer, bottom_outer);
+        let inner = rect.inset(1);
+        if inner.w >= 2 && inner.h >= 2 {
+            self.bevel_1px(inner, top_inner, bottom_inner);
+        }
+    }
+
     /// Corner distance for a point `(px, py)` relative to one of the 4 corner centers.
     #[inline(always)]
     fn corner_coverage(dx: f32, dy: f32, r: f32) -> f32 {
@@ -1115,5 +1168,23 @@ mod tests {
         canvas.draw_sparkline(Rect::new(10, 10, 80, 30), &vals, 0x3b82f6, Some(0x3b82f6));
         // Verify buffer is modified without crashing or out-of-bounds
         assert!(canvas.buffer.as_slice().iter().any(|&p| p != 0x000000));
+    }
+
+    #[test]
+    fn bevel_and_horizontal_gradient_stay_within_rect() {
+        let mut canvas = Canvas::new(40, 20, 0x111111);
+        canvas.bevel(Rect::new(4, 2, 20, 10), 0xffffff, 0xdfdfdf, 0x0a0a0a, 0x808080);
+        let px = canvas.pixels();
+        assert_eq!(px[2 * 40 + 4], 0xffffff);
+        assert_eq!(px[3 * 40 + 5], 0xdfdfdf);
+        assert_eq!(px[11 * 40 + 23], 0x0a0a0a);
+        assert_eq!(px[10 * 40 + 22], 0x808080);
+        assert_eq!(px[1 * 40 + 4], 0x111111);
+
+        canvas.horizontal_gradient(Rect::new(2, 14, 16, 4), 0x000080, 0x1084d0);
+        let px = canvas.pixels();
+        assert_eq!(px[14 * 40 + 2], 0x000080);
+        assert_eq!(px[14 * 40 + 17], 0x1084d0);
+        assert_eq!(px[17 * 40 + 2], 0x000080);
     }
 }

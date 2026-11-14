@@ -15,7 +15,7 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect};
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::Result;
 use std::fs;
@@ -55,12 +55,12 @@ fn read_accounts() -> Vec<AccountInfo> {
     out
 }
 
-fn input_rect(w: i32) -> Rect {
-    Rect::new(22, TITLEBAR_HEIGHT + 194, w - 134, 32)
+fn input_rect(content: Rect) -> Rect {
+    Rect::new(content.x + 22, content.y + 194, content.w - 134, 32)
 }
 
-fn action_btn_rect(w: i32) -> Rect {
-    Rect::new(w - 102, TITLEBAR_HEIGHT + 194, 80, 32)
+fn action_btn_rect(content: Rect) -> Rect {
+    Rect::new(content.right() - 102, content.y + 194, 80, 32)
 }
 
 pub fn run() -> Result<()> {
@@ -86,14 +86,14 @@ pub fn run() -> Result<()> {
             break;
         }
         for event in app.pump()? {
-            let w = app.width as i32;
+            let content = app.content();
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose | UiEvent::Configure { .. } | UiEvent::ConfigChanged => {
                     app.needs_redraw = true;
                 }
                 UiEvent::Motion { x, y, .. } => {
-                    let h = action_btn_rect(w).contains(x, y);
+                    let h = action_btn_rect(content).contains(x, y);
                     if h != btn_hover {
                         btn_hover = h;
                         app.needs_redraw = true;
@@ -105,9 +105,9 @@ pub fn run() -> Result<()> {
                     button: 1,
                     down: true,
                     ..
-                } if y >= TITLEBAR_HEIGHT => {
-                    focused = input_rect(w).contains(x, y);
-                    if action_btn_rect(w).contains(x, y) {
+                } if content.contains(x, y) => {
+                    focused = input_rect(content).contains(x, y);
+                    if action_btn_rect(content).contains(x, y) {
                         status = inspect_or_open(&accounts, query.trim(), euid);
                     }
                     app.needs_redraw = true;
@@ -187,8 +187,11 @@ fn draw_login(
 ) {
     let w = canvas.width as i32;
     canvas.clear(theme.window);
+    let bw = theme.window_border_width();
+    let th = theme.titlebar_height();
+    let content = Rect::new(bw, th, (w - bw * 2).max(1), (canvas.height as i32 - th - bw).max(1));
 
-    let card = Rect::new(18, TITLEBAR_HEIGHT + 16, w - 36, 152);
+    let card = Rect::new(content.x + 18, content.y + 16, content.w - 36, 152);
     ui::card(canvas, theme, card);
     icons::draw(canvas, Icon::Login, card.x + 16, card.y + 16, 36, None);
     text.draw(
@@ -242,8 +245,8 @@ fn draw_login(
     text.draw(
         canvas,
         "查询账户或打开终端",
-        22.0,
-        (TITLEBAR_HEIGHT + 186) as f32,
+        (content.x + 22) as f32,
+        (content.y + 186) as f32,
         11.5,
         theme.text_muted,
         Face::Ui,
@@ -252,7 +255,7 @@ fn draw_login(
         canvas,
         text,
         theme,
-        input_rect(w),
+        input_rect(content),
         query,
         "输入账户名...",
         focused,
@@ -262,19 +265,19 @@ fn draw_login(
         canvas,
         text,
         theme,
-        action_btn_rect(w),
+        action_btn_rect(content),
         "打开",
         None,
         true,
         btn_hover,
     );
 
-    let shown = text.truncate(status, (w - 44) as f32, 11.5, Face::Ui);
+    let shown = text.truncate(status, (content.w - 44) as f32, 11.5, Face::Ui);
     text.draw(
         canvas,
         &shown,
-        22.0,
-        (TITLEBAR_HEIGHT + 252) as f32,
+        (content.x + 22) as f32,
+        (content.y + 252) as f32,
         11.5,
         theme.text_dim,
         Face::Ui,

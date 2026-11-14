@@ -16,7 +16,7 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{CursorKind, Result};
 
@@ -207,7 +207,8 @@ pub fn run() -> Result<()> {
         }
 
         if app.needs_redraw {
-            let vp_h = (app.height as i32 - TITLEBAR_HEIGHT - 1).max(1);
+            let content = app.content();
+            let vp_h = (content.h - 1).max(1);
             let total_h = draw_help(
                 &mut app.canvas,
                 &mut app.text,
@@ -215,12 +216,11 @@ pub fn run() -> Result<()> {
                 current_topic,
                 &mut scroll,
                 hover_topic,
-                app.width as i32,
-                app.height as i32,
+                content,
             );
             let track = Rect::new(
-                app.width as i32 - ui::SCROLLBAR_HIT_W - 2,
-                TITLEBAR_HEIGHT + 5,
+                content.right() - ui::SCROLLBAR_HIT_W - 2,
+                content.y + 5,
                 ui::SCROLLBAR_HIT_W,
                 (vp_h - 8).max(8),
             );
@@ -230,13 +230,14 @@ pub fn run() -> Result<()> {
         }
 
         for event in app.pump_with_fd(None, 60)?.0 {
+            let content = app.content();
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose | UiEvent::Configure { .. } | UiEvent::ConfigChanged => {
                     app.needs_redraw = true;
                 }
                 UiEvent::Wheel { x, delta, .. } => {
-                    if x >= SIDEBAR_W && scroll.wheel(delta as f32 * 22.0) {
+                    if x >= content.x + SIDEBAR_W && scroll.wheel(delta as f32 * 22.0) {
                         app.needs_redraw = true;
                     }
                 }
@@ -250,8 +251,11 @@ pub fn run() -> Result<()> {
                         CursorKind::Default
                     });
                     if !scroll.is_dragging() {
-                        let next_hover = if x < SIDEBAR_W && y >= TITLEBAR_HEIGHT {
-                            let idx = ((y - (TITLEBAR_HEIGHT + 24)) / 38) as usize;
+                        let next_hover = if x >= content.x
+                            && x < content.x + SIDEBAR_W
+                            && y >= content.y
+                        {
+                            let idx = ((y - (content.y + 24)) / 38) as usize;
                             if idx < TOPICS.len() {
                                 Some(idx)
                             } else {
@@ -271,8 +275,12 @@ pub fn run() -> Result<()> {
                 } => {
                     if scroll.handle_button(x, y, button, down) {
                         app.needs_redraw = true;
-                    } else if button == 1 && down && y >= TITLEBAR_HEIGHT && x < SIDEBAR_W {
-                        let idx = ((y - (TITLEBAR_HEIGHT + 24)) / 38) as usize;
+                    } else if button == 1
+                        && down
+                        && content.contains(x, y)
+                        && x < content.x + SIDEBAR_W
+                    {
+                        let idx = ((y - (content.y + 24)) / 38) as usize;
                         if idx < TOPICS.len() {
                             current_topic = TOPICS[idx].0;
                             scroll.snap_to(0.0);
@@ -296,64 +304,74 @@ fn draw_help(
     topic: Topic,
     scroll: &mut ui::SmoothScroll,
     hover: Option<usize>,
-    w: i32,
-    h: i32,
+    content: Rect,
 ) -> i32 {
+    let is_win98 = theme.is_win98();
+    let ctrl_r = theme.radius_control();
     canvas.clear(theme.window);
 
     // Left navigation sidebar
-    let body_h = (h - TITLEBAR_HEIGHT).max(0);
     canvas.fill(
-        Rect::new(0, TITLEBAR_HEIGHT, SIDEBAR_W, body_h),
+        Rect::new(content.x, content.y, SIDEBAR_W, content.h),
         theme.window_alt,
     );
     canvas.fill(
-        Rect::new(SIDEBAR_W - 1, TITLEBAR_HEIGHT, 1, body_h),
+        Rect::new(content.x + SIDEBAR_W - 1, content.y, 1, content.h),
         theme.window_border,
     );
 
     text.draw(
         canvas,
         "使用指南",
-        18.0,
-        (TITLEBAR_HEIGHT + 22) as f32,
+        (content.x + 18) as f32,
+        (content.y + 22) as f32,
         11.0,
         theme.text_muted,
         Face::Bold,
     );
 
     for (i, (t, label)) in TOPICS.iter().enumerate() {
-        let ry = TITLEBAR_HEIGHT + 36 + i as i32 * 38;
-        let r = Rect::new(10, ry, SIDEBAR_W - 20, 32);
+        let ry = content.y + 36 + i as i32 * 38;
+        let r = Rect::new(content.x + 10, ry, SIDEBAR_W - 20, 32);
         let active = topic == *t;
-        if active {
-            canvas.rounded_rect(r, RADIUS_CONTROL, theme.accent_soft, 1.0);
-            canvas.fill(Rect::new(r.x, r.y + 6, 3, r.h - 12), theme.accent);
-        } else if hover == Some(i) {
-            canvas.rounded_rect(r, RADIUS_CONTROL, theme.panel_hover, 1.0);
-        }
+        let fg = if is_win98 {
+            ui::list_item_bg(canvas, theme, r, active, hover == Some(i))
+        } else {
+            if active {
+                canvas.rounded_rect(r, ctrl_r, theme.accent_soft, 1.0);
+                canvas.fill(Rect::new(r.x, r.y + 6, 3, r.h - 12), theme.accent);
+            } else if hover == Some(i) {
+                canvas.rounded_rect(r, ctrl_r, theme.panel_hover, 1.0);
+            }
+            if active { theme.text } else { theme.text_dim }
+        };
         text.draw(
             canvas,
             label,
             (r.x + 14) as f32,
             (r.y + 20) as f32,
             12.0,
-            if active { theme.text } else { theme.text_dim },
+            fg,
             if active { Face::Bold } else { Face::Ui },
         );
     }
 
     // Right content viewport
-    let content_x = SIDEBAR_W + 28;
-    let content_w = (w - content_x - 30).max(360);
-    let vp = Rect::new(SIDEBAR_W, TITLEBAR_HEIGHT, w - SIDEBAR_W, body_h);
+    let content_x = content.x + SIDEBAR_W + 28;
+    let content_w = (content.right() - content_x - 30).max(360);
+    let vp = Rect::new(
+        content.x + SIDEBAR_W,
+        content.y,
+        (content.w - SIDEBAR_W).max(1),
+        content.h,
+    );
     let scroll_y = scroll.offset_i32();
 
     let (heading, sections) = topic_content(topic);
     let mut total_h = 0;
 
     canvas.with_clip(vp, |c| {
-        let mut y = TITLEBAR_HEIGHT + 28 - scroll_y;
+        let mut y = content.y + 28 - scroll_y;
 
         // Big Heading
         text.draw(
@@ -436,8 +454,13 @@ fn draw_help(
                 let code_lines: Vec<&str> = code.lines().collect();
                 let card_h = code_lines.len() as i32 * 20 + 20;
                 let card_r = Rect::new(content_x, y, content_w, card_h);
-                c.rounded_rect(card_r, RADIUS_CONTROL, theme.input_bg, 1.0);
-                c.rounded_border(card_r, RADIUS_CONTROL, theme.panel_border, 1.0, 1);
+                if is_win98 {
+                    c.fill(card_r, theme.input_bg);
+                    ui::sunken_bevel(c, theme, card_r);
+                } else {
+                    c.rounded_rect(card_r, ctrl_r, theme.input_bg, 1.0);
+                    c.rounded_border(card_r, ctrl_r, theme.panel_border, 1.0, 1);
+                }
                 for (c_idx, c_line) in code_lines.into_iter().enumerate() {
                     let ly = card_r.y + 18 + c_idx as i32 * 20;
                     let is_comment = c_line.starts_with('#');
@@ -462,12 +485,12 @@ fn draw_help(
             }
         }
 
-        total_h = (y + scroll_y - (TITLEBAR_HEIGHT + 28)).max(vp.h);
+        total_h = (y + scroll_y - (content.y + 28)).max(vp.h);
     });
 
     // Scrollbar
     let track = Rect::new(
-        w - ui::SCROLLBAR_HIT_W - 2,
+        content.right() - ui::SCROLLBAR_HIT_W - 2,
         vp.y + 4,
         ui::SCROLLBAR_HIT_W,
         (vp.h - 8).max(8),

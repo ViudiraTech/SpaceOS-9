@@ -15,7 +15,9 @@ use std::mem::{size_of, zeroed};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 use uxconf::DesktopConfig;
 
@@ -73,14 +75,12 @@ impl SystemSound {
 const MAX_CONCURRENT_SFX: usize = 4;
 
 struct PlaybackGuard {
-    active: Vec<Child>,
     last_played: [(SystemSound, Option<Instant>); 5],
 }
 
 impl PlaybackGuard {
     const fn new() -> Self {
         Self {
-            active: Vec::new(),
             last_played: [
                 (SystemSound::Startup, None),
                 (SystemSound::Click, None),
@@ -104,6 +104,40 @@ impl PlaybackGuard {
 }
 
 static PLAYER_STATE: Mutex<PlaybackGuard> = Mutex::new(PlaybackGuard::new());
+static SFX_SENDER: OnceLock<SyncSender<(SystemSound, bool)>> = OnceLock::new();
+
+fn sfx_sender() -> &'static SyncSender<(SystemSound, bool)> {
+    SFX_SENDER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<(SystemSound, bool)>(4);
+        let _ = thread::Builder::new()
+            .name("spui-sfx".to_string())
+            .spawn(move || {
+                let mut active: Vec<Child> = Vec::new();
+                while let Ok((kind, bypass_cooldown)) = rx.recv() {
+                    active.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+                    if active.len() >= MAX_CONCURRENT_SFX {
+                        if !bypass_cooldown {
+                            continue;
+                        }
+                        let mut oldest = active.remove(0);
+                        let _ = oldest.kill();
+                        let _ = oldest.wait();
+                    }
+                    let path = kind.asset_path();
+                    if let Ok(child) = Command::new(WAVPLAY_BIN)
+                        .args(["--scale", "100", &path])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        active.push(child);
+                    }
+                }
+            });
+        tx
+    })
+}
 
 fn spawn_wav(kind: SystemSound, bypass_cooldown: bool) -> bool {
     let path = kind.asset_path();
@@ -114,12 +148,6 @@ fn spawn_wav(kind: SystemSound, bypass_cooldown: bool) -> bool {
     let Ok(mut state) = PLAYER_STATE.lock() else {
         return false;
     };
-    state
-        .active
-        .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
-    if state.active.len() >= MAX_CONCURRENT_SFX && !bypass_cooldown {
-        return false;
-    }
     let last_slot = state.slot_mut(kind);
     if !bypass_cooldown
         && last_slot.is_some_and(|prev| now.saturating_duration_since(prev) < kind.cooldown())
@@ -127,27 +155,10 @@ fn spawn_wav(kind: SystemSound, bypass_cooldown: bool) -> bool {
         return false;
     }
     *last_slot = Some(now);
+    drop(state);
 
-    if let Ok(child) = Command::new(WAVPLAY_BIN)
-        .args(["--scale", "100", &path])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        if state.active.len() >= MAX_CONCURRENT_SFX {
-            // Retire the oldest effect explicitly: dropping a `Child` without
-            // `wait()` would leave a zombie. PCM waits are signal-interruptible,
-            // so the reap below returns promptly.
-            let mut oldest = state.active.remove(0);
-            let _ = oldest.kill();
-            let _ = oldest.wait();
-        }
-        state.active.push(child);
-        true
-    } else {
-        false
-    }
+    // Never block the caller (UI thread) on child spawning or reaping.
+    sfx_sender().try_send((kind, bypass_cooldown)).is_ok()
 }
 
 /// Non-blocking playback honoring user mute, master volume, global SFX enable & per-event flag.
@@ -477,10 +488,16 @@ fn rescan_cards(cache: &mut MixerCache) {
     cache.scanned = Some(Instant::now());
 }
 
-/// Apply master volume (0..=100) and mute state to all active ALSA sound cards.
-pub fn apply_mixer_volume(volume: i32, muted: bool) {
+/// Compute hardware mixer `(effective_volume, unmuted)` tuple cleanly.
+pub(crate) fn effective_mixer_params(volume: i32, muted: bool) -> (i32, bool) {
     let unmuted = !muted && volume > 0;
     let effective = if unmuted { volume.clamp(0, 100) } else { 0 };
+    (effective, unmuted)
+}
+
+/// Apply master volume (0..=100) and mute state to all active ALSA sound cards.
+pub fn apply_mixer_volume(volume: i32, muted: bool) {
+    let (effective, unmuted) = effective_mixer_params(volume, muted);
     let Ok(mut cache) = MIXER_CACHE.lock() else {
         return;
     };
@@ -540,5 +557,14 @@ mod tests {
 
         cfg.sound_enabled = false;
         assert!(!SystemSound::Notify.is_enabled(&cfg));
+    }
+
+    #[test]
+    fn effective_mixer_params_clamps_and_mutes() {
+        assert_eq!(effective_mixer_params(80, false), (80, true));
+        assert_eq!(effective_mixer_params(150, false), (100, true));
+        assert_eq!(effective_mixer_params(0, false), (0, false));
+        assert_eq!(effective_mixer_params(60, true), (0, false));
+        assert_eq!(effective_mixer_params(-10, false), (0, false));
     }
 }

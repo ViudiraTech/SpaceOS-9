@@ -16,7 +16,7 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{Key, Result};
 use std::time::Instant;
@@ -255,13 +255,13 @@ pub fn run() -> Result<()> {
         }
 
         if app.needs_redraw {
+            let content = app.content();
             draw_calc(
                 &mut app.canvas,
                 &mut app.text,
                 &app.theme,
                 &state,
-                app.width as i32,
-                app.height as i32,
+                content,
                 hover_btn,
                 pressed_btn,
             );
@@ -271,13 +271,14 @@ pub fn run() -> Result<()> {
 
         let timeout = if pressed_btn.is_some() { 30 } else { 80 };
         for event in app.pump_with_fd(None, timeout)?.0 {
+            let content = app.content();
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose | UiEvent::Configure { .. } | UiEvent::ConfigChanged => {
                     app.needs_redraw = true;
                 }
                 UiEvent::Motion { x, y, .. } => {
-                    let next = hit_test(x, y, app.width as i32, app.height as i32);
+                    let next = hit_test(x, y, content);
                     if next != hover_btn {
                         hover_btn = next;
                         app.needs_redraw = true;
@@ -291,7 +292,7 @@ pub fn run() -> Result<()> {
                     ..
                 } => {
                     if down {
-                        if let Some((r, c)) = hit_test(x, y, app.width as i32, app.height as i32) {
+                        if let Some((r, c)) = hit_test(x, y, content) {
                             pressed_btn = Some((r, c));
                             last_press_time = Some(Instant::now());
                             state.dispatch(BUTTON_GRID[r][c]);
@@ -322,18 +323,22 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn hit_test(x: i32, y: i32, w: i32, h: i32) -> Option<(usize, usize)> {
-    let keypad_top = TITLEBAR_HEIGHT + 104;
-    let keypad_h = h - keypad_top - 12;
-    if x < 12 || x >= w - 12 || y < keypad_top || y >= keypad_top + keypad_h {
+fn hit_test(x: i32, y: i32, content: Rect) -> Option<(usize, usize)> {
+    let keypad_top = content.y + 104;
+    let keypad_h = content.bottom() - keypad_top - 12;
+    if x < content.x + 12
+        || x >= content.right() - 12
+        || y < keypad_top
+        || y >= keypad_top + keypad_h
+    {
         return None;
     }
-    let cell_w = (w - 24) / 4;
+    let cell_w = (content.w - 24) / 4;
     let cell_h = keypad_h / 5;
     if cell_w <= 0 || cell_h <= 0 {
         return None;
     }
-    let col = ((x - 12) / cell_w).clamp(0, 3) as usize;
+    let col = ((x - (content.x + 12)) / cell_w).clamp(0, 3) as usize;
     let row = ((y - keypad_top) / cell_h).clamp(0, 4) as usize;
     Some((row, col))
 }
@@ -361,17 +366,23 @@ fn draw_calc(
     text: &mut TextRenderer,
     theme: &Theme,
     state: &CalculatorState,
-    w: i32,
-    h: i32,
+    content: Rect,
     hover: Option<(usize, usize)>,
     pressed: Option<(usize, usize)>,
 ) {
+    let is_win98 = theme.is_win98();
+    let ctrl_r = theme.radius_control();
     canvas.clear(theme.window);
 
     // Readout Display Area
-    let display_r = Rect::new(12, TITLEBAR_HEIGHT + 8, w - 24, 88);
-    canvas.rounded_rect(display_r, 6, theme.window_alt, 1.0);
-    canvas.rounded_border(display_r, 6, theme.window_border, 1.0, 1);
+    let display_r = Rect::new(content.x + 12, content.y + 8, content.w - 24, 88);
+    if is_win98 {
+        canvas.fill(display_r, theme.input_bg);
+        ui::sunken_bevel(canvas, theme, display_r);
+    } else {
+        canvas.rounded_rect(display_r, 6, theme.window_alt, 1.0);
+        canvas.rounded_border(display_r, 6, theme.window_border, 1.0, 1);
+    }
 
     // Expression history line
     if !state.expression_history.is_empty() {
@@ -410,16 +421,16 @@ fn draw_calc(
     );
 
     // Keypad Grid
-    let keypad_top = TITLEBAR_HEIGHT + 104;
-    let pad_w = w - 24;
-    let pad_h = h - keypad_top - 12;
+    let keypad_top = content.y + 104;
+    let pad_w = content.w - 24;
+    let pad_h = content.bottom() - keypad_top - 12;
     let gap = 6;
     let btn_w = (pad_w - gap * 3) / 4;
     let btn_h = (pad_h - gap * 4) / 5;
 
     for row in 0..5 {
         for col in 0..4 {
-            let bx = 12 + col as i32 * (btn_w + gap);
+            let bx = content.x + 12 + col as i32 * (btn_w + gap);
             let by = keypad_top + row as i32 * (btn_h + gap);
             let mut btn_r = Rect::new(bx, by, btn_w, btn_h);
             let is_hover = hover == Some((row, col));
@@ -447,57 +458,74 @@ fn draw_calc(
                 _ => ("", false, false),
             };
 
-            // Press tactile micro-inset
-            if is_pressed {
-                btn_r.x += 1;
-                btn_r.y += 1;
-                btn_r.w = (btn_r.w - 2).max(1);
-                btn_r.h = (btn_r.h - 2).max(1);
-            }
-
-            let hover_t = ui::animate_bool(
-                (row as u64) << 16 | (col as u64),
-                is_hover,
-                ui::MOTION_HOVER,
-            );
-
-            let bg = if is_accent {
-                if is_pressed {
+            if is_win98 {
+                let bg = if is_accent {
                     theme.accent
-                } else if hover_t > 0.001 {
-                    crate::draw::mix(theme.accent, 0xffffff, 0.12 * hover_t)
+                } else if is_hover {
+                    theme.panel_hover
                 } else {
-                    theme.accent
-                }
-            } else if is_func {
-                let base = theme.window_high;
+                    theme.panel
+                };
+                canvas.fill(btn_r, bg);
                 if is_pressed {
-                    theme.window_alt
-                } else if hover_t > 0.001 {
-                    crate::draw::mix(base, theme.panel_hover, hover_t)
+                    ui::sunken_bevel(canvas, theme, btn_r);
                 } else {
-                    base
+                    ui::raised_bevel(canvas, theme, btn_r);
                 }
             } else {
-                let base = theme.panel;
+                // Press tactile micro-inset
                 if is_pressed {
-                    theme.window_alt
-                } else if hover_t > 0.001 {
-                    crate::draw::mix(base, theme.panel_hover, hover_t)
-                } else {
-                    base
+                    btn_r.x += 1;
+                    btn_r.y += 1;
+                    btn_r.w = (btn_r.w - 2).max(1);
+                    btn_r.h = (btn_r.h - 2).max(1);
                 }
-            };
 
-            canvas.rounded_rect(btn_r, RADIUS_CONTROL, bg, 1.0);
-            if !is_accent {
-                canvas.rounded_border(btn_r, RADIUS_CONTROL, theme.window_border, 1.0, 1);
+                let hover_t = ui::animate_bool(
+                    (row as u64) << 16 | (col as u64),
+                    is_hover,
+                    ui::MOTION_HOVER,
+                );
+
+                let bg = if is_accent {
+                    if is_pressed {
+                        theme.accent
+                    } else if hover_t > 0.001 {
+                        crate::draw::mix(theme.accent, 0xffffff, 0.12 * hover_t)
+                    } else {
+                        theme.accent
+                    }
+                } else if is_func {
+                    let base = theme.window_high;
+                    if is_pressed {
+                        theme.window_alt
+                    } else if hover_t > 0.001 {
+                        crate::draw::mix(base, theme.panel_hover, hover_t)
+                    } else {
+                        base
+                    }
+                } else {
+                    let base = theme.panel;
+                    if is_pressed {
+                        theme.window_alt
+                    } else if hover_t > 0.001 {
+                        crate::draw::mix(base, theme.panel_hover, hover_t)
+                    } else {
+                        base
+                    }
+                };
+
+                canvas.rounded_rect(btn_r, ctrl_r, bg, 1.0);
+                if !is_accent {
+                    canvas.rounded_border(btn_r, ctrl_r, theme.window_border, 1.0, 1);
+                }
             }
 
+            let shift = if is_win98 && is_pressed { 1 } else { 0 };
             let fg = if is_accent {
                 0xffffff
             } else if is_func {
-                theme.text_dim
+                if is_win98 { 0x800000 } else { theme.text_dim }
             } else {
                 theme.text
             };
@@ -511,8 +539,8 @@ fn draw_calc(
             text.draw_centered(
                 canvas,
                 label,
-                btn_r.x as f32 + btn_r.w as f32 * 0.5,
-                btn_r.y as f32 + btn_r.h as f32 * 0.5 + font_sz * 0.35,
+                btn_r.x as f32 + btn_r.w as f32 * 0.5 + shift as f32,
+                btn_r.y as f32 + btn_r.h as f32 * 0.5 + font_sz * 0.35 + shift as f32,
                 font_sz,
                 fg,
                 face,

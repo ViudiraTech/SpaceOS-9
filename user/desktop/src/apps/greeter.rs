@@ -505,6 +505,7 @@ impl Greeter {
 
     fn draw(&mut self) {
         let theme = self.screen.theme;
+        let is_win98 = theme.is_win98();
         let layout = self.layout();
         self.screen.draw_background();
 
@@ -515,7 +516,7 @@ impl Greeter {
             (self.screen.width - 42) as f32,
             44.0,
             27.0,
-            theme.text,
+            if is_win98 { 0xffffff } else { theme.text },
             Face::Bold,
         );
         self.screen.text.draw_right(
@@ -524,25 +525,52 @@ impl Greeter {
             (self.screen.width - 42) as f32,
             66.0,
             11.5,
-            theme.text_muted,
+            if is_win98 { 0xd8f0f0 } else { theme.text_muted },
             Face::Ui,
         );
 
         // Card surface.
-        self.screen
-            .canvas
-            .rounded_rect(layout.card, 12, theme.window, 0.96);
-        self.screen
-            .canvas
-            .rounded_border(layout.card, 12, theme.window_border, 1.0, 1);
         let left = Rect::new(layout.card.x, layout.card.y, LEFT_WIDTH, layout.card.h);
-        self.screen
-            .canvas
-            .rounded_rect(left, 12, theme.window_alt, 0.92);
-        self.screen.canvas.fill(
-            Rect::new(left.right() - 1, left.y + 1, 1, left.h - 2),
-            theme.window_border,
-        );
+        if is_win98 {
+            self.screen.canvas.fill(layout.card, theme.panel);
+            ui::window_outer_bevel(&mut self.screen.canvas, &theme, layout.card);
+            let tb = Rect::new(layout.card.x + 3, layout.card.y + 3, layout.card.w - 6, 22);
+            self.screen
+                .canvas
+                .horizontal_gradient(tb, theme.titlebar, theme.titlebar_hi);
+            self.screen.text.draw(
+                &mut self.screen.canvas,
+                "登录到 Windows",
+                (tb.x + 8) as f32,
+                (tb.y + 15) as f32,
+                11.5,
+                theme.titlebar_text,
+                Face::Bold,
+            );
+            let sep_x = left.right() - 1;
+            self.screen.canvas.fill(
+                Rect::new(sep_x, tb.bottom() + 6, 1, layout.card.h - 36),
+                theme.bevel_shadow,
+            );
+            self.screen.canvas.fill(
+                Rect::new(sep_x + 1, tb.bottom() + 6, 1, layout.card.h - 36),
+                theme.bevel_light,
+            );
+        } else {
+            self.screen
+                .canvas
+                .rounded_rect(layout.card, 12, theme.window, 0.96);
+            self.screen
+                .canvas
+                .rounded_border(layout.card, 12, theme.window_border, 1.0, 1);
+            self.screen
+                .canvas
+                .rounded_rect(left, 12, theme.window_alt, 0.92);
+            self.screen.canvas.fill(
+                Rect::new(left.right() - 1, left.y + 1, 1, left.h - 2),
+                theme.window_border,
+            );
+        }
 
         draw_logo(&mut self.screen, left.x + 32, left.y + 30, 42);
         self.screen.text.draw(
@@ -621,22 +649,35 @@ impl Greeter {
         for (index, user) in self.backend.config.users.iter().take(4).enumerate() {
             let row = layout.user_rows[index];
             let selected = self.selected_user == Some(index);
-            if selected {
-                self.screen
-                    .canvas
-                    .rounded_rect(row, 8, theme.accent_soft, 1.0);
-            } else if self.hover == Focus::User(index) {
-                self.screen
-                    .canvas
-                    .rounded_rect(row, 8, theme.panel_hover, 1.0);
+            let hovered = self.hover == Focus::User(index);
+            let win98_sel = is_win98 && selected;
+            let row_fg = if is_win98 {
+                ui::list_item_bg(&mut self.screen.canvas, &theme, row, selected, hovered)
+            } else {
+                if selected {
+                    self.screen
+                        .canvas
+                        .rounded_rect(row, 8, theme.accent_soft, 1.0);
+                } else if hovered {
+                    self.screen
+                        .canvas
+                        .rounded_rect(row, 8, theme.panel_hover, 1.0);
+                }
+                theme.text
+            };
+            if is_win98 {
+                let badge = Rect::new(row.x + 10, row.y + 9, 32, 32);
+                self.screen.canvas.fill(badge, theme.accent);
+                ui::raised_bevel(&mut self.screen.canvas, &theme, badge);
+            } else {
+                self.screen.canvas.circle(
+                    (row.x + 26) as f32,
+                    (row.y + 25) as f32,
+                    18.0,
+                    theme.panel_high,
+                    1.0,
+                );
             }
-            self.screen.canvas.circle(
-                (row.x + 26) as f32,
-                (row.y + 25) as f32,
-                18.0,
-                theme.panel_high,
-                1.0,
-            );
             let initial = user_initial(&user.display, &user.name);
             self.screen.text.draw_centered(
                 &mut self.screen.canvas,
@@ -644,7 +685,7 @@ impl Greeter {
                 (row.x + 26) as f32,
                 (row.y + 30) as f32,
                 14.0,
-                theme.text,
+                if is_win98 { 0xffffff } else { theme.text },
                 Face::Bold,
             );
             let display =
@@ -657,7 +698,7 @@ impl Greeter {
                 (row.x + 52) as f32,
                 (row.y + 21) as f32,
                 12.5,
-                theme.text,
+                if win98_sel { row_fg } else { theme.text },
                 Face::Bold,
             );
             self.screen.text.draw(
@@ -666,7 +707,7 @@ impl Greeter {
                 (row.x + 52) as f32,
                 (row.y + 38) as f32,
                 10.5,
-                theme.text_muted,
+                if win98_sel { row_fg } else { theme.text_muted },
                 Face::Mono,
             );
         }
@@ -693,13 +734,18 @@ impl Greeter {
         );
 
         let avatar = Rect::new(right_x, layout.card.y + 108, 56, 56);
-        self.screen.canvas.circle(
-            (avatar.x + 28) as f32,
-            (avatar.y + 28) as f32,
-            28.0,
-            theme.panel_high,
-            1.0,
-        );
+        if is_win98 {
+            self.screen.canvas.fill(avatar, theme.accent);
+            ui::sunken_bevel(&mut self.screen.canvas, &theme, avatar);
+        } else {
+            self.screen.canvas.circle(
+                (avatar.x + 28) as f32,
+                (avatar.y + 28) as f32,
+                28.0,
+                theme.panel_high,
+                1.0,
+            );
+        }
         let initial = user_initial(
             &self
                 .backend
@@ -716,7 +762,7 @@ impl Greeter {
             (avatar.x + 28) as f32,
             (avatar.y + 36) as f32,
             20.0,
-            theme.text,
+            if is_win98 { 0xffffff } else { theme.text },
             Face::Bold,
         );
         let display_name = self
@@ -830,21 +876,40 @@ impl Greeter {
         for (index, session) in self.backend.config.sessions.iter().take(3).enumerate() {
             let rect = layout.session_chips[index];
             let active = session.id == self.session;
-            self.screen.canvas.rounded_rect(
-                rect,
-                6,
+            let fg = if is_win98 {
+                self.screen.canvas.fill(
+                    rect,
+                    if active {
+                        theme.selection_bg
+                    } else {
+                        theme.panel
+                    },
+                );
                 if active {
-                    theme.accent_soft
+                    ui::sunken_bevel(&mut self.screen.canvas, &theme, rect);
+                    theme.selection_text
                 } else {
-                    theme.panel_high
-                },
-                1.0,
-            );
-            if active {
-                self.screen
-                    .canvas
-                    .rounded_border(rect, 6, theme.accent, 0.8, 1);
-            }
+                    ui::raised_bevel(&mut self.screen.canvas, &theme, rect);
+                    theme.text
+                }
+            } else {
+                self.screen.canvas.rounded_rect(
+                    rect,
+                    6,
+                    if active {
+                        theme.accent_soft
+                    } else {
+                        theme.panel_high
+                    },
+                    1.0,
+                );
+                if active {
+                    self.screen
+                        .canvas
+                        .rounded_border(rect, 6, theme.accent, 0.8, 1);
+                }
+                if active { theme.text } else { theme.text_dim }
+            };
             let name =
                 self.screen
                     .text
@@ -855,7 +920,7 @@ impl Greeter {
                 (rect.x + 8) as f32,
                 (rect.y + 20) as f32,
                 10.5,
-                if active { theme.text } else { theme.text_dim },
+                fg,
                 Face::Ui,
             );
         }
@@ -943,11 +1008,29 @@ impl Greeter {
         let card = self.confirm_card();
         self.screen
             .canvas
-            .fill_alpha(self.screen.canvas.bounds(), 0x000000, 0.58);
-        self.screen.canvas.rounded_rect(card, 10, theme.window, 1.0);
-        self.screen
-            .canvas
-            .rounded_border(card, 10, theme.window_border, 1.0, 1);
+            .fill_alpha(self.screen.canvas.bounds(), 0x000000, 0.52);
+        if theme.is_win98() {
+            self.screen.canvas.fill(card, theme.panel);
+            ui::window_outer_bevel(&mut self.screen.canvas, &theme, card);
+            let tb = Rect::new(card.x + 3, card.y + 3, card.w - 6, 22);
+            self.screen
+                .canvas
+                .horizontal_gradient(tb, theme.titlebar, theme.titlebar_hi);
+            self.screen.text.draw(
+                &mut self.screen.canvas,
+                "关闭 Windows",
+                (tb.x + 8) as f32,
+                (tb.y + 15) as f32,
+                11.5,
+                theme.titlebar_text,
+                Face::Bold,
+            );
+        } else {
+            self.screen.canvas.rounded_rect(card, 10, theme.window, 1.0);
+            self.screen
+                .canvas
+                .rounded_border(card, 10, theme.window_border, 1.0, 1);
+        }
         let title = match action {
             PowerAction::Reboot => "重新启动计算机？",
             PowerAction::PowerOff => "关闭计算机？",

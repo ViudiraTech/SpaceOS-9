@@ -16,7 +16,8 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect, Sprite};
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
+use crate::ui;
 use crate::x11::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -204,9 +205,10 @@ pub fn run(initial_path: Option<&str>) -> Result<()> {
     app.min_height = 360;
 
     // Initial fit
+    let init_content = app.content();
     state.fit_to_viewport(
-        (app.width as f32).max(100.0),
-        (app.height as f32 - TITLEBAR_HEIGHT as f32 - 48.0).max(100.0),
+        (init_content.w as f32).max(100.0),
+        (init_content.h as f32 - 48.0).max(100.0),
     );
 
     let mut drag_origin: Option<(i32, i32, f32, f32)> = None;
@@ -256,8 +258,9 @@ pub fn run(initial_path: Option<&str>) -> Result<()> {
                     ..
                 } => {
                     if down {
-                        if y >= TITLEBAR_HEIGHT {
-                            let tb_r = toolbar_rect(app.width as i32, app.height as i32);
+                        let content = app.content();
+                        if content.contains(x, y) {
+                            let tb_r = toolbar_rect(content);
                             if tb_r.contains(x, y) {
                                 if let Some(btn_idx) = hit_toolbar(tb_r, x, y) {
                                     match btn_idx {
@@ -266,9 +269,8 @@ pub fn run(initial_path: Option<&str>) -> Result<()> {
                                         2 => state.zoom = (state.zoom / 1.25).max(0.05),
                                         3 => state.zoom = (state.zoom * 1.25).min(8.0),
                                         4 => state.fit_to_viewport(
-                                            app.width as f32,
-                                            (app.height as f32 - TITLEBAR_HEIGHT as f32 - 48.0)
-                                                .max(100.0),
+                                            (content.w as f32).max(100.0),
+                                            (content.h as f32 - 48.0).max(100.0),
                                         ),
                                         5 => state.rotate_90(),
                                         6 => state.set_as_wallpaper(),
@@ -285,7 +287,7 @@ pub fn run(initial_path: Option<&str>) -> Result<()> {
                     }
                 }
                 UiEvent::Motion { x, y, .. } => {
-                    let tb_r = toolbar_rect(app.width as i32, app.height as i32);
+                    let tb_r = toolbar_rect(app.content());
                     let next_hover = if tb_r.contains(x, y) {
                         hit_toolbar(tb_r, x, y)
                     } else {
@@ -326,9 +328,10 @@ pub fn run(initial_path: Option<&str>) -> Result<()> {
                         }
                         0x30 => {
                             // '0' reset fit
+                            let content = app.content();
                             state.fit_to_viewport(
-                                app.width as f32,
-                                (app.height as f32 - TITLEBAR_HEIGHT as f32 - 48.0).max(100.0),
+                                (content.w as f32).max(100.0),
+                                (content.h as f32 - 48.0).max(100.0),
                             );
                             app.needs_redraw = true;
                         }
@@ -347,10 +350,21 @@ pub fn run(initial_path: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn toolbar_rect(w: i32, h: i32) -> Rect {
-    let tb_w = 420;
+fn content_rect(theme: &Theme, w: i32, h: i32) -> Rect {
+    let bw = theme.window_border_width();
+    let th = theme.titlebar_height();
+    Rect::new(bw, th, (w - bw * 2).max(1), (h - th - bw).max(1))
+}
+
+fn toolbar_rect(content: Rect) -> Rect {
+    let tb_w = 420.min((content.w - 16).max(160));
     let tb_h = 36;
-    Rect::new((w - tb_w) / 2, h - tb_h - 14, tb_w, tb_h)
+    Rect::new(
+        content.x + (content.w - tb_w) / 2,
+        content.bottom() - tb_h - 14,
+        tb_w,
+        tb_h,
+    )
 }
 
 fn hit_toolbar(tb: Rect, x: i32, y: i32) -> Option<usize> {
@@ -372,42 +386,50 @@ fn draw_viewer(
     h: i32,
     hover: Option<usize>,
 ) {
-    // Dark neutral canvas for image presentation
-    let canvas_bg = if theme.is_dark() { 0x121214 } else { 0x222226 };
-    canvas.clear(canvas_bg);
-
-    // Canvas viewport
-    let vp_y = TITLEBAR_HEIGHT;
-    let vp_h = h - vp_y;
-    let _vp_rect = Rect::new(0, vp_y, w, vp_h);
-
-    if let Some(sprite) = &state.image {
-        let sw = (sprite.width as f32 * state.zoom).round() as i32;
-        let sh = (sprite.height as f32 * state.zoom).round() as i32;
-
-        let center_x = w / 2 + state.offset_x.round() as i32;
-        let center_y = vp_y + vp_h / 2 + state.offset_y.round() as i32;
-        let draw_x = center_x - sw / 2;
-        let draw_y = center_y - sh / 2;
-
-        // Bilinear or nearest scaled blit
-        if (state.zoom - 1.0).abs() < 0.01 {
-            canvas.blit_sprite(draw_x, draw_y, sprite);
-        } else if sw > 0 && sh > 0 {
-            let scaled = sprite.scale_bilinear(sw as u32, sh as u32);
-            canvas.blit_sprite(draw_x, draw_y, &scaled);
-        }
+    let is_win98 = theme.is_win98();
+    let content = content_rect(theme, w, h);
+    // Dark neutral canvas for image presentation (classic workspace gray in Win98)
+    let canvas_bg = if is_win98 {
+        theme.bevel_shadow
+    } else if theme.is_dark() {
+        0x121214
     } else {
-        text.draw_centered(
-            canvas,
-            "无法解码或读取图片",
-            w as f32 * 0.5,
-            vp_y as f32 + vp_h as f32 * 0.5,
-            14.0,
-            theme.text_muted,
-            Face::Ui,
-        );
+        0x222226
+    };
+    canvas.fill(content, canvas_bg);
+    if is_win98 {
+        ui::sunken_bevel(canvas, theme, content);
     }
+
+    canvas.with_clip(content.inset(if is_win98 { 2 } else { 0 }), |c| {
+        if let Some(sprite) = &state.image {
+            let sw = (sprite.width as f32 * state.zoom).round() as i32;
+            let sh = (sprite.height as f32 * state.zoom).round() as i32;
+
+            let center_x = content.x + content.w / 2 + state.offset_x.round() as i32;
+            let center_y = content.y + content.h / 2 + state.offset_y.round() as i32;
+            let draw_x = center_x - sw / 2;
+            let draw_y = center_y - sh / 2;
+
+            // Bilinear or nearest scaled blit
+            if (state.zoom - 1.0).abs() < 0.01 {
+                c.blit_sprite(draw_x, draw_y, sprite);
+            } else if sw > 0 && sh > 0 {
+                let scaled = sprite.scale_bilinear(sw as u32, sh as u32);
+                c.blit_sprite(draw_x, draw_y, &scaled);
+            }
+        } else {
+            text.draw_centered(
+                c,
+                "无法解码或读取图片",
+                content.x as f32 + content.w as f32 * 0.5,
+                content.y as f32 + content.h as f32 * 0.5,
+                14.0,
+                if is_win98 { 0xffffff } else { theme.text_muted },
+                Face::Ui,
+            );
+        }
+    });
 
     // Top metadata badge
     let filename = state
@@ -427,27 +449,38 @@ fn draw_viewer(
     };
     let meta_w = text.measure(&meta_str, 11.5, Face::Ui) + 24.0;
     let meta_r = Rect::new(
-        (w - meta_w as i32) / 2,
-        TITLEBAR_HEIGHT + 10,
+        content.x + (content.w - meta_w as i32) / 2,
+        content.y + 10,
         meta_w as i32,
         26,
     );
-    canvas.rounded_rect(meta_r, RADIUS_CONTROL, 0x18181b, 0.88);
-    canvas.rounded_border(meta_r, RADIUS_CONTROL, 0x3f3f46, 0.70, 1);
+    let ctrl_rad = theme.radius_control();
+    if is_win98 {
+        canvas.fill(meta_r, theme.panel);
+        ui::raised_bevel(canvas, theme, meta_r);
+    } else {
+        canvas.rounded_rect(meta_r, ctrl_rad, 0x18181b, 0.88);
+        canvas.rounded_border(meta_r, ctrl_rad, 0x3f3f46, 0.70, 1);
+    }
     text.draw_centered(
         canvas,
         &meta_str,
         meta_r.x as f32 + meta_r.w as f32 * 0.5,
         meta_r.y as f32 + 18.0,
         11.5,
-        0xf4f4f5,
+        if is_win98 { theme.text } else { 0xf4f4f5 },
         Face::Ui,
     );
 
-    // Floating pill toolbar
-    let tb_r = toolbar_rect(w, h);
-    canvas.rounded_rect(tb_r, RADIUS_CONTROL + 2, 0x18181b, 0.92);
-    canvas.rounded_border(tb_r, RADIUS_CONTROL + 2, 0x3f3f46, 0.85, 1);
+    // Floating toolbar
+    let tb_r = toolbar_rect(content);
+    if is_win98 {
+        canvas.fill(tb_r, theme.panel);
+        ui::raised_bevel(canvas, theme, tb_r);
+    } else {
+        canvas.rounded_rect(tb_r, ctrl_rad + 2, 0x18181b, 0.92);
+        canvas.rounded_border(tb_r, ctrl_rad + 2, 0x3f3f46, 0.85, 1);
+    }
 
     let tools = [
         "上一张",
@@ -463,11 +496,25 @@ fn draw_viewer(
     for (i, label) in tools.iter().enumerate() {
         let bx = tb_r.x + i as i32 * item_w;
         let br = Rect::new(bx, tb_r.y, item_w, tb_r.h);
-        if hover == Some(i) {
-            canvas.rounded_rect(br.inset(2), RADIUS_CONTROL, 0x27272a, 1.0);
-        }
-        let is_special = i == 6;
-        let fg = if is_special { theme.accent } else { 0xe4e4e7 };
+        let hovered = hover == Some(i);
+        let fg = if is_win98 {
+            if hovered {
+                ui::list_item_bg(canvas, theme, br.inset(3), true, false)
+            } else if i == 6 {
+                theme.accent
+            } else {
+                theme.text
+            }
+        } else {
+            if hovered {
+                canvas.rounded_rect(br.inset(2), ctrl_rad, 0x27272a, 1.0);
+            }
+            if i == 6 {
+                theme.accent
+            } else {
+                0xe4e4e7
+            }
+        };
         text.draw_centered(
             canvas,
             label,
@@ -475,18 +522,31 @@ fn draw_viewer(
             br.y as f32 + br.h as f32 * 0.5 + 4.0,
             11.5,
             fg,
-            if is_special { Face::Bold } else { Face::Ui },
+            if i == 6 { Face::Bold } else { Face::Ui },
         );
         if i > 0 {
-            canvas.fill(Rect::new(bx, tb_r.y + 8, 1, tb_r.h - 16), 0x27272a);
+            if is_win98 {
+                canvas.fill(Rect::new(bx, tb_r.y + 6, 1, tb_r.h - 12), theme.bevel_shadow);
+                canvas.fill(Rect::new(bx + 1, tb_r.y + 6, 1, tb_r.h - 12), theme.bevel_light);
+            } else {
+                canvas.fill(Rect::new(bx, tb_r.y + 8, 1, tb_r.h - 16), 0x27272a);
+            }
         }
     }
 
     // Temporary status badge (e.g. "已设置为桌面壁纸")
     if let Some(msg) = &state.status_msg {
         let msg_w = text.measure(msg, 12.0, Face::Bold) + 24.0;
-        let msg_r = Rect::new((w - msg_w as i32) / 2, tb_r.y - 36, msg_w as i32, 28);
-        canvas.rounded_rect(msg_r, RADIUS_CONTROL, theme.accent, 0.95);
+        let msg_r = Rect::new(
+            content.x + (content.w - msg_w as i32) / 2,
+            tb_r.y - 36,
+            msg_w as i32,
+            28,
+        );
+        canvas.rounded_rect(msg_r, ctrl_rad, theme.accent, 0.95);
+        if is_win98 {
+            ui::raised_bevel(canvas, theme, msg_r);
+        }
         text.draw_centered(
             canvas,
             msg,

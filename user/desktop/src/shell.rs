@@ -18,7 +18,7 @@ use crate::draw::{Canvas, Rect, Sprite};
 use crate::icons::{self, Icon};
 use crate::start_screen::{ShellConfigHost, StartAction, StartScreenState};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, RADIUS_CONTROL, RADIUS_POPUP};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{CursorKind, Key, Result, X};
 use std::fs;
@@ -29,7 +29,7 @@ use uxconf::client::{UxConfClient, UxConfWatch};
 use uxconf::{BackdropStyle, DesktopConfig, FocusMode, PanelPosition, WindowPlacement};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux,
-    ConnectionExt, EventMask, ModMask, PropMode, Window,
+    ConnectionExt, EventMask, ModMask, NotifyDetail, NotifyMode, PropMode, Window,
 };
 use x11rb::protocol::Event;
 
@@ -45,6 +45,7 @@ const TOAST_WIDTH: i32 = 324;
 const TOAST_HEIGHT: i32 = 74;
 const VOL_POPUP_WIDTH: i32 = 286;
 const VOL_POPUP_HEIGHT: i32 = 138;
+const VOLUME_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppCategory {
@@ -226,7 +227,8 @@ pub struct Shell {
     vol_canvas: Canvas,
     vol_open: bool,
     vol_dragging: bool,
-    vol_persist_pending: bool,
+    vol_persist: VolumePersistState,
+    pointer_grab: Option<Window>,
     toast_window: Window,
     toast_canvas: Canvas,
     toast: Option<Toast>,
@@ -239,6 +241,152 @@ pub struct Shell {
     last_net_refresh: Instant,
     last_launch: Option<(&'static str, Instant)>,
     running: bool,
+}
+
+impl Drop for Shell {
+    fn drop(&mut self) {
+        self.release_popup_grab();
+        self.x.ungrab_pointer();
+        self.flush_volume_persist();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SoundSnapshot {
+    master_volume: i32,
+    muted: bool,
+    enabled: bool,
+}
+
+impl SoundSnapshot {
+    fn from_config(cfg: &DesktopConfig) -> Self {
+        Self {
+            master_volume: cfg.sound_master_volume,
+            muted: cfg.sound_muted,
+            enabled: cfg.sound_enabled,
+        }
+    }
+
+    fn apply_to_config(self, cfg: &mut DesktopConfig) {
+        cfg.sound_master_volume = self.master_volume;
+        cfg.sound_muted = self.muted;
+        cfg.sound_enabled = self.enabled;
+    }
+}
+
+/// Coalesces burst clicks, wheel scrolls, and slider drags into a single
+/// debounced `uxconfd` persist so the shell UI thread never blocks while a
+/// popup pointer grab is held.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VolumePersistState {
+    persisted: SoundSnapshot,
+    dirty: bool,
+    deadline: Option<Instant>,
+}
+
+impl VolumePersistState {
+    fn new(initial: SoundSnapshot) -> Self {
+        Self {
+            persisted: initial,
+            dirty: false,
+            deadline: None,
+        }
+    }
+
+    fn stage(&mut self, current: SoundSnapshot, now: Instant) {
+        if current == self.persisted {
+            self.dirty = false;
+            self.deadline = None;
+        } else {
+            self.dirty = true;
+            self.deadline = Some(now + VOLUME_PERSIST_DEBOUNCE);
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn timeout_ms_until(&self, now: Instant) -> Option<i32> {
+        if !self.dirty {
+            return None;
+        }
+        self.deadline.map(|dl| {
+            dl.saturating_duration_since(now)
+                .as_millis()
+                .clamp(1, i32::MAX as u128) as i32
+        })
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.dirty && self.deadline.is_some_and(|dl| now >= dl)
+    }
+
+    fn take_pending_changes(
+        &mut self,
+        current: SoundSnapshot,
+    ) -> Option<Vec<(&'static str, uxconf::Value)>> {
+        if !self.dirty && current == self.persisted {
+            self.deadline = None;
+            return None;
+        }
+        let mut props = Vec::with_capacity(3);
+        if current.master_volume != self.persisted.master_volume {
+            props.push((
+                "/master-volume",
+                uxconf::Value::Int(i64::from(current.master_volume)),
+            ));
+        }
+        if current.muted != self.persisted.muted {
+            props.push(("/muted", uxconf::Value::Bool(current.muted)));
+        }
+        if current.enabled != self.persisted.enabled {
+            props.push((
+                "/system-sounds-enabled",
+                uxconf::Value::Bool(current.enabled),
+            ));
+        }
+        self.persisted = current;
+        self.dirty = false;
+        self.deadline = None;
+        if props.is_empty() {
+            None
+        } else {
+            Some(props)
+        }
+    }
+
+    fn sync_from_external(&mut self, external: SoundSnapshot) {
+        if !self.dirty {
+            self.persisted = external;
+        }
+    }
+}
+
+fn transition_popup_grab(current: Option<Window>, target: Window, grabbed: bool) -> Option<Window> {
+    let _ = current;
+    if grabbed {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+fn popup_contains_point(width: i32, height: i32, x: i32, y: i32) -> bool {
+    Rect::new(0, 0, width, height).contains(x, y)
+}
+
+fn taskbar_local_point(
+    screen_w: i32,
+    taskbar_y: i32,
+    panel_h: i32,
+    root_x: i32,
+    root_y: i32,
+) -> Option<(i32, i32)> {
+    if root_x < 0 || root_x >= screen_w || root_y < taskbar_y || root_y >= taskbar_y + panel_h {
+        return None;
+    }
+    Some((root_x, root_y - taskbar_y))
 }
 
 pub fn session_identity() -> String {
@@ -309,6 +457,24 @@ fn apply_display_mode(mode_arg: &str) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+fn draw_etched_sep(canvas: &mut Canvas, theme: &Theme, x: i32, y: i32, h: i32) {
+    if theme.is_win98() {
+        canvas.fill(Rect::new(x, y, 1, h), theme.bevel_shadow);
+        canvas.fill(Rect::new(x + 1, y, 1, h), theme.bevel_hi);
+    } else {
+        canvas.fill(Rect::new(x, y, 1, h), theme.panel_border);
+    }
+}
+
+fn draw_etched_hsep(canvas: &mut Canvas, theme: &Theme, x: i32, y: i32, w: i32) {
+    if theme.is_win98() {
+        canvas.fill(Rect::new(x, y, w, 1), theme.bevel_shadow);
+        canvas.fill(Rect::new(x, y + 1, w, 1), theme.bevel_hi);
+    } else {
+        canvas.fill(Rect::new(x, y, w, 1), theme.panel_border);
     }
 }
 
@@ -405,7 +571,7 @@ struct TaskbarLayout {
 
 impl TaskbarLayout {
     fn compute(screen_w: i32, panel_h: i32, tray_w: i32, show_pinned: bool) -> Self {
-        let start_bh = (panel_h - 10).clamp(28, 42);
+        let start_bh = (panel_h - 10).clamp(26, 42);
         let start = Rect::new(6, (panel_h - start_bh) / 2, 86, start_bh);
         let start_sep_x = start.right() + 6;
         let pinned_start_x = start_sep_x + 6;
@@ -415,7 +581,7 @@ impl TaskbarLayout {
         } else {
             start_sep_x + 8
         };
-        let tray_bh = (panel_h - 12).clamp(26, 38);
+        let tray_bh = (panel_h - 12).clamp(24, 38);
         let tray_y = (panel_h - tray_bh) / 2;
         let clock_sep_x = screen_w - tray_w;
         let bell = Rect::new(clock_sep_x - 40, tray_y, 32, tray_bh);
@@ -434,7 +600,7 @@ impl TaskbarLayout {
     }
 
     fn pinned_rect(&self, panel_h: i32, slot: usize) -> Rect {
-        let bh = (panel_h - 12).clamp(26, 38);
+        let bh = (panel_h - 12).clamp(24, 38);
         Rect::new(
             self.start_sep_x + 6 + slot as i32 * 36,
             (panel_h - bh) / 2,
@@ -444,7 +610,7 @@ impl TaskbarLayout {
     }
 
     fn window_button_rect(&self, panel_h: i32, count: usize, index: usize) -> Rect {
-        let bh = (panel_h - 12).clamp(26, 40);
+        let bh = (panel_h - 12).clamp(24, 40);
         let available = (self.net.x - 10 - self.win_start_x).max(80);
         let count = count.clamp(1, 6) as i32;
         let btn_w = ((available - (count - 1) * 4) / count).clamp(28, 160);
@@ -570,12 +736,19 @@ impl Shell {
                 | EventMask::BUTTON_RELEASE
                 | EventMask::POINTER_MOTION
                 | EventMask::LEAVE_WINDOW
-                | EventMask::KEY_PRESS,
+                | EventMask::KEY_PRESS
+                | EventMask::FOCUS_CHANGE
+                | EventMask::STRUCTURE_NOTIFY,
             theme.panel,
         )?;
         x.set_wm_type(menu, x.atoms.net_wm_type_dialog)?;
         if !config.panel_start_fullscreen {
-            x.set_rounded_shape(menu, MENU_WIDTH as u16, MENU_HEIGHT as u16, RADIUS_POPUP)?;
+            x.set_rounded_shape(
+                menu,
+                MENU_WIDTH as u16,
+                MENU_HEIGHT as u16,
+                theme.radius_popup(),
+            )?;
         }
 
         // Bind global Start Screen shortcuts (Super_L, Super_R, Ctrl+Escape).
@@ -596,11 +769,18 @@ impl Shell {
                 | EventMask::BUTTON_PRESS
                 | EventMask::POINTER_MOTION
                 | EventMask::LEAVE_WINDOW
-                | EventMask::KEY_PRESS,
+                | EventMask::KEY_PRESS
+                | EventMask::FOCUS_CHANGE
+                | EventMask::STRUCTURE_NOTIFY,
             theme.panel,
         )?;
         x.set_wm_type(ctx_menu, x.atoms.net_wm_type_dialog)?;
-        x.set_rounded_shape(ctx_menu, CTX_WIDTH as u16, CTX_HEIGHT as u16, RADIUS_POPUP)?;
+        x.set_rounded_shape(
+            ctx_menu,
+            CTX_WIDTH as u16,
+            CTX_HEIGHT as u16,
+            theme.radius_popup(),
+        )?;
 
         let vol_popup = x.generate_id()?;
         x.create_window(
@@ -616,7 +796,9 @@ impl Shell {
                 | EventMask::BUTTON_RELEASE
                 | EventMask::POINTER_MOTION
                 | EventMask::LEAVE_WINDOW
-                | EventMask::KEY_PRESS,
+                | EventMask::KEY_PRESS
+                | EventMask::FOCUS_CHANGE
+                | EventMask::STRUCTURE_NOTIFY,
             theme.panel,
         )?;
         x.set_wm_type(vol_popup, x.atoms.net_wm_type_dialog)?;
@@ -624,7 +806,7 @@ impl Shell {
             vol_popup,
             VOL_POPUP_WIDTH as u16,
             VOL_POPUP_HEIGHT as u16,
-            RADIUS_POPUP,
+            theme.radius_popup(),
         )?;
 
         let toast_y = if config.panel_position == PanelPosition::Top {
@@ -649,7 +831,7 @@ impl Shell {
             toast_window,
             TOAST_WIDTH as u16,
             TOAST_HEIGHT as u16,
-            RADIUS_POPUP,
+            theme.radius_popup(),
         )?;
 
         let desktop_canvas = x.create_canvas(x.width as usize, x.height as usize, theme.bg_top);
@@ -666,6 +848,7 @@ impl Shell {
 
         let net_fd = crate::netmgr::open_event_socket();
         let net_status = crate::netmgr::query_status();
+        let vol_persist = VolumePersistState::new(SoundSnapshot::from_config(&config));
 
         let mut shell = Self {
             x,
@@ -696,7 +879,8 @@ impl Shell {
             vol_canvas,
             vol_open: false,
             vol_dragging: false,
-            vol_persist_pending: false,
+            vol_persist,
+            pointer_grab: None,
             toast_window,
             toast_canvas,
             toast: None,
@@ -731,7 +915,7 @@ impl Shell {
     }
 
     fn panel_height(&self) -> i32 {
-        self.config.panel_size.clamp(34, 60)
+        self.theme.panel_height(&self.config)
     }
 
     fn taskbar_y(&self) -> i32 {
@@ -764,7 +948,8 @@ impl Shell {
         };
         self.x.move_resize(self.menu, mx, my, mw, mh)?;
         if rounded {
-            self.x.set_rounded_shape(self.menu, mw, mh, RADIUS_POPUP)?;
+            self.x
+                .set_rounded_shape(self.menu, mw, mh, self.theme.radius_popup())?;
         } else {
             self.x.clear_shape(self.menu)?;
         }
@@ -940,10 +1125,30 @@ impl Shell {
 
         self.apply_x11_settings(Some(&prev));
 
+        let prev_panel_h = Theme::from_config(&prev).panel_height(&prev);
+        let ph = self.panel_height();
         let panel_geom_changed = prev.panel_position != self.config.panel_position
-            || prev.panel_size != self.config.panel_size;
+            || prev.panel_size != self.config.panel_size
+            || prev_panel_h != ph;
+        let theme_style_changed = prev.theme_style != self.config.theme_style;
+        if theme_style_changed {
+            let radius = self.theme.radius_popup();
+            self.x
+                .set_rounded_shape(self.ctx_menu, CTX_WIDTH as u16, CTX_HEIGHT as u16, radius)?;
+            self.x.set_rounded_shape(
+                self.vol_popup,
+                VOL_POPUP_WIDTH as u16,
+                VOL_POPUP_HEIGHT as u16,
+                radius,
+            )?;
+            self.x.set_rounded_shape(
+                self.toast_window,
+                TOAST_WIDTH as u16,
+                TOAST_HEIGHT as u16,
+                radius,
+            )?;
+        }
         if panel_geom_changed {
-            let ph = self.panel_height();
             self.x.move_resize(
                 self.taskbar,
                 0,
@@ -965,8 +1170,20 @@ impl Shell {
                         .create_canvas(self.x.width as usize, ph as usize, self.theme.panel);
             }
         }
-        if panel_geom_changed || prev.panel_start_fullscreen != self.config.panel_start_fullscreen {
+        if panel_geom_changed
+            || theme_style_changed
+            || prev.panel_start_fullscreen != self.config.panel_start_fullscreen
+        {
             self.sync_menu_window()?;
+            if self.menu_open && prev.panel_start_fullscreen != self.config.panel_start_fullscreen {
+                if self.config.panel_start_fullscreen {
+                    if self.pointer_grab == Some(self.menu) {
+                        self.release_popup_grab();
+                    }
+                } else {
+                    let _ = self.acquire_popup_grab(self.menu);
+                }
+            }
         }
 
         let wp_file_changed = prev.wallpaper != self.config.wallpaper;
@@ -976,13 +1193,23 @@ impl Shell {
         if backdrop_changed {
             self.reload_wallpaper(wp_file_changed);
         }
+        let desktop_redraw_needed = backdrop_changed
+            || theme_style_changed
+            || panel_geom_changed
+            || prev.mode != self.config.mode
+            || prev.accent != self.config.accent
+            || prev.font_scale != self.config.font_scale
+            || prev.desktop_icons_visible != self.config.desktop_icons_visible
+            || prev.desktop_icon_size != self.config.desktop_icon_size;
         {
             let host = ShellConfigHost::new(&self.x, &mut self.config, &mut self.ux_client);
             self.start_screen.on_config_changed(&host);
         }
 
-        self.draw_desktop();
-        self.present_desktop()?;
+        if desktop_redraw_needed {
+            self.draw_desktop();
+            self.present_desktop()?;
+        }
         self.draw_taskbar();
         self.present_taskbar()?;
         if self.menu_open {
@@ -1019,15 +1246,17 @@ impl Shell {
             self.draw_toast();
             self.present_toast()?;
         }
-        self.x.raise(self.taskbar)?;
-        if self.menu_open {
-            self.x.raise(self.menu)?;
-        }
-        if self.ctx_open {
-            self.x.raise(self.ctx_menu)?;
-        }
-        if self.vol_open {
-            self.x.raise(self.vol_popup)?;
+        if desktop_redraw_needed || panel_geom_changed || self.menu_open || self.ctx_open || self.vol_open {
+            self.x.raise(self.taskbar)?;
+            if self.menu_open {
+                self.x.raise(self.menu)?;
+            }
+            if self.ctx_open {
+                self.x.raise(self.ctx_menu)?;
+            }
+            if self.vol_open {
+                self.x.raise(self.vol_popup)?;
+            }
         }
         Ok(())
     }
@@ -1121,10 +1350,19 @@ impl Shell {
 
     fn poll_uxconf(&mut self) -> Result<()> {
         let prev = self.config.clone();
-        let changed = self
+        let (mut changed, events) = self
             .watch
             .as_mut()
-            .is_some_and(|w| w.poll_into(&mut self.config).0);
+            .map_or((false, Vec::new()), |w| w.poll_into(&mut self.config));
+        if !events.is_empty() {
+            if self.vol_dragging || self.vol_persist.is_dirty() {
+                SoundSnapshot::from_config(&prev).apply_to_config(&mut self.config);
+                changed = self.config != prev;
+            } else {
+                self.vol_persist
+                    .sync_from_external(SoundSnapshot::from_config(&self.config));
+            }
+        }
         if changed {
             self.apply_live_config_diff(prev)?;
         }
@@ -1162,13 +1400,18 @@ impl Shell {
             if raw.is_empty() {
                 let ux_fd = self.watch.as_ref().map(UxConfWatch::as_raw_fd);
                 let anim_active = ui::has_active_animations();
-                let timeout = if anim_active {
+                let mut timeout = if anim_active {
                     16
                 } else if self.config.clock_seconds {
                     200
                 } else {
                     500
                 };
+                if !self.vol_dragging {
+                    if let Some(persist_ms) = self.vol_persist.timeout_ms_until(Instant::now()) {
+                        timeout = timeout.min(persist_ms);
+                    }
+                }
                 let (_, ux_ready, net_ready) = self.x.wait_fds(ux_fd, self.net_fd, timeout);
                 if ux_ready {
                     self.poll_uxconf()?;
@@ -1232,6 +1475,9 @@ impl Shell {
                 if Instant::now() >= toast.deadline {
                     self.hide_toast()?;
                 }
+            }
+            if !self.vol_dragging && self.vol_persist.is_due(Instant::now()) {
+                self.flush_volume_persist();
             }
             self.x.flush()?;
         }
@@ -1388,15 +1634,48 @@ impl Shell {
                     self.present_taskbar()?;
                 }
             }
+            Event::FocusOut(e) => {
+                if e.mode == NotifyMode::NORMAL
+                    && !matches!(
+                        e.detail,
+                        NotifyDetail::POINTER | NotifyDetail::INFERIOR | NotifyDetail::NONE
+                    )
+                {
+                    if e.event == self.vol_popup && self.vol_open {
+                        self.close_vol_popup()?;
+                    } else if e.event == self.ctx_menu && self.ctx_open {
+                        self.close_ctx()?;
+                    } else if e.event == self.menu
+                        && self.menu_open
+                        && !self.config.panel_start_fullscreen
+                    {
+                        self.close_menu()?;
+                    }
+                }
+            }
             Event::UnmapNotify(e) => {
-                let is_minimized = self
-                    .windows
-                    .iter()
-                    .find(|w| w.window == e.window)
-                    .is_some_and(|w| w.minimized);
-                if !is_minimized && self.remove_window(e.window) {
-                    self.draw_taskbar();
-                    self.present_taskbar()?;
+                if e.window == self.vol_popup {
+                    if self.vol_open {
+                        self.close_vol_popup()?;
+                    }
+                } else if e.window == self.ctx_menu {
+                    if self.ctx_open {
+                        self.close_ctx()?;
+                    }
+                } else if e.window == self.menu {
+                    if self.menu_open {
+                        self.close_menu()?;
+                    }
+                } else {
+                    let is_minimized = self
+                        .windows
+                        .iter()
+                        .find(|w| w.window == e.window)
+                        .is_some_and(|w| w.minimized);
+                    if !is_minimized && self.remove_window(e.window) {
+                        self.draw_taskbar();
+                        self.present_taskbar()?;
+                    }
                 }
             }
             Event::DestroyNotify(e) => {
@@ -1540,9 +1819,34 @@ impl Shell {
                     } else if e.detail == 1 {
                         self.close_ctx()?;
                         self.taskbar_click(x, y)?;
+                    } else {
+                        self.close_ctx()?;
+                        self.close_vol_popup()?;
+                        self.close_menu()?;
                     }
                 } else if e.event == self.vol_popup && self.vol_open {
-                    if e.detail == 4 || e.detail == 5 {
+                    if !popup_contains_point(VOL_POPUP_WIDTH, VOL_POPUP_HEIGHT, x, y) {
+                        if (e.detail == 4 || e.detail == 5)
+                            && self
+                                .taskbar_local_coords(e.root_x, e.root_y)
+                                .is_some_and(|(tx, ty)| self.taskbar_hit(tx, ty) == Hit::Volume)
+                        {
+                            let step = if e.detail == 4 { 5 } else { -5 };
+                            self.adjust_volume_step(step)?;
+                        } else {
+                            self.vol_dragging = false;
+                            self.close_vol_popup()?;
+                            if e.detail == 1 {
+                                if let Some((tx, ty)) =
+                                    self.taskbar_local_coords(e.root_x, e.root_y)
+                                {
+                                    if self.taskbar_hit(tx, ty) != Hit::Volume {
+                                        self.taskbar_click(tx, ty)?;
+                                    }
+                                }
+                            }
+                        }
+                    } else if e.detail == 4 || e.detail == 5 {
                         let step = if e.detail == 4 { 5 } else { -5 };
                         self.adjust_volume_step(step)?;
                     } else if e.detail == 1 {
@@ -1575,11 +1879,29 @@ impl Shell {
                             };
                             self.handle_start_action(action, prev_cfg)?;
                         }
+                    } else if !popup_contains_point(MENU_WIDTH, MENU_HEIGHT, x, y) {
+                        self.close_menu()?;
+                        if e.detail == 1 {
+                            if let Some((tx, ty)) = self.taskbar_local_coords(e.root_x, e.root_y) {
+                                if self.taskbar_hit(tx, ty) != Hit::Start {
+                                    self.taskbar_click(tx, ty)?;
+                                }
+                            }
+                        }
                     } else if e.detail == 1 {
                         self.menu_click(x, y)?;
                     }
-                } else if e.event == self.ctx_menu && e.detail == 1 {
-                    self.ctx_click(x, y)?;
+                } else if e.event == self.ctx_menu && self.ctx_open {
+                    if !popup_contains_point(CTX_WIDTH, CTX_HEIGHT, x, y) {
+                        self.close_ctx()?;
+                        if e.detail == 1 {
+                            if let Some((tx, ty)) = self.taskbar_local_coords(e.root_x, e.root_y) {
+                                self.taskbar_click(tx, ty)?;
+                            }
+                        }
+                    } else if e.detail == 1 {
+                        self.ctx_click(x, y)?;
+                    }
                 } else if e.event == self.desktop {
                     self.close_menu()?;
                     self.close_vol_popup()?;
@@ -1608,7 +1930,7 @@ impl Shell {
             Event::ButtonRelease(e) => {
                 if e.detail == 1 && self.vol_dragging {
                     self.vol_dragging = false;
-                    self.commit_staged_volume();
+                    self.stage_sound_persist();
                     crate::sound::play(&self.config, crate::sound::SystemSound::Volume);
                     if self.vol_open {
                         self.draw_vol_popup();
@@ -1660,7 +1982,11 @@ impl Shell {
                         let vol = vol_from_slider_x(vol_popup_slider_rect(), x);
                         self.set_master_volume(vol, false)?;
                     } else {
-                        let hit = self.vol_popup_hit(x, y);
+                        let hit = if popup_contains_point(VOL_POPUP_WIDTH, VOL_POPUP_HEIGHT, x, y) {
+                            self.vol_popup_hit(x, y)
+                        } else {
+                            Hit::None
+                        };
                         if hit != self.hover {
                             self.hover = hit;
                             let cursor = if hit == Hit::None {
@@ -1816,6 +2142,8 @@ impl Shell {
     }
 
     fn manage(&mut self, window: Window) -> Result<()> {
+        self.close_vol_popup()?;
+        self.close_ctx()?;
         if let Some(existing) = self.windows.iter_mut().find(|w| w.window == window) {
             existing.minimized = false;
             self.x.map(window)?;
@@ -1979,6 +2307,8 @@ impl Shell {
     }
 
     fn activate(&mut self, window: Window) -> Result<()> {
+        self.close_vol_popup()?;
+        self.close_ctx()?;
         let Some(managed) = self.windows.iter_mut().find(|w| w.window == window) else {
             return Ok(());
         };
@@ -2133,60 +2463,68 @@ impl Shell {
         }
     }
 
-    fn set_sound_prop(&mut self, prop: &str, val: uxconf::Value) {
+    fn acquire_popup_grab(&mut self, window: Window) -> bool {
+        if self.pointer_grab == Some(window) {
+            return true;
+        }
+        if self.pointer_grab.is_some() {
+            self.release_popup_grab();
+        }
+        let grabbed = self.x.grab_pointer(window);
+        self.pointer_grab = transition_popup_grab(self.pointer_grab, window, grabbed);
+        grabbed
+    }
+
+    fn release_popup_grab(&mut self) {
+        if self.pointer_grab.take().is_some() {
+            self.x.ungrab_pointer();
+        }
+    }
+
+    fn persist_sound_prop(&mut self, prop: &str, val: uxconf::Value) -> bool {
         let _ = self.config.apply_property("sound", prop, &val);
         if self.ux_client.is_none() {
             self.ux_client = UxConfClient::connect().ok();
         }
-        if let Some(client) = self.ux_client.as_mut() {
-            if client.set("sound", prop, val.clone()).is_err() {
-                self.ux_client = UxConfClient::connect().ok();
-                if let Some(c) = self.ux_client.as_mut() {
-                    let _ = c.set("sound", prop, val);
-                }
-            }
-        }
+        let Some(client) = self.ux_client.as_mut() else {
+            return false;
+        };
+        client.set("sound", prop, val).is_ok()
     }
 
-    /// Persist a volume staged during a slider drag (one fsync per gesture).
-    fn commit_staged_volume(&mut self) {
-        if !self.vol_persist_pending {
+    fn stage_sound_persist(&mut self) {
+        self.vol_persist
+            .stage(SoundSnapshot::from_config(&self.config), Instant::now());
+    }
+
+    /// Persist staged volume/mute/sfx changes at most once per debounce burst or popup close.
+    fn flush_volume_persist(&mut self) {
+        let current = SoundSnapshot::from_config(&self.config);
+        let Some(props) = self.vol_persist.take_pending_changes(current) else {
             return;
+        };
+        for (prop, val) in props {
+            if !self.persist_sound_prop(prop, val) {
+                break;
+            }
         }
-        self.vol_persist_pending = false;
-        let vol = self.config.sound_master_volume;
-        let muted = self.config.sound_muted;
-        self.set_sound_prop("/master-volume", uxconf::Value::Int(i64::from(vol)));
-        self.set_sound_prop("/muted", uxconf::Value::Bool(muted));
     }
 
     fn set_master_volume(&mut self, vol: i32, play_sfx: bool) -> Result<()> {
         let clamped = vol.clamp(0, 100);
         let prev_vol = self.config.sound_master_volume;
         let prev_muted = self.config.sound_muted;
-        // While dragging, only stage locally: the uxconfd round trip writes and
-        // fsyncs the channel file and wakes every client, once per motion event.
-        let staged = self.vol_dragging;
         if clamped != prev_vol {
             let value = uxconf::Value::Int(i64::from(clamped));
-            if staged {
-                let _ = self
-                    .config
-                    .apply_property("sound", "/master-volume", &value);
-                self.vol_persist_pending = true;
-            } else {
-                self.set_sound_prop("/master-volume", value);
-            }
+            let _ = self.config.apply_property("sound", "/master-volume", &value);
         }
         if self.config.sound_muted && clamped > 0 {
-            if staged {
-                let _ = self
-                    .config
-                    .apply_property("sound", "/muted", &uxconf::Value::Bool(false));
-                self.vol_persist_pending = true;
-            } else {
-                self.set_sound_prop("/muted", uxconf::Value::Bool(false));
-            }
+            let _ = self
+                .config
+                .apply_property("sound", "/muted", &uxconf::Value::Bool(false));
+        }
+        if clamped != prev_vol || self.config.sound_muted != prev_muted {
+            self.stage_sound_persist();
         }
         crate::sound::apply_mixer_volume(clamped, self.config.sound_muted && clamped == 0);
         if play_sfx {
@@ -2210,7 +2548,10 @@ impl Shell {
 
     fn toggle_mute(&mut self) -> Result<()> {
         let next = !self.config.sound_muted;
-        self.set_sound_prop("/muted", uxconf::Value::Bool(next));
+        let _ = self
+            .config
+            .apply_property("sound", "/muted", &uxconf::Value::Bool(next));
+        self.stage_sound_persist();
         crate::sound::apply_mixer_volume(self.config.sound_master_volume, next);
         if !next {
             crate::sound::play(&self.config, crate::sound::SystemSound::Volume);
@@ -2222,6 +2563,16 @@ impl Shell {
             self.present_vol_popup()?;
         }
         Ok(())
+    }
+
+    fn taskbar_local_coords(&self, root_x: i16, root_y: i16) -> Option<(i32, i32)> {
+        taskbar_local_point(
+            i32::from(self.x.width),
+            self.taskbar_y(),
+            self.panel_height(),
+            i32::from(root_x),
+            i32::from(root_y),
+        )
     }
 
     fn vol_popup_pos(&self) -> (i16, i16) {
@@ -2254,17 +2605,20 @@ impl Shell {
         self.draw_taskbar();
         self.x.map(self.vol_popup)?;
         self.x.raise(self.vol_popup)?;
-        self.x.focus(self.vol_popup)?;
         self.present_vol_popup()?;
         self.present_taskbar()?;
+        let _ = self.x.focus(self.vol_popup);
+        let _ = self.acquire_popup_grab(self.vol_popup);
         Ok(())
     }
 
     fn close_vol_popup(&mut self) -> Result<()> {
         if self.vol_open {
+            // Release pointer grab and unmap visually BEFORE flushing uxconfd I/O so
+            // popup dismissal is instantaneous and never bricks input on IPC stall.
+            self.release_popup_grab();
             self.vol_open = false;
             self.vol_dragging = false;
-            self.commit_staged_volume();
             if matches!(
                 self.hover,
                 Hit::VolMute | Hit::VolSlider | Hit::VolSfx | Hit::VolSettings
@@ -2272,11 +2626,12 @@ impl Shell {
                 self.hover = Hit::None;
             }
             self.x.unmap(self.vol_popup)?;
-            if let Some(active) = self.active {
-                let _ = self.x.focus(active);
-            }
+            let target = self.active.unwrap_or(self.x.root);
+            let _ = self.x.focus(target);
             self.draw_taskbar();
             self.present_taskbar()?;
+            let _ = self.x.flush();
+            self.flush_volume_persist();
         }
         Ok(())
     }
@@ -2313,7 +2668,12 @@ impl Shell {
             }
             Hit::VolSfx => {
                 let next = !self.config.sound_enabled;
-                self.set_sound_prop("/system-sounds-enabled", uxconf::Value::Bool(next));
+                let _ = self.config.apply_property(
+                    "sound",
+                    "/system-sounds-enabled",
+                    &uxconf::Value::Bool(next),
+                );
+                self.stage_sound_persist();
                 if next {
                     crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 }
@@ -2429,13 +2789,18 @@ impl Shell {
         self.x.map(self.ctx_menu)?;
         self.x.raise(self.ctx_menu)?;
         self.present_ctx()?;
+        let _ = self.x.focus(self.ctx_menu);
+        let _ = self.acquire_popup_grab(self.ctx_menu);
         Ok(())
     }
 
     fn close_ctx(&mut self) -> Result<()> {
         if self.ctx_open {
+            self.release_popup_grab();
             self.ctx_open = false;
             self.x.unmap(self.ctx_menu)?;
+            let target = self.active.unwrap_or(self.x.root);
+            let _ = self.x.focus(target);
             self.x.flush()?;
         }
         Ok(())
@@ -2487,22 +2852,27 @@ impl Shell {
             self.draw_taskbar();
             self.x.map(self.menu)?;
             self.x.raise(self.menu)?;
-            self.x.focus(self.menu)?;
             self.present_menu()?;
             self.present_taskbar()?;
+            self.x.focus(self.menu)?;
+            if !self.config.panel_start_fullscreen {
+                let _ = self.acquire_popup_grab(self.menu);
+            }
             Ok(())
         }
     }
 
     fn close_menu(&mut self) -> Result<()> {
         if self.menu_open {
+            if self.pointer_grab == Some(self.menu) {
+                self.release_popup_grab();
+            }
             self.menu_open = false;
             self.menu_query.clear();
             self.menu_confirm_power = None;
             self.x.unmap(self.menu)?;
-            if let Some(active) = self.active {
-                let _ = self.x.focus(active);
-            }
+            let target = self.active.unwrap_or(self.x.root);
+            let _ = self.x.focus(target);
             self.draw_taskbar();
             self.present_taskbar()?;
         }
@@ -2581,19 +2951,33 @@ impl Shell {
             let hovered = self.hover == Hit::DesktopIcon(idx);
             let selected = self.selected_desktop_icon == Some(idx);
             if selected || hovered {
-                self.desktop_canvas.rounded_rect(
-                    cell,
-                    6,
-                    0xffffff,
-                    if selected { 0.22 } else { 0.13 },
-                );
-                self.desktop_canvas.rounded_border(
-                    cell,
-                    6,
-                    0xffffff,
-                    if selected { 0.42 } else { 0.22 },
-                    1,
-                );
+                if self.theme.is_win98() {
+                    self.desktop_canvas.fill(
+                        cell,
+                        if selected {
+                            self.theme.selection_bg
+                        } else {
+                            crate::draw::mix(self.config.solid_color, self.theme.selection_bg, 0.35)
+                        },
+                    );
+                    if selected {
+                        self.desktop_canvas.border_1px(cell, 0xffff80);
+                    }
+                } else {
+                    self.desktop_canvas.rounded_rect(
+                        cell,
+                        6,
+                        0xffffff,
+                        if selected { 0.22 } else { 0.13 },
+                    );
+                    self.desktop_canvas.rounded_border(
+                        cell,
+                        6,
+                        0xffffff,
+                        if selected { 0.42 } else { 0.22 },
+                        1,
+                    );
+                }
             }
             icons::draw(
                 &mut self.desktop_canvas,
@@ -2641,6 +3025,8 @@ impl Shell {
         let net = layout.net;
         let vol = layout.volume;
         let bell = layout.bell;
+        let is_win98 = self.theme.is_win98();
+        let ctrl_r = self.theme.radius_control();
         let border_y = if self.config.panel_position == PanelPosition::Top {
             h - 1
         } else {
@@ -2649,15 +3035,41 @@ impl Shell {
 
         let canvas = &mut self.taskbar_canvas;
         canvas.fill(Rect::new(0, 0, w, h), self.theme.panel);
-        canvas.fill(Rect::new(0, border_y, w, 1), self.theme.panel_border);
+        if is_win98 {
+            if self.config.panel_position == PanelPosition::Top {
+                canvas.fill(Rect::new(0, h - 2, w, 1), self.theme.bevel_shadow);
+                canvas.fill(Rect::new(0, h - 1, w, 1), self.theme.bevel_dark);
+            } else {
+                canvas.fill(Rect::new(0, 0, w, 1), self.theme.bevel_light);
+                canvas.fill(Rect::new(0, 1, w, 1), self.theme.bevel_hi);
+            }
+        } else {
+            canvas.fill(Rect::new(0, border_y, w, 1), self.theme.panel_border);
+        }
 
         // Start button using official SpaceOS9.png logo.
         let start_active = self.menu_open || self.hover == Hit::Start;
         let start_t = ui::animate_bool(start, start_active, ui::MOTION_HOVER);
-        if start_t > 0.001 {
+        let mut start_shift = 0;
+        if is_win98 {
+            canvas.fill(
+                start,
+                if self.hover == Hit::Start && !self.menu_open {
+                    self.theme.panel_hover
+                } else {
+                    self.theme.panel
+                },
+            );
+            if self.menu_open {
+                ui::sunken_bevel(canvas, &self.theme, start);
+                start_shift = 1;
+            } else {
+                ui::raised_bevel(canvas, &self.theme, start);
+            }
+        } else if start_t > 0.001 {
             canvas.rounded_rect(
                 start,
-                RADIUS_CONTROL,
+                ctrl_r,
                 if self.menu_open {
                     self.theme.accent_soft
                 } else {
@@ -2667,7 +3079,7 @@ impl Shell {
             );
             canvas.rounded_border(
                 start,
-                RADIUS_CONTROL,
+                ctrl_r,
                 if self.menu_open {
                     self.theme.accent
                 } else {
@@ -2680,27 +3092,24 @@ impl Shell {
         icons::draw(
             canvas,
             Icon::SpaceLogo,
-            start.x + 9,
-            start.y + (start.h - 22) / 2,
+            start.x + 9 + start_shift,
+            start.y + (start.h - 22) / 2 + start_shift,
             22,
             None,
         );
         self.text.draw(
             canvas,
             "开始",
-            (start.x + 38) as f32,
-            start.y as f32 + start.h as f32 * 0.5 + 4.8,
+            (start.x + 38 + start_shift) as f32,
+            start.y as f32 + start.h as f32 * 0.5 + 4.8 + start_shift as f32,
             13.0,
             self.theme.text,
             Face::Bold,
         );
 
-        let sep_h = (h - 20).clamp(16, 26);
+        let sep_h = (h - 14).clamp(16, 26);
         let sep_y = (h - sep_h) / 2;
-        canvas.fill(
-            Rect::new(layout.start_sep_x, sep_y, 1, sep_h),
-            self.theme.panel_border,
-        );
+        draw_etched_sep(canvas, &self.theme, layout.start_sep_x, sep_y, sep_h);
 
         // Quick-launch curated core apps (optional).
         if show_pinned {
@@ -2709,8 +3118,13 @@ impl Shell {
                     continue;
                 };
                 let hov_t = ui::animate_bool(rect, self.hover == Hit::Pinned(i), ui::MOTION_HOVER);
-                if hov_t > 0.001 {
-                    canvas.rounded_rect(rect, RADIUS_CONTROL, self.theme.panel_hover, hov_t);
+                if is_win98 {
+                    if self.hover == Hit::Pinned(i) {
+                        canvas.fill(rect, self.theme.panel_hover);
+                        canvas.bevel_1px(rect, self.theme.bevel_hi, self.theme.bevel_shadow);
+                    }
+                } else if hov_t > 0.001 {
+                    canvas.rounded_rect(rect, ctrl_r, self.theme.panel_hover, hov_t);
                 }
                 icons::draw(
                     canvas,
@@ -2721,10 +3135,7 @@ impl Shell {
                     None,
                 );
             }
-            canvas.fill(
-                Rect::new(layout.pinned_sep_x, sep_y, 1, sep_h),
-                self.theme.panel_border,
-            );
+            draw_etched_sep(canvas, &self.theme, layout.pinned_sep_x, sep_y, sep_h);
         }
 
         // Running window buttons.
@@ -2733,44 +3144,66 @@ impl Shell {
             let is_active = !managed.minimized && self.active == Some(managed.window);
             let is_hover = self.hover == Hit::Window(index);
             let hov_t = ui::animate_bool(rect, is_hover, ui::MOTION_HOVER);
-            let bg = if is_active {
-                self.theme.panel_high
-            } else if hov_t > 0.001 {
-                crate::draw::mix(self.theme.panel, self.theme.panel_hover, hov_t)
+            let mut win_shift = 0;
+            if is_win98 {
+                if is_active {
+                    canvas.fill(
+                        rect,
+                        crate::draw::mix(self.theme.panel, self.theme.bevel_hi, 0.45),
+                    );
+                    ui::sunken_bevel(canvas, &self.theme, rect);
+                    win_shift = 1;
+                } else {
+                    canvas.fill(
+                        rect,
+                        if is_hover {
+                            self.theme.panel_hover
+                        } else {
+                            self.theme.panel
+                        },
+                    );
+                    ui::raised_bevel(canvas, &self.theme, rect);
+                }
             } else {
-                self.theme.panel
-            };
-            canvas.rounded_rect(rect, RADIUS_CONTROL, bg, 1.0);
-            if is_active || hov_t > 0.001 {
-                let border_alpha = if is_active { 1.0 } else { hov_t };
-                canvas.rounded_border(
-                    rect,
-                    RADIUS_CONTROL,
-                    self.theme.panel_border,
-                    border_alpha,
-                    1,
-                );
-            }
-            if is_active {
-                canvas.rounded_rect(
-                    Rect::new(rect.x + 10, rect.bottom() - 3, rect.w - 20, 2),
-                    1,
-                    self.theme.accent,
-                    1.0,
-                );
-            } else if !managed.minimized {
-                canvas.rounded_rect(
-                    Rect::new(rect.x + rect.w / 2 - 6, rect.bottom() - 3, 12, 2),
-                    1,
-                    self.theme.text_muted,
-                    1.0,
-                );
+                let bg = if is_active {
+                    self.theme.panel_high
+                } else if hov_t > 0.001 {
+                    crate::draw::mix(self.theme.panel, self.theme.panel_hover, hov_t)
+                } else {
+                    self.theme.panel
+                };
+                canvas.rounded_rect(rect, ctrl_r, bg, 1.0);
+                if is_active || hov_t > 0.001 {
+                    let border_alpha = if is_active { 1.0 } else { hov_t };
+                    canvas.rounded_border(
+                        rect,
+                        ctrl_r,
+                        self.theme.panel_border,
+                        border_alpha,
+                        1,
+                    );
+                }
+                if is_active {
+                    canvas.rounded_rect(
+                        Rect::new(rect.x + 10, rect.bottom() - 3, rect.w - 20, 2),
+                        1,
+                        self.theme.accent,
+                        1.0,
+                    );
+                } else if !managed.minimized {
+                    canvas.rounded_rect(
+                        Rect::new(rect.x + rect.w / 2 - 6, rect.bottom() - 3, 12, 2),
+                        1,
+                        self.theme.text_muted,
+                        1.0,
+                    );
+                }
             }
             icons::draw(
                 canvas,
                 managed.icon,
-                rect.x + 8,
-                rect.y + (rect.h - 18) / 2,
+                rect.x + 8 + win_shift,
+                rect.y + (rect.h - 18) / 2 + win_shift,
                 18,
                 None,
             );
@@ -2786,19 +3219,31 @@ impl Shell {
             self.text.draw(
                 canvas,
                 &label,
-                (rect.x + 31) as f32,
-                rect.y as f32 + rect.h as f32 * 0.5 + 4.5,
+                (rect.x + 31 + win_shift) as f32,
+                rect.y as f32 + rect.h as f32 * 0.5 + 4.5 + win_shift as f32,
                 12.0,
                 fg,
-                Face::Ui,
+                if is_win98 && is_active {
+                    Face::Bold
+                } else {
+                    Face::Ui
+                },
             );
         }
 
         // Right tray: wired network status, speaker volume icon, notification bell & clock.
+        if is_win98 {
+            let well = Rect::new(net.x - 4, 4, w - (net.x - 4) - 4, h - 8);
+            canvas.bevel_1px(well, self.theme.bevel_shadow, self.theme.bevel_hi);
+        }
         let net_hov = ui::animate_bool(net, self.hover == Hit::Network, ui::MOTION_HOVER);
         let net_connected = self.net_status.connected();
-        if net_hov > 0.001 {
-            canvas.rounded_rect(net, RADIUS_CONTROL, self.theme.panel_hover, net_hov);
+        if is_win98 {
+            if self.hover == Hit::Network {
+                canvas.bevel_1px(net, self.theme.bevel_hi, self.theme.bevel_shadow);
+            }
+        } else if net_hov > 0.001 {
+            canvas.rounded_rect(net, ctrl_r, self.theme.panel_hover, net_hov);
         }
         let (net_icon, net_tint) = if net_connected {
             (Icon::NetworkWired, self.theme.text)
@@ -2818,10 +3263,16 @@ impl Shell {
 
         let vol_active = self.vol_open || self.hover == Hit::Volume;
         let vol_hov = ui::animate_bool(vol, vol_active, ui::MOTION_HOVER);
-        if vol_hov > 0.001 {
+        if is_win98 {
+            if self.vol_open {
+                canvas.bevel_1px(vol, self.theme.bevel_shadow, self.theme.bevel_hi);
+            } else if self.hover == Hit::Volume {
+                canvas.bevel_1px(vol, self.theme.bevel_hi, self.theme.bevel_shadow);
+            }
+        } else if vol_hov > 0.001 {
             canvas.rounded_rect(
                 vol,
-                RADIUS_CONTROL,
+                ctrl_r,
                 if self.vol_open {
                     self.theme.accent_soft
                 } else {
@@ -2848,8 +3299,12 @@ impl Shell {
         );
 
         let bell_hov = ui::animate_bool(bell, self.hover == Hit::Bell, ui::MOTION_HOVER);
-        if bell_hov > 0.001 {
-            canvas.rounded_rect(bell, RADIUS_CONTROL, self.theme.panel_hover, bell_hov);
+        if is_win98 {
+            if self.hover == Hit::Bell {
+                canvas.bevel_1px(bell, self.theme.bevel_hi, self.theme.bevel_shadow);
+            }
+        } else if bell_hov > 0.001 {
+            canvas.rounded_rect(bell, ctrl_r, self.theme.panel_hover, bell_hov);
         }
         icons::draw(
             canvas,
@@ -2867,10 +3322,12 @@ impl Shell {
                 self.theme.text_dim
             }),
         );
-        canvas.fill(
-            Rect::new(layout.clock_sep_x, sep_y, 1, sep_h),
-            self.theme.panel_border,
-        );
+        if !is_win98 {
+            canvas.fill(
+                Rect::new(layout.clock_sep_x, sep_y, 1, sep_h),
+                self.theme.panel_border,
+            );
+        }
 
         let (year, month, day, hour, minute, sec, weekday) = now_local();
         let time_str = if self.config.clock_24h {
@@ -2948,7 +3405,12 @@ impl Shell {
         let canvas = &mut self.menu_canvas;
         let (w, h) = (MENU_WIDTH, MENU_HEIGHT);
         canvas.clear(self.theme.panel);
-        ui::popup_surface(canvas, &self.theme, Rect::new(0, 0, w, h), RADIUS_POPUP);
+        ui::popup_surface(
+            canvas,
+            &self.theme,
+            Rect::new(0, 0, w, h),
+            self.theme.radius_popup(),
+        );
 
         ui::text_input(
             canvas,
@@ -2972,14 +3434,18 @@ impl Shell {
                 Face::Ui,
             );
         } else {
+            let is_win98 = self.theme.is_win98();
             for (slot, &app_idx) in filtered.iter().enumerate() {
                 let app = &APPS[app_idx];
                 let row = menu_row_rect(slot);
                 let hovered = self.hover == Hit::MenuRow(app_idx)
                     || (slot == 0 && !self.menu_query.is_empty());
-                if hovered {
-                    canvas.rounded_rect(row, RADIUS_CONTROL, self.theme.panel_hover, 1.0);
-                }
+                let fg = ui::list_item_bg(canvas, &self.theme, row, hovered, false);
+                let sub_fg = if hovered && is_win98 {
+                    self.theme.selection_text
+                } else {
+                    self.theme.text_muted
+                };
                 icons::draw(canvas, app.icon, row.x + 10, row.y + 8, 32, None);
                 self.text.draw(
                     canvas,
@@ -2987,7 +3453,7 @@ impl Shell {
                     (row.x + 52) as f32,
                     (row.y + 20) as f32,
                     13.0,
-                    self.theme.text,
+                    fg,
                     Face::Bold,
                 );
                 self.text.draw(
@@ -2996,7 +3462,7 @@ impl Shell {
                     (row.x + 52) as f32,
                     (row.y + 37) as f32,
                     11.0,
-                    self.theme.text_muted,
+                    sub_fg,
                     Face::Ui,
                 );
             }
@@ -3004,8 +3470,8 @@ impl Shell {
 
         // Footer bar.
         let (logout, reboot, power_off, confirm_cancel, confirm_ok) = compact_footer_rects();
-        canvas.fill(Rect::new(1, h - 54, w - 2, 53), self.theme.window_alt);
-        canvas.fill(Rect::new(1, h - 54, w - 2, 1), self.theme.panel_border);
+        canvas.fill(Rect::new(3, h - 54, w - 6, 51), self.theme.window_alt);
+        draw_etched_hsep(canvas, &self.theme, 3, h - 54, w - 6);
         if let Some(action) = self.menu_confirm_power {
             let (prompt, ok_label, ok_icon) = match action {
                 PowerAction::Reboot => ("确认重新启动计算机？", "重启", Icon::Refresh),
@@ -3094,7 +3560,7 @@ impl Shell {
             canvas,
             &self.theme,
             Rect::new(0, 0, CTX_WIDTH, CTX_HEIGHT),
-            RADIUS_POPUP,
+            self.theme.radius_popup(),
         );
 
         let items = [
@@ -3103,17 +3569,17 @@ impl Shell {
             ("刷新桌面", Icon::Refresh),
             ("桌面与外观设置", Icon::Settings),
         ];
-        canvas.fill(
-            Rect::new(10, 104, CTX_WIDTH - 20, 1),
-            self.theme.panel_border,
-        );
+        draw_etched_hsep(canvas, &self.theme, 10, 104, CTX_WIDTH - 20);
         for (idx, (label, ic)) in items.iter().enumerate() {
             let row = ctx_row_rect(idx);
-            if self.hover == Hit::ContextRow(idx) {
-                canvas.rounded_rect(row, RADIUS_CONTROL, self.theme.panel_hover, 1.0);
-            }
+            let hovered = self.hover == Hit::ContextRow(idx);
+            let fg = ui::list_item_bg(canvas, &self.theme, row, hovered, false);
             let tint = if ic.is_symbolic() {
-                Some(self.theme.text_dim)
+                Some(if hovered && self.theme.is_win98() {
+                    fg
+                } else {
+                    self.theme.text_dim
+                })
             } else {
                 None
             };
@@ -3124,7 +3590,7 @@ impl Shell {
                 (row.x + 32) as f32,
                 (row.y + 20) as f32,
                 12.0,
-                self.theme.text,
+                fg,
                 Face::Ui,
             );
         }
@@ -3134,7 +3600,12 @@ impl Shell {
         let canvas = &mut self.toast_canvas;
         let (w, h) = (TOAST_WIDTH, TOAST_HEIGHT);
         canvas.clear(self.theme.panel);
-        ui::popup_surface(canvas, &self.theme, Rect::new(0, 0, w, h), RADIUS_POPUP);
+        ui::popup_surface(
+            canvas,
+            &self.theme,
+            Rect::new(0, 0, w, h),
+            self.theme.radius_popup(),
+        );
         icons::draw(canvas, Icon::Notify, 14, (h - 28) / 2, 28, None);
         if let Some(toast) = &self.toast {
             self.text.draw(
@@ -3248,8 +3719,15 @@ impl Shell {
         let canvas = &mut self.vol_canvas;
         let w = VOL_POPUP_WIDTH;
         let h = VOL_POPUP_HEIGHT;
+        let is_win98 = self.theme.is_win98();
+        let ctrl_r = self.theme.radius_control();
         canvas.clear(self.theme.panel);
-        ui::popup_surface(canvas, &self.theme, Rect::new(0, 0, w, h), RADIUS_POPUP);
+        ui::popup_surface(
+            canvas,
+            &self.theme,
+            Rect::new(0, 0, w, h),
+            self.theme.radius_popup(),
+        );
 
         let muted = self.config.sound_muted;
         let vol = self.config.sound_master_volume.clamp(0, 100);
@@ -3284,10 +3762,26 @@ impl Shell {
 
         let mute_r = vol_popup_mute_rect();
         let mute_hov = self.hover == Hit::VolMute;
-        if muted || mute_hov {
+        if is_win98 {
+            canvas.fill(
+                mute_r,
+                if muted {
+                    self.theme.window_alt
+                } else if mute_hov {
+                    self.theme.panel_hover
+                } else {
+                    self.theme.panel
+                },
+            );
+            if muted {
+                ui::sunken_bevel(canvas, &self.theme, mute_r);
+            } else {
+                ui::raised_bevel(canvas, &self.theme, mute_r);
+            }
+        } else if muted || mute_hov {
             canvas.rounded_rect(
                 mute_r,
-                RADIUS_CONTROL,
+                ctrl_r,
                 if muted {
                     crate::draw::mix(self.theme.panel_hover, self.theme.danger, 0.20)
                 } else {
@@ -3320,11 +3814,11 @@ impl Shell {
             self.vol_dragging,
         );
 
-        canvas.fill(Rect::new(14, 84, w - 28, 1), self.theme.window_border);
+        draw_etched_hsep(canvas, &self.theme, 14, 84, w - 28);
 
         let sfx_r = vol_popup_sfx_rect();
         if self.hover == Hit::VolSfx {
-            canvas.rounded_rect(sfx_r, RADIUS_CONTROL, self.theme.panel_hover, 0.7);
+            canvas.rounded_rect(sfx_r, ctrl_r, self.theme.panel_hover, 0.7);
         }
         self.text.draw(
             canvas,
@@ -3411,7 +3905,7 @@ mod tests {
     #[test]
     fn taskbar_geometry_has_no_overlaps() {
         for screen_w in [800, 1024, 1280, 1920] {
-            for panel_h in [38, 46, 56] {
+            for panel_h in [34, 38, 46, 56] {
                 for tray_w in [108, 136] {
                     for show_pinned in [true, false] {
                         let layout = TaskbarLayout::compute(screen_w, panel_h, tray_w, show_pinned);
@@ -3466,5 +3960,126 @@ mod tests {
         assert_eq!(vol_from_slider_x(slider_r, slider_r.x - 10), 0);
         assert_eq!(vol_from_slider_x(slider_r, slider_r.right() + 10), 100);
         assert_eq!(vol_from_slider_x(slider_r, slider_r.x + slider_r.w / 2), 50);
+    }
+
+    #[test]
+    fn popup_bounds_and_taskbar_passthrough_work() {
+        assert!(popup_contains_point(VOL_POPUP_WIDTH, VOL_POPUP_HEIGHT, 0, 0));
+        assert!(popup_contains_point(
+            VOL_POPUP_WIDTH,
+            VOL_POPUP_HEIGHT,
+            VOL_POPUP_WIDTH - 1,
+            VOL_POPUP_HEIGHT - 1
+        ));
+        assert!(!popup_contains_point(
+            VOL_POPUP_WIDTH,
+            VOL_POPUP_HEIGHT,
+            -1,
+            10
+        ));
+        assert!(!popup_contains_point(
+            VOL_POPUP_WIDTH,
+            VOL_POPUP_HEIGHT,
+            10,
+            VOL_POPUP_HEIGHT
+        ));
+        assert_eq!(
+            taskbar_local_point(1280, 754, 46, 1200, 770),
+            Some((1200, 16))
+        );
+        assert_eq!(taskbar_local_point(1280, 754, 46, 1200, 750), None);
+    }
+
+    #[test]
+    fn volume_persist_coalesces_burst_clicks_and_ignores_stale_external_sync() {
+        let t0 = Instant::now();
+        let initial = SoundSnapshot {
+            master_volume: 60,
+            muted: false,
+            enabled: true,
+        };
+        let mut st = VolumePersistState::new(initial);
+        assert!(!st.is_dirty());
+        assert_eq!(st.timeout_ms_until(t0), None);
+
+        // Rapid clicks / wheel steps extend debounce and stay dirty without blocking I/O.
+        st.stage(
+            SoundSnapshot {
+                master_volume: 65,
+                muted: false,
+                enabled: true,
+            },
+            t0,
+        );
+        st.stage(
+            SoundSnapshot {
+                master_volume: 75,
+                muted: true,
+                enabled: true,
+            },
+            t0 + Duration::from_millis(40),
+        );
+        assert!(st.is_dirty());
+        assert!(!st.is_due(t0 + Duration::from_millis(280)));
+        assert!(st.is_due(t0 + Duration::from_millis(290)));
+
+        // Stale external broadcast while dirty must not erase our persisted baseline.
+        st.sync_from_external(SoundSnapshot {
+            master_volume: 65,
+            muted: false,
+            enabled: true,
+        });
+
+        let changes = st
+            .take_pending_changes(SoundSnapshot {
+                master_volume: 75,
+                muted: true,
+                enabled: true,
+            })
+            .expect("must emit changed props");
+        assert_eq!(
+            changes,
+            vec![
+                ("/master-volume", uxconf::Value::Int(75)),
+                ("/muted", uxconf::Value::Bool(true)),
+            ]
+        );
+        assert!(!st.is_dirty());
+
+        // Toggling back to persisted value before debounce cancels write cleanly.
+        let t1 = t0 + Duration::from_millis(300);
+        st.stage(
+            SoundSnapshot {
+                master_volume: 75,
+                muted: false,
+                enabled: true,
+            },
+            t1,
+        );
+        assert!(st.is_dirty());
+        st.stage(
+            SoundSnapshot {
+                master_volume: 75,
+                muted: true,
+                enabled: true,
+            },
+            t1 + Duration::from_millis(20),
+        );
+        assert!(!st.is_dirty());
+        assert_eq!(
+            st.take_pending_changes(SoundSnapshot {
+                master_volume: 75,
+                muted: true,
+                enabled: true,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn popup_grab_transition_clears_on_failure() {
+        assert_eq!(transition_popup_grab(None, 42, true), Some(42));
+        assert_eq!(transition_popup_grab(Some(42), 99, true), Some(99));
+        assert_eq!(transition_popup_grab(Some(42), 99, false), None);
     }
 }

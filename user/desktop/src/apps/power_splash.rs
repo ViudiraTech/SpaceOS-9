@@ -10,7 +10,10 @@
 
 use crate::ddm::wire::PowerAction;
 use crate::draw::{mix, Canvas, Rect};
+use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
+use crate::theme::Theme;
+use crate::ui;
 use crate::x11::{CursorKind, X};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -278,6 +281,173 @@ fn draw_progress_ring(canvas: &mut Canvas, cx: f32, cy: f32, elapsed_s: f32, don
 fn draw_frame(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
+    theme: &Theme,
+    action: PowerAction,
+    elapsed_s: f32,
+    tailer: &LogTailer,
+) {
+    if theme.is_win98() {
+        draw_frame_win98(canvas, text, theme, action, elapsed_s, tailer);
+        return;
+    }
+    draw_frame_spui(canvas, text, action, elapsed_s, tailer);
+}
+
+fn draw_frame_win98(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    action: PowerAction,
+    elapsed_s: f32,
+    tailer: &LogTailer,
+) {
+    let bounds = canvas.bounds();
+    canvas.fill(bounds, theme.bg_top);
+
+    let is_reboot = matches!(action, PowerAction::Reboot);
+    let dw = (bounds.w - 96).clamp(480, 740);
+    let dh = (bounds.h - 96).clamp(340, 460);
+    let dialog = Rect::new((bounds.w - dw) / 2, (bounds.h - dh) / 2, dw, dh);
+    canvas.fill(dialog, theme.panel);
+    ui::window_outer_bevel(canvas, theme, dialog);
+
+    let tb = Rect::new(dialog.x + 3, dialog.y + 3, dialog.w - 6, 22);
+    canvas.horizontal_gradient(tb, theme.titlebar, theme.titlebar_hi);
+    text.draw(
+        canvas,
+        if is_reboot {
+            "正在重新启动 Windows"
+        } else {
+            "正在关闭 Windows"
+        },
+        (tb.x + 8) as f32,
+        (tb.y + 15) as f32,
+        11.5,
+        theme.titlebar_text,
+        Face::Bold,
+    );
+
+    icons::draw(canvas, Icon::SpaceLogo, dialog.x + 22, tb.bottom() + 18, 42, None);
+    let heading = if tailer.done {
+        if is_reboot {
+            "即将重新启动计算机…"
+        } else {
+            "现在可以安全地关闭计算机了。"
+        }
+    } else if is_reboot {
+        "SpaceOS 正在重新启动，请稍候…"
+    } else {
+        "SpaceOS 正在保存设置并关机，请稍候…"
+    };
+    text.draw(
+        canvas,
+        heading,
+        (dialog.x + 76) as f32,
+        (tb.bottom() + 36) as f32,
+        15.0,
+        theme.text,
+        Face::Bold,
+    );
+    let status_sub = if tailer.done {
+        "正在移交控制权至系统内核…"
+    } else {
+        "正在停止后台服务并同步磁盘缓存…"
+    };
+    text.draw(
+        canvas,
+        status_sub,
+        (dialog.x + 76) as f32,
+        (tb.bottom() + 56) as f32,
+        11.5,
+        theme.text_dim,
+        Face::Ui,
+    );
+
+    // Classic Windows 98 chunky block marquee progress bar
+    let bar = Rect::new(dialog.x + 22, tb.bottom() + 74, dialog.w - 44, 20);
+    canvas.fill(bar, theme.input_bg);
+    ui::sunken_bevel(canvas, theme, bar);
+    let inner = bar.inset(3);
+    if tailer.done {
+        canvas.fill(inner, theme.selection_bg);
+    } else {
+        let block_w = 12;
+        let gap = 3;
+        let span = (inner.w + 80).max(120);
+        let head = ((elapsed_s * 140.0) as i32) % span - 70;
+        canvas.with_clip(inner, |cv| {
+            for k in 0..5 {
+                let bx = inner.x + head + k * (block_w + gap);
+                cv.fill(Rect::new(bx, inner.y, block_w, inner.h), theme.selection_bg);
+            }
+        });
+    }
+
+    text.draw(
+        canvas,
+        "系统关机服务日志:",
+        (dialog.x + 22) as f32,
+        (bar.bottom() + 20) as f32,
+        11.0,
+        theme.text,
+        Face::Ui,
+    );
+    let log_y = bar.bottom() + 28;
+    let log_rect = Rect::new(
+        dialog.x + 22,
+        log_y,
+        dialog.w - 44,
+        (dialog.bottom() - log_y - 18).max(120),
+    );
+    canvas.fill(log_rect, 0x000000);
+    ui::sunken_bevel(canvas, theme, log_rect);
+
+    let body = log_rect.inset(8);
+    let line_h = 18;
+    let max_lines = (body.h / line_h).max(1) as usize;
+    let start_idx = tailer.lines.len().saturating_sub(max_lines);
+    let max_w = (body.w - 6) as f32;
+    canvas.with_clip(body, |canvas| {
+        if tailer.lines.is_empty() {
+            text.draw(
+                canvas,
+                "Awaiting systemg PID-1 shutdown telemetry...",
+                body.x as f32,
+                (body.y + 14) as f32,
+                11.5,
+                0xc0c0c0,
+                Face::Mono,
+            );
+            return;
+        }
+        let mut y = body.y + 14;
+        let visible = &tailer.lines[start_idx..];
+        let blink_cursor = ((elapsed_s * 2.5) as u32).is_multiple_of(2);
+        for (idx, line) in visible.iter().enumerate() {
+            let is_last = idx + 1 == visible.len();
+            let raw = if is_last && blink_cursor {
+                format!("{} _", line.text)
+            } else {
+                line.text.clone()
+            };
+            let clipped = text.truncate(&raw, max_w, 11.5, Face::Mono);
+            text.draw(
+                canvas,
+                &clipped,
+                body.x as f32,
+                y as f32,
+                11.5,
+                line.accent,
+                Face::Mono,
+            );
+            y += line_h;
+        }
+    });
+}
+
+fn draw_frame_spui(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
     action: PowerAction,
     elapsed_s: f32,
     tailer: &LogTailer,
@@ -480,20 +650,29 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let cfg = uxconf::storage::load_desktop_config_readonly();
+    let theme = Theme::from_config(&cfg);
+    let bg_color = if theme.is_win98() {
+        theme.bg_top
+    } else {
+        0x040812
+    };
+
     let x = X::connect()?;
     let mut text = TextRenderer::load()?;
+    text.set_ui_scale(theme.ui_scale());
     let win = x.generate_id()?;
     let mask = EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY;
-    x.create_window(win, x.root, 0, 0, x.width, x.height, true, mask, 0x040812)?;
+    x.create_window(win, x.root, 0, 0, x.width, x.height, true, mask, bg_color)?;
     x.set_title(win, "SpaceOS Shutdown")?;
     x.set_class(win, "spui-power-splash", "SPUI")?;
     let _ = x.set_cursor(win, CursorKind::Default);
 
-    let mut canvas = x.create_canvas(usize::from(x.width), usize::from(x.height), 0x040812);
+    let mut canvas = x.create_canvas(usize::from(x.width), usize::from(x.height), bg_color);
     let mut tailer = LogTailer::new();
     let start = Instant::now();
 
-    draw_frame(&mut canvas, &mut text, action, 0.0, &tailer);
+    draw_frame(&mut canvas, &mut text, &theme, action, 0.0, &tailer);
     let _ = x.put_canvas(win, &canvas, canvas.bounds());
     x.map(win)?;
     x.raise(win)?;
@@ -512,7 +691,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         tailer.poll();
         let elapsed_s = start.elapsed().as_secs_f32();
-        draw_frame(&mut canvas, &mut text, action, elapsed_s, &tailer);
+        draw_frame(&mut canvas, &mut text, &theme, action, elapsed_s, &tailer);
         let _ = x.put_canvas(win, &canvas, canvas.bounds());
         let _ = x.flush();
         std::thread::sleep(Duration::from_millis(25));

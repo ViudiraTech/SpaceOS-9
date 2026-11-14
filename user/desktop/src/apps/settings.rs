@@ -18,7 +18,7 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect, Sprite};
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{CursorKind, Key, Result};
 use std::ffi::CStr;
@@ -30,8 +30,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uxconf::{
     format_hex_rgb, BackdropStyle, ButtonLayout, ConfError, CursorStyle, DesktopConfig,
-    DoubleClickAction, FocusMode, NetMode, PanelPosition, ThemeMode, Value, WindowPlacement,
-    ACCENT_PRESETS, RESOLUTIONS, SOLID_BG_PRESETS, TIMEZONES, WALLPAPERS, WALLPAPER_DIR,
+    DoubleClickAction, FocusMode, NetMode, PanelPosition, ThemeMode, ThemePreset, Value,
+    WindowPlacement, ACCENT_PRESETS, RESOLUTIONS, SOLID_BG_PRESETS, THEME_PRESETS, TIMEZONES,
+    WALLPAPERS, WALLPAPER_DIR,
 };
 use x11rb::protocol::xproto::ConnectionExt;
 
@@ -55,6 +56,11 @@ pub trait SettingsHost {
     /// (atomic write + fsync + broadcast). Used for high-rate previews such as
     /// slider drags; the final value is committed with `set_config_property`.
     fn stage_config_property(&mut self, channel: &str, property: &str, value: Value);
+    fn apply_theme_preset(&mut self, preset: ThemePreset) {
+        for (channel, property, value) in preset.properties() {
+            self.set_config_property(channel, property, value);
+        }
+    }
     fn reset_config_channel(&mut self, channel: &str);
     fn factory_reset(&mut self) -> Option<std::result::Result<(), ConfError>>;
 }
@@ -188,6 +194,13 @@ pub struct SettingSearchItem {
 
 pub const SETTING_ITEMS: &[SettingSearchItem] = &[
     // 外观
+    SettingSearchItem {
+        page: Page::Appearance,
+        category: "外观",
+        title: "系统桌面主题",
+        subtitle: "切换 SPUI 4.0 现代界面与经典 Windows 98 主题",
+        keywords: "theme style win98 windows 98 classic spui 主题 经典 风格 复古",
+    },
     SettingSearchItem {
         page: Page::Appearance,
         category: "外观",
@@ -411,6 +424,7 @@ const NAV: [(Page, &str, Icon); 11] = [
 enum HitTarget {
     Nav(usize),
     ResetPage,
+    ThemePreset(usize),
     ThemeMode(ThemeMode),
     Accent(usize),
     FontScale(usize),
@@ -1368,12 +1382,7 @@ pub fn run(initial_page: Option<&str>) -> Result<()> {
         }
 
         if app.needs_redraw {
-            let bounds = Rect::new(
-                0,
-                TITLEBAR_HEIGHT,
-                app.width as i32,
-                (app.height as i32 - TITLEBAR_HEIGHT).max(1),
-            );
+            let bounds = app.content();
             state.draw(
                 &mut app.canvas,
                 &mut app.text,
@@ -1505,6 +1514,11 @@ impl SettingsState {
                     _ => {}
                 }
                 self.status = "已恢复默认设置".to_string();
+            }
+            HitTarget::ThemePreset(i) => {
+                let preset = THEME_PRESETS[i];
+                host.apply_theme_preset(preset);
+                self.status = format!("已切换为「{}」系统主题", preset.name());
             }
             HitTarget::ThemeMode(mode) => {
                 host.set_config_property(
@@ -2161,6 +2175,8 @@ impl SettingsState {
         let sidebar_w = sidebar_width_for(bounds, style);
         let header_h = header_height_for(style);
 
+        let ctrl_r = theme.radius_control();
+        let is_win98 = theme.is_win98();
         match style {
             SettingsRenderStyle::Classic => {
                 canvas.fill(bounds, theme.window);
@@ -2183,26 +2199,38 @@ impl SettingsState {
                 );
             }
             SettingsRenderStyle::Xj380 => {
-                let pane_bg = if theme.mode == ThemeMode::Dark {
-                    0x101620
+                if is_win98 {
+                    canvas.fill(bounds, theme.window);
+                    canvas.fill(
+                        Rect::new(bounds.x, bounds.y, sidebar_w, bounds.h),
+                        theme.window_alt,
+                    );
+                    canvas.fill(
+                        Rect::new(bounds.x + sidebar_w - 1, bounds.y, 1, bounds.h),
+                        theme.bevel_shadow,
+                    );
                 } else {
-                    0xf3f5f8
-                };
-                let nav_bg = if theme.mode == ThemeMode::Dark {
-                    0x0d131d
-                } else {
-                    0xe7ecf3
-                };
-                canvas.fill_alpha(bounds, pane_bg, 0.88);
-                canvas.fill_alpha(
-                    Rect::new(bounds.x, bounds.y, sidebar_w, bounds.h),
-                    nav_bg,
-                    0.94,
-                );
-                canvas.fill(
-                    Rect::new(bounds.x + sidebar_w - 1, bounds.y, 1, bounds.h),
-                    theme.panel_border,
-                );
+                    let pane_bg = if theme.mode == ThemeMode::Dark {
+                        0x101620
+                    } else {
+                        0xf3f5f8
+                    };
+                    let nav_bg = if theme.mode == ThemeMode::Dark {
+                        0x0d131d
+                    } else {
+                        0xe7ecf3
+                    };
+                    canvas.fill_alpha(bounds, pane_bg, 0.88);
+                    canvas.fill_alpha(
+                        Rect::new(bounds.x, bounds.y, sidebar_w, bounds.h),
+                        nav_bg,
+                        0.94,
+                    );
+                    canvas.fill(
+                        Rect::new(bounds.x + sidebar_w - 1, bounds.y, 1, bounds.h),
+                        theme.panel_border,
+                    );
+                }
                 text.draw(
                     canvas,
                     "控制分类 / SETTINGS",
@@ -2220,22 +2248,29 @@ impl SettingsState {
             .iter()
             .position(|(id, _, _)| *id == self.page)
             .unwrap_or(0);
-        let target_nav_y = (nav_top + active_idx as i32 * 38) as f32;
-        let nav_y = ui::animate_float("settings_nav", target_nav_y, ui::MOTION_INDICATOR);
-        let active_pill = Rect::new(bounds.x + 10, nav_y.round() as i32, sidebar_w - 20, 34);
-        canvas.rounded_rect(active_pill, RADIUS_CONTROL, theme.accent_soft, 1.0);
-        canvas.fill(
-            Rect::new(active_pill.x, active_pill.y + 7, 3, active_pill.h - 14),
-            theme.accent,
-        );
+        if !is_win98 {
+            let target_nav_y = (nav_top + active_idx as i32 * 38) as f32;
+            let nav_y = ui::animate_float("settings_nav", target_nav_y, ui::MOTION_INDICATOR);
+            let active_pill = Rect::new(bounds.x + 10, nav_y.round() as i32, sidebar_w - 20, 34);
+            canvas.rounded_rect(active_pill, ctrl_r, theme.accent_soft, 1.0);
+            canvas.fill(
+                Rect::new(active_pill.x, active_pill.y + 7, 3, active_pill.h - 14),
+                theme.accent,
+            );
+        }
 
         for (i, (id, label, icon)) in NAV.iter().enumerate() {
             let r = Rect::new(bounds.x + 10, nav_top + i as i32 * 38, sidebar_w - 20, 34);
             let active = self.page == *id;
             let target = HitTarget::Nav(i);
-            if self.hover == Some(target) && !active {
-                canvas.rounded_rect(r, RADIUS_CONTROL, theme.panel_hover, 1.0);
-            }
+            let fg = if is_win98 {
+                ui::list_item_bg(canvas, theme, r, active, self.hover == Some(target))
+            } else {
+                if self.hover == Some(target) && !active {
+                    canvas.rounded_rect(r, ctrl_r, theme.panel_hover, 1.0);
+                }
+                if active { theme.text } else { theme.text_dim }
+            };
             icons::draw(canvas, *icon, r.x + 10, r.y + (r.h - 18) / 2, 18, None);
             text.draw(
                 canvas,
@@ -2243,7 +2278,7 @@ impl SettingsState {
                 (r.x + 36) as f32,
                 (r.y + 22) as f32,
                 12.5,
-                if active { theme.text } else { theme.text_dim },
+                fg,
                 if active { Face::Bold } else { Face::Ui },
             );
             self.hits.push(HitBox { rect: r, target });
@@ -2393,11 +2428,10 @@ impl SettingsState {
                     }
                     let row_r = Rect::new(content_x + 6, ry + 4, card_w - 12, row_h - 8);
                     let target = HitTarget::SearchJump(item.page);
-                    if hover == Some(target) {
-                        canvas.rounded_rect(row_r, RADIUS_CONTROL, theme.panel_hover, 1.0);
-                    }
+                    let row_fg =
+                        ui::list_item_bg(canvas, theme, row_r, hover == Some(target), false);
                     let badge_r = Rect::new(content_x + 14, ry + 11, 82, 22);
-                    canvas.rounded_rect(badge_r, 4, theme.accent_soft, 1.0);
+                    canvas.rounded_rect(badge_r, if is_win98 { 0 } else { 4 }, theme.accent_soft, 1.0);
                     text.draw_centered(
                         canvas,
                         item.category,
@@ -2415,7 +2449,7 @@ impl SettingsState {
                         (badge_r.right() + 12) as f32,
                         (ry + 26) as f32,
                         12.0,
-                        theme.text,
+                        row_fg,
                         Face::Ui,
                     );
                     push_clipped_hit(hits, viewport, row_r, target);
@@ -2424,6 +2458,148 @@ impl SettingsState {
             }
             match page {
                 Page::Appearance => {
+                    y = draw_section_heading(canvas, text, theme, content_x, y, "系统主题方案");
+                    let c_theme = Rect::new(content_x, y, card_w, 134);
+                    ui::card(canvas, theme, c_theme);
+                    let active_preset = THEME_PRESETS
+                        .iter()
+                        .copied()
+                        .find(|p| p.id() == cfg.theme_id)
+                        .unwrap_or_else(|| ThemePreset::from_style(cfg.theme_style));
+                    let preset_gap = 14;
+                    let preset_w = (card_w - 32 - preset_gap) / 2;
+                    for (idx, preset) in THEME_PRESETS.iter().enumerate() {
+                        let card_r = Rect::new(
+                            content_x + 16 + idx as i32 * (preset_w + preset_gap),
+                            y + 14,
+                            preset_w,
+                            82,
+                        );
+                        let selected = *preset == active_preset;
+                        let target = HitTarget::ThemePreset(idx);
+                        let hovered = hover == Some(target);
+                        if is_win98 {
+                            canvas.fill(
+                                card_r,
+                                if selected {
+                                    theme.window_alt
+                                } else if hovered {
+                                    theme.panel_hover
+                                } else {
+                                    theme.panel
+                                },
+                            );
+                            if selected {
+                                ui::sunken_bevel(canvas, theme, card_r);
+                            } else {
+                                ui::raised_bevel(canvas, theme, card_r);
+                            }
+                        } else {
+                            let fill = if selected {
+                                theme.accent_soft
+                            } else if hovered {
+                                theme.panel_hover
+                            } else {
+                                theme.window_alt
+                            };
+                            canvas.rounded_rect(card_r, ctrl_r, fill, 1.0);
+                            canvas.rounded_border(
+                                card_r,
+                                ctrl_r,
+                                if selected {
+                                    theme.accent
+                                } else {
+                                    theme.window_border
+                                },
+                                1.0,
+                                if selected { 2 } else { 1 },
+                            );
+                        }
+
+                        // Mini desktop + window preview.
+                        let mini = Rect::new(card_r.x + 12, card_r.y + 13, 82, 56);
+                        match preset {
+                            ThemePreset::Spui4 => {
+                                canvas.rounded_rect(mini, 4, 0x0f172a, 1.0);
+                                let win_m = Rect::new(mini.x + 10, mini.y + 8, mini.w - 20, 32);
+                                canvas.rounded_rect(win_m, 3, 0x1e293b, 1.0);
+                                canvas.fill(
+                                    Rect::new(win_m.x + 1, win_m.y + 1, win_m.w - 2, 7),
+                                    0x2563eb,
+                                );
+                                canvas.fill(
+                                    Rect::new(mini.x + 2, mini.bottom() - 9, mini.w - 4, 7),
+                                    0x111827,
+                                );
+                                canvas.rounded_border(mini, 4, theme.panel_border, 1.0, 1);
+                            }
+                            ThemePreset::Win98 => {
+                                canvas.fill(mini, 0x008080);
+                                let win_m = Rect::new(mini.x + 8, mini.y + 7, mini.w - 16, 33);
+                                canvas.fill(win_m, 0xc0c0c0);
+                                canvas.bevel_1px(win_m, 0xffffff, 0x404040);
+                                canvas.horizontal_gradient(
+                                    Rect::new(win_m.x + 2, win_m.y + 2, win_m.w - 4, 8),
+                                    0x000080,
+                                    0x1084d0,
+                                );
+                                canvas.fill(
+                                    Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
+                                    0xc0c0c0,
+                                );
+                                canvas.fill(
+                                    Rect::new(mini.x + 3, mini.bottom() - 7, 16, 5),
+                                    0xdfdfdf,
+                                );
+                                canvas.bevel_1px(mini, 0x808080, 0xffffff);
+                            }
+                        }
+
+                        let tx = mini.right() + 12;
+                        text.draw(
+                            canvas,
+                            preset.name(),
+                            tx as f32,
+                            (card_r.y + 28) as f32,
+                            13.5,
+                            if selected { theme.accent } else { theme.text },
+                            Face::Bold,
+                        );
+                        let sub_max = (card_r.right() - tx - 10).max(40) as f32;
+                        let sub_shown = text.truncate(preset.subtitle(), sub_max, 11.0, Face::Ui);
+                        text.draw(
+                            canvas,
+                            &sub_shown,
+                            tx as f32,
+                            (card_r.y + 47) as f32,
+                            11.0,
+                            theme.text_dim,
+                            Face::Ui,
+                        );
+                        if selected {
+                            text.draw(
+                                canvas,
+                                "● 当前启用",
+                                tx as f32,
+                                (card_r.y + 66) as f32,
+                                10.5,
+                                theme.accent,
+                                Face::Bold,
+                            );
+                        }
+                        push_clipped_hit(hits, viewport, card_r, target);
+                    }
+                    text.draw(
+                        canvas,
+                        "切换主题将立即更新桌面、任务栏、开始菜单、全部应用、登录及关机界面；深浅/强调色仍可微调",
+                        (content_x + 16) as f32,
+                        (y + 116) as f32,
+                        11.0,
+                        theme.text_muted,
+                        Face::Ui,
+                    );
+                    y += c_theme.h + 16;
+
                     y = draw_section_heading(canvas, text, theme, content_x, y, "主题与色彩");
                     let c1 = Rect::new(content_x, y, card_w, 166);
                     ui::card(canvas, theme, c1);
@@ -2458,25 +2634,42 @@ impl SettingsState {
                         } else {
                             theme.window_alt
                         };
-                        canvas.rounded_rect(card_r, RADIUS_CONTROL, fill, 1.0);
-                        canvas.rounded_border(
-                            card_r,
-                            RADIUS_CONTROL,
+                        if is_win98 {
+                            canvas.fill(
+                                card_r,
+                                if selected {
+                                    theme.window_alt
+                                } else {
+                                    theme.panel
+                                },
+                            );
                             if selected {
-                                theme.accent
+                                ui::sunken_bevel(canvas, theme, card_r);
                             } else {
-                                theme.window_border
-                            },
-                            1.0,
-                            if selected { 2 } else { 1 },
-                        );
+                                ui::raised_bevel(canvas, theme, card_r);
+                            }
+                        } else {
+                            canvas.rounded_rect(card_r, ctrl_r, fill, 1.0);
+                            canvas.rounded_border(
+                                card_r,
+                                ctrl_r,
+                                if selected {
+                                    theme.accent
+                                } else {
+                                    theme.window_border
+                                },
+                                1.0,
+                                if selected { 2 } else { 1 },
+                            );
+                        }
                         let mini = Rect::new(card_r.x + 12, card_r.y + 11, 56, 44);
-                        canvas.rounded_rect(mini, 4, bg_col, 1.0);
+                        let mini_r = if is_win98 { 0 } else { 4 };
+                        canvas.rounded_rect(mini, mini_r, bg_col, 1.0);
                         canvas.fill(
                             Rect::new(mini.x + 1, mini.y + 1, mini.w - 2, 10),
                             chrome_col,
                         );
-                        canvas.rounded_border(mini, 4, theme.panel_border, 1.0, 1);
+                        canvas.rounded_border(mini, mini_r, theme.panel_border, 1.0, 1);
                         canvas.fill(Rect::new(mini.x + 7, mini.y + 18, 22, 4), cfg.accent);
                         canvas.fill(Rect::new(mini.x + 7, mini.y + 27, 36, 3), fg_col);
                         canvas.fill(Rect::new(mini.x + 7, mini.y + 34, 28, 3), chrome_col);
@@ -2574,7 +2767,7 @@ impl SettingsState {
                     } else {
                         theme.window_alt
                     };
-                    canvas.rounded_rect(badge_r, RADIUS_CONTROL, badge_bg, 1.0);
+                    canvas.rounded_rect(badge_r, ctrl_r, badge_bg, 1.0);
                     let (net_ic, ic_tint) = if connected {
                         (Icon::NetworkWired, theme.success)
                     } else {
@@ -4007,18 +4200,14 @@ impl SettingsState {
                         let row_r = Rect::new(content_x + 6, ry + 4, card_w - 12, tz_row_h - 8);
                         let selected = cfg.timezone == *tz_id;
                         let target = HitTarget::Timezone(i);
-                        if selected {
-                            canvas.rounded_rect(row_r, RADIUS_CONTROL, theme.accent_soft, 1.0);
-                        } else if hover == Some(target) {
-                            canvas.rounded_rect(row_r, RADIUS_CONTROL, theme.panel_hover, 1.0);
-                        }
+                        let fg = ui::list_item_bg(canvas, theme, row_r, selected, hover == Some(target));
                         text.draw(
                             canvas,
                             tz_name,
                             (content_x + 18) as f32,
                             (ry + 27) as f32,
                             12.5,
-                            if selected { theme.accent } else { theme.text },
+                            if selected && !is_win98 { theme.accent } else { fg },
                             if selected { Face::Bold } else { Face::Ui },
                         );
                         let id_w = text.measure(tz_id, 11.5, Face::Ui);
@@ -4029,7 +4218,7 @@ impl SettingsState {
                             (ry + 27) as f32,
                             11.5,
                             if selected {
-                                theme.accent
+                                if is_win98 { fg } else { theme.accent }
                             } else {
                                 theme.text_muted
                             },
@@ -4126,13 +4315,13 @@ impl SettingsState {
                         };
                         let target = HitTarget::LogFilter(f_idx);
                         if is_active {
-                            canvas.rounded_rect(btn_r, RADIUS_CONTROL, theme.accent_soft, 1.0);
+                            canvas.rounded_rect(btn_r, ctrl_r, theme.accent_soft, 1.0);
                             canvas.fill(
                                 Rect::new(btn_r.x + 12, btn_r.bottom() - 2, btn_r.w - 24, 2),
                                 theme.accent,
                             );
                         } else if hover == Some(target) {
-                            canvas.rounded_rect(btn_r, RADIUS_CONTROL, theme.panel_hover, 1.0);
+                            canvas.rounded_rect(btn_r, ctrl_r, theme.panel_hover, 1.0);
                         }
                         let lw = text.measure(
                             flabel,
@@ -4269,9 +4458,9 @@ impl SettingsState {
                             let target = HitTarget::LogSelect(*orig_idx);
 
                             if is_selected {
-                                canvas.rounded_rect(row_r, RADIUS_CONTROL, theme.accent_soft, 1.0);
+                                canvas.rounded_rect(row_r, ctrl_r, theme.accent_soft, 1.0);
                             } else if hover == Some(target) {
-                                canvas.rounded_rect(row_r, RADIUS_CONTROL, theme.panel_hover, 1.0);
+                                canvas.rounded_rect(row_r, ctrl_r, theme.panel_hover, 1.0);
                             }
 
                             let (badge_txt, badge_bg, badge_fg) = match entry.prio {

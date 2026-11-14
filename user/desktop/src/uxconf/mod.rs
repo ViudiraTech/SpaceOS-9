@@ -400,6 +400,138 @@ impl ThemeMode {
     }
 }
 
+/// Visual chrome / widget geometry family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ThemeStyle {
+    Spui,
+    Win98,
+}
+
+impl ThemeStyle {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spui => "spui",
+            Self::Win98 => "win98",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("win98") {
+            Self::Win98
+        } else {
+            Self::Spui
+        }
+    }
+}
+
+/// Built-in complete desktop theme packs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ThemePreset {
+    Spui4,
+    Win98,
+}
+
+impl ThemePreset {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Spui4 => "spui-4",
+            Self::Win98 => "win98",
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Spui4 => "SPUI 4.0",
+            Self::Win98 => "Windows 98",
+        }
+    }
+
+    pub const fn subtitle(self) -> &'static str {
+        match self {
+            Self::Spui4 => "现代圆角纯色风格 · 深浅双色可调",
+            Self::Win98 => "经典 98 立体浮雕边框 · #008080 青绿桌面",
+        }
+    }
+
+    pub const fn style(self) -> ThemeStyle {
+        match self {
+            Self::Spui4 => ThemeStyle::Spui,
+            Self::Win98 => ThemeStyle::Win98,
+        }
+    }
+
+    pub const fn from_style(style: ThemeStyle) -> Self {
+        match style {
+            ThemeStyle::Spui => Self::Spui4,
+            ThemeStyle::Win98 => Self::Win98,
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        let lower = raw.trim().to_ascii_lowercase();
+        if lower == "win98" || lower == "windows98" {
+            Self::Win98
+        } else {
+            Self::Spui4
+        }
+    }
+
+    /// Canonical `(channel, property, value)` bundle applied when switching theme packs.
+    pub fn properties(self) -> Vec<(&'static str, &'static str, Value)> {
+        match self {
+            Self::Spui4 => vec![
+                ("appearance", "/theme/id", Value::String("spui-4".to_string())),
+                ("appearance", "/theme/style", Value::String("spui".to_string())),
+                ("appearance", "/theme/mode", Value::String("dark".to_string())),
+                (
+                    "appearance",
+                    "/theme/accent",
+                    Value::String("#3b82f6".to_string()),
+                ),
+                ("appearance", "/font/scale", Value::Int(100)),
+                (
+                    "desktop",
+                    "/backdrop/style",
+                    Value::String("cover".to_string()),
+                ),
+                (
+                    "desktop",
+                    "/backdrop/wallpaper",
+                    Value::String(WALLPAPERS[0].file.to_string()),
+                ),
+                (
+                    "desktop",
+                    "/backdrop/solid-color",
+                    Value::String("#1e293b".to_string()),
+                ),
+            ],
+            Self::Win98 => vec![
+                ("appearance", "/theme/id", Value::String("win98".to_string())),
+                ("appearance", "/theme/style", Value::String("win98".to_string())),
+                ("appearance", "/theme/mode", Value::String("light".to_string())),
+                (
+                    "appearance",
+                    "/theme/accent",
+                    Value::String("#000080".to_string()),
+                ),
+                ("appearance", "/font/scale", Value::Int(100)),
+                (
+                    "desktop",
+                    "/backdrop/style",
+                    Value::String("solid".to_string()),
+                ),
+                (
+                    "desktop",
+                    "/backdrop/solid-color",
+                    Value::String("#008080".to_string()),
+                ),
+            ],
+        }
+    }
+}
+
+pub const THEME_PRESETS: [ThemePreset; 2] = [ThemePreset::Spui4, ThemePreset::Win98];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackdropStyle {
     Cover,
@@ -617,7 +749,7 @@ pub const WALLPAPERS: [WallpaperInfo; 4] = [
     },
 ];
 
-pub const ACCENT_PRESETS: [(u32, &str); 8] = [
+pub const ACCENT_PRESETS: [(u32, &str); 9] = [
     (0x3b82f6, "湛蓝"),
     (0x0ea5e9, "天青"),
     (0x10b981, "翡翠"),
@@ -626,10 +758,12 @@ pub const ACCENT_PRESETS: [(u32, &str); 8] = [
     (0x8b5cf6, "紫罗兰"),
     (0x6366f1, "靛蓝"),
     (0x64748b, "石板灰"),
+    (0x000080, "98 深蓝"),
 ];
 
-pub const SOLID_BG_PRESETS: [(u32, &str); 6] = [
+pub const SOLID_BG_PRESETS: [(u32, &str); 7] = [
     (0x1e293b, "深岩灰蓝"),
+    (0x008080, "Win98 青绿"),
     (0x18181b, "石墨纯黑"),
     (0x0f3d3e, "深海墨绿"),
     (0x2e1f47, "暮色暗紫"),
@@ -786,6 +920,8 @@ pub fn encode_start_tiles(tiles: &[StartTileSpec]) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesktopConfig {
     // appearance
+    pub theme_id: String,
+    pub theme_style: ThemeStyle,
     pub mode: ThemeMode,
     pub accent: u32,
     pub font_scale: i32,
@@ -859,6 +995,8 @@ pub struct DesktopConfig {
 impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
+            theme_id: ThemePreset::Spui4.id().to_string(),
+            theme_style: ThemeStyle::Spui,
             mode: ThemeMode::Dark,
             accent: ACCENT_PRESETS[0].0,
             font_scale: 100,
@@ -925,10 +1063,30 @@ impl DesktopConfig {
         format!("{WALLPAPER_DIR}/{}", self.wallpaper)
     }
 
+    /// Apply a built-in theme preset bundle in memory (used by tests & offline previews).
+    pub fn apply_theme_preset(&mut self, preset: ThemePreset) -> bool {
+        let mut changed = false;
+        for (ch, prop, val) in preset.properties() {
+            changed |= self.apply_property(ch, prop, &val);
+        }
+        changed
+    }
+
     /// Apply a single `(channel, property, value)` update, returning `true` if the snapshot changed.
     pub fn apply_property(&mut self, channel: &str, property: &str, value: &Value) -> bool {
         let before = self.clone();
         match (channel, property) {
+            ("appearance", "/theme/id") => {
+                if let Some(s) = value.as_str() {
+                    let parsed = ThemePreset::parse(s);
+                    self.theme_id = parsed.id().to_string();
+                }
+            }
+            ("appearance", "/theme/style") => {
+                if let Some(s) = value.as_str() {
+                    self.theme_style = ThemeStyle::parse(s);
+                }
+            }
             ("appearance", "/theme/mode") => {
                 if let Some(s) = value.as_str() {
                     self.mode = ThemeMode::parse(s);
@@ -1315,5 +1473,35 @@ mod tests {
         assert_eq!(sanitized[0].size, StartTileSize::Wide);
         assert_eq!(sanitized[1].id, "app-term");
         assert_eq!(sanitized[1].size, StartTileSize::Large);
+    }
+
+    #[test]
+    fn theme_preset_roundtrip_and_overrides() {
+        let mut cfg = DesktopConfig::default();
+        assert_eq!(cfg.theme_id, "spui-4");
+        assert_eq!(cfg.theme_style, ThemeStyle::Spui);
+
+        assert!(cfg.apply_theme_preset(ThemePreset::Win98));
+        assert_eq!(cfg.theme_id, "win98");
+        assert_eq!(cfg.theme_style, ThemeStyle::Win98);
+        assert_eq!(cfg.mode, ThemeMode::Light);
+        assert_eq!(cfg.accent, 0x000080);
+        assert_eq!(cfg.backdrop_style, BackdropStyle::Solid);
+        assert_eq!(cfg.solid_color, 0x008080);
+
+        // User override keeps Win98 chrome while changing accent cleanly.
+        assert!(cfg.apply_property(
+            "appearance",
+            "/theme/accent",
+            &Value::String("#e11d48".to_string())
+        ));
+        assert_eq!(cfg.theme_style, ThemeStyle::Win98);
+        assert_eq!(cfg.accent, 0xe11d48);
+
+        assert!(cfg.apply_theme_preset(ThemePreset::Spui4));
+        assert_eq!(cfg.theme_id, "spui-4");
+        assert_eq!(cfg.theme_style, ThemeStyle::Spui);
+        assert_eq!(cfg.mode, ThemeMode::Dark);
+        assert_eq!(cfg.backdrop_style, BackdropStyle::Cover);
     }
 }

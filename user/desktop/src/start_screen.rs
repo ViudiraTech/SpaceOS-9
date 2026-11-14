@@ -22,7 +22,7 @@ use crate::icons::{self, Icon};
 use crate::netmgr::NetStatus;
 use crate::shell::{now_local, session_identity, AppCategory, APPS};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, RADIUS_CONTROL, RADIUS_POPUP};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::{CursorKind, Key, X};
 use std::fs;
@@ -285,6 +285,7 @@ struct BackdropSig {
     style: BackdropStyle,
     solid: u32,
     mode: ThemeMode,
+    theme_style: uxconf::ThemeStyle,
 }
 
 /// Responsive top-header layout coordinates guaranteed overlap-free at 800..1920+ px.
@@ -1081,6 +1082,7 @@ impl StartScreenState {
             style: config.backdrop_style,
             solid: config.solid_color,
             mode: config.mode,
+            theme_style: config.theme_style,
         };
         if self.backdrop_sig.as_ref() == Some(&sig)
             && self.backdrop.len() == usize::from(w) * usize::from(h)
@@ -1164,12 +1166,20 @@ impl StartScreenState {
         hdr: HeaderLayout,
     ) {
         let w = canvas.width as i32;
-        let hdr_bg = if theme.mode == ThemeMode::Dark {
-            0x0a1019
+        let is_win98 = theme.is_win98();
+        let ctrl_r = theme.radius_control();
+        if is_win98 {
+            canvas.fill(Rect::new(0, 0, w, hdr.height - 2), theme.panel);
+            canvas.fill(Rect::new(0, hdr.height - 2, w, 1), theme.bevel_shadow);
+            canvas.fill(Rect::new(0, hdr.height - 1, w, 1), theme.bevel_hi);
         } else {
-            0xeaf0f6
-        };
-        canvas.fill_alpha(Rect::new(0, 0, w, hdr.height - 3), hdr_bg, 0.92);
+            let hdr_bg = if theme.mode == ThemeMode::Dark {
+                0x0a1019
+            } else {
+                0xeaf0f6
+            };
+            canvas.fill_alpha(Rect::new(0, 0, w, hdr.height - 3), hdr_bg, 0.92);
+        }
 
         // XJ380 branding on the left.
         let logo_sz = if hdr.compact { 26 } else { 32 };
@@ -1205,7 +1215,11 @@ impl StartScreenState {
             );
             text.draw(
                 canvas,
-                "SPACEOS 9 · SPUI",
+                if is_win98 {
+                    "SPACEOS 9 · 经典模式"
+                } else {
+                    "SPACEOS 9 · SPUI"
+                },
                 (logo_x + logo_sz + 12) as f32,
                 (logo_y + 31) as f32,
                 10.0,
@@ -1214,48 +1228,62 @@ impl StartScreenState {
             );
         }
 
-        // Animated active tab indicator under XJ380 Metro tab buttons.
+        // Animated active tab indicator under XJ380 Metro tab buttons (SPUI).
         let active_idx = StartTab::ALL
             .iter()
             .position(|(t, _)| *t == self.tab)
             .unwrap_or(0);
-        let target_tab_x = hdr.tabs[active_idx].x as f32;
-        let anim_x = ui::animate_float("start_tab_x", target_tab_x, ui::MOTION_INDICATOR);
-        let tab_r = hdr.tabs[active_idx];
-        canvas.rounded_rect(
-            Rect::new(anim_x.round() as i32, tab_r.y, tab_r.w, tab_r.h),
-            RADIUS_CONTROL,
-            theme.accent,
-            0.22,
-        );
+        if !is_win98 {
+            let target_tab_x = hdr.tabs[active_idx].x as f32;
+            let anim_x = ui::animate_float("start_tab_x", target_tab_x, ui::MOTION_INDICATOR);
+            let tab_r = hdr.tabs[active_idx];
+            canvas.rounded_rect(
+                Rect::new(anim_x.round() as i32, tab_r.y, tab_r.w, tab_r.h),
+                ctrl_r,
+                theme.accent,
+                0.22,
+            );
+        }
 
         for (i, (tab, label)) in StartTab::ALL.iter().enumerate() {
             let r = hdr.tabs[i];
             let active = *tab == self.tab;
             let hov = self.hover == Some(StartHit::Tab(*tab));
-            let fill = if active {
-                theme.accent
-            } else if hov {
-                theme.panel_hover
-            } else if theme.mode == ThemeMode::Dark {
-                0x192334
-            } else {
-                0xdde5ef
-            };
-            let fill_alpha = if active { 0.88 } else { 0.80 };
-            canvas.rounded_rect(r, RADIUS_CONTROL, fill, fill_alpha);
-            canvas.rounded_border(
-                r,
-                RADIUS_CONTROL,
-                if active || hov {
-                    theme.accent
+            let txt_col = if is_win98 {
+                if active {
+                    canvas.fill(r, mix(theme.panel, theme.bevel_hi, 0.45));
+                    ui::sunken_bevel(canvas, theme, r);
+                    canvas.fill(Rect::new(r.x + 2, r.y + 2, r.w - 4, 2), theme.accent);
                 } else {
-                    theme.panel_border
-                },
-                if active { 0.9 } else { 0.6 },
-                1,
-            );
-            let txt_col = if active { 0xffffff } else { theme.text };
+                    canvas.fill(r, if hov { theme.panel_hover } else { theme.panel });
+                    ui::raised_bevel(canvas, theme, r);
+                }
+                theme.text
+            } else {
+                let fill = if active {
+                    theme.accent
+                } else if hov {
+                    theme.panel_hover
+                } else if theme.mode == ThemeMode::Dark {
+                    0x192334
+                } else {
+                    0xdde5ef
+                };
+                let fill_alpha = if active { 0.88 } else { 0.80 };
+                canvas.rounded_rect(r, ctrl_r, fill, fill_alpha);
+                canvas.rounded_border(
+                    r,
+                    ctrl_r,
+                    if active || hov {
+                        theme.accent
+                    } else {
+                        theme.panel_border
+                    },
+                    if active { 0.9 } else { 0.6 },
+                    1,
+                );
+                if active { 0xffffff } else { theme.text }
+            };
             text.draw_centered(
                 canvas,
                 label,
@@ -1705,13 +1733,19 @@ impl StartScreenState {
 
         // XJ380 Bottom Status & Return-to-Desktop Footer.
         let footer = Rect::new(0, body.bottom() - footer_h, body.w, footer_h);
-        let foot_bg = if theme.mode == ThemeMode::Dark {
-            0x0a1019
+        if theme.is_win98() {
+            canvas.fill(footer, theme.panel);
+            canvas.fill(Rect::new(0, footer.y, body.w, 1), theme.bevel_light);
+            canvas.fill(Rect::new(0, footer.y + 1, body.w, 1), theme.bevel_hi);
         } else {
-            0xeaf0f6
-        };
-        canvas.fill_alpha(footer, foot_bg, 0.90);
-        canvas.fill(Rect::new(0, footer.y, body.w, 1), theme.panel_border);
+            let foot_bg = if theme.mode == ThemeMode::Dark {
+                0x0a1019
+            } else {
+                0xeaf0f6
+            };
+            canvas.fill_alpha(footer, foot_bg, 0.90);
+            canvas.fill(Rect::new(0, footer.y, body.w, 1), theme.panel_border);
+        }
         let status_summary = format!(
             "运行窗口: {}  ·  CPU: {}%  ·  内存: {}/{} MiB  ·  右键磁贴自定义布局  ·  按 Esc 返回",
             open_windows, self.cpu_pct, self.mem_used_mb, self.mem_total_mb
@@ -1788,6 +1822,7 @@ impl StartScreenState {
             Face::Bold,
         );
 
+        let is_win98 = theme.is_win98();
         if app_matches.is_empty() {
             text.draw(
                 canvas,
@@ -1803,9 +1838,8 @@ impl StartScreenState {
                 let ry = y + 38 + slot as i32 * 38;
                 let r = Rect::new(left_x, ry, col_w, 34);
                 let target = StartHit::SearchApp(app_idx);
-                if self.hover == Some(target) || slot == 0 {
-                    canvas.rounded_rect(r, RADIUS_CONTROL, theme.accent_soft, 1.0);
-                }
+                let sel = self.hover == Some(target) || slot == 0;
+                let row_fg = ui::list_item_bg(canvas, theme, r, sel, false);
                 let app = &APPS[app_idx];
                 icons::draw(canvas, app.icon, r.x + 8, r.y + 6, 22, None);
                 let label = format!("{}  ·  {}", app.name, app.subtitle);
@@ -1816,7 +1850,7 @@ impl StartScreenState {
                     (r.x + 36) as f32,
                     (r.y + 22) as f32,
                     12.0,
-                    theme.text,
+                    row_fg,
                     Face::Ui,
                 );
                 if let Some(clipped) = non_empty_clip(r, viewport) {
@@ -1840,11 +1874,10 @@ impl StartScreenState {
                 let ry = y + 38 + slot as i32 * 38;
                 let r = Rect::new(right_x, ry, col_w, 34);
                 let target = StartHit::SearchSetting(slot);
-                if self.hover == Some(target) {
-                    canvas.rounded_rect(r, RADIUS_CONTROL, theme.panel_hover, 1.0);
-                }
+                let row_fg =
+                    ui::list_item_bg(canvas, theme, r, self.hover == Some(target), false);
                 let badge = Rect::new(r.x + 6, r.y + 7, 72, 20);
-                canvas.rounded_rect(badge, 3, theme.accent_soft, 1.0);
+                canvas.rounded_rect(badge, if is_win98 { 0 } else { 3 }, theme.accent_soft, 1.0);
                 text.draw_centered(
                     canvas,
                     item.category,
@@ -1862,7 +1895,7 @@ impl StartScreenState {
                     (badge.right() + 10) as f32,
                     (r.y + 22) as f32,
                     11.5,
-                    theme.text,
+                    row_fg,
                     Face::Ui,
                 );
                 if let Some(clipped) = non_empty_clip(r, viewport) {
@@ -2223,16 +2256,26 @@ impl StartScreenState {
                 // Interactive quick-mute pill on the top-right of the tile.
                 let mute_r = Rect::new(r.right() - 62, r.y + 14, 48, 22);
                 let hov_m = self.hover == Some(StartHit::AudioTileMute);
-                canvas.rounded_rect(
-                    mute_r,
-                    4,
-                    if hov_m {
-                        theme.accent
+                let bar_rad = if theme.is_win98() { 0 } else { 4 };
+                if theme.is_win98() {
+                    canvas.fill(mute_r, if hov_m { theme.panel_hover } else { theme.panel });
+                    if cfg.sound_muted {
+                        ui::sunken_bevel(canvas, theme, mute_r);
                     } else {
-                        theme.accent_soft
-                    },
-                    1.0,
-                );
+                        ui::raised_bevel(canvas, theme, mute_r);
+                    }
+                } else {
+                    canvas.rounded_rect(
+                        mute_r,
+                        4,
+                        if hov_m {
+                            theme.accent
+                        } else {
+                            theme.accent_soft
+                        },
+                        1.0,
+                    );
+                }
                 text.draw_centered(
                     canvas,
                     if cfg.sound_muted {
@@ -2243,7 +2286,11 @@ impl StartScreenState {
                     mute_r.x as f32 + 24.0,
                     (mute_r.y + 15) as f32,
                     9.5,
-                    if hov_m { 0xffffff } else { theme.text },
+                    if hov_m && !theme.is_win98() {
+                        0xffffff
+                    } else {
+                        theme.text
+                    },
                     Face::Bold,
                 );
                 if let Some(clipped) = non_empty_clip(mute_r, viewport) {
@@ -2253,10 +2300,15 @@ impl StartScreenState {
                 // Visual volume level meter bar.
                 let bar_w = (r.w - 32).max(40);
                 let bar_r = Rect::new(r.x + 16, r.y + 56, bar_w, 8);
-                canvas.rounded_rect(bar_r, 4, theme.panel_border, 0.7);
+                canvas.rounded_rect(bar_r, bar_rad, theme.panel_border, 0.7);
                 let fill_w = ((bar_w * if cfg.sound_muted { 0 } else { vol }) / 100).max(0);
                 if fill_w > 0 {
-                    canvas.rounded_rect(Rect::new(bar_r.x, bar_r.y, fill_w, 8), 4, accent, 1.0);
+                    canvas.rounded_rect(
+                        Rect::new(bar_r.x, bar_r.y, fill_w, 8),
+                        bar_rad,
+                        accent,
+                        1.0,
+                    );
                 }
                 let music_txt = format!("曲库默认: {}", self.music_track);
                 let shown = text.truncate(&music_txt, (r.w - 32).max(80) as f32, 11.5, Face::Ui);
@@ -2329,6 +2381,7 @@ impl StartScreenState {
                 let left_bar = Rect::new(r.x + 16, r.y + 70, bar_w, 8);
                 let right_bar = Rect::new(left_bar.right() + 16, r.y + 70, bar_w, 8);
 
+                let bar_rad = if theme.is_win98() { 0 } else { 4 };
                 text.draw(
                     canvas,
                     &format!("CPU {}%", self.cpu_pct),
@@ -2338,12 +2391,12 @@ impl StartScreenState {
                     theme.text_dim,
                     Face::Bold,
                 );
-                canvas.rounded_rect(left_bar, 4, theme.panel_border, 0.7);
+                canvas.rounded_rect(left_bar, bar_rad, theme.panel_border, 0.7);
                 let cpu_fill = (bar_w * i32::from(self.cpu_pct)) / 100;
                 if cpu_fill > 0 {
                     canvas.rounded_rect(
                         Rect::new(left_bar.x, left_bar.y, cpu_fill, 8),
-                        4,
+                        bar_rad,
                         accent,
                         1.0,
                     );
@@ -2358,12 +2411,12 @@ impl StartScreenState {
                     theme.text_dim,
                     Face::Bold,
                 );
-                canvas.rounded_rect(right_bar, 4, theme.panel_border, 0.7);
+                canvas.rounded_rect(right_bar, bar_rad, theme.panel_border, 0.7);
                 let mem_fill = (bar_w * i32::from(self.mem_pct)) / 100;
                 if mem_fill > 0 {
                     canvas.rounded_rect(
                         Rect::new(right_bar.x, right_bar.y, mem_fill, 8),
-                        4,
+                        bar_rad,
                         theme.accent,
                         1.0,
                     );
@@ -2492,22 +2545,33 @@ impl StartScreenState {
         body: Rect,
     ) {
         let rail_w = if body.w >= 960 { 224 } else { 180 };
-        let nav_bg = if theme.mode == ThemeMode::Dark {
-            0x0d131d
+        let is_win98 = theme.is_win98();
+        let ctrl_r = theme.radius_control();
+        if is_win98 {
+            canvas.fill(body, theme.window);
+            canvas.fill(Rect::new(body.x, body.y, rail_w, body.h), theme.window_alt);
+            canvas.fill(
+                Rect::new(body.x + rail_w - 1, body.y, 1, body.h),
+                theme.bevel_shadow,
+            );
         } else {
-            0xe7ecf3
-        };
-        let pane_bg = if theme.mode == ThemeMode::Dark {
-            0x101620
-        } else {
-            0xf3f5f8
-        };
-        canvas.fill_alpha(body, pane_bg, 0.84);
-        canvas.fill_alpha(Rect::new(body.x, body.y, rail_w, body.h), nav_bg, 0.94);
-        canvas.fill(
-            Rect::new(body.x + rail_w - 1, body.y, 1, body.h),
-            theme.panel_border,
-        );
+            let nav_bg = if theme.mode == ThemeMode::Dark {
+                0x0d131d
+            } else {
+                0xe7ecf3
+            };
+            let pane_bg = if theme.mode == ThemeMode::Dark {
+                0x101620
+            } else {
+                0xf3f5f8
+            };
+            canvas.fill_alpha(body, pane_bg, 0.84);
+            canvas.fill_alpha(Rect::new(body.x, body.y, rail_w, body.h), nav_bg, 0.94);
+            canvas.fill(
+                Rect::new(body.x + rail_w - 1, body.y, 1, body.h),
+                theme.panel_border,
+            );
+        }
 
         text.draw(
             canvas,
@@ -2524,12 +2588,17 @@ impl StartScreenState {
             let r = Rect::new(body.x + 10, body.y + 40 + i as i32 * 40, rail_w - 20, 34);
             let active = self.app_filter == *filter;
             let target = StartHit::AppFilter(*filter);
-            if active {
-                canvas.rounded_rect(r, RADIUS_CONTROL, theme.accent_soft, 1.0);
-                canvas.fill(Rect::new(r.x, r.y + 7, 3, r.h - 14), theme.accent);
-            } else if self.hover == Some(target) {
-                canvas.rounded_rect(r, RADIUS_CONTROL, theme.panel_hover, 1.0);
-            }
+            let label_fg = if is_win98 {
+                ui::list_item_bg(canvas, theme, r, active, self.hover == Some(target))
+            } else {
+                if active {
+                    canvas.rounded_rect(r, ctrl_r, theme.accent_soft, 1.0);
+                    canvas.fill(Rect::new(r.x, r.y + 7, 3, r.h - 14), theme.accent);
+                } else if self.hover == Some(target) {
+                    canvas.rounded_rect(r, ctrl_r, theme.panel_hover, 1.0);
+                }
+                if active { theme.text } else { theme.text_dim }
+            };
             icons::draw(canvas, *icon, r.x + 10, r.y + (r.h - 18) / 2, 18, None);
             text.draw(
                 canvas,
@@ -2537,7 +2606,7 @@ impl StartScreenState {
                 (r.x + 36) as f32,
                 (r.y + 22) as f32,
                 12.5,
-                if active { theme.text } else { theme.text_dim },
+                label_fg,
                 if active { Face::Bold } else { Face::Ui },
             );
             self.push_hit(r, target);
@@ -2645,7 +2714,12 @@ impl StartScreenState {
                     );
                     if is_pinned {
                         let pin_r = Rect::new(card_r.right() - 56, card_r.y + 14, 44, 18);
-                        canvas.rounded_rect(pin_r, 3, theme.accent_soft, 1.0);
+                        canvas.rounded_rect(
+                            pin_r,
+                            if is_win98 { 0 } else { 3 },
+                            theme.accent_soft,
+                            1.0,
+                        );
                         text.draw_centered(
                             canvas,
                             "已固定",
@@ -2738,11 +2812,13 @@ impl StartScreenState {
         let is_pinned = existing.is_some();
 
         let rect = ctx.rect(w, h);
-        ui::popup_surface(canvas, theme, rect, RADIUS_POPUP);
-        canvas.fill(
-            Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, 2),
-            theme.accent,
-        );
+        ui::popup_surface(canvas, theme, rect, theme.radius_popup());
+        if !theme.is_win98() {
+            canvas.fill(
+                Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, 2),
+                theme.accent,
+            );
+        }
 
         let mut items: Vec<(String, StartHit, bool)> = vec![
             (
@@ -2793,18 +2869,24 @@ impl StartScreenState {
 
         for (i, (label, target, active)) in items.into_iter().enumerate() {
             let row = Rect::new(rect.x + 6, rect.y + 6 + i as i32 * 32, rect.w - 12, 28);
-            if self.hover == Some(target) {
-                canvas.rounded_rect(row, RADIUS_CONTROL, theme.panel_hover, 1.0);
-            } else if active {
-                canvas.rounded_rect(row, RADIUS_CONTROL, theme.accent_soft, 1.0);
-            }
+            let hovered = self.hover == Some(target);
+            let fg = if theme.is_win98() {
+                ui::list_item_bg(canvas, theme, row, hovered, false)
+            } else {
+                if hovered {
+                    canvas.rounded_rect(row, theme.radius_control(), theme.panel_hover, 1.0);
+                } else if active {
+                    canvas.rounded_rect(row, theme.radius_control(), theme.accent_soft, 1.0);
+                }
+                if active { theme.accent } else { theme.text }
+            };
             text.draw(
                 canvas,
                 &label,
                 (row.x + 10) as f32,
                 (row.y + 19) as f32,
                 12.0,
-                if active { theme.accent } else { theme.text },
+                fg,
                 if active { Face::Bold } else { Face::Ui },
             );
             self.push_hit(row, target);
@@ -2823,18 +2905,36 @@ impl StartScreenState {
         self.hits.clear();
         canvas.fill_alpha(Rect::new(0, 0, w, h), 0x000000, 0.62);
         let card = confirm_power_card_rect(w, h);
-        draw_xj380_card(canvas, theme, card, theme.accent, false, 0.98);
-        canvas.rounded_border(card, RADIUS_POPUP, theme.accent, 0.85, 1);
-
         let (title, ok_label, ok_icon) = match action {
             PowerAction::Reboot => ("重新启动计算机？", "重启", Icon::Refresh),
             PowerAction::PowerOff => ("关闭计算机？", "关机", Icon::Shutdown),
         };
+        let title_y = if theme.is_win98() {
+            canvas.fill(card, theme.window);
+            ui::window_outer_bevel(canvas, theme, card);
+            let tb = Rect::new(card.x + 3, card.y + 3, card.w - 6, 22);
+            canvas.horizontal_gradient(tb, theme.titlebar, theme.titlebar_hi);
+            text.draw(
+                canvas,
+                "SpaceOS 电源确认",
+                (tb.x + 8) as f32,
+                (tb.y + 15) as f32,
+                11.5,
+                theme.titlebar_text,
+                Face::Bold,
+            );
+            54
+        } else {
+            draw_xj380_card(canvas, theme, card, theme.accent, false, 0.98);
+            canvas.rounded_border(card, theme.radius_popup(), theme.accent, 0.85, 1);
+            44
+        };
+
         text.draw(
             canvas,
             title,
             (card.x + 24) as f32,
-            (card.y + 44) as f32,
+            (card.y + title_y) as f32,
             18.0,
             theme.text,
             Face::Bold,
@@ -2843,7 +2943,7 @@ impl StartScreenState {
             canvas,
             "将通过 systemg PID 1 依次停止服务、清理挂载并安全断电。",
             (card.x + 24) as f32,
-            (card.y + 74) as f32,
+            (card.y + title_y + 28) as f32,
             11.5,
             theme.text_muted,
             Face::Ui,
@@ -2943,15 +3043,32 @@ fn draw_xj380_card(
     hovered: bool,
     alpha: f32,
 ) {
+    if theme.is_win98() {
+        canvas.fill(
+            rect,
+            if hovered {
+                theme.panel_hover
+            } else {
+                theme.panel
+            },
+        );
+        ui::raised_bevel(canvas, theme, rect);
+        canvas.fill(
+            Rect::new(rect.x + 2, rect.y + 2, (rect.w - 4).max(1), 2),
+            accent,
+        );
+        return;
+    }
     let base = if theme.mode == ThemeMode::Dark {
         mix(theme.panel, accent, if hovered { 0.22 } else { 0.12 })
     } else {
         mix(0xffffff, accent, if hovered { 0.14 } else { 0.06 })
     };
-    canvas.rounded_rect(rect, RADIUS_CONTROL, base, alpha);
+    let ctrl_r = theme.radius_control();
+    canvas.rounded_rect(rect, ctrl_r, base, alpha);
     canvas.rounded_border(
         rect,
-        RADIUS_CONTROL,
+        ctrl_r,
         if hovered { accent } else { theme.panel_border },
         if hovered { 0.95 } else { 0.70 },
         1,
@@ -3064,6 +3181,15 @@ pub fn build_start_backdrop(
     wallpaper_scaled: &[u32],
 ) -> Vec<u32> {
     let len = usize::from(w) * usize::from(h);
+    if config.theme_style == uxconf::ThemeStyle::Win98 {
+        if wallpaper_scaled.len() == len {
+            return wallpaper_scaled
+                .iter()
+                .map(|&px| mix(px, 0x008080, 0.25))
+                .collect();
+        }
+        return vec![config.solid_color; len];
+    }
     let scrim = if config.mode == ThemeMode::Dark {
         0x080d16
     } else {

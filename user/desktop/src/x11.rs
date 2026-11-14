@@ -249,6 +249,9 @@ impl X {
         if !self.has_shape || width == 0 || height == 0 {
             return Ok(());
         }
+        if radius <= 0 {
+            return self.clear_shape(window);
+        }
         let r = radius
             .max(0)
             .min(i32::from(width) / 2)
@@ -457,6 +460,38 @@ impl X {
         self.conn
             .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)?;
         Ok(())
+    }
+
+    /// Acquire an async pointer grab scoped to `window` so popup menus/sliders
+    /// reliably catch outside dismissal clicks and off-window drag releases.
+    pub fn grab_pointer(&self, window: Window) -> bool {
+        let mask = EventMask::BUTTON_PRESS
+            | EventMask::BUTTON_RELEASE
+            | EventMask::POINTER_MOTION
+            | EventMask::ENTER_WINDOW
+            | EventMask::LEAVE_WINDOW;
+        let Ok(cookie) = self.conn.grab_pointer(
+            false,
+            window,
+            mask,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        ) else {
+            return false;
+        };
+        let _ = self.flush();
+        cookie
+            .reply()
+            .is_ok_and(|r| r.status == x11rb::protocol::xproto::GrabStatus::SUCCESS)
+    }
+
+    /// Release any active pointer grab held by this X11 connection.
+    pub fn ungrab_pointer(&self) {
+        let _ = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
+        let _ = self.flush();
     }
 
     pub fn set_active_window(&self, window: Window) -> Result<()> {

@@ -26,6 +26,32 @@ pub const DEFAULT_SYSTEM_DIR: &str = "/etc/uxconf/channels";
 pub const DEFAULT_USER_DIR: &str = "/var/lib/uxconf/channels";
 pub const FALLBACK_USER_DIR: &str = "/tmp/uxconf/channels";
 
+/// Load layered system + user `.conf` files without spawning `uxconfd` or probing writability.
+pub fn load_desktop_config_readonly() -> crate::DesktopConfig {
+    let sys_dir = resolve_system_dir(None);
+    let usr_dir = match std::env::var("UXCONF_USER_DIR") {
+        Ok(val) if !val.is_empty() => PathBuf::from(val),
+        _ => PathBuf::from(DEFAULT_USER_DIR),
+    };
+    let mut cfg = crate::DesktopConfig::default();
+    for &ch in &BUILTIN_CHANNELS {
+        let mut entries = BTreeMap::new();
+        for (k, v) in schema::channel_defaults(ch) {
+            entries.insert(k.to_string(), v);
+        }
+        if let Ok(raw) = fs::read_to_string(sys_dir.join(format!("{ch}.conf"))) {
+            entries.extend(parse_channel_conf(&raw, ch));
+        }
+        if let Ok(raw) = fs::read_to_string(usr_dir.join(format!("{ch}.conf"))) {
+            entries.extend(parse_channel_conf(&raw, ch));
+        }
+        for (prop, val) in entries {
+            cfg.apply_property(ch, &prop, &val);
+        }
+    }
+    cfg
+}
+
 /// Parse a channel `.conf` text payload into a sorted `property -> Value` map.
 pub fn parse_channel_conf(raw: &str, channel: &str) -> BTreeMap<String, Value> {
     let mut map = BTreeMap::new();
@@ -285,21 +311,21 @@ impl ConfigStore {
             .and_then(|layer| layer.effective(&prop))
             .cloned();
 
+        if prev.as_ref() == Some(&value) {
+            return Ok(None);
+        }
+
         let layer = self.channels.entry(ch.clone()).or_default();
         layer.user.insert(prop.clone(), value.clone());
         let encoded = encode_channel_conf(&ch, &layer.user);
         let usr_path = self.user_dir.join(format!("{ch}.conf"));
         atomic_write_file(&usr_path, &encoded)?;
 
-        if prev.as_ref() != Some(&value) {
-            Ok(Some(ChangeEvent {
-                channel: ch,
-                property: prop,
-                value: Some(value),
-            }))
-        } else {
-            Ok(None)
-        }
+        Ok(Some(ChangeEvent {
+            channel: ch,
+            property: prop,
+            value: Some(value),
+        }))
     }
 
     /// Reset a single property or recursive subtree back to system/schema defaults.

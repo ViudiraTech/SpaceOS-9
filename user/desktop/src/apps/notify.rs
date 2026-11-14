@@ -15,13 +15,13 @@ use crate::app::{App, UiEvent};
 use crate::draw::{Canvas, Rect};
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, TITLEBAR_HEIGHT};
+use crate::theme::Theme;
 use crate::ui;
 use crate::x11::Result;
 use std::time::{Duration, Instant};
 
-fn dismiss_btn_rect(w: i32, h: i32) -> Rect {
-    Rect::new(w - 84, h - 38, 70, 26)
+fn dismiss_btn_rect(content: Rect) -> Rect {
+    Rect::new(content.right() - 84, content.bottom() - 38, 70, 26)
 }
 
 pub fn run(title: &str, body: &str) -> Result<()> {
@@ -44,14 +44,14 @@ pub fn run(title: &str, body: &str) -> Result<()> {
         let (events, _) = app.pump_with_fd(None, remaining_ms.max(10))?;
 
         for event in events {
-            let (w, h) = (app.width as i32, app.height as i32);
+            let content = app.content();
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose | UiEvent::Configure { .. } | UiEvent::ConfigChanged => {
                     app.needs_redraw = true;
                 }
                 UiEvent::Motion { x, y, .. } => {
-                    let hov = dismiss_btn_rect(w, h).contains(x, y);
+                    let hov = dismiss_btn_rect(content).contains(x, y);
                     if hov != btn_hover {
                         btn_hover = hov;
                         app.needs_redraw = true;
@@ -64,7 +64,7 @@ pub fn run(title: &str, body: &str) -> Result<()> {
                     button: 1,
                     down: true,
                     ..
-                } if dismiss_btn_rect(w, h).contains(x, y) => {
+                } if dismiss_btn_rect(content).contains(x, y) => {
                     crate::sound::play(&app.config, crate::sound::SystemSound::Click);
                     app.request_close();
                 }
@@ -98,16 +98,19 @@ fn draw_notify(
 ) {
     let w = canvas.width as i32;
     let h = canvas.height as i32;
+    let bw = theme.window_border_width();
+    let th = theme.titlebar_height();
+    let content = Rect::new(bw, th, (w - bw * 2).max(1), (h - th - bw).max(1));
     canvas.clear(theme.window);
 
-    icons::draw(canvas, Icon::Notify, 16, TITLEBAR_HEIGHT + 16, 32, None);
-    let max_w = (w - 72) as f32;
+    icons::draw(canvas, Icon::Notify, content.x + 16, content.y + 16, 32, None);
+    let max_w = (content.w - 72) as f32;
     let shown_title = text.truncate(title, max_w, 13.5, Face::Bold);
     text.draw(
         canvas,
         &shown_title,
-        60.0,
-        (TITLEBAR_HEIGHT + 30) as f32,
+        (content.x + 60) as f32,
+        (content.y + 30) as f32,
         13.5,
         theme.text,
         Face::Bold,
@@ -126,8 +129,8 @@ fn draw_notify(
     text.draw(
         canvas,
         &shown_body,
-        60.0,
-        (TITLEBAR_HEIGHT + 52) as f32,
+        (content.x + 60) as f32,
+        (content.y + 52) as f32,
         12.0,
         theme.text_dim,
         Face::Ui,
@@ -137,7 +140,7 @@ fn draw_notify(
         canvas,
         text,
         theme,
-        dismiss_btn_rect(w, h),
+        dismiss_btn_rect(content),
         "确定",
         None,
         false,

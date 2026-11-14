@@ -724,9 +724,11 @@ pub extern "C" fn spk_uptime_ms() -> u64 {
     crate::time::uptime_micros() / 1000
 }
 
-fn wait_micros(microseconds: u64) {
-    if crate::sched::current().is_some() {
-        crate::sched::sleep_micros(microseconds);
+fn busy_wait_micros(microseconds: u64) {
+    if crate::time::counter_frequency().is_none() {
+        for _ in 0..microseconds.saturating_mul(64) {
+            core::hint::spin_loop();
+        }
         return;
     }
     let deadline = crate::time::uptime_micros().saturating_add(microseconds);
@@ -735,17 +737,22 @@ fn wait_micros(microseconds: u64) {
     }
 }
 
-/// Sleep in process context.  During early boot, before the scheduler exists,
-/// this degrades to a bounded busy wait.
+/// Sleep in process context.  In early boot, interrupt handlers, or irqsave
+/// critical sections, this degrades to a bounded busy wait.
 #[unsafe(no_mangle)]
 pub extern "C" fn spk_msleep(milliseconds: u64) {
-    wait_micros(milliseconds.saturating_mul(1000));
+    let microseconds = milliseconds.saturating_mul(1000);
+    if crate::sched::current().is_some() && crate::arch::irqs_enabled() {
+        crate::sched::sleep_micros(microseconds);
+        return;
+    }
+    busy_wait_micros(microseconds);
 }
 
-/// Busy-wait or sleep for a short microsecond delay.
+/// Busy-wait for a short microsecond delay (always safe under spinlocks/IRQs off).
 #[unsafe(no_mangle)]
 pub extern "C" fn spk_udelay(microseconds: u64) {
-    wait_micros(microseconds);
+    busy_wait_micros(microseconds);
 }
 
 /// UTS release string as a NUL-terminated C string.
