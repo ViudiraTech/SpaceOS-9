@@ -20,6 +20,7 @@ pub mod monitor;
 pub mod music;
 pub mod notify;
 pub mod oobe;
+pub mod power_splash;
 pub mod session_ui;
 pub mod settings;
 pub mod term;

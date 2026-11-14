@@ -13,8 +13,10 @@
 //! menu, top- or bottom-docked panel, XShape-clipped Start Menu (with live
 //! search) and notification toasts, synchronized live with `uxconfd`.
 
+use crate::ddm::wire::PowerAction;
 use crate::draw::{Canvas, Rect, Sprite};
 use crate::icons::{self, Icon};
+use crate::start_screen::{ShellConfigHost, StartAction, StartScreenState};
 use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, RADIUS_CONTROL, RADIUS_POPUP};
 use crate::ui;
@@ -27,7 +29,7 @@ use uxconf::client::{UxConfClient, UxConfWatch};
 use uxconf::{BackdropStyle, DesktopConfig, FocusMode, PanelPosition, WindowPlacement};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux,
-    ConnectionExt, EventMask, PropMode, Window,
+    ConnectionExt, EventMask, ModMask, PropMode, Window,
 };
 use x11rb::protocol::Event;
 
@@ -41,22 +43,33 @@ const CTX_WIDTH: i32 = 192;
 const CTX_HEIGHT: i32 = 148;
 const TOAST_WIDTH: i32 = 324;
 const TOAST_HEIGHT: i32 = 74;
+const VOL_POPUP_WIDTH: i32 = 286;
+const VOL_POPUP_HEIGHT: i32 = 138;
 
-struct AppEntry {
-    name: &'static str,
-    subtitle: &'static str,
-    keywords: &'static str,
-    icon: Icon,
-    mode: &'static str,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppCategory {
+    System,
+    Productivity,
+    Media,
 }
 
-const APPS: [AppEntry; 9] = [
+pub struct AppEntry {
+    pub name: &'static str,
+    pub subtitle: &'static str,
+    pub keywords: &'static str,
+    pub icon: Icon,
+    pub mode: &'static str,
+    pub category: AppCategory,
+}
+
+pub const APPS: [AppEntry; 9] = [
     AppEntry {
         name: "文件管理器",
         subtitle: "浏览目录与系统文件",
         keywords: "files folder directory dolphin 文件 目录",
         icon: Icon::Files,
         mode: "files",
+        category: AppCategory::Productivity,
     },
     AppEntry {
         name: "终端",
@@ -64,6 +77,7 @@ const APPS: [AppEntry; 9] = [
         keywords: "term terminal shell sh bash console 终端 命令行",
         icon: Icon::Terminal,
         mode: "term",
+        category: AppCategory::System,
     },
     AppEntry {
         name: "系统监视器",
@@ -71,6 +85,7 @@ const APPS: [AppEntry; 9] = [
         keywords: "monitor taskmgr top htop task manager 监视器 性能 进程 任务管理器",
         icon: Icon::Monitor,
         mode: "monitor",
+        category: AppCategory::System,
     },
     AppEntry {
         name: "文本编辑器",
@@ -78,6 +93,7 @@ const APPS: [AppEntry; 9] = [
         keywords: "edit editor text notepad kwrite 文本 编辑器",
         icon: Icon::Editor,
         mode: "edit",
+        category: AppCategory::Productivity,
     },
     AppEntry {
         name: "计算器",
@@ -85,6 +101,7 @@ const APPS: [AppEntry; 9] = [
         keywords: "calc calculator math 计算器 计算 数学",
         icon: Icon::Calculator,
         mode: "calc",
+        category: AppCategory::Productivity,
     },
     AppEntry {
         name: "看图工具",
@@ -92,6 +109,7 @@ const APPS: [AppEntry; 9] = [
         keywords: "view image viewer photo picture 看图 图片 图像 相册",
         icon: Icon::ImageViewer,
         mode: "view",
+        category: AppCategory::Media,
     },
     AppEntry {
         name: "音乐播放器",
@@ -99,6 +117,7 @@ const APPS: [AppEntry; 9] = [
         keywords: "music mp3 audio player media 音乐 播放器 音频 歌曲",
         icon: Icon::Music,
         mode: "music",
+        category: AppCategory::Media,
     },
     AppEntry {
         name: "系统设置",
@@ -107,6 +126,7 @@ const APPS: [AppEntry; 9] = [
             "settings network ip dhcp ethernet display wallpaper theme 外观 网络 壁纸 分辨率 设置",
         icon: Icon::Settings,
         mode: "settings",
+        category: AppCategory::System,
     },
     AppEntry {
         name: "帮助手册",
@@ -114,6 +134,7 @@ const APPS: [AppEntry; 9] = [
         keywords: "help manual guide doc 帮助 手册 快捷键 文档 指南",
         icon: Icon::Help,
         mode: "help",
+        category: AppCategory::System,
     },
 ];
 
@@ -125,7 +146,7 @@ fn pinned_app_entry(slot: usize) -> Option<&'static AppEntry> {
     APPS.iter().find(|app| app.mode == mode)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Hit {
     None,
     DesktopIcon(usize),
@@ -133,9 +154,18 @@ enum Hit {
     Pinned(usize),
     Window(usize),
     Network,
+    Volume,
     Bell,
+    VolMute,
+    VolSlider,
+    VolSfx,
+    VolSettings,
     MenuRow(usize),
     Logout,
+    Reboot,
+    PowerOff,
+    ConfirmPowerOk,
+    ConfirmPowerCancel,
     ContextRow(usize),
 }
 
@@ -160,6 +190,7 @@ pub struct Shell {
     x: X,
     text: TextRenderer,
     config: DesktopConfig,
+    ux_client: Option<UxConfClient>,
     watch: Option<UxConfWatch>,
     theme: Theme,
     wallpaper_raw: Option<Sprite>,
@@ -177,9 +208,15 @@ pub struct Shell {
     menu_canvas: Canvas,
     menu_open: bool,
     menu_query: String,
+    menu_confirm_power: Option<PowerAction>,
+    start_screen: StartScreenState,
     ctx_menu: Window,
     ctx_canvas: Canvas,
     ctx_open: bool,
+    vol_popup: Window,
+    vol_canvas: Canvas,
+    vol_open: bool,
+    vol_dragging: bool,
     toast_window: Window,
     toast_canvas: Canvas,
     toast: Option<Toast>,
@@ -194,7 +231,7 @@ pub struct Shell {
     running: bool,
 }
 
-fn session_identity() -> String {
+pub fn session_identity() -> String {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "user".to_string());
@@ -206,7 +243,7 @@ fn session_identity() -> String {
     format!("{user}@{host}")
 }
 
-fn now_local() -> (i32, i32, i32, i32, i32, i32, i32) {
+pub fn now_local() -> (i32, i32, i32, i32, i32, i32, i32) {
     // SAFETY: `localtime_r` writes into stack-owned zeroed `libc::tm` with no shared state.
     unsafe {
         let stamp = std::time::SystemTime::now()
@@ -269,6 +306,15 @@ fn menu_row_rect(index: usize) -> Rect {
     Rect::new(12, 58 + index as i32 * 52, MENU_WIDTH - 24, 48)
 }
 
+fn compact_footer_rects() -> (Rect, Rect, Rect, Rect, Rect) {
+    let logout = Rect::new(MENU_WIDTH - 222, MENU_HEIGHT - 42, 66, 30);
+    let reboot = Rect::new(MENU_WIDTH - 150, MENU_HEIGHT - 42, 66, 30);
+    let power_off = Rect::new(MENU_WIDTH - 78, MENU_HEIGHT - 42, 66, 30);
+    let confirm_cancel = Rect::new(MENU_WIDTH - 148, MENU_HEIGHT - 42, 64, 30);
+    let confirm_ok = Rect::new(MENU_WIDTH - 78, MENU_HEIGHT - 42, 66, 30);
+    (logout, reboot, power_off, confirm_cancel, confirm_ok)
+}
+
 fn ctx_row_rect(index: usize) -> Rect {
     let y = match index {
         0 => 6,
@@ -277,6 +323,27 @@ fn ctx_row_rect(index: usize) -> Rect {
         _ => 110,
     };
     Rect::new(6, y, CTX_WIDTH - 12, 30)
+}
+
+fn vol_popup_mute_rect() -> Rect {
+    Rect::new(14, 43, 30, 30)
+}
+
+fn vol_popup_slider_rect() -> Rect {
+    Rect::new(52, 47, VOL_POPUP_WIDTH - 68, 22)
+}
+
+fn vol_popup_sfx_rect() -> Rect {
+    Rect::new(14, 95, 134, 28)
+}
+
+fn vol_popup_settings_rect() -> Rect {
+    Rect::new(VOL_POPUP_WIDTH - 110, 95, 96, 28)
+}
+
+fn vol_from_slider_x(rect: Rect, x: i32) -> i32 {
+    let frac = ((x - rect.x) as f32 / rect.w.max(1) as f32).clamp(0.0, 1.0);
+    (frac * 100.0).round() as i32
 }
 
 fn infer_window_icon(title: &str) -> Icon {
@@ -318,8 +385,9 @@ struct TaskbarLayout {
     start_sep_x: i32,
     pinned_sep_x: i32,
     win_start_x: i32,
-    bell: Rect,
     net: Rect,
+    volume: Rect,
+    bell: Rect,
     clock_sep_x: i32,
 }
 
@@ -339,14 +407,16 @@ impl TaskbarLayout {
         let tray_y = (panel_h - tray_bh) / 2;
         let clock_sep_x = screen_w - tray_w;
         let bell = Rect::new(clock_sep_x - 40, tray_y, 32, tray_bh);
-        let net = Rect::new(bell.x - 36, tray_y, 32, tray_bh);
+        let volume = Rect::new(bell.x - 36, tray_y, 32, tray_bh);
+        let net = Rect::new(volume.x - 36, tray_y, 32, tray_bh);
         Self {
             start,
             start_sep_x,
             pinned_sep_x,
             win_start_x,
-            bell,
             net,
+            volume,
+            bell,
             clock_sep_x,
         }
     }
@@ -365,7 +435,7 @@ impl TaskbarLayout {
         let bh = (panel_h - 12).clamp(26, 40);
         let available = (self.net.x - 10 - self.win_start_x).max(80);
         let count = count.clamp(1, 6) as i32;
-        let btn_w = ((available - (count - 1) * 4) / count).clamp(48, 160);
+        let btn_w = ((available - (count - 1) * 4) / count).clamp(28, 160);
         Rect::new(
             self.win_start_x + index as i32 * (btn_w + 4),
             (panel_h - bh) / 2,
@@ -459,19 +529,29 @@ impl Shell {
         x.set_wm_type(taskbar, x.atoms.net_wm_type_dock)?;
         x.map(taskbar)?;
 
-        let menu_y = if config.panel_position == PanelPosition::Top {
+        let popup_menu_y = if config.panel_position == PanelPosition::Top {
             panel_h + 6
         } else {
             (taskbar_y - MENU_HEIGHT - 6).max(8)
+        };
+        let (menu_x, menu_y, menu_w, menu_h) = if config.panel_start_fullscreen {
+            (0i16, 0i16, x.width, x.height)
+        } else {
+            (
+                6i16,
+                popup_menu_y as i16,
+                MENU_WIDTH as u16,
+                MENU_HEIGHT as u16,
+            )
         };
         let menu = x.generate_id()?;
         x.create_window(
             menu,
             x.root,
-            6,
-            menu_y as i16,
-            MENU_WIDTH as u16,
-            MENU_HEIGHT as u16,
+            menu_x,
+            menu_y,
+            menu_w,
+            menu_h,
             true,
             EventMask::EXPOSURE
                 | EventMask::BUTTON_PRESS
@@ -482,7 +562,14 @@ impl Shell {
             theme.panel,
         )?;
         x.set_wm_type(menu, x.atoms.net_wm_type_dialog)?;
-        x.set_rounded_shape(menu, MENU_WIDTH as u16, MENU_HEIGHT as u16, RADIUS_POPUP)?;
+        if !config.panel_start_fullscreen {
+            x.set_rounded_shape(menu, MENU_WIDTH as u16, MENU_HEIGHT as u16, RADIUS_POPUP)?;
+        }
+
+        // Bind global Start Screen shortcuts (Super_L, Super_R, Ctrl+Escape).
+        x.grab_global_key(0xffeb, ModMask::from(0u16));
+        x.grab_global_key(0xffec, ModMask::from(0u16));
+        x.grab_global_key(0xff1b, ModMask::CONTROL);
 
         let ctx_menu = x.generate_id()?;
         x.create_window(
@@ -502,6 +589,31 @@ impl Shell {
         )?;
         x.set_wm_type(ctx_menu, x.atoms.net_wm_type_dialog)?;
         x.set_rounded_shape(ctx_menu, CTX_WIDTH as u16, CTX_HEIGHT as u16, RADIUS_POPUP)?;
+
+        let vol_popup = x.generate_id()?;
+        x.create_window(
+            vol_popup,
+            x.root,
+            0,
+            0,
+            VOL_POPUP_WIDTH as u16,
+            VOL_POPUP_HEIGHT as u16,
+            true,
+            EventMask::EXPOSURE
+                | EventMask::BUTTON_PRESS
+                | EventMask::BUTTON_RELEASE
+                | EventMask::POINTER_MOTION
+                | EventMask::LEAVE_WINDOW
+                | EventMask::KEY_PRESS,
+            theme.panel,
+        )?;
+        x.set_wm_type(vol_popup, x.atoms.net_wm_type_dialog)?;
+        x.set_rounded_shape(
+            vol_popup,
+            VOL_POPUP_WIDTH as u16,
+            VOL_POPUP_HEIGHT as u16,
+            RADIUS_POPUP,
+        )?;
 
         let toast_y = if config.panel_position == PanelPosition::Top {
             panel_h + 12
@@ -530,8 +642,13 @@ impl Shell {
 
         let desktop_canvas = x.create_canvas(x.width as usize, x.height as usize, theme.bg_top);
         let taskbar_canvas = x.create_canvas(x.width as usize, panel_h as usize, theme.panel);
-        let menu_canvas = x.create_canvas(MENU_WIDTH as usize, MENU_HEIGHT as usize, theme.panel);
+        let menu_canvas = x.create_canvas(menu_w as usize, menu_h as usize, theme.panel);
         let ctx_canvas = x.create_canvas(CTX_WIDTH as usize, CTX_HEIGHT as usize, theme.panel);
+        let vol_canvas = x.create_canvas(
+            VOL_POPUP_WIDTH as usize,
+            VOL_POPUP_HEIGHT as usize,
+            theme.panel,
+        );
         let toast_canvas =
             x.create_canvas(TOAST_WIDTH as usize, TOAST_HEIGHT as usize, theme.panel);
 
@@ -542,6 +659,7 @@ impl Shell {
             x,
             text,
             config,
+            ux_client,
             watch,
             theme,
             wallpaper_raw: None,
@@ -557,9 +675,15 @@ impl Shell {
             menu_canvas,
             menu_open: false,
             menu_query: String::new(),
+            menu_confirm_power: None,
+            start_screen: StartScreenState::new(),
             ctx_menu,
             ctx_canvas,
             ctx_open: false,
+            vol_popup,
+            vol_canvas,
+            vol_open: false,
+            vol_dragging: false,
             toast_window,
             toast_canvas,
             toast: None,
@@ -575,12 +699,17 @@ impl Shell {
         };
         shell.claim_wm()?;
         shell.apply_x11_settings(None);
+        crate::sound::apply_mixer_volume(
+            shell.config.sound_master_volume,
+            shell.config.sound_muted,
+        );
         shell.reload_wallpaper(true);
         shell.draw_desktop();
         shell.present_desktop()?;
         shell.update_clock();
         shell.draw_taskbar();
         shell.present_taskbar()?;
+        crate::sound::play(&shell.config, crate::sound::SystemSound::Startup);
         eprintln!(
             "spui: desktop ready at {} ms",
             startup.elapsed().as_millis()
@@ -606,6 +735,92 @@ impl Shell {
         } else {
             (self.taskbar_y() - MENU_HEIGHT - 6).max(8)
         }
+    }
+
+    fn sync_menu_window(&mut self) -> Result<()> {
+        let (mx, my, mw, mh, rounded) = if self.config.panel_start_fullscreen {
+            (0i16, 0i16, self.x.width, self.x.height, false)
+        } else {
+            (
+                6i16,
+                self.menu_y() as i16,
+                MENU_WIDTH as u16,
+                MENU_HEIGHT as u16,
+                true,
+            )
+        };
+        self.x.move_resize(self.menu, mx, my, mw, mh)?;
+        if rounded {
+            self.x.set_rounded_shape(self.menu, mw, mh, RADIUS_POPUP)?;
+        } else {
+            self.x.clear_shape(self.menu)?;
+        }
+        if self.menu_canvas.width != mw as usize || self.menu_canvas.height != mh as usize {
+            self.x.release_canvas(&self.menu_canvas);
+            self.menu_canvas = self
+                .x
+                .create_canvas(mw as usize, mh as usize, self.theme.panel);
+            self.start_screen.invalidate_backdrop();
+        }
+        Ok(())
+    }
+
+    fn handle_start_action(
+        &mut self,
+        action: StartAction,
+        prev_cfg: Option<DesktopConfig>,
+    ) -> Result<()> {
+        let cfg_updated = if let Some(prev) = prev_cfg {
+            self.apply_live_config_diff(prev)?;
+            true
+        } else {
+            false
+        };
+        match action {
+            StartAction::None => {}
+            StartAction::Redraw => {
+                if !cfg_updated && self.menu_open {
+                    self.draw_menu();
+                    self.present_menu()?;
+                }
+            }
+            StartAction::Close => {
+                self.close_menu()?;
+            }
+            StartAction::Launch(mode) => {
+                self.close_menu()?;
+                self.launch(mode);
+            }
+            StartAction::Logout => {
+                self.close_menu()?;
+                // DDM owns the session. Exiting the shell tears down the
+                // session cleanly and returns to the greeter.
+                std::process::exit(0);
+            }
+            StartAction::Power(action) => {
+                self.execute_power_action(action)?;
+            }
+            StartAction::ToggleMute => {
+                self.toggle_mute()?;
+                if self.menu_open {
+                    self.draw_menu();
+                    self.present_menu()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_power_action(&mut self, action: PowerAction) -> Result<()> {
+        if let Err(err) = crate::apps::session_ui::send_power_request(action) {
+            self.close_menu()?;
+            let label = match action {
+                PowerAction::Reboot => "重启失败",
+                PowerAction::PowerOff => "关机失败",
+            };
+            self.show_toast(label, &err.to_string());
+        }
+        Ok(())
     }
 
     fn toast_y(&self) -> i32 {
@@ -664,7 +879,8 @@ impl Shell {
     }
 
     fn pinned_rect(&self, index: usize) -> Rect {
-        self.taskbar_layout().pinned_rect(self.panel_height(), index)
+        self.taskbar_layout()
+            .pinned_rect(self.panel_height(), index)
     }
 
     fn apply_x11_settings(&self, prev: Option<&DesktopConfig>) {
@@ -723,13 +939,6 @@ impl Shell {
                 ph as u16,
             )?;
             self.x.move_resize(
-                self.menu,
-                6,
-                self.menu_y() as i16,
-                MENU_WIDTH as u16,
-                MENU_HEIGHT as u16,
-            )?;
-            self.x.move_resize(
                 self.toast_window,
                 (i32::from(self.x.width) - TOAST_WIDTH - 12) as i16,
                 self.toast_y() as i16,
@@ -743,6 +952,9 @@ impl Shell {
                         .create_canvas(self.x.width as usize, ph as usize, self.theme.panel);
             }
         }
+        if panel_geom_changed || prev.panel_start_fullscreen != self.config.panel_start_fullscreen {
+            self.sync_menu_window()?;
+        }
 
         let wp_file_changed = prev.wallpaper != self.config.wallpaper;
         let backdrop_changed = wp_file_changed
@@ -750,6 +962,10 @@ impl Shell {
             || prev.solid_color != self.config.solid_color;
         if backdrop_changed {
             self.reload_wallpaper(wp_file_changed);
+        }
+        {
+            let host = ShellConfigHost::new(&self.x, &mut self.config, &mut self.ux_client);
+            self.start_screen.on_config_changed(&host);
         }
 
         self.draw_desktop();
@@ -764,11 +980,42 @@ impl Shell {
             self.draw_ctx();
             self.present_ctx()?;
         }
+        if prev.sound_master_volume != self.config.sound_master_volume
+            || prev.sound_muted != self.config.sound_muted
+        {
+            crate::sound::apply_mixer_volume(
+                self.config.sound_master_volume,
+                self.config.sound_muted,
+            );
+        }
+        if self.vol_open {
+            if panel_geom_changed {
+                let (vx, vy) = self.vol_popup_pos();
+                self.x.move_resize(
+                    self.vol_popup,
+                    vx,
+                    vy,
+                    VOL_POPUP_WIDTH as u16,
+                    VOL_POPUP_HEIGHT as u16,
+                )?;
+            }
+            self.draw_vol_popup();
+            self.present_vol_popup()?;
+        }
         if self.toast.is_some() {
             self.draw_toast();
             self.present_toast()?;
         }
         self.x.raise(self.taskbar)?;
+        if self.menu_open {
+            self.x.raise(self.menu)?;
+        }
+        if self.ctx_open {
+            self.x.raise(self.ctx_menu)?;
+        }
+        if self.vol_open {
+            self.x.raise(self.vol_popup)?;
+        }
         Ok(())
     }
 
@@ -887,8 +1134,10 @@ impl Shell {
             self.poll_uxconf()?;
 
             let mut net_dirty = false;
+            let mut net_event = false;
             if let Some(fd) = self.net_fd {
                 if crate::netmgr::drain_events(fd) {
+                    net_event = true;
                     net_dirty |= self.refresh_net_status();
                 }
             }
@@ -915,6 +1164,7 @@ impl Shell {
                     if let Some(fd) = self.net_fd {
                         let _ = crate::netmgr::drain_events(fd);
                     }
+                    net_event = true;
                     net_dirty |= self.refresh_net_status();
                 }
                 while let Some(event) = self.x.poll()? {
@@ -944,10 +1194,26 @@ impl Shell {
                 self.handle(event)?;
             }
 
+            let start_net = if net_event {
+                self.start_screen.on_net_event()
+            } else {
+                false
+            };
             let anim_active = ui::has_active_animations();
             if self.update_clock() || anim_active || net_dirty {
                 self.draw_taskbar();
                 self.present_taskbar()?;
+            }
+            if self.vol_open && anim_active {
+                self.draw_vol_popup();
+                self.present_vol_popup()?;
+            }
+            if self.menu_open && self.config.panel_start_fullscreen {
+                let start_tick = self.start_screen.tick(&self.config);
+                if start_tick || start_net || anim_active || net_dirty {
+                    self.draw_menu();
+                    self.present_menu()?;
+                }
             }
             if let Some(toast) = &self.toast {
                 if Instant::now() >= toast.deadline {
@@ -970,13 +1236,7 @@ impl Shell {
         self.x.move_resize(self.desktop, 0, 0, new_w, new_h)?;
         self.x
             .move_resize(self.taskbar, 0, self.taskbar_y() as i16, new_w, ph as u16)?;
-        self.x.move_resize(
-            self.menu,
-            6,
-            self.menu_y() as i16,
-            MENU_WIDTH as u16,
-            MENU_HEIGHT as u16,
-        )?;
+        self.sync_menu_window()?;
         self.x.move_resize(
             self.toast_window,
             (i32::from(new_w) - TOAST_WIDTH - 12) as i16,
@@ -999,11 +1259,34 @@ impl Shell {
             .create_canvas(new_w as usize, ph as usize, self.theme.panel);
 
         self.reload_wallpaper(false);
+        {
+            let host = ShellConfigHost::new(&self.x, &mut self.config, &mut self.ux_client);
+            self.start_screen.on_config_changed(&host);
+        }
         self.draw_desktop();
         self.present_desktop()?;
         self.draw_taskbar();
         self.present_taskbar()?;
+        if self.menu_open {
+            self.draw_menu();
+            self.present_menu()?;
+        }
+        if self.vol_open {
+            let (vx, vy) = self.vol_popup_pos();
+            self.x.move_resize(
+                self.vol_popup,
+                vx,
+                vy,
+                VOL_POPUP_WIDTH as u16,
+                VOL_POPUP_HEIGHT as u16,
+            )?;
+            self.draw_vol_popup();
+            self.present_vol_popup()?;
+        }
         self.x.raise(self.taskbar)?;
+        if self.menu_open {
+            self.x.raise(self.menu)?;
+        }
         Ok(())
     }
 
@@ -1071,6 +1354,7 @@ impl Shell {
                 if self.config.wm_focus_mode == FocusMode::Sloppy
                     && !self.menu_open
                     && !self.ctx_open
+                    && !self.vol_open
                     && self.active != Some(e.event)
                     && self
                         .windows
@@ -1113,8 +1397,12 @@ impl Shell {
                     let active = self.x.get_active_window();
                     if active != self.active {
                         self.active = active;
+                        if active.is_some() && self.vol_open {
+                            self.close_vol_popup()?;
+                        }
                         let target = active.filter(|window| {
                             !self.menu_open
+                                && !self.vol_open
                                 && self
                                     .windows
                                     .iter()
@@ -1166,20 +1454,51 @@ impl Shell {
                 } else if e.window == self.ctx_menu && self.ctx_open {
                     self.ctx_canvas.mark_dirty(area);
                     self.present_ctx()?;
+                } else if e.window == self.vol_popup && self.vol_open {
+                    self.vol_canvas.mark_dirty(area);
+                    self.present_vol_popup()?;
                 } else if e.window == self.toast_window && self.toast.is_some() {
                     self.toast_canvas.mark_dirty(area);
                     self.present_toast()?;
                 }
             }
             Event::LeaveNotify(e) => {
+                if e.event == self.menu
+                    && self.menu_open
+                    && self.config.panel_start_fullscreen
+                    && self.start_screen.on_leave()
+                {
+                    self.draw_menu();
+                    self.present_menu()?;
+                }
                 let prev = self.hover;
                 if (e.event == self.taskbar
                     && matches!(
                         prev,
-                        Hit::Start | Hit::Pinned(_) | Hit::Window(_) | Hit::Network | Hit::Bell
+                        Hit::Start
+                            | Hit::Pinned(_)
+                            | Hit::Window(_)
+                            | Hit::Network
+                            | Hit::Volume
+                            | Hit::Bell
                     ))
-                    || (e.event == self.menu && matches!(prev, Hit::MenuRow(_) | Hit::Logout))
+                    || (e.event == self.menu
+                        && matches!(
+                            prev,
+                            Hit::MenuRow(_)
+                                | Hit::Logout
+                                | Hit::Reboot
+                                | Hit::PowerOff
+                                | Hit::ConfirmPowerOk
+                                | Hit::ConfirmPowerCancel
+                        ))
                     || (e.event == self.ctx_menu && matches!(prev, Hit::ContextRow(_)))
+                    || (e.event == self.vol_popup
+                        && !self.vol_dragging
+                        && matches!(
+                            prev,
+                            Hit::VolMute | Hit::VolSlider | Hit::VolSfx | Hit::VolSettings
+                        ))
                 {
                     self.hover = Hit::None;
                     if e.event == self.taskbar {
@@ -1191,22 +1510,66 @@ impl Shell {
                     } else if e.event == self.ctx_menu && self.ctx_open {
                         self.draw_ctx();
                         self.present_ctx()?;
+                    } else if e.event == self.vol_popup && self.vol_open {
+                        self.draw_vol_popup();
+                        self.present_vol_popup()?;
                     }
                 }
             }
             Event::ButtonPress(e) => {
                 let (x, y) = (e.event_x as i32, e.event_y as i32);
-                if e.event == self.taskbar && e.detail == 1 {
-                    self.close_ctx()?;
-                    self.taskbar_click(x, y)?;
-                } else if e.event == self.menu && e.detail == 1 {
-                    self.menu_click(x, y)?;
+                if e.event == self.taskbar {
+                    if (e.detail == 4 || e.detail == 5) && self.vol_rect().contains(x, y) {
+                        let step = if e.detail == 4 { 5 } else { -5 };
+                        self.adjust_volume_step(step)?;
+                    } else if (e.detail == 2 || e.detail == 3) && self.vol_rect().contains(x, y) {
+                        self.toggle_mute()?;
+                    } else if e.detail == 1 {
+                        self.close_ctx()?;
+                        self.taskbar_click(x, y)?;
+                    }
+                } else if e.event == self.vol_popup && self.vol_open {
+                    if e.detail == 4 || e.detail == 5 {
+                        let step = if e.detail == 4 { 5 } else { -5 };
+                        self.adjust_volume_step(step)?;
+                    } else if e.detail == 1 {
+                        self.vol_popup_click(x, y)?;
+                    }
+                } else if e.event == self.menu && self.menu_open {
+                    if self.config.panel_start_fullscreen {
+                        if e.detail == 4 || e.detail == 5 {
+                            let delta = if e.detail == 4 { -1 } else { 1 };
+                            if self.start_screen.on_wheel(
+                                i32::from(self.x.width),
+                                i32::from(self.x.height),
+                                x,
+                                y,
+                                delta,
+                            ) {
+                                self.draw_menu();
+                                self.present_menu()?;
+                            }
+                        } else if e.detail == 1 || e.detail == 3 {
+                            let (action, prev_cfg) = {
+                                let mut host = ShellConfigHost::new(
+                                    &self.x,
+                                    &mut self.config,
+                                    &mut self.ux_client,
+                                );
+                                let action =
+                                    self.start_screen.on_button(&mut host, x, y, e.detail, true);
+                                (action, host.take_changed())
+                            };
+                            self.handle_start_action(action, prev_cfg)?;
+                        }
+                    } else if e.detail == 1 {
+                        self.menu_click(x, y)?;
+                    }
                 } else if e.event == self.ctx_menu && e.detail == 1 {
                     self.ctx_click(x, y)?;
                 } else if e.event == self.desktop {
-                    if self.menu_open {
-                        self.close_menu()?;
-                    }
+                    self.close_menu()?;
+                    self.close_vol_popup()?;
                     if e.detail == 3 {
                         self.open_ctx(i32::from(e.root_x), i32::from(e.root_y))?;
                     } else if e.detail == 1 {
@@ -1216,6 +1579,7 @@ impl Shell {
                             self.selected_desktop_icon = Some(idx);
                             self.draw_desktop();
                             self.present_desktop()?;
+                            crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                             self.launch(APPS[idx].mode);
                         } else if self.selected_desktop_icon.take().is_some() {
                             self.draw_desktop();
@@ -1226,6 +1590,29 @@ impl Shell {
                     if Rect::new(TOAST_WIDTH - 30, 8, 22, 22).contains(x, y) {
                         self.hide_toast()?;
                     }
+                }
+            }
+            Event::ButtonRelease(e) => {
+                if e.detail == 1 && self.vol_dragging {
+                    self.vol_dragging = false;
+                    crate::sound::play(&self.config, crate::sound::SystemSound::Volume);
+                    if self.vol_open {
+                        self.draw_vol_popup();
+                        self.present_vol_popup()?;
+                    }
+                } else if e.event == self.menu
+                    && self.menu_open
+                    && self.config.panel_start_fullscreen
+                    && e.detail == 1
+                {
+                    let (x, y) = (e.event_x as i32, e.event_y as i32);
+                    let (action, prev_cfg) = {
+                        let mut host =
+                            ShellConfigHost::new(&self.x, &mut self.config, &mut self.ux_client);
+                        let action = self.start_screen.on_button(&mut host, x, y, 1, false);
+                        (action, host.take_changed())
+                    };
+                    self.handle_start_action(action, prev_cfg)?;
                 }
             }
             Event::MotionNotify(e) => {
@@ -1254,12 +1641,49 @@ impl Shell {
                         self.draw_taskbar();
                         self.present_taskbar()?;
                     }
+                } else if e.event == self.vol_popup && self.vol_open {
+                    if self.vol_dragging {
+                        let vol = vol_from_slider_x(vol_popup_slider_rect(), x);
+                        self.set_master_volume(vol, false)?;
+                    } else {
+                        let hit = self.vol_popup_hit(x, y);
+                        if hit != self.hover {
+                            self.hover = hit;
+                            let cursor = if hit == Hit::None {
+                                CursorKind::Default
+                            } else {
+                                CursorKind::Pointer
+                            };
+                            let _ = self.x.set_cursor(self.vol_popup, cursor);
+                            self.draw_vol_popup();
+                            self.present_vol_popup()?;
+                        }
+                    }
                 } else if e.event == self.menu && self.menu_open {
-                    let hit = self.menu_hit(x, y);
-                    if hit != self.hover {
-                        self.hover = hit;
-                        self.draw_menu();
-                        self.present_menu()?;
+                    if self.config.panel_start_fullscreen {
+                        let (redraw, cursor, prev_cfg) = {
+                            let mut host = ShellConfigHost::new(
+                                &self.x,
+                                &mut self.config,
+                                &mut self.ux_client,
+                            );
+                            let (r, c) = self.start_screen.on_motion(&mut host, x, y);
+                            (r, c, host.take_changed())
+                        };
+                        let _ = self.x.set_cursor(self.menu, cursor);
+                        if let Some(prev) = prev_cfg {
+                            self.apply_live_config_diff(prev)?;
+                        } else if redraw {
+                            self.draw_menu();
+                            self.present_menu()?;
+                        }
+                    } else {
+                        let hit = self.menu_hit(x, y);
+                        if hit != self.hover {
+                            self.hover = hit;
+                            self.draw_menu();
+                            self.present_menu()?;
+                        }
                     }
                 } else if e.event == self.ctx_menu && self.ctx_open {
                     let hit = self.ctx_hit(x, y);
@@ -1276,9 +1700,35 @@ impl Shell {
                     state: e.state.into(),
                     sym: self.x.key_symbol(e.detail, e.state.into()),
                 };
-                if self.ctx_open && key.is_escape() {
+                if matches!(key.sym, 0xffeb | 0xffec) || (key.control() && key.is_escape()) {
+                    self.toggle_menu()?;
+                } else if self.ctx_open && key.is_escape() {
                     self.close_ctx()?;
+                } else if self.vol_open && key.is_escape() {
+                    self.close_vol_popup()?;
+                } else if self.menu_open && self.config.panel_start_fullscreen {
+                    let (action, prev_cfg) = {
+                        let mut host =
+                            ShellConfigHost::new(&self.x, &mut self.config, &mut self.ux_client);
+                        let action = self.start_screen.on_key(&mut host, key);
+                        (action, host.take_changed())
+                    };
+                    self.handle_start_action(action, prev_cfg)?;
                 } else if self.menu_open {
+                    if let Some(action) = self.menu_confirm_power {
+                        if key.is_enter() {
+                            self.menu_confirm_power = None;
+                            self.execute_power_action(action)?;
+                            return Ok(());
+                        }
+                        if key.is_escape() {
+                            self.menu_confirm_power = None;
+                            self.draw_menu();
+                            self.present_menu()?;
+                            return Ok(());
+                        }
+                        return Ok(());
+                    }
                     if key.is_escape() {
                         self.close_menu()?;
                     } else if key.is_backspace() {
@@ -1556,6 +2006,10 @@ impl Shell {
         self.taskbar_layout().net
     }
 
+    fn vol_rect(&self) -> Rect {
+        self.taskbar_layout().volume
+    }
+
     fn bell_rect(&self) -> Rect {
         self.taskbar_layout().bell
     }
@@ -1579,6 +2033,9 @@ impl Shell {
         if self.net_rect().contains(x, y) {
             return Hit::Network;
         }
+        if self.vol_rect().contains(x, y) {
+            return Hit::Volume;
+        }
         if self.bell_rect().contains(x, y) {
             return Hit::Bell;
         }
@@ -1587,9 +2044,14 @@ impl Shell {
 
     fn taskbar_click(&mut self, x: i32, y: i32) -> Result<()> {
         match self.taskbar_hit(x, y) {
-            Hit::Start => self.toggle_menu(),
+            Hit::Start => {
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                self.toggle_menu()
+            }
             Hit::Pinned(idx) => {
                 self.close_menu()?;
+                self.close_vol_popup()?;
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 if let Some(app) = pinned_app_entry(idx) {
                     self.launch(app.mode);
                 }
@@ -1597,6 +2059,8 @@ impl Shell {
             }
             Hit::Window(index) => {
                 self.close_menu()?;
+                self.close_vol_popup()?;
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 if let Some(managed) = self.windows.get(index) {
                     let window = managed.window;
                     let is_min = managed.minimized;
@@ -1610,6 +2074,8 @@ impl Shell {
             }
             Hit::Network => {
                 self.close_menu()?;
+                self.close_vol_popup()?;
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 let _ = self.refresh_net_status();
                 let st = &self.net_status;
                 if let Some((ip, prefix)) = st.ipv4.filter(|_| st.up && st.carrier) {
@@ -1634,27 +2100,216 @@ impl Shell {
                 self.launch_arg("settings", "network");
                 Ok(())
             }
+            Hit::Volume => {
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                self.toggle_vol_popup()
+            }
             Hit::Bell => {
                 self.close_menu()?;
+                self.close_vol_popup()?;
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 self.show_toast("系统通知", "当前没有未读系统通知");
                 Ok(())
             }
             _ => {
                 self.close_menu()?;
+                self.close_vol_popup()?;
                 Ok(())
             }
         }
     }
 
+    fn set_sound_prop(&mut self, prop: &str, val: uxconf::Value) {
+        let _ = self.config.apply_property("sound", prop, &val);
+        if self.ux_client.is_none() {
+            self.ux_client = UxConfClient::connect().ok();
+        }
+        if let Some(client) = self.ux_client.as_mut() {
+            if client.set("sound", prop, val.clone()).is_err() {
+                self.ux_client = UxConfClient::connect().ok();
+                if let Some(c) = self.ux_client.as_mut() {
+                    let _ = c.set("sound", prop, val);
+                }
+            }
+        }
+    }
+
+    fn set_master_volume(&mut self, vol: i32, play_sfx: bool) -> Result<()> {
+        let clamped = vol.clamp(0, 100);
+        let prev_vol = self.config.sound_master_volume;
+        let prev_muted = self.config.sound_muted;
+        if clamped != prev_vol {
+            self.set_sound_prop("/master-volume", uxconf::Value::Int(i64::from(clamped)));
+        }
+        if self.config.sound_muted && clamped > 0 {
+            self.set_sound_prop("/muted", uxconf::Value::Bool(false));
+        }
+        crate::sound::apply_mixer_volume(clamped, self.config.sound_muted && clamped == 0);
+        if play_sfx {
+            crate::sound::play(&self.config, crate::sound::SystemSound::Volume);
+        }
+        if clamped != prev_vol || self.config.sound_muted != prev_muted {
+            self.draw_taskbar();
+            self.present_taskbar()?;
+        }
+        if self.vol_open {
+            self.draw_vol_popup();
+            self.present_vol_popup()?;
+        }
+        Ok(())
+    }
+
+    fn adjust_volume_step(&mut self, delta_pct: i32) -> Result<()> {
+        let next = (self.config.sound_master_volume + delta_pct).clamp(0, 100);
+        self.set_master_volume(next, true)
+    }
+
+    fn toggle_mute(&mut self) -> Result<()> {
+        let next = !self.config.sound_muted;
+        self.set_sound_prop("/muted", uxconf::Value::Bool(next));
+        crate::sound::apply_mixer_volume(self.config.sound_master_volume, next);
+        if !next {
+            crate::sound::play(&self.config, crate::sound::SystemSound::Volume);
+        }
+        self.draw_taskbar();
+        self.present_taskbar()?;
+        if self.vol_open {
+            self.draw_vol_popup();
+            self.present_vol_popup()?;
+        }
+        Ok(())
+    }
+
+    fn vol_popup_pos(&self) -> (i16, i16) {
+        let vr = self.vol_rect();
+        let x = (vr.right() + 12 - VOL_POPUP_WIDTH)
+            .clamp(8, (i32::from(self.x.width) - VOL_POPUP_WIDTH - 8).max(8));
+        let y = if self.config.panel_position == PanelPosition::Top {
+            self.panel_height() + 6
+        } else {
+            (self.taskbar_y() - VOL_POPUP_HEIGHT - 6).max(8)
+        };
+        (x as i16, y as i16)
+    }
+
+    fn open_vol_popup(&mut self) -> Result<()> {
+        self.close_menu()?;
+        self.close_ctx()?;
+        let (vx, vy) = self.vol_popup_pos();
+        self.x.move_resize(
+            self.vol_popup,
+            vx,
+            vy,
+            VOL_POPUP_WIDTH as u16,
+            VOL_POPUP_HEIGHT as u16,
+        )?;
+        self.vol_open = true;
+        self.vol_dragging = false;
+        self.hover = Hit::None;
+        self.draw_vol_popup();
+        self.draw_taskbar();
+        self.x.map(self.vol_popup)?;
+        self.x.raise(self.vol_popup)?;
+        self.x.focus(self.vol_popup)?;
+        self.present_vol_popup()?;
+        self.present_taskbar()?;
+        Ok(())
+    }
+
+    fn close_vol_popup(&mut self) -> Result<()> {
+        if self.vol_open {
+            self.vol_open = false;
+            self.vol_dragging = false;
+            if matches!(
+                self.hover,
+                Hit::VolMute | Hit::VolSlider | Hit::VolSfx | Hit::VolSettings
+            ) {
+                self.hover = Hit::None;
+            }
+            self.x.unmap(self.vol_popup)?;
+            if let Some(active) = self.active {
+                let _ = self.x.focus(active);
+            }
+            self.draw_taskbar();
+            self.present_taskbar()?;
+        }
+        Ok(())
+    }
+
+    fn toggle_vol_popup(&mut self) -> Result<()> {
+        if self.vol_open {
+            self.close_vol_popup()
+        } else {
+            self.open_vol_popup()
+        }
+    }
+
+    fn vol_popup_hit(&self, x: i32, y: i32) -> Hit {
+        if vol_popup_mute_rect().contains(x, y) {
+            Hit::VolMute
+        } else if vol_popup_slider_rect().contains(x, y) {
+            Hit::VolSlider
+        } else if vol_popup_sfx_rect().contains(x, y) {
+            Hit::VolSfx
+        } else if vol_popup_settings_rect().contains(x, y) {
+            Hit::VolSettings
+        } else {
+            Hit::None
+        }
+    }
+
+    fn vol_popup_click(&mut self, x: i32, y: i32) -> Result<()> {
+        match self.vol_popup_hit(x, y) {
+            Hit::VolMute => self.toggle_mute(),
+            Hit::VolSlider => {
+                self.vol_dragging = true;
+                let vol = vol_from_slider_x(vol_popup_slider_rect(), x);
+                self.set_master_volume(vol, false)
+            }
+            Hit::VolSfx => {
+                let next = !self.config.sound_enabled;
+                self.set_sound_prop("/system-sounds-enabled", uxconf::Value::Bool(next));
+                if next {
+                    crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                }
+                self.draw_vol_popup();
+                self.present_vol_popup()
+            }
+            Hit::VolSettings => {
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                self.close_vol_popup()?;
+                self.launch_arg("settings", "sound");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn menu_hit(&self, x: i32, y: i32) -> Hit {
+        let (logout, reboot, power_off, confirm_cancel, confirm_ok) = compact_footer_rects();
+        if self.menu_confirm_power.is_some() {
+            if confirm_cancel.contains(x, y) {
+                return Hit::ConfirmPowerCancel;
+            }
+            if confirm_ok.contains(x, y) {
+                return Hit::ConfirmPowerOk;
+            }
+            return Hit::None;
+        }
         let filtered = self.filtered_apps();
         for (slot, &app_idx) in filtered.iter().enumerate() {
             if menu_row_rect(slot).contains(x, y) {
                 return Hit::MenuRow(app_idx);
             }
         }
-        if Rect::new(MENU_WIDTH - 96, MENU_HEIGHT - 42, 82, 30).contains(x, y) {
+        if logout.contains(x, y) {
             return Hit::Logout;
+        }
+        if reboot.contains(x, y) {
+            return Hit::Reboot;
+        }
+        if power_off.contains(x, y) {
+            return Hit::PowerOff;
         }
         Hit::None
     }
@@ -1663,21 +2318,50 @@ impl Shell {
         match self.menu_hit(x, y) {
             Hit::MenuRow(app_idx) => {
                 let mode = APPS[app_idx].mode;
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 self.close_menu()?;
                 self.launch(mode);
                 Ok(())
             }
             Hit::Logout => {
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 self.close_menu()?;
                 // DDM owns the session.  Exiting the shell makes the daemon
                 // tear down the whole process group and show the greeter again.
                 std::process::exit(0);
+            }
+            Hit::Reboot => {
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                self.menu_confirm_power = Some(PowerAction::Reboot);
+                self.draw_menu();
+                self.present_menu()
+            }
+            Hit::PowerOff => {
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                self.menu_confirm_power = Some(PowerAction::PowerOff);
+                self.draw_menu();
+                self.present_menu()
+            }
+            Hit::ConfirmPowerOk => {
+                if let Some(action) = self.menu_confirm_power.take() {
+                    crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                    self.execute_power_action(action)?;
+                }
+                Ok(())
+            }
+            Hit::ConfirmPowerCancel => {
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                self.menu_confirm_power = None;
+                self.draw_menu();
+                self.present_menu()
             }
             _ => Ok(()),
         }
     }
 
     fn open_ctx(&mut self, root_x: i32, root_y: i32) -> Result<()> {
+        self.close_menu()?;
+        self.close_vol_popup()?;
         let ph = self.panel_height();
         let min_y = if self.config.panel_position == PanelPosition::Top {
             ph + 4
@@ -1724,6 +2408,9 @@ impl Shell {
     fn ctx_click(&mut self, x: i32, y: i32) -> Result<()> {
         let hit = self.ctx_hit(x, y);
         self.close_ctx()?;
+        if hit != Hit::None {
+            crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+        }
         match hit {
             Hit::ContextRow(0) => self.launch("term"),
             Hit::ContextRow(1) => self.launch("files"),
@@ -1743,9 +2430,14 @@ impl Shell {
             self.close_menu()
         } else {
             self.close_ctx()?;
+            self.close_vol_popup()?;
             self.menu_open = true;
             self.menu_query.clear();
             self.hover = Hit::None;
+            self.sync_menu_window()?;
+            if self.config.panel_start_fullscreen {
+                self.start_screen.on_open();
+            }
             self.draw_menu();
             self.draw_taskbar();
             self.x.map(self.menu)?;
@@ -1761,6 +2453,7 @@ impl Shell {
         if self.menu_open {
             self.menu_open = false;
             self.menu_query.clear();
+            self.menu_confirm_power = None;
             self.x.unmap(self.menu)?;
             if let Some(active) = self.active {
                 let _ = self.x.focus(active);
@@ -1804,6 +2497,7 @@ impl Shell {
             body: body.to_string(),
             deadline: Instant::now() + Duration::from_secs(4),
         });
+        crate::sound::play(&self.config, crate::sound::SystemSound::Notify);
         self.draw_toast();
         let _ = self.x.map(self.toast_window);
         let _ = self.x.raise(self.toast_window);
@@ -1900,6 +2594,7 @@ impl Shell {
             .map(|i| layout.window_button_rect(h, win_count, i))
             .collect();
         let net = layout.net;
+        let vol = layout.volume;
         let bell = layout.bell;
         let border_y = if self.config.panel_position == PanelPosition::Top {
             h - 1
@@ -2054,7 +2749,7 @@ impl Shell {
             );
         }
 
-        // Right tray: compact wired network status, notification bell & clock.
+        // Right tray: wired network status, speaker volume icon, notification bell & clock.
         let net_hov = ui::animate_bool(net, self.hover == Hit::Network, ui::MOTION_HOVER);
         let net_connected = self.net_status.connected();
         if net_hov > 0.001 {
@@ -2074,6 +2769,37 @@ impl Shell {
             net.y + (net.h - 18) / 2,
             18,
             Some(net_tint),
+        );
+
+        let vol_active = self.vol_open || self.hover == Hit::Volume;
+        let vol_hov = ui::animate_bool(vol, vol_active, ui::MOTION_HOVER);
+        if vol_hov > 0.001 {
+            canvas.rounded_rect(
+                vol,
+                RADIUS_CONTROL,
+                if self.vol_open {
+                    self.theme.accent_soft
+                } else {
+                    self.theme.panel_hover
+                },
+                vol_hov,
+            );
+        }
+        let vol_icon = Icon::for_volume(self.config.sound_master_volume, self.config.sound_muted);
+        let vol_tint = if self.config.sound_muted || self.config.sound_master_volume <= 0 {
+            self.theme.text_muted
+        } else if self.vol_open {
+            self.theme.accent
+        } else {
+            self.theme.text
+        };
+        icons::draw(
+            canvas,
+            vol_icon,
+            vol.x + (vol.w - 18) / 2,
+            vol.y + (vol.h - 18) / 2,
+            18,
+            Some(vol_tint),
         );
 
         let bell_hov = ui::animate_bool(bell, self.hover == Hit::Bell, ui::MOTION_HOVER);
@@ -2160,6 +2886,19 @@ impl Shell {
     }
 
     fn draw_menu(&mut self) {
+        if self.config.panel_start_fullscreen {
+            let host = ShellConfigHost::new(&self.x, &mut self.config, &mut self.ux_client);
+            self.start_screen.draw(
+                &mut self.menu_canvas,
+                &mut self.text,
+                &self.theme,
+                &host,
+                &self.net_status,
+                &self.wallpaper_scaled,
+                self.windows.len(),
+            );
+            return;
+        }
         let filtered = self.filtered_apps();
         let canvas = &mut self.menu_canvas;
         let (w, h) = (MENU_WIDTH, MENU_HEIGHT);
@@ -2219,31 +2958,88 @@ impl Shell {
         }
 
         // Footer bar.
+        let (logout, reboot, power_off, confirm_cancel, confirm_ok) = compact_footer_rects();
         canvas.fill(Rect::new(1, h - 54, w - 2, 53), self.theme.window_alt);
         canvas.fill(Rect::new(1, h - 54, w - 2, 1), self.theme.panel_border);
-        icons::draw(canvas, Icon::SpaceLogo, 16, h - 38, 22, None);
-        let identity = session_identity();
-        self.text.draw(
-            canvas,
-            &identity,
-            46.0,
-            (h - 22) as f32,
-            12.5,
-            self.theme.text,
-            Face::Ui,
-        );
+        if let Some(action) = self.menu_confirm_power {
+            let (prompt, ok_label, ok_icon) = match action {
+                PowerAction::Reboot => ("确认重新启动计算机？", "重启", Icon::Refresh),
+                PowerAction::PowerOff => ("确认关闭计算机？", "关机", Icon::Shutdown),
+            };
+            self.text.draw(
+                canvas,
+                prompt,
+                16.0,
+                (h - 22) as f32,
+                12.5,
+                self.theme.text,
+                Face::Bold,
+            );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                confirm_cancel,
+                "取消",
+                None,
+                false,
+                self.hover == Hit::ConfirmPowerCancel,
+            );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                confirm_ok,
+                ok_label,
+                Some(ok_icon),
+                true,
+                self.hover == Hit::ConfirmPowerOk,
+            );
+        } else {
+            icons::draw(canvas, Icon::SpaceLogo, 16, h - 38, 22, None);
+            let identity = session_identity();
+            let shown_id = self.text.truncate(&identity, 102.0, 12.0, Face::Ui);
+            self.text.draw(
+                canvas,
+                &shown_id,
+                44.0,
+                (h - 22) as f32,
+                12.0,
+                self.theme.text,
+                Face::Ui,
+            );
 
-        let logout = Rect::new(w - 96, h - 42, 82, 30);
-        ui::button(
-            canvas,
-            &mut self.text,
-            &self.theme,
-            logout,
-            "注销",
-            Some(Icon::Logout),
-            false,
-            self.hover == Hit::Logout,
-        );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                logout,
+                "注销",
+                Some(Icon::Logout),
+                false,
+                self.hover == Hit::Logout,
+            );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                reboot,
+                "重启",
+                Some(Icon::Refresh),
+                false,
+                self.hover == Hit::Reboot,
+            );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                power_off,
+                "关机",
+                Some(Icon::Shutdown),
+                false,
+                self.hover == Hit::PowerOff,
+            );
+        }
     }
 
     fn draw_ctx(&mut self) {
@@ -2402,6 +3198,127 @@ impl Shell {
             .put_canvas(self.toast_window, &self.toast_canvas, area)?;
         self.x.flush()
     }
+
+    fn draw_vol_popup(&mut self) {
+        let canvas = &mut self.vol_canvas;
+        let w = VOL_POPUP_WIDTH;
+        let h = VOL_POPUP_HEIGHT;
+        canvas.clear(self.theme.panel);
+        ui::popup_surface(canvas, &self.theme, Rect::new(0, 0, w, h), RADIUS_POPUP);
+
+        let muted = self.config.sound_muted;
+        let vol = self.config.sound_master_volume.clamp(0, 100);
+
+        self.text.draw(
+            canvas,
+            "音频输出 · 主音量",
+            16.0,
+            28.0,
+            12.5,
+            self.theme.text,
+            Face::Bold,
+        );
+        let pct_txt = if muted {
+            "已静音".to_string()
+        } else {
+            format!("{vol}%")
+        };
+        self.text.draw_right(
+            canvas,
+            &pct_txt,
+            (w - 16) as f32,
+            28.0,
+            12.5,
+            if muted {
+                self.theme.danger
+            } else {
+                self.theme.accent
+            },
+            Face::Bold,
+        );
+
+        let mute_r = vol_popup_mute_rect();
+        let mute_hov = self.hover == Hit::VolMute;
+        if muted || mute_hov {
+            canvas.rounded_rect(
+                mute_r,
+                RADIUS_CONTROL,
+                if muted {
+                    crate::draw::mix(self.theme.panel_hover, self.theme.danger, 0.20)
+                } else {
+                    self.theme.panel_hover
+                },
+                1.0,
+            );
+        }
+        icons::draw(
+            canvas,
+            Icon::for_volume(vol, muted),
+            mute_r.x + (mute_r.w - 18) / 2,
+            mute_r.y + (mute_r.h - 18) / 2,
+            18,
+            Some(if muted {
+                self.theme.text_muted
+            } else {
+                self.theme.text
+            }),
+        );
+
+        let slider_r = vol_popup_slider_rect();
+        let progress = if muted { 0.0 } else { vol as f32 / 100.0 };
+        ui::slider(
+            canvas,
+            &self.theme,
+            slider_r,
+            progress,
+            self.hover == Hit::VolSlider,
+            self.vol_dragging,
+        );
+
+        canvas.fill(Rect::new(14, 84, w - 28, 1), self.theme.window_border);
+
+        let sfx_r = vol_popup_sfx_rect();
+        if self.hover == Hit::VolSfx {
+            canvas.rounded_rect(sfx_r, RADIUS_CONTROL, self.theme.panel_hover, 0.7);
+        }
+        self.text.draw(
+            canvas,
+            "提示音效",
+            (sfx_r.x + 6) as f32,
+            (sfx_r.y + 19) as f32,
+            12.0,
+            self.theme.text_dim,
+            Face::Ui,
+        );
+        let sw_r = Rect::new(sfx_r.right() - 44, sfx_r.y + 3, 40, 22);
+        ui::toggle_switch_with_id(
+            canvas,
+            &self.theme,
+            Hit::VolSfx,
+            sw_r,
+            self.config.sound_enabled,
+            self.hover == Hit::VolSfx,
+        );
+
+        let cfg_r = vol_popup_settings_rect();
+        ui::button(
+            canvas,
+            &mut self.text,
+            &self.theme,
+            cfg_r,
+            "声音设置 ›",
+            None,
+            false,
+            self.hover == Hit::VolSettings,
+        );
+    }
+
+    fn present_vol_popup(&mut self) -> Result<()> {
+        let area = self.vol_canvas.bounds();
+        self.vol_canvas.take_dirty();
+        self.x.put_canvas(self.vol_popup, &self.vol_canvas, area)?;
+        self.x.flush()
+    }
 }
 
 #[cfg(test)]
@@ -2468,7 +3385,8 @@ mod tests {
                             assert!(layout.win_start_x > layout.start_sep_x);
                         }
 
-                        assert!(layout.net.right() < layout.bell.x);
+                        assert!(layout.net.right() < layout.volume.x);
+                        assert!(layout.volume.right() < layout.bell.x);
                         assert!(layout.bell.right() < layout.clock_sep_x);
 
                         for count in [1, 3, 6] {
@@ -2486,5 +3404,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn volume_popup_controls_fit_without_overlap() {
+        let mute_r = vol_popup_mute_rect();
+        let slider_r = vol_popup_slider_rect();
+        let sfx_r = vol_popup_sfx_rect();
+        let cfg_r = vol_popup_settings_rect();
+        assert!(mute_r.right() < slider_r.x);
+        assert!(slider_r.right() < VOL_POPUP_WIDTH);
+        assert!(sfx_r.right() < cfg_r.x);
+        assert!(cfg_r.right() < VOL_POPUP_WIDTH);
+        assert!(cfg_r.bottom() < VOL_POPUP_HEIGHT);
+        assert_eq!(vol_from_slider_x(slider_r, slider_r.x - 10), 0);
+        assert_eq!(vol_from_slider_x(slider_r, slider_r.right() + 10), 100);
+        assert_eq!(vol_from_slider_x(slider_r, slider_r.x + slider_r.w / 2), 50);
     }
 }

@@ -120,7 +120,8 @@ fn flush_local(vaddr: u64, pages: usize) {
 }
 
 pub fn tlb_shootdown(virtual_address: u64, pages: usize) {
-    let flags = crate::arch::irq_save();
+    // Acquire TLB_LOCK before masking local interrupts so CPUs spinning on
+    // TLB_LOCK keep interrupts enabled and still service peer TLB IPIs.
     let _guard = TLB_LOCK.lock();
     PENDING_VADDR.store(virtual_address, Ordering::Release);
     PENDING_PAGES.store(pages, Ordering::Release);
@@ -151,5 +152,4 @@ pub fn tlb_shootdown(virtual_address: u64, pages: usize) {
             core::hint::spin_loop();
         }
     }
-    crate::arch::irq_restore(flags);
 }

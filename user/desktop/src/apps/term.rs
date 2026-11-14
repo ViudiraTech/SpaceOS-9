@@ -24,11 +24,12 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use uxconf::CursorStyle;
 
 const PAD_X: i32 = 10;
 const PAD_Y: i32 = 8;
-const SCROLLBAR_W: i32 = 8;
+const SCROLLBAR_W: i32 = ui::SCROLLBAR_HIT_W;
 
 const TIOCSWINSZ_REQ: u64 = 0x5414;
 const TIOCSCTTY_REQ: u64 = 0x540e;
@@ -227,6 +228,7 @@ struct VtTerm {
     utf8_need: usize,
     pending_reply: Vec<u8>,
     title_change: Option<String>,
+    bell: bool,
 }
 
 impl VtTerm {
@@ -261,6 +263,7 @@ impl VtTerm {
             utf8_need: 0,
             pending_reply: Vec::new(),
             title_change: None,
+            bell: false,
         }
     }
 
@@ -481,7 +484,11 @@ impl VtTerm {
                     self.cur_col = next.min(self.cols - 1);
                     return;
                 }
-                0x00..=0x07 | 0x0e..=0x1a | 0x1c..=0x1f => return,
+                0x07 => {
+                    self.bell = true;
+                    return;
+                }
+                0x00..=0x06 | 0x0e..=0x1a | 0x1c..=0x1f => return,
                 _ => {}
             }
         }
@@ -918,10 +925,16 @@ impl VtTerm {
         }
     }
 
+    #[allow(dead_code)]
     fn view_row(&self, vis_row: usize) -> &[Cell] {
         let total_sb = self.scrollback.len();
         let top_global = total_sb.saturating_sub(self.scroll_offset);
         let idx = top_global + vis_row;
+        self.global_row(idx)
+    }
+
+    fn global_row(&self, idx: usize) -> &[Cell] {
+        let total_sb = self.scrollback.len();
         if idx < total_sb {
             &self.scrollback[idx]
         } else {
@@ -1262,6 +1275,41 @@ fn calc_grid(content: Rect, cell_w: i32, cell_h: i32) -> (usize, usize) {
     (cols, rows)
 }
 
+fn term_scrollbar_track(win_w: i32, win_h: i32) -> Rect {
+    Rect::new(
+        win_w - SCROLLBAR_W - 2,
+        TITLEBAR_HEIGHT + 2,
+        SCROLLBAR_W,
+        (win_h - TITLEBAR_HEIGHT - 4).max(8),
+    )
+}
+
+fn term_is_at_bottom(vt: &VtTerm, scroll: &ui::SmoothScroll, cell_h: i32) -> bool {
+    let max_off = (vt.scrollback.len() as i32 * cell_h) as f32;
+    max_off <= 0.0 || scroll.target() >= max_off - 2.0
+}
+
+fn sync_term_scroll(
+    vt: &mut VtTerm,
+    scroll: &mut ui::SmoothScroll,
+    win_w: i32,
+    win_h: i32,
+    cell_h: i32,
+    snap_bottom: bool,
+) {
+    let ch = cell_h.max(1);
+    let vp_h = (vt.rows as i32 * ch).max(ch) as f32;
+    let total_h = ((vt.scrollback.len() + vt.rows) as i32 * ch) as f32;
+    let max_off = (total_h - vp_h).max(0.0);
+    scroll.set_bounds(vp_h, total_h, term_scrollbar_track(win_w, win_h));
+    if snap_bottom {
+        scroll.snap_to(max_off);
+        vt.scroll_offset = 0;
+    } else {
+        vt.scroll_offset = ((max_off - scroll.offset()).max(0.0) / ch as f32).round() as usize;
+    }
+}
+
 pub fn run(argument: Option<&str>) -> Result<()> {
     let mut app = App::new("终端", Icon::Terminal, 820, 520)?;
     app.min_width = 420;
@@ -1271,6 +1319,8 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     let mut metrics = compute_metrics(&mut app.text, app.config.term_font_size);
     let (init_cols, init_rows) = calc_grid(app.content(), metrics.cell_w, metrics.cell_h);
     let mut vt = VtTerm::new(init_cols, init_rows, app.config.term_scrollback_lines);
+    let mut term_scroll = ui::SmoothScroll::new("term_scroll");
+    let mut last_bell = Instant::now() - Duration::from_secs(1);
 
     let workdir = argument
         .map(PathBuf::from)
@@ -1291,6 +1341,14 @@ pub fn run(argument: Option<&str>) -> Result<()> {
             None
         }
     };
+    sync_term_scroll(
+        &mut vt,
+        &mut term_scroll,
+        app.width as i32,
+        app.height as i32,
+        metrics.cell_h,
+        true,
+    );
 
     let mut read_buf = [0u8; 8192];
     loop {
@@ -1302,6 +1360,10 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         let (events, pty_ready) = app.pump_with_fd(extra_fd, 60)?;
 
         if pty_ready || pty.is_some() {
+            let win_w = app.width as i32;
+            let win_h = app.height as i32;
+            let was_at_bottom = term_is_at_bottom(&vt, &term_scroll, metrics.cell_h);
+            let mut fed_bytes = false;
             let mut eof = false;
             if let Some(p) = &pty {
                 loop {
@@ -1312,6 +1374,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         }
                         Ok(n) => {
                             vt.feed(&read_buf[..n]);
+                            fed_bytes = true;
                             if !vt.pending_reply.is_empty() {
                                 p.write_all(&vt.pending_reply);
                                 vt.pending_reply.clear();
@@ -1327,6 +1390,20 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                     }
                 }
             }
+            if fed_bytes {
+                sync_term_scroll(
+                    &mut vt,
+                    &mut term_scroll,
+                    win_w,
+                    win_h,
+                    metrics.cell_h,
+                    was_at_bottom,
+                );
+            }
+            if std::mem::take(&mut vt.bell) && last_bell.elapsed() >= Duration::from_millis(250) {
+                last_bell = Instant::now();
+                crate::sound::play(&app.config, crate::sound::SystemSound::Alert);
+            }
             if let Some(new_title) = vt.title_change.take() {
                 app.title = new_title;
                 let _ = app.x.set_title(app.win, &app.title);
@@ -1339,10 +1416,13 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         }
 
         for event in events {
+            let win_w = app.width as i32;
+            let win_h = app.height as i32;
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose => app.needs_redraw = true,
                 UiEvent::ConfigChanged => {
+                    let was_at_bottom = term_is_at_bottom(&vt, &term_scroll, metrics.cell_h);
                     metrics = compute_metrics(&mut app.text, app.config.term_font_size);
                     vt.set_max_scrollback(app.config.term_scrollback_lines);
                     let (cols, rows) = calc_grid(app.content(), metrics.cell_w, metrics.cell_h);
@@ -1357,9 +1437,18 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                             );
                         }
                     }
+                    sync_term_scroll(
+                        &mut vt,
+                        &mut term_scroll,
+                        win_w,
+                        win_h,
+                        metrics.cell_h,
+                        was_at_bottom,
+                    );
                     app.needs_redraw = true;
                 }
                 UiEvent::Configure { .. } => {
+                    let was_at_bottom = term_is_at_bottom(&vt, &term_scroll, metrics.cell_h);
                     let (cols, rows) = calc_grid(app.content(), metrics.cell_w, metrics.cell_h);
                     if cols != vt.cols || rows != vt.rows {
                         vt.resize(cols, rows);
@@ -1372,33 +1461,94 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                             );
                         }
                     }
+                    sync_term_scroll(
+                        &mut vt,
+                        &mut term_scroll,
+                        win_w,
+                        win_h,
+                        metrics.cell_h,
+                        was_at_bottom,
+                    );
                     app.needs_redraw = true;
                 }
+                UiEvent::Motion { x, y, .. } => {
+                    if term_scroll.handle_motion(x, y) {
+                        app.needs_redraw = true;
+                    }
+                    app.set_content_cursor(
+                        if term_scroll.is_hovered() || term_scroll.is_dragging() {
+                            CursorKind::Pointer
+                        } else {
+                            CursorKind::Text
+                        },
+                    );
+                }
+                UiEvent::Button {
+                    x, y, button, down, ..
+                } => {
+                    if term_scroll.handle_button(x, y, button, down) {
+                        app.set_content_cursor(
+                            if term_scroll.is_hovered() || term_scroll.is_dragging() {
+                                CursorKind::Pointer
+                            } else {
+                                CursorKind::Text
+                            },
+                        );
+                        app.needs_redraw = true;
+                    }
+                }
                 UiEvent::Wheel { delta, .. } => {
-                    let max_off = vt.scrollback.len();
-                    let next = if delta < 0 {
-                        (vt.scroll_offset + (-delta as usize)).min(max_off)
-                    } else {
-                        vt.scroll_offset.saturating_sub(delta as usize)
-                    };
-                    if next != vt.scroll_offset {
-                        vt.scroll_offset = next;
+                    sync_term_scroll(
+                        &mut vt,
+                        &mut term_scroll,
+                        win_w,
+                        win_h,
+                        metrics.cell_h,
+                        false,
+                    );
+                    if term_scroll.wheel(delta as f32 * metrics.cell_h as f32) {
                         app.needs_redraw = true;
                     }
                 }
                 UiEvent::Key(key) => {
                     if key.shift() && key.is_page_up() {
-                        vt.scroll_offset = (vt.scroll_offset + vt.rows.saturating_sub(2).max(1))
-                            .min(vt.scrollback.len());
+                        sync_term_scroll(
+                            &mut vt,
+                            &mut term_scroll,
+                            win_w,
+                            win_h,
+                            metrics.cell_h,
+                            false,
+                        );
+                        let step =
+                            (vt.rows.saturating_sub(2).max(1) as i32 * metrics.cell_h) as f32;
+                        term_scroll.animate_to(term_scroll.target() - step, ui::MOTION_SCROLL);
                         app.needs_redraw = true;
                     } else if key.shift() && key.is_page_down() {
-                        vt.scroll_offset = vt
-                            .scroll_offset
-                            .saturating_sub(vt.rows.saturating_sub(2).max(1));
+                        sync_term_scroll(
+                            &mut vt,
+                            &mut term_scroll,
+                            win_w,
+                            win_h,
+                            metrics.cell_h,
+                            false,
+                        );
+                        let step =
+                            (vt.rows.saturating_sub(2).max(1) as i32 * metrics.cell_h) as f32;
+                        term_scroll.animate_to(term_scroll.target() + step, ui::MOTION_SCROLL);
                         app.needs_redraw = true;
                     } else if let Some(bytes) = key_to_pty_bytes(&key, vt.app_cursor_keys) {
-                        if vt.scroll_offset != 0 {
-                            vt.scroll_offset = 0;
+                        if !term_is_at_bottom(&vt, &term_scroll, metrics.cell_h)
+                            || vt.scroll_offset != 0
+                        {
+                            sync_term_scroll(
+                                &mut vt,
+                                &mut term_scroll,
+                                win_w,
+                                win_h,
+                                metrics.cell_h,
+                                true,
+                            );
                             app.needs_redraw = true;
                         }
                         if let Some(p) = &pty {
@@ -1406,7 +1556,6 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         }
                     }
                 }
-                _ => {}
             }
         }
 
@@ -1416,6 +1565,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 &mut app.text,
                 &app.theme,
                 &vt,
+                &mut term_scroll,
                 metrics,
                 app.config.term_cursor_style,
                 app.active,
@@ -1427,11 +1577,13 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_terminal(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
     theme: &Theme,
     vt: &VtTerm,
+    scroll: &mut ui::SmoothScroll,
     metrics: TermMetrics,
     cursor_style: CursorStyle,
     window_active: bool,
@@ -1439,150 +1591,154 @@ fn draw_terminal(
     let cell_w = metrics.cell_w;
     let cell_h = metrics.cell_h;
     let font_px = metrics.font_px;
+    let w = canvas.width as i32;
+    let h = canvas.height as i32;
     let default_bg = ColorSpec::DefaultBg.resolve(theme, false);
-    let body = Rect::new(
-        0,
-        TITLEBAR_HEIGHT,
-        canvas.width as i32,
-        (canvas.height as i32 - TITLEBAR_HEIGHT).max(0),
-    );
+    let body = Rect::new(0, TITLEBAR_HEIGHT, w, (h - TITLEBAR_HEIGHT).max(0));
     canvas.fill(body, default_bg);
 
     let origin_x = PAD_X;
     let origin_y = TITLEBAR_HEIGHT + PAD_Y;
+    let total_sb = vt.scrollback.len();
+    let total_rows = total_sb + vt.rows;
+    let vp_h = (vt.rows as i32 * cell_h).max(cell_h) as f32;
+    let total_h = (total_rows as i32 * cell_h) as f32;
+    let track = term_scrollbar_track(w, h);
+    scroll.set_bounds(vp_h, total_h, track);
 
-    for row_idx in 0..vt.rows {
-        let line = vt.view_row(row_idx);
-        let row_y = origin_y + row_idx as i32 * cell_h;
-        if row_y >= canvas.height as i32 - 1 {
-            break;
-        }
+    let scroll_px = scroll
+        .offset_i32()
+        .clamp(0, (total_sb as i32 * cell_h).max(0));
+    let first_row = (scroll_px / cell_h).clamp(0, total_rows.saturating_sub(1) as i32) as usize;
+    let content_clip = Rect::new(0, TITLEBAR_HEIGHT, (w - SCROLLBAR_W - 2).max(1), body.h);
+    let vis_span = ((content_clip.h + cell_h - 1) / cell_h + 2).max(2) as usize;
 
-        // Coalesce contiguous non-default background runs per row.
-        let mut col = 0;
-        while col < vt.cols && col < line.len() {
-            let cell = line[col];
-            let cell_bg = if cell.inverse {
-                cell.fg.resolve(theme, cell.bold)
-            } else {
-                cell.bg.resolve(theme, false)
-            };
-            if cell_bg != default_bg {
-                let start = col;
-                col += 1;
-                while col < vt.cols && col < line.len() {
-                    let next = line[col];
-                    let next_bg = if next.inverse {
-                        next.fg.resolve(theme, next.bold)
-                    } else {
-                        next.bg.resolve(theme, false)
-                    };
-                    if next_bg != cell_bg {
-                        break;
+    canvas.with_clip(content_clip, |c| {
+        for row_idx in first_row..(first_row + vis_span).min(total_rows) {
+            let line = vt.global_row(row_idx);
+            let row_y = origin_y + row_idx as i32 * cell_h - scroll_px;
+            if row_y >= h {
+                break;
+            }
+
+            // Coalesce contiguous non-default background runs per row.
+            let mut col = 0;
+            while col < vt.cols && col < line.len() {
+                let cell = line[col];
+                let cell_bg = if cell.inverse {
+                    cell.fg.resolve(theme, cell.bold)
+                } else {
+                    cell.bg.resolve(theme, false)
+                };
+                if cell_bg != default_bg {
+                    let start = col;
+                    col += 1;
+                    while col < vt.cols && col < line.len() {
+                        let next = line[col];
+                        let next_bg = if next.inverse {
+                            next.fg.resolve(theme, next.bold)
+                        } else {
+                            next.bg.resolve(theme, false)
+                        };
+                        if next_bg != cell_bg {
+                            break;
+                        }
+                        col += 1;
                     }
+                    c.fill(
+                        Rect::new(
+                            origin_x + start as i32 * cell_w,
+                            row_y,
+                            (col - start) as i32 * cell_w,
+                            cell_h,
+                        ),
+                        cell_bg,
+                    );
+                } else {
                     col += 1;
                 }
-                canvas.fill(
-                    Rect::new(
-                        origin_x + start as i32 * cell_w,
-                        row_y,
-                        (col - start) as i32 * cell_w,
-                        cell_h,
-                    ),
-                    cell_bg,
+            }
+
+            // Draw foreground glyphs.
+            let baseline = row_y as f32 + metrics.baseline_off;
+            let mut buf = [0u8; 4];
+            for (c_idx, cell) in line.iter().take(vt.cols).enumerate() {
+                if cell.wide_cont || cell.ch == ' ' {
+                    continue;
+                }
+                let mut fg = if cell.inverse {
+                    cell.bg.resolve(theme, false)
+                } else {
+                    cell.fg.resolve(theme, cell.bold)
+                };
+                if cell.dim {
+                    fg = crate::draw::mix(fg, default_bg, 0.38);
+                }
+                let face = if cell.bold { Face::Bold } else { Face::Mono };
+                let s = cell.ch.encode_utf8(&mut buf);
+                text.draw(
+                    c,
+                    s,
+                    (origin_x + c_idx as i32 * cell_w) as f32,
+                    baseline,
+                    font_px,
+                    fg,
+                    face,
                 );
-            } else {
-                col += 1;
             }
         }
 
-        // Draw foreground glyphs.
-        let baseline = row_y as f32 + metrics.baseline_off;
-        let mut buf = [0u8; 4];
-        for (c_idx, cell) in line.iter().take(vt.cols).enumerate() {
-            if cell.wide_cont || cell.ch == ' ' {
-                continue;
-            }
-            let mut fg = if cell.inverse {
-                cell.bg.resolve(theme, false)
+        // Draw cursor relative to live screen rows.
+        if vt.cursor_visible && vt.cur_row < vt.rows && vt.cur_col < vt.cols {
+            let cur_cell = vt.screen[vt.cur_row][vt.cur_col];
+            let cur_w = if !cur_cell.wide_cont && char_display_width(cur_cell.ch) == 2 {
+                cell_w * 2
             } else {
-                cell.fg.resolve(theme, cell.bold)
+                cell_w
             };
-            if cell.dim {
-                fg = crate::draw::mix(fg, default_bg, 0.38);
-            }
-            let face = if cell.bold { Face::Bold } else { Face::Mono };
-            let s = cell.ch.encode_utf8(&mut buf);
-            text.draw(
-                canvas,
-                s,
-                (origin_x + c_idx as i32 * cell_w) as f32,
-                baseline,
-                font_px,
-                fg,
-                face,
-            );
-        }
-    }
-
-    // Draw cursor when viewing live bottom screen.
-    if vt.scroll_offset == 0 && vt.cursor_visible && vt.cur_row < vt.rows && vt.cur_col < vt.cols {
-        let cur_cell = vt.screen[vt.cur_row][vt.cur_col];
-        let cur_w = if !cur_cell.wide_cont && char_display_width(cur_cell.ch) == 2 {
-            cell_w * 2
-        } else {
-            cell_w
-        };
-        let cx = origin_x + vt.cur_col as i32 * cell_w;
-        let cy = origin_y + vt.cur_row as i32 * cell_h;
-        let cursor_color = theme.accent;
-        match cursor_style {
-            CursorStyle::Beam => {
-                let thickness = if window_active { 2 } else { 1 };
-                canvas.fill(Rect::new(cx, cy + 2, thickness, cell_h - 4), cursor_color);
-            }
-            CursorStyle::Underline => {
-                let thickness = if window_active { 2 } else { 1 };
-                canvas.fill(
-                    Rect::new(cx, cy + cell_h - 3, cur_w, thickness),
-                    cursor_color,
-                );
-            }
-            CursorStyle::Block => {
-                let cursor_rect = Rect::new(cx, cy + 1, cur_w, cell_h - 2);
-                if window_active {
-                    canvas.fill(cursor_rect, cursor_color);
-                    if cur_cell.ch != ' ' && !cur_cell.wide_cont {
-                        let mut buf = [0u8; 4];
-                        let s = cur_cell.ch.encode_utf8(&mut buf);
-                        text.draw(
-                            canvas,
-                            s,
-                            cx as f32,
-                            cy as f32 + metrics.baseline_off,
-                            font_px,
-                            0xffffff,
-                            Face::Mono,
+            let cx = origin_x + vt.cur_col as i32 * cell_w;
+            let cy = origin_y + (total_sb + vt.cur_row) as i32 * cell_h - scroll_px;
+            if cy + cell_h > TITLEBAR_HEIGHT && cy < h {
+                let cursor_color = theme.accent;
+                match cursor_style {
+                    CursorStyle::Beam => {
+                        let thickness = if window_active { 2 } else { 1 };
+                        c.fill(Rect::new(cx, cy + 2, thickness, cell_h - 4), cursor_color);
+                    }
+                    CursorStyle::Underline => {
+                        let thickness = if window_active { 2 } else { 1 };
+                        c.fill(
+                            Rect::new(cx, cy + cell_h - 3, cur_w, thickness),
+                            cursor_color,
                         );
                     }
-                } else {
-                    canvas.border_1px(cursor_rect, cursor_color);
+                    CursorStyle::Block => {
+                        let cursor_rect = Rect::new(cx, cy + 1, cur_w, cell_h - 2);
+                        if window_active {
+                            c.fill(cursor_rect, cursor_color);
+                            if cur_cell.ch != ' ' && !cur_cell.wide_cont {
+                                let mut buf = [0u8; 4];
+                                let s = cur_cell.ch.encode_utf8(&mut buf);
+                                text.draw(
+                                    c,
+                                    s,
+                                    cx as f32,
+                                    cy as f32 + metrics.baseline_off,
+                                    font_px,
+                                    0xffffff,
+                                    Face::Mono,
+                                );
+                            }
+                        } else {
+                            c.border_1px(cursor_rect, cursor_color);
+                        }
+                    }
                 }
             }
         }
-    }
+    });
 
-    if !vt.scrollback.is_empty() {
-        let total = vt.scrollback.len() + vt.rows;
-        let top_offset = vt.scrollback.len().saturating_sub(vt.scroll_offset);
-        let track = Rect::new(
-            canvas.width as i32 - SCROLLBAR_W - 2,
-            TITLEBAR_HEIGHT + 2,
-            SCROLLBAR_W,
-            (canvas.height as i32 - TITLEBAR_HEIGHT - 4).max(8),
-        );
-        ui::scrollbar_v(canvas, theme, track, total, vt.rows, top_offset);
-    }
+    scroll.draw_v(canvas, theme, track, vp_h, total_h);
 }
 
 #[cfg(test)]

@@ -79,7 +79,7 @@ def main() -> int:
         run("mmd", "-i", str(IMAGE), f"::{directory}")
 
     for name in ("hello", "cat", "echo", "sh", "fastfetch", "systemctl", "systemg-analyze",
-                 "mp3play"):
+                 "mp3play", "wavplay"):
         source = USERLAND / name
         if source.exists():
             run("mcopy", "-i", str(IMAGE), str(source), f"::/bin/{name}")

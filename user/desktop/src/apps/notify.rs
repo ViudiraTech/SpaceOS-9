@@ -28,6 +28,7 @@ pub fn run(title: &str, body: &str) -> Result<()> {
     let mut app = App::new(title, Icon::Notify, 380, 134)?;
     app.min_width = 320;
     app.min_height = 124;
+    crate::sound::play(&app.config, crate::sound::SystemSound::Notify);
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut btn_hover = false;
@@ -63,7 +64,10 @@ pub fn run(title: &str, body: &str) -> Result<()> {
                     button: 1,
                     down: true,
                     ..
-                } if dismiss_btn_rect(w, h).contains(x, y) => app.request_close(),
+                } if dismiss_btn_rect(w, h).contains(x, y) => {
+                    crate::sound::play(&app.config, crate::sound::SystemSound::Click);
+                    app.request_close();
+                }
                 _ => {}
             }
         }

@@ -5,12 +5,13 @@
  *       Copyright (C) 2026 ViudiraTech.
  */
 use super::*;
+use crate::sync::Mutex;
 const ARG: u64 = 0x10000;
 fn call(
     file: &Arc<dyn Inode>,
     nr: u8,
     bytes: &mut [u8],
-    space: &Arc<SpinLock<UserAddressSpace>>,
+    space: &Arc<Mutex<UserAddressSpace>>,
 ) -> Result<(), VfsError> {
     space.lock().write_bytes(ARG, bytes)?;
     let (size, dir) = abi::descriptor(nr).unwrap();
@@ -30,7 +31,7 @@ pub fn run() -> &'static str {
     let resources_before = gpu.live_resources();
     let task = crate::sched::current().unwrap();
     let old = task.address_space();
-    let scratch = Arc::new(SpinLock::new(UserAddressSpace::new().unwrap()));
+    let scratch = Arc::new(Mutex::new(UserAddressSpace::new().unwrap()));
     scratch.lock().map_zeroed(ARG, 65536, 3).unwrap();
     task.lock().set_address_space(scratch.clone());
     let first = vfs::open_abs("/dev/dri/card0", vfs::abi::O_RDWR, 0)
@@ -218,7 +219,7 @@ pub fn run() -> &'static str {
         "virtio-gpu(kms+reclaim)"
     }
 }
-fn context(file: &Arc<dyn Inode>, capset: u32, space: &Arc<SpinLock<UserAddressSpace>>) {
+fn context(file: &Arc<dyn Inode>, capset: u32, space: &Arc<Mutex<UserAddressSpace>>) {
     let mut params = vec![0; 32];
     put64(&mut params, 0, 1);
     put64(&mut params, 8, capset as u64);
@@ -230,7 +231,7 @@ fn context(file: &Arc<dyn Inode>, capset: u32, space: &Arc<SpinLock<UserAddressS
     put64(&mut init, 8, 0x13000);
     call(file, 0x4b, &mut init, space).unwrap();
 }
-fn virgl(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<SpinLock<UserAddressSpace>>) {
+fn virgl(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<Mutex<UserAddressSpace>>) {
     let capset = gpu
         .capsets
         .lock()
@@ -329,7 +330,7 @@ fn virgl(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<SpinLock<UserAddress
         "VirGL host-rendered clear/readback self-test passed"
     ));
 }
-fn venus(gpu: &Arc<Gpu>, space: &Arc<SpinLock<UserAddressSpace>>) {
+fn venus(gpu: &Arc<Gpu>, space: &Arc<Mutex<UserAddressSpace>>) {
     let file = vfs::open_abs("/dev/dri/renderD128", vfs::abi::O_RDWR, 0)
         .unwrap()
         .inode
@@ -475,7 +476,7 @@ fn venus(gpu: &Arc<Gpu>, space: &Arc<SpinLock<UserAddressSpace>>) {
     ));
 }
 
-fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<SpinLock<UserAddressSpace>>) {
+fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<Mutex<UserAddressSpace>>) {
     let output = gpu.outputs.lock()[0].clone();
     let mut dumb = empty(32);
     put32(&mut dumb, 0, output.height);

@@ -19,14 +19,72 @@ use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, TITLEBAR_HEIGHT};
 use crate::ui;
 use crate::x11::Result;
+use std::fs;
+use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-const TRACK: &str = "/usr/share/music/spaceos-theme.mp3";
-const TRACK_TITLE: &str = "SpaceOS 主题曲";
-const TRACK_SUBTITLE: &str = "示例 MP3 · 44.1 kHz · 立体声";
+const MUSIC_DIR: &str = "/usr/share/music";
+const DEFAULT_TRACK: &str = "/usr/share/music/qingtian.mp3";
+
+struct TrackInfo {
+    path: String,
+    title: String,
+    subtitle: String,
+}
+
+fn describe_track(path: &str) -> TrackInfo {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path);
+    match name {
+        "qingtian.mp3" => TrackInfo {
+            path: path.to_string(),
+            title: String::from("晴天"),
+            subtitle: String::from("Opus 5.5 生成 · MP3 · 44.1 kHz · 立体声"),
+        },
+        "spaceos-theme.mp3" => TrackInfo {
+            path: path.to_string(),
+            title: String::from("SpaceOS 主题曲"),
+            subtitle: String::from("示例 MP3 · 44.1 kHz · 立体声"),
+        },
+        _ => TrackInfo {
+            path: path.to_string(),
+            title: name.strip_suffix(".mp3").unwrap_or(name).to_string(),
+            subtitle: String::from("MP3 · /usr/share/music"),
+        },
+    }
+}
+
+fn load_tracks() -> Vec<TrackInfo> {
+    let mut paths = Vec::new();
+    if let Ok(entries) = fs::read_dir(MUSIC_DIR) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mp3"))
+            {
+                paths.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    paths.sort();
+    if let Some(pos) = paths.iter().position(|p| p == DEFAULT_TRACK) {
+        let preferred = paths.remove(pos);
+        paths.insert(0, preferred);
+    }
+    if paths.is_empty() {
+        paths.push(String::from(DEFAULT_TRACK));
+    }
+    paths.into_iter().map(|p| describe_track(&p)).collect()
+}
 
 struct PlayerState {
+    tracks: Vec<TrackInfo>,
+    current: usize,
     child: Option<Child>,
     status: String,
     started: Instant,
@@ -35,10 +93,16 @@ struct PlayerState {
 impl PlayerState {
     fn new() -> Self {
         Self {
+            tracks: load_tracks(),
+            current: 0,
             child: None,
             status: String::from("就绪"),
             started: Instant::now(),
         }
+    }
+
+    fn current_track(&self) -> &TrackInfo {
+        &self.tracks[self.current]
     }
 
     fn playing(&self) -> bool {
@@ -49,7 +113,8 @@ impl PlayerState {
         if self.child.is_some() {
             return;
         }
-        match Command::new("/bin/mp3play").arg(TRACK).spawn() {
+        let path = self.current_track().path.clone();
+        match Command::new("/bin/mp3play").arg(&path).spawn() {
             Ok(child) => {
                 self.child = Some(child);
                 self.status = String::from("正在播放");
@@ -67,6 +132,20 @@ impl PlayerState {
             let _ = child.wait();
         }
         self.status = String::from("已停止");
+    }
+
+    fn next_track(&mut self) {
+        if self.tracks.len() <= 1 {
+            return;
+        }
+        let was_playing = self.playing();
+        self.stop();
+        self.current = (self.current + 1) % self.tracks.len();
+        if was_playing {
+            self.play();
+        } else {
+            self.status = String::from("就绪");
+        }
     }
 
     fn poll(&mut self) -> bool {
@@ -101,6 +180,7 @@ pub fn run() -> Result<()> {
     let mut state = PlayerState::new();
     let mut hover_play = false;
     let mut hover_stop = false;
+    let mut hover_next = false;
     let mut last_spectrum = Instant::now();
 
     loop {
@@ -120,36 +200,37 @@ pub fn run() -> Result<()> {
                 app.height as i32,
                 hover_play,
                 hover_stop,
+                hover_next,
             );
             app.draw_chrome();
             app.present()?;
             last_spectrum = Instant::now();
         } else if state.playing() && last_spectrum.elapsed() >= Duration::from_millis(80) {
-            draw_spectrum(
-                &mut app.canvas,
-                &app.theme,
-                &state,
-                app.width as i32,
-                true,
-            );
+            draw_spectrum(&mut app.canvas, &app.theme, &state, app.width as i32, true);
             app.needs_redraw = true;
             app.present()?;
             last_spectrum = Instant::now();
         }
 
-        for event in app.pump_with_fd(None, if state.playing() { 80 } else { 200 })?.0 {
+        for event in app
+            .pump_with_fd(None, if state.playing() { 80 } else { 200 })?
+            .0
+        {
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose | UiEvent::Configure { .. } | UiEvent::ConfigChanged => {
                     app.needs_redraw = true;
                 }
                 UiEvent::Motion { x, y, .. } => {
-                    let (play, stop) = button_rects(app.height as i32);
+                    let (play, stop, next) = button_rects(app.height as i32);
                     let next_play = play.contains(x, y);
                     let next_stop = stop.contains(x, y);
-                    if next_play != hover_play || next_stop != hover_stop {
+                    let next_btn = state.tracks.len() > 1 && next.contains(x, y);
+                    if next_play != hover_play || next_stop != hover_stop || next_btn != hover_next
+                    {
                         hover_play = next_play;
                         hover_stop = next_stop;
+                        hover_next = next_btn;
                         app.needs_redraw = true;
                     }
                 }
@@ -160,11 +241,13 @@ pub fn run() -> Result<()> {
                     down: true,
                     ..
                 } => {
-                    let (play, stop) = button_rects(app.height as i32);
+                    let (play, stop, next) = button_rects(app.height as i32);
                     if play.contains(x, y) {
                         state.play();
                     } else if stop.contains(x, y) {
                         state.stop();
+                    } else if state.tracks.len() > 1 && next.contains(x, y) {
+                        state.next_track();
                     }
                     app.needs_redraw = true;
                 }
@@ -184,11 +267,12 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn button_rects(height: i32) -> (Rect, Rect) {
+fn button_rects(height: i32) -> (Rect, Rect, Rect) {
     let y = height - 64;
     (
-        Rect::new(24, y, 136, 40),
-        Rect::new(172, y, 112, 40),
+        Rect::new(24, y, 120, 40),
+        Rect::new(154, y, 100, 40),
+        Rect::new(264, y, 100, 40),
     )
 }
 
@@ -202,6 +286,7 @@ fn draw_player(
     height: i32,
     hover_play: bool,
     hover_stop: bool,
+    hover_next: bool,
 ) {
     canvas.clear(theme.window);
 
@@ -226,10 +311,11 @@ fn draw_player(
         Face::Bold,
     );
 
+    let track = state.current_track();
     let title_x = art.right() as f32 + 22.0;
     text.draw(
         canvas,
-        TRACK_TITLE,
+        &track.title,
         title_x,
         album.y as f32 + 48.0,
         21.0,
@@ -238,7 +324,7 @@ fn draw_player(
     );
     text.draw(
         canvas,
-        TRACK_SUBTITLE,
+        &track.subtitle,
         title_x,
         album.y as f32 + 72.0,
         12.0,
@@ -262,8 +348,12 @@ fn draw_player(
     // Decorative spectrum that moves while playback is active.
     draw_spectrum(canvas, theme, state, width, false);
 
-    let (play, stop) = button_rects(height);
-    let play_label = if state.playing() { "播放中" } else { "播放" };
+    let (play, stop, next) = button_rects(height);
+    let play_label = if state.playing() {
+        "播放中"
+    } else {
+        "播放"
+    };
     ui::button(
         canvas,
         text,
@@ -284,6 +374,9 @@ fn draw_player(
         false,
         hover_stop,
     );
+    if state.tracks.len() > 1 {
+        ui::button(canvas, text, theme, next, "下一首", None, false, hover_next);
+    }
 
     text.draw(
         canvas,

@@ -6,7 +6,7 @@
  */
 use crate::{
     arch, sched,
-    sync::SpinLock,
+    sync::{Mutex, SpinLock},
     user::{UserAddressSpace, elf, stack, uaccess},
     vfs::{self, VfsError, abi},
 };
@@ -52,7 +52,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
         let sp = stack::setup(&mut space, &loaded, &path, &args, &environment)
             .map_err(|_| VfsError::NoSpace)?;
         Ok((
-            Arc::new(SpinLock::new(space)),
+            Arc::new(Mutex::new(space)),
             loaded.initial_pc,
             sp,
             loaded.tls_tp,
@@ -95,7 +95,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
             }
         }
     }
-    space.lock().activate();
+    UserAddressSpace::activate_shared(&space);
     drop(old);
     // enter_user_mode never returns, so anything still owned by this frame would
     // never be dropped; a leaked space would keep every page of this image alive.
@@ -479,7 +479,7 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
     } else {
         let mut space = parent_space.lock();
         match space.fork_copy() {
-            Ok(space) => Arc::new(SpinLock::new(space)),
+            Ok(space) => Arc::new(Mutex::new(space)),
             Err(_) => return -abi::ENOMEM,
         }
     };
@@ -558,14 +558,13 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
     let result = crate::sched::spawn_user(
         move || {
             if let Some(address) = set_child_tid {
-                // The TID word must be globally visible before this thread can
-                // run user code on another CPU.  Interrupts stay masked from
-                // the store through the GS/SYSRET handoff so the task cannot
-                // migrate between them.
-                crate::arch::disable_interrupts();
+                // Lock Mutex<UserAddressSpace> while interrupts are enabled,
+                // then publish the store and keep interrupts masked through
+                // the GS/SYSRET handoff.
                 let _ = child_space_for_tid
                     .lock()
                     .write_bytes(address, &(ltid as i32).to_le_bytes());
+                crate::arch::disable_interrupts();
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             }
             // SAFETY: the child owns this address space and the captured user

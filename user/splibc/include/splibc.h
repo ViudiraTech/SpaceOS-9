@@ -516,6 +516,14 @@ int init_module(const void *image, unsigned long length, const char *parameters)
 int finit_module(int fd, const char *parameters, int flags);
 int delete_module(const char *name, int flags);
 
+#define RB_AUTOBOOT 0x01234567u
+#define RB_HALT_SYSTEM 0xcdef0123u
+#define RB_POWER_OFF 0x4321fedcu
+
+void sync(void);
+int umount2(const char *target, int flags);
+int reboot(unsigned int cmd);
+
 pid_t fork(void);
 pid_t getpid(void);
 pid_t getppid(void);

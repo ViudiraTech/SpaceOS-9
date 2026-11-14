@@ -27,6 +27,8 @@ pub enum Face {
     Ui,
     Bold,
     Mono,
+    CyberDisplay,
+    CyberMono,
 }
 
 pub struct Glyph {
@@ -154,6 +156,13 @@ impl OutlineBuilder for Outline<'_> {
 }
 
 impl Font {
+    fn has_glyph(&self, ch: char) -> bool {
+        ParsedFace::parse(&self.data, self.index)
+            .ok()
+            .and_then(|f| f.glyph_index(ch))
+            .is_some_and(|id| id.0 != 0)
+    }
+
     fn rasterize(&self, ch: char, px: f32) -> Glyph {
         let face = ParsedFace::parse(&self.data, self.index).expect("validated font");
         let id = face.glyph_index(ch).unwrap_or(GlyphId(0));
@@ -201,6 +210,8 @@ pub struct TextRenderer {
     ui: Font,
     bold: Font,
     mono: Font,
+    cyber_display: Option<Font>,
+    cyber_mono: Option<Font>,
     ui_scale: f32,
     cache: HashMap<(Face, char, u16), Arc<Glyph>>,
 }
@@ -302,10 +313,14 @@ impl TextRenderer {
             .or_else(|_| load(theme::FONT_UI, "CJK SC", &mut files))?;
         let mono = load(theme::FONT_MONO, "Mono CJK SC", &mut files)
             .or_else(|_| load(theme::FONT_MONO, "CJK SC", &mut files))?;
+        let cyber_display = load(theme::FONT_CYBER_DISPLAY, "", &mut files).ok();
+        let cyber_mono = load(theme::FONT_CYBER_MONO, "", &mut files).ok();
         Ok(Self {
             ui,
             bold,
             mono,
+            cyber_display,
+            cyber_mono,
             ui_scale: 1.0,
             cache: HashMap::with_capacity(512),
         })
@@ -315,11 +330,21 @@ impl TextRenderer {
         self.ui_scale = scale.clamp(0.75, 1.5);
     }
 
-    fn font(&self, face: Face) -> &Font {
+    fn font_for_char(&self, face: Face, ch: char) -> &Font {
         match face {
             Face::Ui => &self.ui,
             Face::Bold => &self.bold,
             Face::Mono => &self.mono,
+            Face::CyberDisplay => self
+                .cyber_display
+                .as_ref()
+                .filter(|f| f.has_glyph(ch))
+                .unwrap_or(&self.bold),
+            Face::CyberMono => self
+                .cyber_mono
+                .as_ref()
+                .filter(|f| f.has_glyph(ch))
+                .unwrap_or(&self.mono),
         }
     }
 
@@ -333,7 +358,7 @@ impl TextRenderer {
         if let Some(glyph) = self.cache.get(&key) {
             return glyph.clone();
         }
-        let font = self.font(face);
+        let font = self.font_for_char(face, ch);
         let glyph = Arc::new(font.rasterize(ch, eff_px));
         self.cache.insert(key, glyph.clone());
         glyph

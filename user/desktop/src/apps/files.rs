@@ -18,7 +18,7 @@ use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
 use crate::ui;
-use crate::x11::Result;
+use crate::x11::{CursorKind, Result};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ const SIDEBAR_W: i32 = 168;
 const HEADER_H: i32 = 28;
 const ROW_H: i32 = 30;
 const STATUS_H: i32 = 26;
-const SCROLLBAR_W: i32 = 8;
+const SCROLLBAR_W: i32 = ui::SCROLLBAR_HIT_W;
 
 #[derive(Clone)]
 struct Entry {
@@ -67,7 +67,7 @@ struct BrowserState {
     history: Vec<PathBuf>,
     entries: Vec<Entry>,
     selected: Option<usize>,
-    scroll: usize,
+    scroll: ui::SmoothScroll,
     hover: HoverTarget,
     status: String,
     last_row_click: Option<(usize, Instant)>,
@@ -113,13 +113,20 @@ impl BrowserState {
             history: Vec::new(),
             entries,
             selected: None,
-            scroll: 0,
+            scroll: ui::SmoothScroll::new("files_scroll"),
             hover: HoverTarget::None,
             status,
             last_row_click: None,
             show_hidden,
             folders_first,
         }
+    }
+
+    fn sync_scroll_bounds(&mut self, win_w: i32, win_h: i32) {
+        let rows_area = table_rows_rect(win_w, win_h);
+        let track = scrollbar_track(win_w, win_h);
+        let total_h = (self.entries.len() as i32 * ROW_H) as f32;
+        self.scroll.set_bounds(rows_area.h as f32, total_h, track);
     }
 
     fn navigate_to(&mut self, target: PathBuf, record_history: bool) {
@@ -133,38 +140,41 @@ impl BrowserState {
         self.current = target;
         self.entries = scan(&self.current, self.show_hidden, self.folders_first);
         self.selected = None;
-        self.scroll = 0;
+        self.scroll.snap_to(0.0);
         self.last_row_click = None;
         self.status = summarize_entries(&self.entries);
     }
 
-    fn go_back(&mut self) {
+    fn go_back(&mut self) -> bool {
         if let Some(prev) = self.history.pop() {
             self.navigate_to(prev, false);
+            return true;
         }
+        false
     }
 
-    fn go_up(&mut self) {
+    fn go_up(&mut self) -> bool {
         if let Some(parent) = self.current.parent().map(Path::to_path_buf) {
             if parent != self.current {
                 self.navigate_to(parent, true);
+                return true;
             }
         }
+        false
     }
 
-    fn refresh(&mut self, visible_rows: usize) {
+    fn refresh(&mut self, win_w: i32, win_h: i32) {
         self.entries = scan(&self.current, self.show_hidden, self.folders_first);
         if let Some(sel) = self.selected {
             if sel >= self.entries.len() {
                 self.selected = self.entries.len().checked_sub(1);
             }
         }
-        let max_scroll = self.entries.len().saturating_sub(visible_rows.max(1));
-        self.scroll = self.scroll.min(max_scroll);
+        self.sync_scroll_bounds(win_w, win_h);
         self.status = format!("已刷新 · {}", summarize_entries(&self.entries));
     }
 
-    fn apply_prefs(&mut self, show_hidden: bool, folders_first: bool, visible_rows: usize) {
+    fn apply_prefs(&mut self, show_hidden: bool, folders_first: bool, win_w: i32, win_h: i32) {
         if self.show_hidden != show_hidden || self.folders_first != folders_first {
             self.show_hidden = show_hidden;
             self.folders_first = folders_first;
@@ -174,22 +184,23 @@ impl BrowserState {
                     self.selected = self.entries.len().checked_sub(1);
                 }
             }
-            let max_scroll = self.entries.len().saturating_sub(visible_rows.max(1));
-            self.scroll = self.scroll.min(max_scroll);
+            self.sync_scroll_bounds(win_w, win_h);
             self.status = summarize_entries(&self.entries);
         }
     }
 
-    fn ensure_selected_visible(&mut self, visible_rows: usize) {
+    fn ensure_selected_visible(&mut self, win_w: i32, win_h: i32) {
+        self.sync_scroll_bounds(win_w, win_h);
         let Some(sel) = self.selected else { return };
-        let vis = visible_rows.max(1);
-        if sel < self.scroll {
-            self.scroll = sel;
-        } else if sel >= self.scroll + vis {
-            self.scroll = sel + 1 - vis;
+        let vp_h = table_rows_rect(win_w, win_h).h.max(ROW_H) as f32;
+        let sel_top = (sel as i32 * ROW_H) as f32;
+        let sel_bot = ((sel + 1) as i32 * ROW_H) as f32;
+        let cur = self.scroll.target();
+        if sel_top < cur {
+            self.scroll.animate_to(sel_top, ui::MOTION_SCROLL);
+        } else if sel_bot > cur + vp_h {
+            self.scroll.animate_to(sel_bot - vp_h, ui::MOTION_SCROLL);
         }
-        let max_scroll = self.entries.len().saturating_sub(vis);
-        self.scroll = self.scroll.min(max_scroll);
     }
 
     fn activate_entry(&mut self, index: usize) {
@@ -267,6 +278,17 @@ fn place_rect(index: usize) -> Rect {
     )
 }
 
+fn scrollbar_track(win_w: i32, win_h: i32) -> Rect {
+    let top = TITLEBAR_HEIGHT + TOOLBAR_H + HEADER_H;
+    let bottom = (win_h - STATUS_H).max(top);
+    Rect::new(
+        win_w - SCROLLBAR_W - 2,
+        top + 2,
+        SCROLLBAR_W,
+        (bottom - top - 4).max(8),
+    )
+}
+
 fn table_rows_rect(win_w: i32, win_h: i32) -> Rect {
     let top = TITLEBAR_HEIGHT + TOOLBAR_H + HEADER_H;
     let bottom = (win_h - STATUS_H).max(top);
@@ -310,7 +332,8 @@ fn hit_test(state: &BrowserState, win_w: i32, win_h: i32, x: i32, y: i32) -> Hov
     }
     let rows_area = table_rows_rect(win_w, win_h);
     if rows_area.contains(x, y) {
-        let idx = state.scroll + ((y - rows_area.y) / ROW_H) as usize;
+        let scroll_px = state.scroll.offset_i32().max(0);
+        let idx = ((y - rows_area.y + scroll_px) / ROW_H) as usize;
         if idx < state.entries.len() {
             return HoverTarget::Row(idx);
         }
@@ -338,13 +361,16 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         app.config.files_show_hidden,
         app.config.files_folders_first,
     );
+    state.sync_scroll_bounds(app.width as i32, app.height as i32);
 
     loop {
         if app.close {
             break;
         }
         for event in app.pump()? {
-            let vis = visible_row_count(app.height as i32);
+            let win_w = app.width as i32;
+            let win_h = app.height as i32;
+            let vis = visible_row_count(win_h);
             match event {
                 UiEvent::Close => app.request_close(),
                 UiEvent::Expose => app.needs_redraw = true,
@@ -352,152 +378,190 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                     state.apply_prefs(
                         app.config.files_show_hidden,
                         app.config.files_folders_first,
-                        vis,
+                        win_w,
+                        win_h,
                     );
                     app.needs_redraw = true;
                 }
-                UiEvent::Configure { .. } => {
-                    let max_scroll = state.entries.len().saturating_sub(vis);
-                    state.scroll = state.scroll.min(max_scroll);
+                UiEvent::Configure { width, height } => {
+                    state.sync_scroll_bounds(width as i32, height as i32);
                     app.needs_redraw = true;
                 }
                 UiEvent::Motion { x, y, .. } => {
-                    let target = hit_test(&state, app.width as i32, app.height as i32, x, y);
-                    if target != state.hover {
-                        state.hover = target;
+                    if state.scroll.handle_motion(x, y) {
                         app.needs_redraw = true;
+                    }
+                    app.set_content_cursor(
+                        if state.scroll.is_hovered() || state.scroll.is_dragging() {
+                            CursorKind::Pointer
+                        } else {
+                            CursorKind::Default
+                        },
+                    );
+                    if !state.scroll.is_dragging() {
+                        let target = hit_test(&state, win_w, win_h, x, y);
+                        if target != state.hover {
+                            state.hover = target;
+                            app.needs_redraw = true;
+                        }
                     }
                 }
                 UiEvent::Wheel { delta, .. } => {
-                    let max_scroll = state.entries.len().saturating_sub(vis);
-                    let next = if delta > 0 {
-                        (state.scroll + delta as usize).min(max_scroll)
-                    } else {
-                        state.scroll.saturating_sub((-delta) as usize)
-                    };
-                    if next != state.scroll {
-                        state.scroll = next;
+                    state.sync_scroll_bounds(win_w, win_h);
+                    if state.scroll.wheel(delta as f32 * 22.0) {
                         app.needs_redraw = true;
                     }
                 }
                 UiEvent::Button {
-                    x,
-                    y,
-                    button: 1,
-                    down: true,
-                    ..
-                } if y >= TITLEBAR_HEIGHT => {
-                    match hit_test(&state, app.width as i32, app.height as i32, x, y) {
-                        HoverTarget::Back => {
-                            state.go_back();
-                            app.needs_redraw = true;
-                        }
-                        HoverTarget::Up => {
-                            state.go_up();
-                            app.needs_redraw = true;
-                        }
-                        HoverTarget::Home => {
-                            let h = state.home.clone();
-                            state.navigate_to(h, true);
-                            app.needs_redraw = true;
-                        }
-                        HoverTarget::Refresh => {
-                            state.refresh(vis);
-                            app.needs_redraw = true;
-                        }
-                        HoverTarget::OpenTerm => {
-                            state.open_terminal_here();
-                            app.needs_redraw = true;
-                        }
-                        HoverTarget::Place(i) => {
-                            let p = state.places[i].path.clone();
-                            state.navigate_to(p, true);
-                            app.needs_redraw = true;
-                        }
-                        HoverTarget::Row(idx) => {
-                            let now = Instant::now();
-                            let dc_ms = app.config.mouse_double_click_ms;
-                            let is_double =
-                                state.last_row_click.is_some_and(|(prev_idx, prev_t)| {
-                                    prev_idx == idx
-                                        && now.duration_since(prev_t)
-                                            <= Duration::from_millis(dc_ms)
-                                });
-                            state.selected = Some(idx);
-                            if app.config.files_single_click || is_double {
-                                state.last_row_click = None;
-                                state.activate_entry(idx);
+                    x, y, button, down, ..
+                } => {
+                    if state.scroll.handle_button(x, y, button, down) {
+                        app.set_content_cursor(
+                            if state.scroll.is_hovered() || state.scroll.is_dragging() {
+                                CursorKind::Pointer
                             } else {
-                                state.last_row_click = Some((idx, now));
-                                if let Some(entry) = state.entries.get(idx) {
-                                    state.status = format!(
-                                        "{} · {} (双击或按 Enter 打开)",
-                                        entry.name,
-                                        if entry.directory {
-                                            "文件夹".to_string()
-                                        } else {
-                                            format_size(entry.size)
-                                        }
+                                CursorKind::Default
+                            },
+                        );
+                        app.needs_redraw = true;
+                    } else if button == 1 && down && y >= TITLEBAR_HEIGHT {
+                        match hit_test(&state, win_w, win_h, x, y) {
+                            HoverTarget::Back => {
+                                if state.go_back() {
+                                    crate::sound::play(
+                                        &app.config,
+                                        crate::sound::SystemSound::Click,
                                     );
+                                    state.sync_scroll_bounds(win_w, win_h);
                                 }
-                            }
-                            app.needs_redraw = true;
-                        }
-                        HoverTarget::None => {
-                            if state.selected.take().is_some() {
-                                state.status = summarize_entries(&state.entries);
                                 app.needs_redraw = true;
+                            }
+                            HoverTarget::Up => {
+                                if state.go_up() {
+                                    crate::sound::play(
+                                        &app.config,
+                                        crate::sound::SystemSound::Click,
+                                    );
+                                    state.sync_scroll_bounds(win_w, win_h);
+                                }
+                                app.needs_redraw = true;
+                            }
+                            HoverTarget::Home => {
+                                let h = state.home.clone();
+                                state.navigate_to(h, true);
+                                state.sync_scroll_bounds(win_w, win_h);
+                                crate::sound::play(&app.config, crate::sound::SystemSound::Click);
+                                app.needs_redraw = true;
+                            }
+                            HoverTarget::Refresh => {
+                                state.refresh(win_w, win_h);
+                                crate::sound::play(&app.config, crate::sound::SystemSound::Click);
+                                app.needs_redraw = true;
+                            }
+                            HoverTarget::OpenTerm => {
+                                state.open_terminal_here();
+                                crate::sound::play(&app.config, crate::sound::SystemSound::Click);
+                                app.needs_redraw = true;
+                            }
+                            HoverTarget::Place(i) => {
+                                let p = state.places[i].path.clone();
+                                state.navigate_to(p, true);
+                                state.sync_scroll_bounds(win_w, win_h);
+                                crate::sound::play(&app.config, crate::sound::SystemSound::Click);
+                                app.needs_redraw = true;
+                            }
+                            HoverTarget::Row(idx) => {
+                                let now = Instant::now();
+                                let dc_ms = app.config.mouse_double_click_ms;
+                                let is_double =
+                                    state.last_row_click.is_some_and(|(prev_idx, prev_t)| {
+                                        prev_idx == idx
+                                            && now.duration_since(prev_t)
+                                                <= Duration::from_millis(dc_ms)
+                                    });
+                                state.selected = Some(idx);
+                                if app.config.files_single_click || is_double {
+                                    state.last_row_click = None;
+                                    state.activate_entry(idx);
+                                    state.sync_scroll_bounds(win_w, win_h);
+                                    crate::sound::play(
+                                        &app.config,
+                                        crate::sound::SystemSound::Click,
+                                    );
+                                } else {
+                                    state.last_row_click = Some((idx, now));
+                                    if let Some(entry) = state.entries.get(idx) {
+                                        state.status = format!(
+                                            "{} · {} (双击或按 Enter 打开)",
+                                            entry.name,
+                                            if entry.directory {
+                                                "文件夹".to_string()
+                                            } else {
+                                                format_size(entry.size)
+                                            }
+                                        );
+                                    }
+                                }
+                                app.needs_redraw = true;
+                            }
+                            HoverTarget::None => {
+                                if state.selected.take().is_some() {
+                                    state.status = summarize_entries(&state.entries);
+                                    app.needs_redraw = true;
+                                }
                             }
                         }
                     }
                 }
                 UiEvent::Key(key) => {
                     if key.is_backspace() {
-                        state.go_up();
+                        if state.go_up() {
+                            state.sync_scroll_bounds(win_w, win_h);
+                        }
                         app.needs_redraw = true;
                     } else if key.is_enter() {
                         if let Some(idx) = state.selected {
                             state.activate_entry(idx);
+                            state.sync_scroll_bounds(win_w, win_h);
                             app.needs_redraw = true;
                         }
                     } else if key.arrow() == Some(1) && !state.entries.is_empty() {
                         let next = state.selected.map_or(0, |s| s.saturating_sub(1));
                         state.selected = Some(next);
-                        state.ensure_selected_visible(vis);
+                        state.ensure_selected_visible(win_w, win_h);
                         app.needs_redraw = true;
                     } else if key.arrow() == Some(3) && !state.entries.is_empty() {
                         let next = state
                             .selected
                             .map_or(0, |s| (s + 1).min(state.entries.len() - 1));
                         state.selected = Some(next);
-                        state.ensure_selected_visible(vis);
+                        state.ensure_selected_visible(win_w, win_h);
                         app.needs_redraw = true;
                     } else if key.is_page_up() && !state.entries.is_empty() {
                         let next = state.selected.unwrap_or(0).saturating_sub(vis);
                         state.selected = Some(next);
-                        state.ensure_selected_visible(vis);
+                        state.ensure_selected_visible(win_w, win_h);
                         app.needs_redraw = true;
                     } else if key.is_page_down() && !state.entries.is_empty() {
                         let next = (state.selected.unwrap_or(0) + vis).min(state.entries.len() - 1);
                         state.selected = Some(next);
-                        state.ensure_selected_visible(vis);
+                        state.ensure_selected_visible(win_w, win_h);
                         app.needs_redraw = true;
                     } else if key.is_home() && !state.entries.is_empty() {
                         state.selected = Some(0);
-                        state.ensure_selected_visible(vis);
+                        state.ensure_selected_visible(win_w, win_h);
                         app.needs_redraw = true;
                     } else if key.is_end() && !state.entries.is_empty() {
                         state.selected = Some(state.entries.len() - 1);
-                        state.ensure_selected_visible(vis);
+                        state.ensure_selected_visible(win_w, win_h);
                         app.needs_redraw = true;
                     }
                 }
-                _ => {}
             }
         }
 
         if app.needs_redraw {
-            draw_browser(&mut app.canvas, &mut app.text, &app.theme, &state);
+            draw_browser(&mut app.canvas, &mut app.text, &app.theme, &mut state);
             app.draw_chrome();
             app.present()?;
         }
@@ -505,7 +569,12 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn draw_browser(canvas: &mut Canvas, text: &mut TextRenderer, theme: &Theme, state: &BrowserState) {
+fn draw_browser(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    state: &mut BrowserState,
+) {
     let w = canvas.width as i32;
     let h = canvas.height as i32;
     canvas.clear(theme.window);
@@ -669,13 +738,14 @@ fn draw_browser(canvas: &mut Canvas, text: &mut TextRenderer, theme: &Theme, sta
 
     // Table rows
     let rows_top = body_top + HEADER_H;
-    let vis_rows = visible_row_count(h);
     let rows_clip = Rect::new(
         table_x,
         rows_top,
         (table_w - SCROLLBAR_W - 2).max(1),
         (body_bottom - rows_top).max(0),
     );
+    let sb_track = scrollbar_track(w, h);
+    let total_rows_h = (state.entries.len() as i32 * ROW_H) as f32;
 
     if state.entries.is_empty() {
         let cx = table_x + table_w / 2;
@@ -691,15 +761,18 @@ fn draw_browser(canvas: &mut Canvas, text: &mut TextRenderer, theme: &Theme, sta
             Face::Ui,
         );
     } else {
+        let scroll_px = state.scroll.offset_i32().max(0);
+        let first_row = (scroll_px / ROW_H).max(0) as usize;
+        let vis_span = ((rows_clip.h + ROW_H - 1) / ROW_H + 1).max(1) as usize;
         canvas.with_clip(rows_clip, |c| {
             for (slot, entry) in state
                 .entries
                 .iter()
                 .enumerate()
-                .skip(state.scroll)
-                .take(vis_rows + 1)
+                .skip(first_row)
+                .take(vis_span)
             {
-                let ry = rows_top + (slot - state.scroll) as i32 * ROW_H;
+                let ry = rows_top + slot as i32 * ROW_H - scroll_px;
                 if ry >= body_bottom {
                     break;
                 }
@@ -749,22 +822,10 @@ fn draw_browser(canvas: &mut Canvas, text: &mut TextRenderer, theme: &Theme, sta
                 );
             }
         });
-
-        let sb_track = Rect::new(
-            w - SCROLLBAR_W - 2,
-            rows_top + 2,
-            SCROLLBAR_W,
-            (body_bottom - rows_top - 4).max(8),
-        );
-        ui::scrollbar_v(
-            canvas,
-            theme,
-            sb_track,
-            state.entries.len(),
-            vis_rows,
-            state.scroll,
-        );
     }
+    state
+        .scroll
+        .draw_v(canvas, theme, sb_track, rows_clip.h as f32, total_rows_h);
 
     // Bottom status bar
     let status_y = h - STATUS_H;

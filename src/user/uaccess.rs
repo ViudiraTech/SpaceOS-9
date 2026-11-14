@@ -48,7 +48,7 @@ pub fn prefault(address: u64, length: usize, write: bool) -> Result<(), VfsError
 
 /// Bring one page in. Returns false when no mapping permits the access.
 pub fn resolve_fault(
-    space: &alloc::sync::Arc<crate::sync::SpinLock<UserAddressSpace>>,
+    space: &alloc::sync::Arc<crate::sync::Mutex<UserAddressSpace>>,
     address: u64,
     write: bool,
     exec: bool,
@@ -131,7 +131,7 @@ pub fn report_fatal_fault(address: u64, ip: u64, sp: u64) {
     }
 }
 
-pub fn current_space() -> Result<alloc::sync::Arc<crate::sync::SpinLock<UserAddressSpace>>, VfsError>
+pub fn current_space() -> Result<alloc::sync::Arc<crate::sync::Mutex<UserAddressSpace>>, VfsError>
 {
     sched::current()
         .and_then(|t| t.lock().address_space())

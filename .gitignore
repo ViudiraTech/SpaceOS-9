@@ -4,7 +4,11 @@
 
 # Rust objects and generated bootable ISO trees.
 /target/
+/user/desktop/target/
 /build/
+
+# Local demos / unmerged scratch demos.
+/pelican-bicycle/
 
 # Python helper bytecode and OS metadata.
 __pycache__/

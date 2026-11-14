@@ -434,7 +434,8 @@ static int hda_configure_codec(struct hda_chip *chip, int capture,
     if (!capture) {
         hda_verb(chip, nid, AC_VERB_SET_STREAM_FORMAT, format);
         hda_verb(chip, nid, AC_VERB_SET_AMP_GAIN_MUTE,
-                 AC_AMP_OUT_BOTH | chip->gains[0]);
+                 AC_AMP_OUT_BOTH |
+                     (chip->gains[0] ? chip->gains[0] : AC_AMP_MUTE));
         hda_program_converter(chip, nid, HDA_STREAM_TAG);
         hda_verb(chip, pin, AC_VERB_SET_PIN_WIDGET_CONTROL, AC_PINCTL_OUT_EN);
         if (chip->pin_out_amp) {
@@ -880,7 +881,8 @@ static int hda_volume_put(struct snd_kcontrol *kcontrol,
     }
     chip->gains[0] = (unsigned char)((gain * max_step + 50L) / 100L);
     hda_verb(chip, chip->dac, AC_VERB_SET_AMP_GAIN_MUTE,
-             AC_AMP_OUT_BOTH | chip->gains[0]);
+             AC_AMP_OUT_BOTH |
+                 ((gain == 0 || chip->gains[0] == 0) ? AC_AMP_MUTE : chip->gains[0]));
     return 1;
 }
 

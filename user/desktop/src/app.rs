@@ -248,7 +248,10 @@ impl App {
             entry.value = entry.target;
         }
         let out = entry.value;
-        self.anim_active = self.anims.values().any(|a| (a.value - a.target).abs() > 0.002);
+        self.anim_active = self
+            .anims
+            .values()
+            .any(|a| (a.value - a.target).abs() > 0.002);
         out
     }
 

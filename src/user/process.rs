@@ -12,7 +12,7 @@
 
 use crate::{
     arch, sched,
-    sync::SpinLock,
+    sync::{Mutex, SpinLock},
     user::{address_space::UserAddressSpace, elf, stack},
 };
 use alloc::sync::Arc;
@@ -60,7 +60,7 @@ pub fn spawn_init(path: &str) -> Result<u64, &'static str> {
     if sched::alloc_pid() != 1 {
         return Err("PID 1 was already allocated");
     }
-    let space_arc = Arc::new(SpinLock::new(space));
+    let space_arc = Arc::new(Mutex::new(space));
     let entry_va = loaded.initial_pc;
     let tls_tp = loaded.tls_tp;
     let spec = sched::UserTaskSpec {
@@ -110,7 +110,7 @@ pub fn spawn_user_elf(data: &[u8], name: &str) -> Result<u64, &'static str> {
     let mut space = UserAddressSpace::new()?;
     let loaded = elf::load_elf(&mut space, data)?;
     let user_sp = stack::setup_user_stack(&mut space, &loaded, name)?;
-    let space_arc = Arc::new(SpinLock::new(space));
+    let space_arc = Arc::new(Mutex::new(space));
 
     let entry_va = loaded.initial_pc;
     let tls_tp = loaded.tls_tp;

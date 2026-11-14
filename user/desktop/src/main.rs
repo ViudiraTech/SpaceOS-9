@@ -19,6 +19,8 @@ mod draw;
 mod icons;
 mod netmgr;
 mod shell;
+mod sound;
+mod start_screen;
 mod text;
 mod theme;
 mod ui;
@@ -44,6 +46,7 @@ fn main() -> ExitCode {
         "login" => apps::login::run(),
         "greeter" => apps::greeter::run(arguments.get(2..).unwrap_or(&[])),
         "oobe" => apps::oobe::run(arguments.get(2..).unwrap_or(&[])),
+        "power-splash" => apps::power_splash::run(arguments.get(2..).unwrap_or(&[])),
         "ddm" => ddm::run(arguments.get(2..).unwrap_or(&[])).map_err(|error| {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, error))
                 as Box<dyn std::error::Error>

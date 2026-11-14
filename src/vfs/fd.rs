@@ -629,8 +629,11 @@ impl FileDescriptorTable {
             }
         }
     }
+    pub fn take_all(&mut self) -> Vec<Option<FdEntry>> {
+        core::mem::take(&mut self.entries)
+    }
     pub fn close_all(&mut self) {
-        self.entries.clear();
+        let _ = self.take_all();
     }
 
     pub fn get(&self, fd: usize) -> Option<FdEntry> {

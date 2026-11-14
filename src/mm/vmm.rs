@@ -8,6 +8,7 @@
  *
  */
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
@@ -280,6 +281,7 @@ pub fn map_kernel(
         }
         return Err(MapError::InvalidPhysicalAddress);
     }
+    drop(state);
     arch::tlb_shootdown(virtual_address, pages);
     Ok(())
 }
@@ -300,6 +302,7 @@ pub fn unmap_kernel(virtual_address: u64, pages: usize) -> Result<(), MapError> 
     for index in 0..pages {
         clear_mapping(&state, virtual_address + index as u64 * PAGE_SIZE);
     }
+    drop(state);
     arch::tlb_shootdown(virtual_address, pages);
     Ok(())
 }
@@ -384,6 +387,7 @@ pub fn unmap(virtual_address: u64, pages: usize) -> Result<(), MapError> {
     if state.root == 0 {
         return Err(MapError::NotReady);
     }
+    let mut freed_frames = Vec::new();
     for page_idx in 0..pages {
         let va = virtual_address + (page_idx as u64) * PAGE_SIZE;
         let mut table = state.root;
@@ -402,12 +406,15 @@ pub fn unmap(virtual_address: u64, pages: usize) -> Result<(), MapError> {
             let value = unsafe { leaf.read_volatile() };
             if arch::pte_present(value) {
                 unsafe { leaf.write_volatile(0) };
-                let phys = arch::pte_phys(value);
-                let _ = pmm::free(phys, 1);
+                freed_frames.push(arch::pte_phys(value));
             }
         }
     }
+    drop(state);
     arch::tlb_shootdown(virtual_address, pages);
+    for phys in freed_frames {
+        let _ = pmm::free(phys, 1);
+    }
     Ok(())
 }
 
@@ -478,6 +485,7 @@ pub fn protect(
             }
         }
     }
+    drop(state);
     arch::tlb_shootdown(virtual_address, pages);
     Ok(())
 }

@@ -81,6 +81,18 @@ int delete_module(const char *name, int flags) {
     return __sc2(SYS_DELETE_MODULE, (long)name, flags);
 }
 
+void sync(void) {
+    (void)__sc0(SYS_SYNC);
+}
+
+int umount2(const char *target, int flags) {
+    return __sc2(SYS_UMOUNT2, (long)target, flags);
+}
+
+int reboot(unsigned int cmd) {
+    return __sc4(SYS_REBOOT, (long)0xFEE1DEADu, (long)672274793u, (long)cmd, 0);
+}
+
 int fcntl(int fd, int cmd, long arg) {
     return __sc3(SYS_FCNTL, fd, cmd, arg);
 }

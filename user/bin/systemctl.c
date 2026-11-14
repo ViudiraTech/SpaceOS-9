@@ -11,6 +11,12 @@
 #include "splibc.h"
 
 #define SOCK_PATH "/run/systemg.sock"
+#define DDM_POWER_SOCK "/run/ddm/power.sock"
+#define DDM_OP_POWER 4
+#define DDM_OP_POWER_OK 103
+#define DDM_OP_ERROR 105
+#define DDM_POWER_REBOOT 0
+#define DDM_POWER_POWEROFF 1
 
 static char *trim(char *text) {
     while (*text == ' ' || *text == '\t' || *text == '\r') {
@@ -87,7 +93,12 @@ static void print_help(void) {
            "  is-failed UNIT...               Check whether units are failed\n\n"
            "Manager Commands:\n"
            "  daemon-reload                   Reload systemg unit configuration\n"
-           "  help                            Show this help\n");
+           "  poweroff                        Shut down and power-off the system\n"
+           "  reboot                          Shut down and reboot the system\n"
+           "  halt                            Shut down and halt the system\n"
+           "  help                            Show this help\n\n"
+           "Options:\n"
+           "  --no-ddm                        Send power commands directly to systemg PID 1\n");
 }
 
 static int cmd_list_units(void) {
@@ -278,12 +289,110 @@ static int cmd_is_failed(const char *unit_name) {
     return (strcmp(s, "failed") == 0) ? 0 : 1;
 }
 
+static int send_ddm_power(u8 action) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_un sun;
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    strncpy(sun.sun_path, DDM_POWER_SOCK, sizeof(sun.sun_path) - 1);
+    if (connect(fd, &sun, sizeof(sun)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    u8 req[6] = { 2, 0, 0, 0, DDM_OP_POWER, action };
+    ssize_t wr = write(fd, req, sizeof(req));
+    if (wr != (ssize_t)sizeof(req)) {
+        close(fd);
+        return -1;
+    }
+
+    u8 hdr[4];
+    size_t got = 0;
+    while (got < sizeof(hdr)) {
+        ssize_t n = read(fd, hdr + got, sizeof(hdr) - got);
+        if (n <= 0) {
+            close(fd);
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    u32 frame_len = (u32)hdr[0] | ((u32)hdr[1] << 8) | ((u32)hdr[2] << 16) | ((u32)hdr[3] << 24);
+    if (frame_len == 0 || frame_len > 4096) {
+        close(fd);
+        return -1;
+    }
+    u8 payload[4097];
+    got = 0;
+    while (got < frame_len) {
+        ssize_t n = read(fd, payload + got, frame_len - got);
+        if (n <= 0) {
+            close(fd);
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    close(fd);
+
+    if (payload[0] == DDM_OP_POWER_OK) {
+        return 0;
+    }
+    if (payload[0] == DDM_OP_ERROR && frame_len >= 3) {
+        u16 msg_len = (u16)payload[1] | ((u16)payload[2] << 8);
+        if ((u32)msg_len > frame_len - 3) {
+            msg_len = (u16)(frame_len - 3);
+        }
+        payload[3 + msg_len] = 0;
+        fprintf(2, "DDM power error: %s\n", (char *)(payload + 3));
+    } else {
+        fprintf(2, "DDM power request rejected (opcode=%u)\n", (unsigned)payload[0]);
+    }
+    return 1;
+}
+
+static int cmd_power(const char *sys_cmd, u8 ddm_action, int use_ddm) {
+    if (use_ddm && access(DDM_POWER_SOCK, 0) == 0) {
+        int r = send_ddm_power(ddm_action);
+        if (r == 0) {
+            return 0;
+        }
+        if (r > 0) {
+            return 1;
+        }
+        /* Connection failed (e.g. DDM shutting down); fall back to systemg. */
+    }
+    char resp[512];
+    if (send_command(sys_cmd, NULL, resp, sizeof(resp)) < 0) {
+        return 1;
+    }
+    if (strncmp(resp, "ERR:", 4) == 0) {
+        fprintf(2, "Failed to %s: %s\n", sys_cmd, resp + 4);
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
+    int no_ddm = 0;
+    const char *pos[4] = { NULL, NULL, NULL, NULL };
+    int pos_count = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-ddm") == 0) {
+            no_ddm = 1;
+        } else if (pos_count < 4) {
+            pos[pos_count++] = argv[i];
+        }
+    }
+
+    if (pos_count == 0) {
         return cmd_list_units();
     }
 
-    const char *action = argv[1];
+    const char *action = pos[0];
+    const char *arg1 = (pos_count >= 2) ? pos[1] : NULL;
     if (strcmp(action, "--help") == 0 || strcmp(action, "-h") == 0 || strcmp(action, "help") == 0) {
         print_help();
         return 0;
@@ -292,22 +401,22 @@ int main(int argc, char **argv) {
         return cmd_list_units();
     }
     if (strcmp(action, "status") == 0) {
-        return cmd_status(argc >= 3 ? argv[2] : NULL);
+        return cmd_status(arg1);
     }
     if (strcmp(action, "start") == 0) {
-        return cmd_simple("START", argc >= 3 ? argv[2] : NULL);
+        return cmd_simple("START", arg1);
     }
     if (strcmp(action, "stop") == 0) {
-        return cmd_simple("STOP", argc >= 3 ? argv[2] : NULL);
+        return cmd_simple("STOP", arg1);
     }
     if (strcmp(action, "restart") == 0) {
-        return cmd_simple("RESTART", argc >= 3 ? argv[2] : NULL);
+        return cmd_simple("RESTART", arg1);
     }
     if (strcmp(action, "is-active") == 0) {
-        return cmd_is_active(argc >= 3 ? argv[2] : NULL);
+        return cmd_is_active(arg1);
     }
     if (strcmp(action, "is-failed") == 0) {
-        return cmd_is_failed(argc >= 3 ? argv[2] : NULL);
+        return cmd_is_failed(arg1);
     }
     if (strcmp(action, "daemon-reload") == 0 || strcmp(action, "reload") == 0) {
         char resp[512];
@@ -316,9 +425,18 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
+    if (strcmp(action, "poweroff") == 0) {
+        return cmd_power("POWEROFF", DDM_POWER_POWEROFF, !no_ddm);
+    }
+    if (strcmp(action, "reboot") == 0) {
+        return cmd_power("REBOOT", DDM_POWER_REBOOT, !no_ddm);
+    }
+    if (strcmp(action, "halt") == 0) {
+        return cmd_power("HALT", 0, 0);
+    }
 
     /* Fallback: if single argument looks like a unit name, run status */
-    if (argc == 2 && action[0] != '-') {
+    if (pos_count == 1 && action[0] != '-') {
         return cmd_status(action);
     }
 

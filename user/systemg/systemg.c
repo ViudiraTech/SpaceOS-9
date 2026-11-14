@@ -13,7 +13,10 @@
 
 #define MAX_UNITS 32
 #define MAX_DEPS 8
+#define MAX_MOUNTS 64
+#define MNT_DETACH 2
 #define SOCK_PATH "/run/systemg.sock"
+#define SHUTDOWN_LOG_PATH "/run/systemg-shutdown.log"
 #define JOURNAL_QUEUE_CAP 128
 #define JOURNAL_MSG_MAX   320
 
@@ -50,6 +53,9 @@ struct unit {
 static struct unit units[MAX_UNITS];
 static int unit_count;
 static volatile int child_changed;
+static volatile int g_shutting_down;
+static volatile u32 g_power_cmd = RB_POWER_OFF;
+static int g_shutdown_log_enabled;
 static u64 kernel_finish_usec;
 static u64 userspace_start_usec;
 static u64 userspace_finish_usec;
@@ -58,6 +64,18 @@ static const char *g_sock_path = SOCK_PATH;
 static void child_handler(int signal_number) {
     (void)signal_number;
     child_changed = 1;
+}
+
+static void halt_signal_handler(int signal_number) {
+    (void)signal_number;
+    g_power_cmd = RB_HALT_SYSTEM;
+    g_shutting_down = 1;
+}
+
+static void poweroff_signal_handler(int signal_number) {
+    (void)signal_number;
+    g_power_cmd = RB_POWER_OFF;
+    g_shutting_down = 1;
 }
 
 static u64 get_monotonic_usec(void) {
@@ -730,6 +748,9 @@ static struct unit *unit_for_pid(pid_t pid) {
 }
 
 static int should_restart(const struct unit *unit) {
+    if (g_shutting_down) {
+        return 0;
+    }
     if (unit->pending_restart) {
         return 1;
     }
@@ -740,6 +761,396 @@ static int should_restart(const struct unit *unit) {
         return 1;
     }
     return 0;
+}
+
+/* Format and broadcast a shutdown telemetry line to console, journald, and
+ * the temporary splash log in /run while enabled. */
+static void shutdown_log(u64 shut_start_us, const char *tag, const char *fmt, ...) {
+    char raw[320];
+    __builtin_va_list args;
+    __builtin_va_start(args, fmt);
+    vsnprintf(raw, sizeof(raw), fmt, args);
+    __builtin_va_end(args);
+
+    u64 now_us = get_monotonic_usec();
+    u64 elapsed_ms = (now_us >= shut_start_us) ? ((now_us - shut_start_us) / 1000ULL) : 0ULL;
+    u64 secs = elapsed_ms / 1000ULL;
+    u64 ms = elapsed_ms % 1000ULL;
+
+    if (strcmp(tag, "OK") == 0 || strcmp(tag, "STOP") == 0) {
+        printf("[  \033[1;32mOK\033[0m  ] %s\n", raw);
+    } else if (strcmp(tag, "WARN") == 0) {
+        printf("[\033[1;33mWARN\033[0m ] %s\n", raw);
+    } else {
+        printf("[\033[1;36m%-5s\033[0m] %s\n", tag, raw);
+    }
+
+    if (journal_sock_fd >= 0) {
+        journal_log(LOG_INFO, "shutdown.target", "%s", raw);
+    }
+
+    if (g_shutdown_log_enabled) {
+        int fd = open(SHUTDOWN_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (fd >= 0) {
+            char line[416];
+            int n = snprintf(line, sizeof(line), "[%3llu.%03llus] [%-6s] %s\n",
+                             (unsigned long long)secs, (unsigned long long)ms, tag, raw);
+            if (n > 0) {
+                write(fd, line, (size_t)n);
+            }
+            close(fd);
+        }
+    }
+}
+
+/* Stop one managed unit gracefully via SIGTERM, escalating to SIGKILL on
+ * timeout, and return once its process has been reaped. */
+static void stop_unit_and_wait(struct unit *unit, int timeout_ms, u64 shut_start_us) {
+    if (unit == NULL) {
+        return;
+    }
+    unit->pending_restart = 0;
+    unit->started = 0;
+    if (unit->pid <= 0) {
+        return;
+    }
+
+    pid_t target_pid = unit->pid;
+    const char *desc = unit->description[0] ? unit->description : unit->name;
+    u64 step_start = get_monotonic_usec();
+    shutdown_log(shut_start_us, "STOP", "Stopping %s.service - %s (PID %d)...",
+                 unit->name, desc, (int)target_pid);
+
+    kill(target_pid, SIGTERM);
+    if (strcmp(unit->name, "console") == 0) {
+        kill(target_pid, SIGHUP);
+    }
+
+    int status = 0;
+    int reaped = 0;
+    int escalated = 0;
+    int waited_ms = 0;
+    while (waited_ms < timeout_ms) {
+        pid_t dead;
+        while ((dead = waitpid(-1, &status, WNOHANG)) > 0) {
+            if (dead == target_pid) {
+                reaped = 1;
+                break;
+            }
+            struct unit *other = unit_for_pid(dead);
+            if (other != NULL) {
+                other->pid = 0;
+                other->exit_status = status;
+            }
+        }
+        if (reaped) {
+            break;
+        }
+        usleep(20000);
+        waited_ms += 20;
+    }
+
+    if (!reaped) {
+        escalated = 1;
+        shutdown_log(shut_start_us, "WARN",
+                     "%s.service did not exit in %dms; sending SIGKILL...",
+                     unit->name, timeout_ms);
+        if (strcmp(unit->name, "console") != 0) {
+            kill(-target_pid, SIGKILL);
+        }
+        kill(target_pid, SIGKILL);
+        int kill_wait = 0;
+        while (kill_wait < 500) {
+            pid_t dead = waitpid(target_pid, &status, WNOHANG);
+            if (dead == target_pid || dead < 0) {
+                reaped = 1;
+                break;
+            }
+            usleep(20000);
+            kill_wait += 20;
+        }
+    }
+
+    unit->pid = 0;
+    unit->exit_status = status;
+    u64 step_end = get_monotonic_usec();
+    u64 step_ms = (step_end >= step_start) ? ((step_end - step_start) / 1000ULL) : 0ULL;
+
+    if (escalated) {
+        shutdown_log(shut_start_us, "OK", "Stopped %s.service (SIGKILL, %llums).",
+                     unit->name, (unsigned long long)step_ms);
+    } else if (reaped && WIFEXITED(status)) {
+        shutdown_log(shut_start_us, "OK", "Stopped %s.service (exit=%d, %llums).",
+                     unit->name, WEXITSTATUS(status), (unsigned long long)step_ms);
+    } else if (reaped && WIFSIGNALED(status)) {
+        shutdown_log(shut_start_us, "OK", "Stopped %s.service (signal=%d, %llums).",
+                     unit->name, WTERMSIG(status), (unsigned long long)step_ms);
+    } else {
+        shutdown_log(shut_start_us, "OK", "Deactivated %s.service (%llums).",
+                     unit->name, (unsigned long long)step_ms);
+    }
+}
+
+struct mount_entry {
+    char device[64];
+    char target[128];
+    char fstype[32];
+    int depth;
+};
+
+static int mount_path_depth(const char *path) {
+    if (strcmp(path, "/") == 0) {
+        return 0;
+    }
+    int depth = 0;
+    for (const char *p = path; *p != 0; p++) {
+        if (*p == '/') {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+static size_t read_mounts_snapshot(struct mount_entry *entries, size_t max_entries) {
+    int fd = open("/proc/mounts", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 0;
+    }
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+        return 0;
+    }
+    buf[n] = 0;
+
+    size_t count = 0;
+    char *line = buf;
+    while (line != NULL && *line != 0 && count < max_entries) {
+        char *next = strchr(line, '\n');
+        if (next != NULL) {
+            *next = 0;
+            next++;
+        }
+        char *p = trim(line);
+        if (*p != 0) {
+            char *sp1 = strchr(p, ' ');
+            char *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
+            char *sp3 = sp2 ? strchr(sp2 + 1, ' ') : NULL;
+            if (sp1 && sp2) {
+                *sp1 = 0;
+                *sp2 = 0;
+                if (sp3) {
+                    *sp3 = 0;
+                }
+                struct mount_entry *e = &entries[count++];
+                snprintf(e->device, sizeof(e->device), "%s", p);
+                snprintf(e->target, sizeof(e->target), "%s", sp1 + 1);
+                snprintf(e->fstype, sizeof(e->fstype), "%s", sp2 + 1);
+                e->depth = mount_path_depth(e->target);
+            }
+        }
+        line = next;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        for (size_t j = i + 1; j < count; j++) {
+            int swap = 0;
+            if (entries[j].depth > entries[i].depth) {
+                swap = 1;
+            } else if (entries[j].depth == entries[i].depth &&
+                       strlen(entries[j].target) > strlen(entries[i].target)) {
+                swap = 1;
+            }
+            if (swap) {
+                struct mount_entry tmp = entries[i];
+                entries[i] = entries[j];
+                entries[j] = tmp;
+            }
+        }
+    }
+    return count;
+}
+
+static int is_runtime_deferred_mount(const char *target) {
+    return strcmp(target, "/") == 0 ||
+           strcmp(target, "/dev") == 0 ||
+           strcmp(target, "/proc") == 0 ||
+           strcmp(target, "/run") == 0 ||
+           strcmp(target, "/tmp") == 0;
+}
+
+/* Try unmounting one filesystem cleanly, logging every step. */
+static void try_unmount_entry(const struct mount_entry *m, u64 shut_start_us, int console_only) {
+    if (!console_only) {
+        shutdown_log(shut_start_us, "UMOUNT", "Unmounting %s (%s on %s)...",
+                     m->target, m->fstype, m->device);
+    }
+    int rc = umount2(m->target, 0);
+    if (rc < 0 && errno == EBUSY) {
+        rc = umount2(m->target, MNT_DETACH);
+    }
+    if (rc == 0) {
+        if (console_only) {
+            printf("[  \033[1;32mOK\033[0m  ] Unmounted %s (%s).\n", m->target, m->fstype);
+        } else {
+            shutdown_log(shut_start_us, "OK", "Unmounted %s (%s) cleanly.", m->target, m->fstype);
+        }
+    } else {
+        int err = errno;
+        if (console_only) {
+            printf("[\033[1;33mWARN\033[0m ] Could not unmount %s: %s\n", m->target, strerror(err));
+        } else {
+            shutdown_log(shut_start_us, "WARN", "Deferred unmount %s: %s", m->target, strerror(err));
+        }
+    }
+}
+
+static void perform_shutdown(void) __attribute__((noreturn));
+static void perform_shutdown(void) {
+    u64 shut_start_us = get_monotonic_usec();
+    int is_reboot = (g_power_cmd == RB_AUTOBOOT);
+    int is_halt = (g_power_cmd == RB_HALT_SYSTEM);
+
+    int ddm_idx = unit_index("ddm");
+    int ddm_alive = (ddm_idx >= 0 && units[ddm_idx].pid > 0);
+    int journal_idx = unit_index("journald");
+
+    mkdir("/run", 0755);
+    g_shutdown_log_enabled = 1;
+
+    shutdown_log(shut_start_us, "TARGET", "Initiating %s sequence from PID 1 (systemg)...",
+                 is_reboot ? "system reboot" : (is_halt ? "system halt" : "ACPI poweroff"));
+    if (ddm_idx >= 0) {
+        shutdown_log(shut_start_us, "OK", "Stopped target Graphical Interface (graphical.target).");
+    }
+    shutdown_log(shut_start_us, "OK", "Stopped target Multi-User System (multi-user.target).");
+    shutdown_log(shut_start_us, "OK", "Reached target Shutdown (shutdown.target).");
+    if (ddm_alive) {
+        usleep(120000);
+    }
+
+    /* Stop all regular runtime services one by one in reverse order while
+     * keeping ddm (and thus the splash display) and journald until later. */
+    for (int i = unit_count - 1; i >= 0; i--) {
+        if (i == ddm_idx || i == journal_idx) {
+            continue;
+        }
+        struct unit *u = &units[i];
+        if (u->pid > 0) {
+            int timeout = (strcmp(u->name, "console") == 0) ? 450 : 1500;
+            stop_unit_and_wait(u, timeout, shut_start_us);
+            if (ddm_alive) {
+                usleep(110000);
+            }
+        } else if (u->started) {
+            u->started = 0;
+            u->pending_restart = 0;
+            shutdown_log(shut_start_us, "OK", "Stopped %s.service (inactive).", u->name);
+        }
+    }
+
+    /* Flush buffered journal entries and stop journald cleanly. */
+    if (journal_idx >= 0 && units[journal_idx].pid > 0) {
+        shutdown_log(shut_start_us, "SYNC", "Flushing journald message queues...");
+        flush_journal_queue();
+        if (journal_sock_fd >= 0) {
+            close(journal_sock_fd);
+            journal_sock_fd = -1;
+        }
+        stop_unit_and_wait(&units[journal_idx], 1200, shut_start_us);
+        if (ddm_alive) {
+            usleep(100000);
+        }
+    } else if (journal_sock_fd >= 0) {
+        close(journal_sock_fd);
+        journal_sock_fd = -1;
+    }
+
+    /* Sync and run Pass 1 mount cleanup for virtual/aux filesystems. */
+    shutdown_log(shut_start_us, "SYNC", "Synchronizing filesystems and VFS buffers...");
+    sync();
+
+    struct mount_entry mounts[MAX_MOUNTS];
+    size_t mount_count = read_mounts_snapshot(mounts, MAX_MOUNTS);
+    for (size_t i = 0; i < mount_count; i++) {
+        if (is_runtime_deferred_mount(mounts[i].target)) {
+            continue;
+        }
+        try_unmount_entry(&mounts[i], shut_start_us, 0);
+        if (ddm_alive) {
+            usleep(90000);
+        }
+    }
+
+    shutdown_log(shut_start_us, "UMOUNT", "Staging /tmp, /run, /proc, /dev for post-display unmount...");
+    shutdown_log(shut_start_us, "SYNC", "Finalizing pending disk writeback caches...");
+    sync();
+
+    /* Ensure graphical shutdown splash stays readable long enough to display
+     * the full progress animation and mount cleanup log. */
+    if (ddm_alive) {
+        for (;;) {
+            u64 now_us = get_monotonic_usec();
+            u64 elapsed_ms = (now_us >= shut_start_us) ? ((now_us - shut_start_us) / 1000ULL) : 2500ULL;
+            if (elapsed_ms >= 2500ULL) {
+                break;
+            }
+            usleep(50000);
+        }
+    }
+
+    shutdown_log(shut_start_us, "TARGET", "Reached target %s.",
+                 is_reboot ? "Reboot (reboot.target)" : (is_halt ? "Halt (halt.target)" : "Power-Off (poweroff.target)"));
+    shutdown_log(shut_start_us, "DONE", "%s",
+                 is_reboot ? "Tearing down display manager & rebooting kernel..."
+                           : (is_halt ? "Tearing down display manager & halting CPUs..."
+                                      : "Tearing down display manager & powering off..."));
+    if (ddm_alive) {
+        usleep(350000);
+    }
+
+    /* Stop holding/opening /run before stopping ddm and unmounting /run. */
+    g_shutdown_log_enabled = 0;
+    if (ddm_idx >= 0 && units[ddm_idx].pid > 0) {
+        stop_unit_and_wait(&units[ddm_idx], 2500, shut_start_us);
+    }
+
+    int reap_st = 0;
+    while (waitpid(-1, &reap_st, WNOHANG) > 0) {
+    }
+
+    /* Pass 2: unmount remaining virtual/tmpfs mounts (/tmp, /run, /proc). */
+    mount_count = read_mounts_snapshot(mounts, MAX_MOUNTS);
+    int has_proc = 0;
+    for (size_t i = 0; i < mount_count; i++) {
+        if (strcmp(mounts[i].target, "/") == 0 || strcmp(mounts[i].target, "/dev") == 0) {
+            continue;
+        }
+        if (strcmp(mounts[i].target, "/proc") == 0) {
+            has_proc = 1;
+            continue;
+        }
+        try_unmount_entry(&mounts[i], shut_start_us, 1);
+    }
+    if (has_proc) {
+        struct mount_entry proc_entry;
+        memset(&proc_entry, 0, sizeof(proc_entry));
+        snprintf(proc_entry.target, sizeof(proc_entry.target), "/proc");
+        snprintf(proc_entry.fstype, sizeof(proc_entry.fstype), "proc");
+        try_unmount_entry(&proc_entry, shut_start_us, 1);
+    }
+
+    printf("[  \033[1;32mOK\033[0m  ] Flushed caches and unmounted virtual filesystems.\n");
+    sync();
+    sync();
+    printf("systemg[1]: %s\n",
+           is_reboot ? "Restarting system." : (is_halt ? "System halted." : "Power down."));
+    usleep(80000);
+    reboot((u32)g_power_cmd);
+    for (;;) {
+        pause();
+    }
 }
 
 /* Handle systemctl IPC client command */
@@ -1005,6 +1416,18 @@ static void handle_ipc_client(int client_fd) {
         reload_all_units();
         journal_log(LOG_INFO, "systemg.service", "Reloaded unit configuration.");
         snprintf(resp, sizeof(resp), "OK\n");
+    } else if (strcmp(cmd, "POWEROFF") == 0) {
+        g_power_cmd = RB_POWER_OFF;
+        g_shutting_down = 1;
+        snprintf(resp, sizeof(resp), "OK\n");
+    } else if (strcmp(cmd, "REBOOT") == 0) {
+        g_power_cmd = RB_AUTOBOOT;
+        g_shutting_down = 1;
+        snprintf(resp, sizeof(resp), "OK\n");
+    } else if (strcmp(cmd, "HALT") == 0) {
+        g_power_cmd = RB_HALT_SYSTEM;
+        g_shutting_down = 1;
+        snprintf(resp, sizeof(resp), "OK\n");
     } else {
         snprintf(resp, sizeof(resp), "ERR:unknown command\n");
     }
@@ -1082,6 +1505,8 @@ int main(int argc, char **argv, char **envp) {
     setenv("PATH", "/bin:/sbin:/usr/bin", 1);
     setenv("HOME", "/root", 1);
     signal(SIGCHLD, child_handler);
+    signal(SIGUSR1, halt_signal_handler);
+    signal(SIGUSR2, poweroff_signal_handler);
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
@@ -1121,6 +1546,14 @@ int main(int argc, char **argv, char **envp) {
     flush_journal_queue();
 
     for (;;) {
+        if (g_shutting_down) {
+            if (server_fd >= 0) {
+                close(server_fd);
+                server_fd = -1;
+            }
+            unlink(g_sock_path);
+            perform_shutdown();
+        }
         flush_journal_queue();
         int status = 0;
         pid_t pid;
@@ -1184,6 +1617,14 @@ int main(int argc, char **argv, char **envp) {
             }
         } else {
             usleep(100000);
+        }
+        if (g_shutting_down) {
+            if (server_fd >= 0) {
+                close(server_fd);
+                server_fd = -1;
+            }
+            unlink(g_sock_path);
+            perform_shutdown();
         }
         child_changed = 0;
     }

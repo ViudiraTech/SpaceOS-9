@@ -37,6 +37,7 @@ fn fatal_user(name: &str, frame: InterruptStackFrame, code: Option<u64>, signal:
         core::arch::asm!("swapgs", "lfence", options(nostack));
     }
     crate::fpu::disable_current();
+    arch::enable_interrupts();
     crate::kwarn!(
         "user fault: {} code={:?} ip={:?}",
         name,

@@ -43,11 +43,16 @@ pub enum Icon {
     Panel,
     WindowManager,
     Display,
+    Sound,
     InputDevices,
     Network,
     Applications,
     DateTime,
     About,
+    AudioVolumeMuted,
+    AudioVolumeLow,
+    AudioVolumeMedium,
+    AudioVolumeHigh,
     Folder,
     FolderLarge,
     UserHome,
@@ -157,9 +162,26 @@ define_svg_icons! {
     NetworkWired => "network-wired.svg",
     NetworkOffline => "network-offline.svg",
     Info => "info.svg",
+    Sound => "sound.svg",
+    AudioVolumeMuted => "audio-volume-muted.svg",
+    AudioVolumeLow => "audio-volume-low.svg",
+    AudioVolumeMedium => "audio-volume-medium.svg",
+    AudioVolumeHigh => "audio-volume-high.svg",
 }
 
 impl Icon {
+    pub fn for_volume(volume: i32, muted: bool) -> Self {
+        if muted || volume <= 0 {
+            Self::AudioVolumeMuted
+        } else if volume <= 33 {
+            Self::AudioVolumeLow
+        } else if volume <= 66 {
+            Self::AudioVolumeMedium
+        } else {
+            Self::AudioVolumeHigh
+        }
+    }
+
     pub fn is_symbolic(self) -> bool {
         matches!(
             self,
@@ -178,6 +200,10 @@ impl Icon {
                 | Self::NetworkWired
                 | Self::NetworkOffline
                 | Self::Info
+                | Self::AudioVolumeMuted
+                | Self::AudioVolumeLow
+                | Self::AudioVolumeMedium
+                | Self::AudioVolumeHigh
         )
     }
 

@@ -681,6 +681,107 @@ pub fn posix_tz_for_zone(tz: &str) -> String {
     }
 }
 
+/// Size preset for a Windows 8 / 8.1 Start Screen live or app tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StartTileSize {
+    Small,
+    Medium,
+    Wide,
+    Large,
+}
+
+impl StartTileSize {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Wide => "wide",
+            Self::Large => "large",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "小 (1x1)",
+            Self::Medium => "中 (2x2)",
+            Self::Wide => "宽 (4x2)",
+            Self::Large => "大 (4x4)",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "small" | "s" => Some(Self::Small),
+            "medium" | "m" => Some(Self::Medium),
+            "wide" | "w" => Some(Self::Wide),
+            "large" | "l" => Some(Self::Large),
+            _ => None,
+        }
+    }
+
+    /// Footprint in base Start Screen grid units `(cols, rows)`.
+    pub fn grid_span(self) -> (i32, i32) {
+        match self {
+            Self::Small => (1, 1),
+            Self::Medium => (2, 2),
+            Self::Wide => (4, 2),
+            Self::Large => (4, 4),
+        }
+    }
+}
+
+/// Persisted tile entry on the Windows 8 / 8.1 Start Screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartTileSpec {
+    pub id: String,
+    pub size: StartTileSize,
+}
+
+/// Validate that a tile identifier only uses safe ASCII slug characters.
+fn is_valid_tile_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// Parse a serialized `/panel/start-tiles` specification, deduplicating tile IDs.
+pub fn parse_start_tiles(raw: &str) -> Vec<StartTileSpec> {
+    let mut out = Vec::new();
+    for token in raw.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (id, size) = match trimmed.split_once(':') {
+            Some((id, sz)) => (
+                id.trim(),
+                StartTileSize::parse(sz).unwrap_or(StartTileSize::Medium),
+            ),
+            None => (trimmed, StartTileSize::Medium),
+        };
+        if !is_valid_tile_id(id) || out.iter().any(|t: &StartTileSpec| t.id == id) {
+            continue;
+        }
+        out.push(StartTileSpec {
+            id: id.to_string(),
+            size,
+        });
+    }
+    out
+}
+
+/// Serialize Start Screen tiles back into canonical `id:size` form.
+pub fn encode_start_tiles(tiles: &[StartTileSpec]) -> String {
+    tiles
+        .iter()
+        .filter(|t| is_valid_tile_id(&t.id))
+        .map(|t| format!("{}:{}", t.id, t.size.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Typed in-memory snapshot of all SPUI desktop and built-in application channels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesktopConfig {
@@ -698,6 +799,8 @@ pub struct DesktopConfig {
     pub panel_position: PanelPosition,
     pub panel_size: i32,
     pub panel_show_pinned: bool,
+    pub panel_start_fullscreen: bool,
+    pub panel_start_tiles: String,
     // wm
     pub wm_button_layout: ButtonLayout,
     pub wm_double_click: DoubleClickAction,
@@ -715,6 +818,16 @@ pub struct DesktopConfig {
     pub key_repeat_enabled: bool,
     pub key_repeat_delay_ms: i32,
     pub key_repeat_rate_hz: i32,
+    // sound
+    pub sound_master_volume: i32,
+    pub sound_muted: bool,
+    pub sound_enabled: bool,
+    pub sound_event_startup: bool,
+    pub sound_event_ui: bool,
+    pub sound_event_notify: bool,
+    pub sound_event_alert: bool,
+    pub sound_event_volume: bool,
+    pub sound_theme: String,
     // terminal
     pub term_font_size: i32,
     pub term_cursor_style: CursorStyle,
@@ -757,6 +870,8 @@ impl Default for DesktopConfig {
             panel_position: PanelPosition::Bottom,
             panel_size: 46,
             panel_show_pinned: true,
+            panel_start_fullscreen: true,
+            panel_start_tiles: crate::schema::DEFAULT_START_TILES.to_string(),
             wm_button_layout: ButtonLayout::Right,
             wm_double_click: DoubleClickAction::Maximize,
             wm_focus_mode: FocusMode::Click,
@@ -771,6 +886,15 @@ impl Default for DesktopConfig {
             key_repeat_enabled: true,
             key_repeat_delay_ms: 400,
             key_repeat_rate_hz: 30,
+            sound_master_volume: 80,
+            sound_muted: false,
+            sound_enabled: true,
+            sound_event_startup: true,
+            sound_event_ui: true,
+            sound_event_notify: true,
+            sound_event_alert: true,
+            sound_event_volume: true,
+            sound_theme: "modern-glass".to_string(),
             term_font_size: 14,
             term_cursor_style: CursorStyle::Block,
             term_scrollback_lines: 1000,
@@ -862,6 +986,17 @@ impl DesktopConfig {
                     self.panel_show_pinned = b;
                 }
             }
+            ("panel", "/start-fullscreen") => {
+                if let Some(b) = value.as_bool() {
+                    self.panel_start_fullscreen = b;
+                }
+            }
+            ("panel", "/start-tiles") => {
+                if let Some(s) = value.as_str() {
+                    let parsed = parse_start_tiles(s);
+                    self.panel_start_tiles = encode_start_tiles(&parsed);
+                }
+            }
             ("wm", "/button-layout") => {
                 if let Some(s) = value.as_str() {
                     self.wm_button_layout = ButtonLayout::parse(s);
@@ -932,6 +1067,54 @@ impl DesktopConfig {
             ("input", "/keyboard/repeat-rate-hz") => {
                 if let Some(v) = value.as_int() {
                     self.key_repeat_rate_hz = (v as i32).clamp(5, 80);
+                }
+            }
+            ("sound", "/master-volume") => {
+                if let Some(v) = value.as_int() {
+                    self.sound_master_volume = (v as i32).clamp(0, 100);
+                }
+            }
+            ("sound", "/muted") => {
+                if let Some(b) = value.as_bool() {
+                    self.sound_muted = b;
+                }
+            }
+            ("sound", "/system-sounds-enabled") => {
+                if let Some(b) = value.as_bool() {
+                    self.sound_enabled = b;
+                }
+            }
+            ("sound", "/event-startup") => {
+                if let Some(b) = value.as_bool() {
+                    self.sound_event_startup = b;
+                }
+            }
+            ("sound", "/event-ui") => {
+                if let Some(b) = value.as_bool() {
+                    self.sound_event_ui = b;
+                }
+            }
+            ("sound", "/event-notify") => {
+                if let Some(b) = value.as_bool() {
+                    self.sound_event_notify = b;
+                }
+            }
+            ("sound", "/event-alert") => {
+                if let Some(b) = value.as_bool() {
+                    self.sound_event_alert = b;
+                }
+            }
+            ("sound", "/event-volume") => {
+                if let Some(b) = value.as_bool() {
+                    self.sound_event_volume = b;
+                }
+            }
+            ("sound", "/theme") => {
+                if let Some(s) = value.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() && trimmed.len() <= 32 {
+                        self.sound_theme = trimmed.to_string();
+                    }
                 }
             }
             ("terminal", "/font-size") => {
@@ -1115,5 +1298,18 @@ mod tests {
         }
         assert!(validate_schema_type("appearance", "/font/scale", &Value::Bool(true)).is_err());
         assert!(validate_schema_type("custom", "/anything", &Value::Bool(true)).is_ok());
+    }
+
+    #[test]
+    fn start_tiles_parse_and_encode_roundtrip() {
+        let parsed = parse_start_tiles(crate::schema::DEFAULT_START_TILES);
+        assert_eq!(encode_start_tiles(&parsed), crate::schema::DEFAULT_START_TILES);
+
+        let sanitized = parse_start_tiles("status-clock:wide, bad/id:small, status-clock:small, app-term:l");
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(sanitized[0].id, "status-clock");
+        assert_eq!(sanitized[0].size, StartTileSize::Wide);
+        assert_eq!(sanitized[1].id, "app-term");
+        assert_eq!(sanitized[1].size, StartTileSize::Large);
     }
 }

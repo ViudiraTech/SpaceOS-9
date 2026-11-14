@@ -24,8 +24,8 @@ use x11rb::protocol::shm::ConnectionExt as ShmExt;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, AutoRepeatMode, Blanking, ChangeKeyboardControlAux, ChangeWindowAttributesAux,
     ClientMessageEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux, CreateWindowAux, Cursor,
-    EventMask, Exposures, Gcontext, ImageFormat, InputFocus, PropMode, Rectangle, StackMode,
-    Window, WindowClass,
+    EventMask, Exposures, Gcontext, GrabMode, ImageFormat, InputFocus, ModMask, PropMode,
+    Rectangle, StackMode, Window, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -309,6 +309,18 @@ impl X {
         self.conn.free_gc(gc0)?;
         self.conn.free_gc(gc1)?;
         self.conn.free_pixmap(pixmap)?;
+        Ok(())
+    }
+
+    /// Remove any custom XShape bounding/clip mask so `window` covers its full rectangle.
+    pub fn clear_shape(&self, window: Window) -> Result<()> {
+        if !self.has_shape {
+            return Ok(());
+        }
+        self.conn
+            .shape_mask(shape::SO::SET, shape::SK::BOUNDING, window, 0, 0, 0u32)?;
+        self.conn
+            .shape_mask(shape::SO::SET, shape::SK::CLIP, window, 0, 0, 0u32)?;
         Ok(())
     }
 
@@ -651,6 +663,40 @@ impl X {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
+        }
+    }
+
+    /// Grab all keycodes mapped to `keysym` on the root window across Lock/NumLock variants.
+    pub fn grab_global_key(&self, keysym: u32, modifiers: ModMask) {
+        let per = self.keysyms_per.max(1) as usize;
+        if per == 0 {
+            return;
+        }
+        let mut codes = Vec::new();
+        for (idx, chunk) in self.keysyms.chunks(per).enumerate() {
+            if chunk.contains(&keysym) {
+                if let Some(code) = self.min_keycode.checked_add(idx as u8) {
+                    codes.push(code);
+                }
+            }
+        }
+        let extra = [
+            ModMask::from(0u16),
+            ModMask::LOCK,
+            ModMask::M2,
+            ModMask::LOCK | ModMask::M2,
+        ];
+        for code in codes {
+            for lock_bits in extra {
+                let _ = self.conn.grab_key(
+                    true,
+                    self.root,
+                    modifiers | lock_bits,
+                    code,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                );
+            }
         }
     }
 

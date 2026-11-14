@@ -14,6 +14,7 @@
 //! OOBE wizard connect over `/run/ddm/greeter.sock`; `SO_PEERCRED` limits that
 //! socket to the dedicated `ddm` account.
 
+use crate::apps::power_splash::SHUTDOWN_LOG_PATH;
 use crate::ddm::accounts::{self, AccountSpec, SystemSettings};
 use crate::ddm::auth::{self, AuthError, UserRecord};
 use crate::ddm::config::{Config, DEFAULT_CONFIG};
@@ -34,6 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SOCKET_NAME: &str = "greeter.sock";
+const POWER_SOCKET_NAME: &str = "power.sock";
 const XORG_PID: &str = "xorg.pid";
 const GREETER_PID: &str = "greeter.pid";
 const SESSION_PID: &str = "session.pid";
@@ -86,6 +88,7 @@ struct Client {
 
 struct SessionProcess {
     pid: i32,
+    uid: u32,
     user: String,
     id: String,
     auth_file: PathBuf,
@@ -99,11 +102,14 @@ pub struct Daemon {
     failures: HashMap<String, FailureState>,
     dummy_hash: String,
     listener: Option<std::os::unix::net::UnixListener>,
+    power_listener: Option<std::os::unix::net::UnixListener>,
     client: Option<Client>,
     xorg_pid: Option<i32>,
     xorg_started: Option<Instant>,
     greeter_pid: Option<i32>,
     greeter_cookie: Option<[u8; COOKIE_LEN]>,
+    power_splash_pid: Option<i32>,
+    power_in_progress: bool,
     session: Option<SessionProcess>,
     mode: Mode,
     sessions: Vec<Session>,
@@ -215,11 +221,14 @@ impl Daemon {
             failures: HashMap::new(),
             dummy_hash,
             listener: None,
+            power_listener: None,
             client: None,
             xorg_pid: None,
             xorg_started: None,
             greeter_pid: None,
             greeter_cookie: None,
+            power_splash_pid: None,
+            power_in_progress: false,
             session: None,
             mode: Mode::Greeter,
             sessions: Vec::new(),
@@ -227,6 +236,24 @@ impl Daemon {
             restart_xorg_at: None,
             shutting_down: false,
         })
+    }
+
+    fn bind_listener(
+        socket: &Path,
+        mode: u32,
+        owner: Option<(u32, u32)>,
+    ) -> Result<std::os::unix::net::UnixListener, String> {
+        let _ = fs::remove_file(socket);
+        let listener = std::os::unix::net::UnixListener::bind(socket)
+            .map_err(|error| format!("bind {}: {error}", socket.display()))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        xauth::set_mode(socket, mode).map_err(|error| error.to_string())?;
+        if let Some((uid, gid)) = owner {
+            xauth::chown(socket, uid, gid).map_err(|error| error.to_string())?;
+        }
+        Ok(listener)
     }
 
     fn setup_runtime(&mut self) -> Result<(), String> {
@@ -253,15 +280,13 @@ impl Daemon {
         }
 
         let socket = self.socket_path();
-        let _ = fs::remove_file(&socket);
-        let listener = std::os::unix::net::UnixListener::bind(&socket)
-            .map_err(|error| format!("bind {}: {error}", socket.display()))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| error.to_string())?;
-        xauth::set_mode(&socket, 0o660).map_err(|error| error.to_string())?;
-        xauth::chown(&socket, 0, self.ddm.gid).map_err(|error| error.to_string())?;
-        self.listener = Some(listener);
+        self.listener = Some(Self::bind_listener(
+            &socket,
+            0o660,
+            Some((0, self.ddm.gid)),
+        )?);
+        let power_socket = self.power_socket_path();
+        self.power_listener = Some(Self::bind_listener(&power_socket, 0o666, None)?);
         Ok(())
     }
 
@@ -352,6 +377,10 @@ impl Daemon {
 
     fn socket_path(&self) -> PathBuf {
         self.runtime().join(SOCKET_NAME)
+    }
+
+    fn power_socket_path(&self) -> PathBuf {
+        self.runtime().join(POWER_SOCKET_NAME)
     }
 
     fn auth_path(&self) -> PathBuf {
@@ -458,7 +487,7 @@ impl Daemon {
                 }
                 return Err("Xorg exited before creating its socket".to_string());
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(20));
         }
         terminate_group(pid, Duration::from_secs(2));
         self.xorg_pid = None;
@@ -466,7 +495,7 @@ impl Daemon {
     }
 
     fn ensure_xorg(&mut self) {
-        if self.xorg_pid.is_some() {
+        if self.power_in_progress || self.xorg_pid.is_some() {
             return;
         }
         if let Some(deadline) = self.restart_xorg_at {
@@ -474,13 +503,16 @@ impl Daemon {
                 return;
             }
         }
-        self.restart_xorg_at = Some(Instant::now() + Duration::from_secs(2));
         self.stop_client();
         self.stop_session();
         if let Err(error) = self.start_xorg() {
+            self.restart_xorg_at = Some(Instant::now() + Duration::from_secs(2));
             self.log(&format!("cannot restart Xorg: {error}"));
-        } else if let Err(error) = self.start_client() {
-            self.log(&format!("cannot restart greeter: {error}"));
+        } else {
+            self.restart_xorg_at = None;
+            if let Err(error) = self.start_client() {
+                self.log(&format!("cannot restart greeter: {error}"));
+            }
         }
     }
 
@@ -502,6 +534,30 @@ impl Daemon {
         argv.push(self.socket_path().to_string_lossy().into_owned());
 
         let log = open_log(&self.config.log_dir.join("greeter.log"), 0o600, None)?;
+        let env = self.greeter_x11_env();
+        let pid = spawn_as(
+            &self.ddm,
+            &argv,
+            &env,
+            Path::new("/"),
+            log,
+            Some(CString::new(self.ddm.name.as_str()).map_err(|_| "invalid greeter name")?),
+        )?;
+        self.greeter_pid = Some(pid);
+        write_pid(&self.runtime().join(GREETER_PID), pid);
+        self.log(&format!(
+            "{} started as pid {} (uid {})",
+            match self.mode {
+                Mode::Greeter => "greeter",
+                Mode::Oobe => "OOBE",
+            },
+            pid,
+            self.ddm.uid
+        ));
+        Ok(())
+    }
+
+    fn greeter_x11_env(&self) -> Vec<(String, String)> {
         let mut env = self.base_greeter_env();
         env.push(("DISPLAY".to_string(), self.config.display.clone()));
         env.push((
@@ -525,6 +581,21 @@ impl Daemon {
         env.push(("USER".to_string(), self.ddm.name.clone()));
         env.push(("LOGNAME".to_string(), self.ddm.name.clone()));
         env.push(("SHELL".to_string(), "/bin/nologin".to_string()));
+        env
+    }
+
+    fn spawn_power_splash(&mut self, action: PowerAction) -> Result<(), String> {
+        let mode = match action {
+            PowerAction::Reboot => "reboot",
+            PowerAction::PowerOff => "poweroff",
+        };
+        let argv = vec![
+            self.config.greeter_program.clone(),
+            "power-splash".to_string(),
+            mode.to_string(),
+        ];
+        let log = open_log(&self.config.log_dir.join("power-splash.log"), 0o600, None)?;
+        let env = self.greeter_x11_env();
         let pid = spawn_as(
             &self.ddm,
             &argv,
@@ -533,17 +604,8 @@ impl Daemon {
             log,
             Some(CString::new(self.ddm.name.as_str()).map_err(|_| "invalid greeter name")?),
         )?;
-        self.greeter_pid = Some(pid);
-        write_pid(&self.runtime().join(GREETER_PID), pid);
-        self.log(&format!(
-            "{} started as pid {} (uid {})",
-            match self.mode {
-                Mode::Greeter => "greeter",
-                Mode::Oobe => "OOBE",
-            },
-            pid,
-            self.ddm.uid
-        ));
+        self.power_splash_pid = Some(pid);
+        self.log(&format!("power splash ({mode}) started as pid {pid}"));
         Ok(())
     }
 
@@ -702,6 +764,7 @@ impl Daemon {
         };
         self.session = Some(SessionProcess {
             pid,
+            uid: user.uid,
             user: user.name.clone(),
             id: session.id.clone(),
             auth_file,
@@ -723,9 +786,9 @@ impl Daemon {
         Ok(())
     }
 
-    fn stop_session(&mut self) {
+    fn stop_session_keep_xorg(&mut self) {
         if let Some(session) = self.session.take() {
-            terminate_group(session.pid, Duration::from_secs(5));
+            terminate_group(session.pid, Duration::from_secs(3));
             let _ = xauth::remove_if_present(&session.auth_file);
             let _ = fs::remove_file(self.runtime().join(SESSION_PID));
             self.audit(
@@ -737,6 +800,12 @@ impl Daemon {
                 "session {} for {} stopped",
                 session.id, session.user
             ));
+        }
+    }
+
+    fn stop_session(&mut self) {
+        if self.session.is_some() {
+            self.stop_session_keep_xorg();
             // Rotate the X cookie after every session.  Xorg is restarted with
             // a fresh server auth file before the next greeter is shown.
             self.stop_xorg();
@@ -745,7 +814,7 @@ impl Daemon {
 
     fn stop_xorg(&mut self) {
         if let Some(pid) = self.xorg_pid.take() {
-            terminate_group(pid, Duration::from_secs(5));
+            terminate_group(pid, Duration::from_secs(3));
             let _ = fs::remove_file(self.runtime().join(XORG_PID));
             self.log(&format!("Xorg pid {pid} stopped"));
         }
@@ -769,18 +838,28 @@ impl Daemon {
         }
     }
 
+    fn stop_power_splash(&mut self) {
+        if let Some(pid) = self.power_splash_pid.take() {
+            terminate_group(pid, Duration::from_millis(800));
+            self.log(&format!("power splash pid {pid} stopped"));
+        }
+    }
+
     fn shutdown_children(&mut self) {
         self.shutting_down = true;
+        self.power_listener = None;
+        self.stop_power_splash();
         self.stop_session();
         self.stop_client();
         if let Some(pid) = self.xorg_pid.take() {
-            terminate_group(pid, Duration::from_secs(5));
+            terminate_group(pid, Duration::from_secs(3));
             let _ = fs::remove_file(self.runtime().join(XORG_PID));
         }
         for name in [
             XAUTH,
             GREETER_XAUTH,
             SOCKET_NAME,
+            POWER_SOCKET_NAME,
             XORG_PID,
             GREETER_PID,
             SESSION_PID,
@@ -791,7 +870,8 @@ impl Daemon {
     }
 
     fn ensure_client(&mut self) {
-        if self.session.is_some()
+        if self.power_in_progress
+            || self.session.is_some()
             || self.client.is_some()
             || self.greeter_pid.is_some()
             || self.xorg_pid.is_none()
@@ -823,13 +903,18 @@ impl Daemon {
                 self.xorg_pid = None;
                 self.stop_client();
                 self.stop_session();
-                self.restart_xorg_at = Some(Instant::now() + Duration::from_secs(2));
+                if !self.power_in_progress {
+                    self.restart_xorg_at = Some(Instant::now() + Duration::from_secs(2));
+                }
+            } else if Some(pid) == self.power_splash_pid {
+                self.power_splash_pid = None;
+                self.log(&format!("power splash pid {pid} exited: {code}"));
             } else if Some(pid) == self.greeter_pid {
                 self.greeter_pid = None;
                 let _ = fs::remove_file(self.runtime().join(GREETER_PID));
                 self.log(&format!("greeter pid {pid} exited: {code}"));
-                if self.session.is_none() {
-                    self.restart_client_at = Some(Instant::now() + Duration::from_millis(300));
+                if self.session.is_none() && !self.power_in_progress {
+                    self.restart_client_at = Some(Instant::now() + Duration::from_millis(200));
                 }
             } else if self
                 .session
@@ -842,9 +927,13 @@ impl Daemon {
                     .map(|session| session.user.clone())
                     .unwrap_or_default();
                 self.log(&format!("session pid {pid} ({user}) exited: {code}"));
-                self.stop_session();
-                self.mode = Mode::Greeter;
-                self.restart_client_at = Some(Instant::now() + Duration::from_millis(300));
+                if self.power_in_progress {
+                    self.stop_session_keep_xorg();
+                } else {
+                    self.stop_session();
+                    self.mode = Mode::Greeter;
+                    self.restart_client_at = None;
+                }
             }
         }
     }
@@ -852,6 +941,11 @@ impl Daemon {
     fn poll_once(&mut self, timeout_ms: i32) {
         let listener_fd = self.listener.as_ref().map(AsRawFd::as_raw_fd).unwrap_or(-1);
         let client_fd = self.client.as_ref().map_or(-1, |client| client.fd);
+        let power_fd = self
+            .power_listener
+            .as_ref()
+            .map(AsRawFd::as_raw_fd)
+            .unwrap_or(-1);
         let mut fds = [
             libc::pollfd {
                 fd: listener_fd,
@@ -863,8 +957,13 @@ impl Daemon {
                 events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: power_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
@@ -878,6 +977,84 @@ impl Daemon {
         if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             self.read_client();
         }
+        if fds[2].revents & libc::POLLIN != 0 {
+            self.accept_power_client();
+        }
+    }
+
+    fn accept_power_client(&mut self) {
+        let Some(listener) = self.power_listener.as_ref() else {
+            return;
+        };
+        let (stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+            Err(error) => {
+                self.log(&format!("power socket accept failed: {error}"));
+                return;
+            }
+        };
+        let fd = stream.into_raw_fd();
+        let uid = match peer_uid(fd) {
+            Ok(uid) => uid,
+            Err(error) => {
+                self.log(&format!("power SO_PEERCRED failed: {error}"));
+                unsafe {
+                    libc::close(fd);
+                }
+                return;
+            }
+        };
+        let authorized = uid == 0 || self.session.as_ref().is_some_and(|s| s.uid == uid);
+        if !authorized {
+            self.log(&format!(
+                "rejected unauthorized power connection from uid {uid}"
+            ));
+            let mut writer = Writer::new(Opcode::Error);
+            writer
+                .u16(ErrorCode::BadRequest as u16)
+                .string("无权执行电源操作")
+                .u32(0);
+            write_fd_frame(fd, &writer.finish(), |msg| self.log(msg));
+            unsafe {
+                libc::close(fd);
+            }
+            return;
+        }
+
+        let action = match read_single_power_action(fd) {
+            Ok(action) => action,
+            Err(error) => {
+                let mut writer = Writer::new(Opcode::Error);
+                writer.u16(ErrorCode::Protocol as u16).string(&error).u32(0);
+                write_fd_frame(fd, &writer.finish(), |msg| self.log(msg));
+                unsafe {
+                    libc::close(fd);
+                }
+                return;
+            }
+        };
+
+        if !self.config.allow_power {
+            let mut writer = Writer::new(Opcode::Error);
+            writer
+                .u16(ErrorCode::BadRequest as u16)
+                .string("系统策略禁止电源操作")
+                .u32(0);
+            write_fd_frame(fd, &writer.finish(), |msg| self.log(msg));
+            unsafe {
+                libc::close(fd);
+            }
+            return;
+        }
+
+        write_fd_frame(fd, &Writer::new(Opcode::PowerOk).finish(), |msg| {
+            self.log(msg)
+        });
+        unsafe {
+            libc::close(fd);
+        }
+        self.initiate_power(action, &format!("uid:{uid}"));
     }
 
     fn accept_client(&mut self) {
@@ -1281,15 +1458,91 @@ impl Daemon {
             let _ = self.send_error(ErrorCode::BadRequest, "系统策略禁止电源操作", 0);
             return;
         }
+        let _ = self.send(&Writer::new(Opcode::PowerOk).finish());
+        self.initiate_power(action, "greeter");
+    }
+
+    fn initiate_power(&mut self, action: PowerAction, actor: &str) {
+        if self.power_in_progress {
+            return;
+        }
+        self.power_in_progress = true;
+        self.power_listener = None;
+        let _ = fs::remove_file(self.power_socket_path());
+
+        let action_name = match action {
+            PowerAction::Reboot => "reboot",
+            PowerAction::PowerOff => "poweroff",
+        };
         self.audit(
             "POWER",
-            "greeter",
+            actor,
             match action {
                 PowerAction::Reboot => "reboot",
                 PowerAction::PowerOff => "power-off",
             },
         );
-        let _ = self.send(&Writer::new(Opcode::PowerOk).finish());
+
+        let log_path = Path::new(SHUTDOWN_LOG_PATH);
+        if let Some(parent) = log_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(log_path)
+        {
+            let _ = fs::set_permissions(log_path, fs::Permissions::from_mode(0o644));
+            let _ = writeln!(
+                file,
+                "[  0.000s] [DDM   ] Initiating {action_name} transition (actor={actor})..."
+            );
+        }
+
+        // Launch the full-screen splash first while Xorg is still live so the
+        // display transitions smoothly without exposing a blank screen or resetting Xorg.
+        if self.xorg_pid.is_none() {
+            if let Err(error) = self.start_xorg() {
+                self.log(&format!("cannot ensure Xorg for power splash: {error}"));
+            }
+        }
+        if self.xorg_pid.is_some() {
+            match self.spawn_power_splash(action) {
+                Ok(()) => std::thread::sleep(Duration::from_millis(140)),
+                Err(error) => self.log(&format!("power splash failed to start: {error}")),
+            }
+        }
+
+        self.stop_session_keep_xorg();
+        self.stop_client();
+
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+            let _ = writeln!(
+                file,
+                "[  0.050s] [DDM   ] Handing {action_name} sequence to systemg PID 1 (/bin/systemctl --no-ddm {action_name})..."
+            );
+        }
+
+        match Command::new("/bin/systemctl")
+            .arg("--no-ddm")
+            .arg(action_name)
+            .status()
+        {
+            Ok(exit) if exit.success() => {
+                self.log(&format!(
+                    "handed {action_name} workflow cleanly to systemg PID 1"
+                ));
+                return;
+            }
+            Ok(exit) => self.log(&format!(
+                "systemctl --no-ddm {action_name} exited with {exit}"
+            )),
+            Err(error) => self.log(&format!("failed to invoke systemctl: {error}")),
+        }
+
+        // Emergency fallback only if PID 1 is not systemg.
         self.shutdown_children();
         unsafe {
             libc::sync();
@@ -1299,7 +1552,6 @@ impl Daemon {
             };
             libc::reboot(command);
         }
-        self.log("reboot(2) failed; trying /sbin/poweroff");
         let command = match action {
             PowerAction::Reboot => "/sbin/reboot",
             PowerAction::PowerOff => "/sbin/poweroff",
@@ -1342,29 +1594,7 @@ impl Daemon {
         let Some(client) = self.client.as_ref() else {
             return;
         };
-        let Ok(frame) = wire::encode_frame(payload) else {
-            return;
-        };
-        let mut offset = 0usize;
-        while offset < frame.len() {
-            let written = unsafe {
-                libc::send(
-                    client.fd,
-                    frame[offset..].as_ptr() as *const libc::c_void,
-                    frame.len() - offset,
-                    libc::MSG_NOSIGNAL,
-                )
-            };
-            if written <= 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                self.log(&format!("greeter write failed: {error}"));
-                return;
-            }
-            offset += written as usize;
-        }
+        write_fd_frame(client.fd, payload, |msg| self.log(msg));
     }
 
     fn send_error(&mut self, code: ErrorCode, message: &str, retry_ms: u32) -> Result<(), String> {
@@ -1416,6 +1646,7 @@ impl Daemon {
             self.auth_path(),
             self.greeter_auth_path(),
             self.socket_path(),
+            self.power_socket_path(),
             self.runtime().join(XORG_PID),
             self.runtime().join(GREETER_PID),
             self.runtime().join(SESSION_PID),
@@ -1526,6 +1757,102 @@ fn spawn_as(
     Ok(child.id() as i32)
 }
 
+fn write_fd_frame(fd: RawFd, payload: &[u8], mut on_error: impl FnMut(&str)) {
+    let Ok(frame) = wire::encode_frame(payload) else {
+        return;
+    };
+    let mut offset = 0usize;
+    while offset < frame.len() {
+        let written = unsafe {
+            libc::send(
+                fd,
+                frame[offset..].as_ptr() as *const libc::c_void,
+                frame.len() - offset,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if written <= 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            on_error(&format!("socket write failed: {error}"));
+            return;
+        }
+        offset += written as usize;
+    }
+}
+
+fn read_single_power_action(fd: RawFd) -> Result<PowerAction, String> {
+    let mut buffer = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if let Some(payload) = wire::parse_frame(&mut buffer).map_err(|e| e.to_string())? {
+            let mut reader = Reader::new(&payload);
+            let opcode = reader.opcode()?;
+            if opcode != Opcode::Power {
+                return Err("unexpected power socket opcode".to_string());
+            }
+            let action = PowerAction::from_u8(reader.u8()?)
+                .ok_or_else(|| "unknown power action".to_string())?;
+            reader.finish()?;
+            return Ok(action);
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(100) as i32;
+        let ready = unsafe { libc::poll(&mut pfd, 1, remaining_ms.max(10)) };
+        if ready <= 0 {
+            continue;
+        }
+        let mut chunk = [0u8; 512];
+        let count = unsafe {
+            libc::recv(
+                fd,
+                chunk.as_mut_ptr() as *mut libc::c_void,
+                chunk.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if count == 0 {
+            return Err("power client closed early".to_string());
+        }
+        if count < 0 {
+            let err = io::Error::last_os_error();
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                continue;
+            }
+            return Err(err.to_string());
+        }
+        buffer.extend_from_slice(&chunk[..count as usize]);
+        if buffer.len() > 1024 {
+            return Err("power request frame too large".to_string());
+        }
+    }
+    Err("timed out reading power request".to_string())
+}
+
+fn group_alive(pid: i32) -> bool {
+    if pid_alive(pid) {
+        return true;
+    }
+    unsafe {
+        if libc::kill(-pid, 0) == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
 fn terminate_group(pid: i32, grace: Duration) -> i32 {
     if pid <= 0 {
         return 0;
@@ -1536,14 +1863,25 @@ fn terminate_group(pid: i32, grace: Duration) -> i32 {
     }
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
-        if !pid_alive(pid) {
+        let mut status = 0;
+        let _ = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if !group_alive(pid) {
             return 0;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
         libc::kill(pid, libc::SIGKILL);
+    }
+    let kill_deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < kill_deadline {
+        let mut status = 0;
+        let _ = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if !group_alive(pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
     }
     0
 }

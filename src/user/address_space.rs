@@ -17,7 +17,7 @@ use crate::vfs::{Inode, VfsError};
 use crate::{
     arch,
     mm::{pmm, vmm},
-    sync::SpinLock,
+    sync::Mutex,
 };
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
@@ -161,6 +161,8 @@ impl UserAddressSpace {
             .filter(|(_, mapping)| mapping.owned)
             .map(|(&address, mapping)| (address, mapping.physical, mapping.prot))
             .collect();
+        let owned_count = owned.len();
+        let first_owned = owned.first().map(|&(address, _, _)| address);
         for (address, physical, prot) in owned {
             let leaf = self.leaf(address, false)?;
             // SAFETY: the address is present in mapped_frames and the leaf
@@ -169,7 +171,13 @@ impl UserAddressSpace {
             if let Some(mapping) = self.mapped_frames.get_mut(&address) {
                 mapping.cow = true;
             }
-            arch::tlb_shootdown(address, 1);
+        }
+        if let Some(address) = first_owned {
+            if owned_count == 1 {
+                arch::tlb_shootdown(address, 1);
+            } else {
+                arch::tlb_shootdown(0, 0);
+            }
         }
         Ok(child)
     }
@@ -644,7 +652,7 @@ impl UserAddressSpace {
     /// Activate `space` without taking its lock. The context switch path must
     /// not wait for a lock whose holder may need this CPU to make progress, and
     /// the root table never changes after the space is created.
-    pub fn activate_shared(space: &SpinLock<Self>) {
+    pub fn activate_shared(space: &Mutex<Self>) {
         // SAFETY: `root_phys` is immutable after construction, the pointer comes
         // from a live lock, and no reference to the protected value is formed.
         let root = unsafe { core::ptr::addr_of!((*space.as_ptr()).root_phys).read() };
@@ -1165,7 +1173,7 @@ impl UserAddressSpace {
     /// `(start, end, prot, shared, rdev, ino)` for every mapping, as shown in
     /// `/proc/<pid>/maps`. Takes the lock itself because a filesystem's `metadata`
     /// may sleep and so has to run after it is released.
-    pub fn map_entries(space: &SpinLock<Self>) -> Vec<(u64, u64, u32, bool, u64, u64)> {
+    pub fn map_entries(space: &Mutex<Self>) -> Vec<(u64, u64, u32, bool, u64, u64)> {
         let raw = space.lock().raw_map_entries();
         let mut result: Vec<(u64, u64, u32, bool, u64, u64)> = Vec::with_capacity(raw.len());
         for (start, end, prot, shared, file) in raw {

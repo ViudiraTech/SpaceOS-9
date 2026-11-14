@@ -19,12 +19,14 @@ use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const MOTION_TOGGLE: f32 = 0.18;
 pub const MOTION_INDICATOR: f32 = 0.22;
+pub const MOTION_SCROLL: f32 = 0.17;
 #[allow(dead_code)]
 pub const MOTION_HOVER: f32 = 0.12;
+pub const SCROLLBAR_HIT_W: i32 = 12;
 
 /// Material/iOS-style decelerating curve: fast response, gentle settle.
 #[inline]
@@ -167,6 +169,7 @@ pub struct AnimationManager {
     toggles: HashMap<WidgetId, FloatTween>,
     rects: HashMap<WidgetId, RectTween>,
     floats: HashMap<WidgetId, FloatTween>,
+    scroll_deadlines: HashMap<WidgetId, Instant>,
 }
 
 impl AnimationManager {
@@ -201,11 +204,23 @@ impl AnimationManager {
         tween.value(now)
     }
 
+    pub fn keep_scroll_alive(&mut self, id: WidgetId, duration: f32) {
+        if duration <= 0.0 {
+            self.scroll_deadlines.remove(&id);
+        } else {
+            self.scroll_deadlines.insert(
+                id,
+                Instant::now() + Duration::from_secs_f32(duration + 0.02),
+            );
+        }
+    }
+
     pub fn has_active(&self) -> bool {
         let now = Instant::now();
         self.toggles.values().any(|t| t.active(now))
             || self.rects.values().any(|t| t.active(now))
             || self.floats.values().any(|t| t.active(now))
+            || self.scroll_deadlines.values().any(|&until| now < until)
     }
 }
 
@@ -230,6 +245,10 @@ pub fn animate_float(id: impl IntoWidgetId, target: f32, duration: f32) -> f32 {
 
 pub fn has_active_animations() -> bool {
     ANIM_MGR.with(|m| m.borrow().has_active())
+}
+
+fn keep_scroll_alive(id: WidgetId, duration: f32) {
+    ANIM_MGR.with(|m| m.borrow_mut().keep_scroll_alive(id, duration));
 }
 
 pub const CAPTION_BTN_W: i32 = 42;
@@ -763,7 +782,9 @@ pub fn segmented_control(
 ) {
     let seg = segmented_item_rect(rect, labels.len(), selected);
     let ind_rect = animate_rect(rect, seg, MOTION_INDICATOR);
-    segmented_control_anim(canvas, text, theme, rect, labels, ind_rect, selected, hover_idx);
+    segmented_control_anim(
+        canvas, text, theme, rect, labels, ind_rect, selected, hover_idx,
+    );
 }
 
 /// Multi-option segmented selector control with explicit widget ID and automatic smooth animation.
@@ -779,7 +800,9 @@ pub fn segmented_control_with_id(
 ) {
     let seg = segmented_item_rect(rect, labels.len(), selected);
     let ind_rect = animate_rect(id, seg, MOTION_INDICATOR);
-    segmented_control_anim(canvas, text, theme, rect, labels, ind_rect, selected, hover_idx);
+    segmented_control_anim(
+        canvas, text, theme, rect, labels, ind_rect, selected, hover_idx,
+    );
 }
 
 /// Circular color swatch with animated active ring indicator.
@@ -799,10 +822,24 @@ pub fn color_swatch(
     canvas.circle(cx, cy, radius, color, 1.0);
     canvas.ring(cx, cy, radius, 1.0, 0x000000, 0.18);
     if sel_t > 0.001 {
-        canvas.ring(cx, cy, radius + 2.2 * sel_t, 1.8 * sel_t, theme.text, 0.92 * sel_t);
+        canvas.ring(
+            cx,
+            cy,
+            radius + 2.2 * sel_t,
+            1.8 * sel_t,
+            theme.text,
+            0.92 * sel_t,
+        );
         canvas.circle(cx, cy, 3.2 * sel_t, 0xffffff, 0.98 * sel_t);
     } else if hov_t > 0.001 {
-        canvas.ring(cx, cy, radius + 1.8 * hov_t, 1.4 * hov_t, theme.text_muted, 0.75 * hov_t);
+        canvas.ring(
+            cx,
+            cy,
+            radius + 1.8 * hov_t,
+            1.4 * hov_t,
+            theme.text_muted,
+            0.75 * hov_t,
+        );
     }
 }
 
@@ -928,6 +965,270 @@ pub fn text_input(
     });
 }
 
+/// Smooth inertial & interactive vertical scroll state shared across scrollable apps.
+#[derive(Clone, Debug)]
+pub struct SmoothScroll {
+    id: WidgetId,
+    tween: FloatTween,
+    max_offset: f32,
+    viewport_len: f32,
+    total_len: f32,
+    last_track: Rect,
+    dragging: bool,
+    drag_grab_off: i32,
+    hovered: bool,
+    last_wheel_at: Option<Instant>,
+}
+
+impl SmoothScroll {
+    pub fn new(id: impl IntoWidgetId) -> Self {
+        Self {
+            id: id.into_widget_id(),
+            tween: FloatTween::new(0.0),
+            max_offset: 0.0,
+            viewport_len: 1.0,
+            total_len: 1.0,
+            last_track: Rect::default(),
+            dragging: false,
+            drag_grab_off: 0,
+            hovered: false,
+            last_wheel_at: None,
+        }
+    }
+
+    pub fn offset(&self) -> f32 {
+        self.tween.value(Instant::now()).clamp(0.0, self.max_offset)
+    }
+
+    pub fn offset_i32(&self) -> i32 {
+        self.offset().round() as i32
+    }
+
+    pub fn target(&self) -> f32 {
+        self.tween.to.clamp(0.0, self.max_offset)
+    }
+
+    pub fn max_offset(&self) -> f32 {
+        self.max_offset
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.tween.active(Instant::now())
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
+    pub fn is_hovered(&self) -> bool {
+        self.hovered
+    }
+
+    pub fn set_bounds(&mut self, viewport_len: f32, total_len: f32, track: Rect) {
+        self.viewport_len = viewport_len.max(1.0);
+        self.total_len = total_len.max(self.viewport_len);
+        self.max_offset = (self.total_len - self.viewport_len).max(0.0);
+        self.last_track = track;
+        if self.tween.to > self.max_offset {
+            self.tween.to = self.max_offset;
+        }
+        if self.tween.from > self.max_offset {
+            self.tween.from = self.max_offset;
+        }
+        if self.max_offset <= 0.0 {
+            self.dragging = false;
+            self.hovered = false;
+        }
+    }
+
+    pub fn snap_to(&mut self, offset: f32) {
+        let clamped = offset.clamp(0.0, self.max_offset.max(offset.max(0.0)));
+        let now = Instant::now();
+        self.tween.from = clamped;
+        self.tween.to = clamped;
+        self.tween.start = now;
+        self.tween.duration = 0.0;
+        keep_scroll_alive(self.id, 0.0);
+    }
+
+    pub fn animate_to(&mut self, target: f32, duration: f32) {
+        let clamped = target.clamp(0.0, self.max_offset);
+        let now = Instant::now();
+        self.tween.set_target(clamped, now, duration);
+        keep_scroll_alive(self.id, duration);
+    }
+
+    pub fn wheel(&mut self, delta_px: f32) -> bool {
+        if self.max_offset <= 0.0 || delta_px == 0.0 {
+            return false;
+        }
+        let now = Instant::now();
+        let boost = if self
+            .last_wheel_at
+            .is_some_and(|prev| now.saturating_duration_since(prev) < Duration::from_millis(85))
+        {
+            1.22
+        } else {
+            1.0
+        };
+        self.last_wheel_at = Some(now);
+        let current_target = self.tween.to.clamp(0.0, self.max_offset);
+        let next = (current_target + delta_px * boost).clamp(0.0, self.max_offset);
+        if (next - self.offset()).abs() < 0.25 && (next - current_target).abs() < 0.25 {
+            return false;
+        }
+        self.tween.set_target(next, now, MOTION_SCROLL);
+        keep_scroll_alive(self.id, MOTION_SCROLL);
+        true
+    }
+
+    fn current_thumb_rect(&self) -> Option<Rect> {
+        scrollbar_thumb_rect_f32(
+            self.last_track,
+            self.total_len,
+            self.viewport_len,
+            self.offset(),
+        )
+    }
+
+    pub fn handle_button(&mut self, x: i32, y: i32, button: u8, down: bool) -> bool {
+        if button != 1 {
+            return false;
+        }
+        if !down {
+            if self.dragging {
+                self.dragging = false;
+                return true;
+            }
+            return false;
+        }
+        if self.max_offset <= 0.0 || !self.last_track.contains(x, y) {
+            return false;
+        }
+        if let Some(thumb) = self.current_thumb_rect() {
+            if y >= thumb.y && y < thumb.bottom() {
+                let cur = self.offset();
+                self.snap_to(cur);
+                self.dragging = true;
+                self.drag_grab_off = (y - thumb.y).clamp(0, thumb.h.max(1));
+                return true;
+            }
+            let page_step = (self.viewport_len * 0.85).max(36.0);
+            let dir = if y < thumb.y { -1.0 } else { 1.0 };
+            self.animate_to(self.target() + dir * page_step, MOTION_SCROLL);
+            return true;
+        }
+        false
+    }
+
+    pub fn handle_motion(&mut self, x: i32, y: i32) -> bool {
+        if self.dragging {
+            if let Some(thumb) = self.current_thumb_rect() {
+                let travel = (self.last_track.h - thumb.h).max(1) as f32;
+                let desired_y = (y - self.drag_grab_off - self.last_track.y) as f32;
+                let frac = (desired_y / travel).clamp(0.0, 1.0);
+                let next = frac * self.max_offset;
+                if (next - self.offset()).abs() >= 0.25 {
+                    self.snap_to(next);
+                    return true;
+                }
+            }
+            return true;
+        }
+        let hov = self.max_offset > 0.0 && self.last_track.contains(x, y);
+        if hov != self.hovered {
+            self.hovered = hov;
+            return true;
+        }
+        false
+    }
+
+    pub fn draw_v(
+        &mut self,
+        canvas: &mut Canvas,
+        theme: &Theme,
+        track: Rect,
+        viewport: f32,
+        total: f32,
+    ) {
+        self.set_bounds(viewport, total, track);
+        if total <= viewport || viewport <= 0.0 || track.h <= 8 {
+            return;
+        }
+        scrollbar_v_animated(
+            canvas,
+            theme,
+            self.id,
+            track,
+            total,
+            viewport,
+            self.offset(),
+            self.hovered,
+            self.dragging,
+            self.is_animating(),
+        );
+    }
+}
+
+fn scrollbar_thumb_rect_f32(track: Rect, total: f32, visible: f32, offset: f32) -> Option<Rect> {
+    if total <= visible || visible <= 0.0 || track.h <= 8 {
+        return None;
+    }
+    let thumb_h = ((track.h as f32 * visible) / total)
+        .max(28.0)
+        .min(track.h as f32);
+    let max_offset = (total - visible).max(1.0);
+    let travel = (track.h as f32 - thumb_h).max(0.0);
+    let frac = (offset.clamp(0.0, max_offset)) / max_offset;
+    let thumb_y = track.y + (frac * travel).round() as i32;
+    Some(Rect::new(track.x, thumb_y, track.w, thumb_h.round() as i32))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn scrollbar_v_animated(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    id: impl IntoWidgetId,
+    track: Rect,
+    total: f32,
+    visible: f32,
+    offset: f32,
+    hovered: bool,
+    dragging: bool,
+    scrolling: bool,
+) {
+    let Some(base_thumb) = scrollbar_thumb_rect_f32(track, total, visible, offset) else {
+        return;
+    };
+    let expand_t = animate_bool(id, hovered || dragging || scrolling, 0.14);
+    let track_alpha = 0.20 + 0.65 * expand_t;
+    let track_pill = Rect::new(
+        (track.right() - (4.0 + 4.0 * expand_t).round() as i32 - 3).max(track.x),
+        track.y,
+        ((4.0 + 4.0 * expand_t).round() as i32 + 2).min(track.w),
+        track.h,
+    );
+    canvas.rounded_rect(
+        track_pill,
+        (track_pill.w / 2).max(2),
+        theme.scrollbar_track,
+        track_alpha,
+    );
+
+    let thumb_w = (4.0 + (track.w - 6).clamp(3, 5) as f32 * expand_t)
+        .round()
+        .clamp(4.0, (track.w - 2).max(4) as f32) as i32;
+    let thumb_x = track.right() - 2 - thumb_w;
+    let thumb = Rect::new(thumb_x, base_thumb.y, thumb_w, base_thumb.h);
+    let thumb_color = if dragging {
+        mix(theme.scrollbar_thumb, theme.accent, 0.65)
+    } else {
+        mix(theme.scrollbar_thumb, theme.text, 0.28 * expand_t)
+    };
+    canvas.rounded_rect(thumb, (thumb_w / 2).max(2), thumb_color, 1.0);
+}
+
+#[allow(dead_code)]
 pub fn scrollbar_v(
     canvas: &mut Canvas,
     theme: &Theme,
@@ -936,18 +1237,18 @@ pub fn scrollbar_v(
     visible: usize,
     offset: usize,
 ) {
-    if total <= visible || visible == 0 || track.h <= 8 {
-        return;
-    }
-    canvas.fill(track, theme.scrollbar_track);
-    let thumb_h = ((track.h as usize * visible) / total)
-        .max(24)
-        .min(track.h as usize) as i32;
-    let max_offset = total - visible;
-    let travel = (track.h - thumb_h).max(0);
-    let thumb_y = track.y + ((offset.min(max_offset) * travel as usize) / max_offset) as i32;
-    let thumb = Rect::new(track.x + 1, thumb_y, (track.w - 2).max(2), thumb_h);
-    canvas.rounded_rect(thumb, 3, theme.scrollbar_thumb, 1.0);
+    scrollbar_v_animated(
+        canvas,
+        theme,
+        track,
+        track,
+        total as f32,
+        visible as f32,
+        offset as f32,
+        false,
+        false,
+        false,
+    );
 }
 
 #[cfg(test)]
@@ -959,7 +1260,11 @@ mod tests {
         assert_eq!(ease_out_cubic(0.0), 0.0);
         assert_eq!(ease_out_cubic(1.0), 1.0);
         let mid = ease_out_cubic(0.5);
-        assert!(mid > 0.5, "Ease-out cubic should accelerate early: mid={}", mid);
+        assert!(
+            mid > 0.5,
+            "Ease-out cubic should accelerate early: mid={}",
+            mid
+        );
         assert!((mid - 0.875).abs() < 1e-4);
     }
 
@@ -995,5 +1300,40 @@ mod tests {
         assert_eq!(out1.y, 0);
         assert_eq!(out1.w, 100);
         assert_eq!(out1.h, 30);
+    }
+
+    #[test]
+    fn test_smooth_scroll_wheel_track_and_drag() {
+        let mut s = SmoothScroll::new("test_smooth_scroll");
+        let track = Rect::new(200, 50, 12, 300);
+        s.set_bounds(300.0, 1200.0, track);
+        assert_eq!(s.max_offset(), 900.0);
+
+        // Wheel clamps cleanly and triggers active animation.
+        assert!(s.wheel(120.0));
+        assert!(s.target() > 0.0 && s.target() <= 900.0);
+        assert!(s.is_animating());
+
+        // Over-scrolling down clamps cleanly to max_offset.
+        assert!(s.wheel(5000.0));
+        assert_eq!(s.target(), 900.0);
+        s.snap_to(0.0);
+        assert_eq!(s.offset(), 0.0);
+        assert!(!s.is_animating());
+
+        // Track click below thumb pages smoothly downward.
+        assert!(s.handle_button(206, 260, 1, true));
+        assert!(s.target() > 200.0);
+        s.snap_to(0.0);
+
+        // Grab thumb near top and drag halfway down -> maps 1:1 immediately.
+        assert!(s.handle_button(206, 60, 1, true));
+        assert!(s.is_dragging());
+        let drag_to_y = 60 + 112; // ~half of travel
+        assert!(s.handle_motion(160, drag_to_y)); // off-axis X remains captured
+        assert!(s.offset() > 350.0 && s.offset() < 550.0);
+        assert!(!s.is_animating());
+        assert!(s.handle_button(160, drag_to_y, 1, false));
+        assert!(!s.is_dragging());
     }
 }

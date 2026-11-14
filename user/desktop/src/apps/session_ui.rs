@@ -19,10 +19,12 @@ use crate::text::TextRenderer;
 use crate::theme::Theme;
 use crate::x11::{Result, X};
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 const MAX_FRAME: usize = 128 * 1024;
+pub const POWER_SOCKET: &str = "/run/ddm/power.sock";
 
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
@@ -128,30 +130,7 @@ impl Backend {
     }
 
     pub fn send(&self, payload: &[u8]) -> Result<()> {
-        let frame = wire::encode_frame(payload)?;
-        let mut offset = 0;
-        while offset < frame.len() {
-            let written = unsafe {
-                libc::send(
-                    self.fd,
-                    frame[offset..].as_ptr() as *const libc::c_void,
-                    frame.len() - offset,
-                    libc::MSG_NOSIGNAL,
-                )
-            };
-            if written < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error.into());
-            }
-            if written == 0 {
-                return Err("DDM socket closed".into());
-            }
-            offset += written as usize;
-        }
-        Ok(())
+        send_fd_frame(self.fd, payload)
     }
 
     pub fn login(&self, user: &str, password: &[u8], session: &str) -> Result<()> {
@@ -228,6 +207,103 @@ impl Backend {
         };
         decode_frame(&payload).map(Some)
     }
+}
+
+fn send_fd_frame(fd: RawFd, payload: &[u8]) -> Result<()> {
+    let frame = wire::encode_frame(payload)?;
+    let mut offset = 0;
+    while offset < frame.len() {
+        let written = unsafe {
+            libc::send(
+                fd,
+                frame[offset..].as_ptr() as *const libc::c_void,
+                frame.len() - offset,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if written < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if written == 0 {
+            return Err("DDM socket closed".into());
+        }
+        offset += written as usize;
+    }
+    Ok(())
+}
+
+/// Request a graceful `PowerOff` or `Reboot` via the active user's DDM power
+/// socket so the splash UI and `systemg` orderly shutdown execute together.
+pub fn send_power_request(action: crate::ddm::wire::PowerAction) -> Result<()> {
+    let stream = UnixStream::connect(POWER_SOCKET)?;
+    stream.set_nonblocking(true)?;
+    let fd = stream.as_raw_fd();
+    let mut writer = Writer::new(Opcode::Power);
+    writer.u8(action as u8);
+    send_fd_frame(fd, &writer.finish())?;
+
+    let mut buffer = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Some(payload) = wire::parse_frame(&mut buffer)? {
+            return match decode_frame(&payload)? {
+                Message::PowerOk => Ok(()),
+                Message::Error { message, .. } => Err(message.into()),
+                _ => Err("DDM 返回了无效电源应答".into()),
+            };
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        let remaining_ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .min(500) as i32;
+        let ready = unsafe { libc::poll(&mut pfd, 1, remaining_ms.max(10)) };
+        if ready < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        if ready == 0 {
+            continue;
+        }
+        let mut chunk = [0u8; 4096];
+        let count = unsafe {
+            libc::recv(
+                fd,
+                chunk.as_mut_ptr() as *mut libc::c_void,
+                chunk.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if count == 0 {
+            return Err("DDM 电源连接已关闭".into());
+        }
+        if count < 0 {
+            let err = io::Error::last_os_error();
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                continue;
+            }
+            return Err(err.into());
+        }
+        buffer.extend_from_slice(&chunk[..count as usize]);
+        if buffer.len() > MAX_FRAME {
+            return Err("DDM 电源应答帧过大".into());
+        }
+    }
+    Err("等待 DDM 电源应答超时".into())
 }
 
 fn decode_frame(payload: &[u8]) -> Result<Message> {
@@ -381,22 +457,22 @@ impl Screen {
         x.set_title(win, "SpaceOS Login")?;
         x.set_class(win, "spui", "SpuiGreeter")?;
         x.set_wm_type(win, x.atoms.net_wm_type_normal)?;
-        x.map(win)?;
-        x.raise(win)?;
-        let _ = x.focus(win);
         let _ = x.apply_screensaver_timeout(0);
-        x.flush()?;
 
         let mut text =
             TextRenderer::load().map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         text.set_ui_scale(1.0);
-        let canvas = x.create_canvas(width as usize, height as usize, 0x101014);
+        let theme = Theme::dark_with_accent(0x3b82f6);
+        let background = wallpaper(wallpaper_path, width as usize, height as usize);
+        let mut canvas = x.create_canvas(width as usize, height as usize, 0x101014);
+        canvas.copy_background(&background);
         let backing = x.create_backing(win, width as u16, height as u16)?;
         x.put_canvas(backing, &canvas, canvas.bounds())?;
         x.set_background_pixmap(win, backing)?;
+        x.map(win)?;
+        x.raise(win)?;
+        let _ = x.focus(win);
         x.flush()?;
-        let theme = Theme::dark_with_accent(0x3b82f6);
-        let background = wallpaper(wallpaper_path, width as usize, height as usize);
         Ok(Self {
             x,
             window: win,

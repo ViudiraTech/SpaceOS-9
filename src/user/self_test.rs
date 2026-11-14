@@ -144,14 +144,14 @@ pub fn run() {
 
 pub fn syscalls() {
     use crate::{
-        sync::SpinLock,
+        sync::Mutex,
         syscall::{dispatch, numbers::*},
         vfs::{self, abi},
     };
     use alloc::sync::Arc;
     let task = crate::sched::current().unwrap();
     let old = task.address_space();
-    let scratch = Arc::new(SpinLock::new(UserAddressSpace::new().unwrap()));
+    let scratch = Arc::new(Mutex::new(UserAddressSpace::new().unwrap()));
     scratch.lock().map_zeroed(0x10000, 16384, 3).unwrap();
     task.lock().set_address_space(scratch.clone());
     let read_i32 = |address: u64| -> i32 {
@@ -801,7 +801,7 @@ pub fn syscalls() {
 pub fn ipc_advanced() {
     use crate::{
         signal::{self, SIGUSR1},
-        sync::SpinLock,
+        sync::Mutex,
         syscall::{dispatch, numbers::*},
         vfs::{self, abi},
     };
@@ -809,7 +809,7 @@ pub fn ipc_advanced() {
 
     let task = crate::sched::current().unwrap();
     let old = task.address_space();
-    let scratch = Arc::new(SpinLock::new(UserAddressSpace::new().unwrap()));
+    let scratch = Arc::new(Mutex::new(UserAddressSpace::new().unwrap()));
     scratch.lock().map_zeroed(0x10000, 0x4000, 3).unwrap();
     task.lock().set_address_space(scratch.clone());
     scratch.lock().activate();

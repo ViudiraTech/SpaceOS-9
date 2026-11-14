@@ -451,6 +451,49 @@ pub fn sleep_micros(micros: u64) {
     arch::irq_restore(flags);
 }
 pub fn exit(exit_code: i32) -> ! {
+    // Enable interrupts so Mutex locks, FD drops (e.g. PTY/GPU teardown), and
+    // address-space TLB shootdowns execute in normal preemptible task context.
+    arch::enable_interrupts();
+    if let Some(current_task) = current() {
+        let stats = current_task.stats();
+        if stats.user {
+            // CLONE_CHILD_CLEARTID must reach the exiting thread's address
+            // space before it is torn down.
+            let (space, address) = {
+                let mut task = current_task.lock();
+                let clear = (task.address_space.clone(), task.clear_child_tid);
+                task.clear_child_tid = 0;
+                clear
+            };
+            if let (Some(space), address) = (space, address)
+                && address != 0
+            {
+                let root = {
+                    let mut space = space.lock();
+                    let root = space.root_physical();
+                    let _ = space.write_bytes(address, &0u32.to_le_bytes());
+                    root
+                };
+                // Publish the cleared word before the exit becomes observable
+                // to another CPU waiting on it.
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                crate::ipc::futex::wake_cleared(root, address, 1);
+            }
+        }
+        // Tear down per-process FDs and private address space before taking the
+        // runqueue lock so drop handlers never run inside finish_switch/IRQs.
+        let (closed_fds, space) = {
+            let mut task = current_task.lock();
+            let closed_fds = (!task.files_shared).then(|| task.fd_table.lock().take_all());
+            let space = task.address_space.take();
+            (closed_fds, space)
+        };
+        drop(closed_fds);
+        if space.is_some() {
+            crate::user::UserAddressSpace::deactivate();
+        }
+        drop(space);
+    }
     arch::disable_interrupts();
     let rq = scheduler().cpus[smp::current_cpu()].queue.lock();
     dispatch(rq, Disposition::Exit(exit_code), true);
@@ -591,39 +634,16 @@ pub(crate) fn finish_switch() {
     let retired = queue.lock().retired.take();
     if let Some(retired) = retired {
         let stats = retired.value.stats();
-        if stats.user {
-            // CLONE_CHILD_CLEARTID must reach the exiting thread's address
-            // space before it is dropped.
-            let (space, address) = {
-                let mut task = retired.value.lock();
-                let clear = (task.address_space.clone(), task.clear_child_tid);
-                task.address_space = None;
-                if !task.files_shared {
-                    task.fd_table.lock().close_all();
-                }
-                clear
-            };
-            if let (Some(space), address) = (space, address)
-                && address != 0
-            {
-                let root = {
-                    let mut space = space.lock();
-                    let root = space.root_physical();
-                    let _ = space.write_bytes(address, &0u32.to_le_bytes());
-                    root
-                };
-                // Publish the cleared word before the exit becomes observable
-                // to another CPU waiting on it.
-                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                crate::ipc::futex::wake_cleared(root, address, 1);
-            }
-        } else {
+        let (space, closed_fds) = {
             let mut task = retired.value.lock();
-            task.address_space = None;
-            if !task.files_shared {
-                task.fd_table.lock().close_all();
-            }
-        }
+            let space = task.address_space.take();
+            let closed_fds = (!task.files_shared).then(|| task.fd_table.lock().take_all());
+            (space, closed_fds)
+        };
+        // Drop outside `retired.value.lock()` so close/drop paths (e.g. PTY/GPU)
+        // never re-enter the task list or lock this task while its lock is held.
+        drop(closed_fds);
+        drop(space);
         if stats.user && stats.state == TaskState::Zombie {
             if stats.ltid == stats.tgid {
                 // The group leader is retained until the whole group exits.

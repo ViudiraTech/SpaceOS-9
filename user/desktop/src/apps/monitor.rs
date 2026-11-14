@@ -18,7 +18,7 @@ use crate::icons::Icon;
 use crate::text::{Face, TextRenderer};
 use crate::theme::{Theme, TITLEBAR_HEIGHT};
 use crate::ui;
-use crate::x11::Result;
+use crate::x11::{CursorKind, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
@@ -291,6 +291,54 @@ fn format_kib(kib: u64) -> String {
     }
 }
 
+const PROC_TH_H: i32 = 28;
+const PROC_ROW_H: i32 = 30;
+const PROC_SCROLLBAR_W: i32 = ui::SCROLLBAR_HIT_W;
+
+fn proc_table_rect(w: i32, h: i32) -> Rect {
+    let top = TITLEBAR_HEIGHT + 58;
+    Rect::new(14, top + 26, w - 28, h - (top + 26) - 56)
+}
+
+fn proc_rows_clip(table_r: Rect) -> Rect {
+    Rect::new(
+        table_r.x,
+        table_r.y + PROC_TH_H,
+        (table_r.w - PROC_SCROLLBAR_W - 4).max(1),
+        (table_r.h - PROC_TH_H - 2).max(0),
+    )
+}
+
+fn proc_scrollbar_track(table_r: Rect) -> Rect {
+    Rect::new(
+        table_r.right() - PROC_SCROLLBAR_W - 2,
+        table_r.y + PROC_TH_H + 2,
+        PROC_SCROLLBAR_W,
+        (table_r.h - PROC_TH_H - 4).max(8),
+    )
+}
+
+fn filtered_proc_count(data: &SystemMonitorData, query: &str) -> usize {
+    data.processes
+        .iter()
+        .filter(|p| query.is_empty() || p.name.contains(query) || p.pid.to_string().contains(query))
+        .count()
+}
+
+fn sync_proc_scroll(
+    data: &SystemMonitorData,
+    query: &str,
+    scroll: &mut ui::SmoothScroll,
+    w: i32,
+    h: i32,
+) {
+    let table_r = proc_table_rect(w, h);
+    let rows_r = proc_rows_clip(table_r);
+    let track = proc_scrollbar_track(table_r);
+    let total_h = (filtered_proc_count(data, query) as i32 * PROC_ROW_H) as f32;
+    scroll.set_bounds(rows_r.h as f32, total_h, track);
+}
+
 pub fn run() -> Result<()> {
     let mut app = App::new("系统监视器", Icon::Monitor, 780, 520)?;
     app.min_width = 680;
@@ -299,9 +347,16 @@ pub fn run() -> Result<()> {
     let mut tab = Tab::Performance;
     let mut data = SystemMonitorData::new();
     let mut selected_pid: Option<i32> = None;
-    let mut proc_scroll: usize = 0;
+    let mut proc_scroll = ui::SmoothScroll::new("monitor_proc_scroll");
     let query = String::new();
     let mut last_sample = Instant::now();
+    sync_proc_scroll(
+        &data,
+        &query,
+        &mut proc_scroll,
+        app.width as i32,
+        app.height as i32,
+    );
 
     loop {
         if app.close {
@@ -310,6 +365,13 @@ pub fn run() -> Result<()> {
 
         if last_sample.elapsed().as_millis() >= 1000 {
             data.sample();
+            sync_proc_scroll(
+                &data,
+                &query,
+                &mut proc_scroll,
+                app.width as i32,
+                app.height as i32,
+            );
             last_sample = Instant::now();
             app.needs_redraw = true;
         }
@@ -322,7 +384,7 @@ pub fn run() -> Result<()> {
                 tab,
                 &data,
                 selected_pid,
-                proc_scroll,
+                &mut proc_scroll,
                 &query,
                 app.width as i32,
                 app.height as i32,
@@ -331,84 +393,118 @@ pub fn run() -> Result<()> {
             app.present()?;
         }
 
-        let timeout = (1000 - last_sample.elapsed().as_millis() as i32).clamp(20, 100);
+        let timeout = if ui::has_active_animations() {
+            16
+        } else {
+            (1000 - last_sample.elapsed().as_millis() as i32).clamp(20, 100)
+        };
         for event in app.pump_with_fd(None, timeout)?.0 {
+            let (win_w, win_h) = (app.width as i32, app.height as i32);
             match event {
                 UiEvent::Close => app.request_close(),
-                UiEvent::Expose | UiEvent::Configure { .. } | UiEvent::ConfigChanged => {
+                UiEvent::Expose | UiEvent::ConfigChanged => {
                     app.needs_redraw = true;
+                }
+                UiEvent::Configure { width, height } => {
+                    sync_proc_scroll(&data, &query, &mut proc_scroll, width as i32, height as i32);
+                    app.needs_redraw = true;
+                }
+                UiEvent::Motion { x, y, .. } => {
+                    if tab == Tab::Processes {
+                        if proc_scroll.handle_motion(x, y) {
+                            app.needs_redraw = true;
+                        }
+                        app.set_content_cursor(
+                            if proc_scroll.is_hovered() || proc_scroll.is_dragging() {
+                                CursorKind::Pointer
+                            } else {
+                                CursorKind::Default
+                            },
+                        );
+                    } else {
+                        app.set_content_cursor(CursorKind::Default);
+                    }
                 }
                 UiEvent::Wheel { delta, .. } => {
                     if tab == Tab::Processes {
-                        if delta > 0 {
-                            proc_scroll = proc_scroll.saturating_add(3);
-                        } else {
-                            proc_scroll = proc_scroll.saturating_sub(3);
+                        sync_proc_scroll(&data, &query, &mut proc_scroll, win_w, win_h);
+                        if proc_scroll.wheel(delta as f32 * 22.0) {
+                            app.needs_redraw = true;
                         }
-                        app.needs_redraw = true;
                     }
                 }
                 UiEvent::Button {
-                    x,
-                    y,
-                    button: 1,
-                    down: true,
-                    ..
-                } if y >= TITLEBAR_HEIGHT => {
-                    // Check tab bar
-                    let tab_w = 200;
-                    let tab_r = Rect::new(
-                        app.width as i32 - 16 - tab_w,
-                        TITLEBAR_HEIGHT + 10,
-                        tab_w,
-                        28,
-                    );
-                    if tab_r.contains(x, y) {
-                        let seg0 = ui::segmented_item_rect(tab_r, 2, 0);
-                        if seg0.contains(x, y) {
-                            tab = Tab::Performance;
-                        } else {
-                            tab = Tab::Processes;
-                        }
+                    x, y, button, down, ..
+                } => {
+                    if tab == Tab::Processes && proc_scroll.handle_button(x, y, button, down) {
+                        app.set_content_cursor(
+                            if proc_scroll.is_hovered() || proc_scroll.is_dragging() {
+                                CursorKind::Pointer
+                            } else {
+                                CursorKind::Default
+                            },
+                        );
                         app.needs_redraw = true;
                         continue;
                     }
-
-                    if tab == Tab::Processes {
-                        let list_top = TITLEBAR_HEIGHT + 84;
-                        let row_h = 30;
-                        let kill_btn = Rect::new(
-                            app.width as i32 - 16 - 100,
-                            app.height as i32 - 16 - 30,
-                            100,
-                            30,
-                        );
-                        if kill_btn.contains(x, y) {
-                            if let Some(pid) = selected_pid {
-                                // SAFETY: Standard POSIX kill signal sent to designated PID.
-                                unsafe {
-                                    libc::kill(pid, libc::SIGTERM);
-                                }
-                                data.sample();
-                                app.needs_redraw = true;
-                            }
+                    if button == 1 && down && y >= TITLEBAR_HEIGHT {
+                        // Check tab bar
+                        let tab_w = 200;
+                        let tab_r = Rect::new(win_w - 16 - tab_w, TITLEBAR_HEIGHT + 10, tab_w, 28);
+                        if tab_r.contains(x, y) {
+                            let seg0 = ui::segmented_item_rect(tab_r, 2, 0);
+                            tab = if seg0.contains(x, y) {
+                                Tab::Performance
+                            } else {
+                                sync_proc_scroll(&data, &query, &mut proc_scroll, win_w, win_h);
+                                Tab::Processes
+                            };
+                            crate::sound::play(&app.config, crate::sound::SystemSound::Click);
+                            app.needs_redraw = true;
                             continue;
                         }
 
-                        if y >= list_top && y < app.height as i32 - 54 {
-                            let idx = ((y - list_top) / row_h) as usize + proc_scroll;
-                            let filtered: Vec<&ProcessInfo> = data
-                                .processes
-                                .iter()
-                                .filter(|p| {
-                                    query.is_empty()
-                                        || p.name.contains(&query)
-                                        || p.pid.to_string().contains(&query)
-                                })
-                                .collect();
-                            if let Some(target) = filtered.get(idx) {
-                                selected_pid = Some(target.pid);
-                                app.needs_redraw = true;
+                        if tab == Tab::Processes {
+                            let kill_btn = Rect::new(win_w - 16 - 100, win_h - 16 - 30, 100, 30);
+                            if kill_btn.contains(x, y) {
+                                if let Some(pid) = selected_pid {
+                                    // SAFETY: Standard POSIX kill signal sent to designated PID.
+                                    unsafe {
+                                        libc::kill(pid, libc::SIGTERM);
+                                    }
+                                    data.sample();
+                                    sync_proc_scroll(&data, &query, &mut proc_scroll, win_w, win_h);
+                                    crate::sound::play(
+                                        &app.config,
+                                        crate::sound::SystemSound::Click,
+                                    );
+                                    app.needs_redraw = true;
+                                }
+                                continue;
+                            }
+
+                            let table_r = proc_table_rect(win_w, win_h);
+                            let rows_clip = proc_rows_clip(table_r);
+                            if rows_clip.contains(x, y) {
+                                let scroll_px = proc_scroll.offset_i32().max(0);
+                                let idx = ((y - rows_clip.y + scroll_px) / PROC_ROW_H) as usize;
+                                let filtered: Vec<&ProcessInfo> = data
+                                    .processes
+                                    .iter()
+                                    .filter(|p| {
+                                        query.is_empty()
+                                            || p.name.contains(&query)
+                                            || p.pid.to_string().contains(&query)
+                                    })
+                                    .collect();
+                                if let Some(target) = filtered.get(idx) {
+                                    selected_pid = Some(target.pid);
+                                    crate::sound::play(
+                                        &app.config,
+                                        crate::sound::SystemSound::Click,
+                                    );
+                                    app.needs_redraw = true;
+                                }
                             }
                         }
                     }
@@ -428,7 +524,7 @@ fn draw_monitor(
     tab: Tab,
     data: &SystemMonitorData,
     selected_pid: Option<i32>,
-    proc_scroll: usize,
+    proc_scroll: &mut ui::SmoothScroll,
     query: &str,
     w: i32,
     h: i32,
@@ -667,7 +763,7 @@ fn draw_processes_tab(
     theme: &Theme,
     data: &SystemMonitorData,
     selected_pid: Option<i32>,
-    proc_scroll: usize,
+    proc_scroll: &mut ui::SmoothScroll,
     query: &str,
     w: i32,
     h: i32,
@@ -707,16 +803,15 @@ fn draw_processes_tab(
     );
 
     // Table Header
-    let table_r = Rect::new(14, top + 26, w - 28, h - (top + 26) - 56);
+    let table_r = proc_table_rect(w, h);
     ui::card(canvas, theme, table_r);
 
-    let th_h = 28;
     canvas.fill(
-        Rect::new(table_r.x, table_r.y, table_r.w, th_h),
+        Rect::new(table_r.x, table_r.y, table_r.w, PROC_TH_H),
         theme.window_alt,
     );
     canvas.fill(
-        Rect::new(table_r.x, table_r.y + th_h - 1, table_r.w, 1),
+        Rect::new(table_r.x, table_r.y + PROC_TH_H - 1, table_r.w, 1),
         theme.window_border,
     );
 
@@ -724,7 +819,8 @@ fn draw_processes_tab(
     let col_pid = table_r.x + (table_r.w * 45) / 100;
     let col_cpu = table_r.x + (table_r.w * 62) / 100;
     let col_rss = table_r.x + (table_r.w * 78) / 100;
-    let col_st = table_r.right() - 36;
+    let rows_clip = proc_rows_clip(table_r);
+    let col_st = rows_clip.right() - 28;
 
     let th_baseline = table_r.y as f32 + 18.0;
     text.draw(
@@ -773,88 +869,98 @@ fn draw_processes_tab(
         Face::Bold,
     );
 
-    // Rows
-    let row_h = 30;
-    let visible_rows = ((table_r.h - th_h) / row_h).max(1) as usize;
-    let slice = filtered.iter().skip(proc_scroll).take(visible_rows);
+    // Rows with smooth pixel clipping and animated scrollbar
+    let sb_track = proc_scrollbar_track(table_r);
+    let total_h = (filtered.len() as i32 * PROC_ROW_H) as f32;
+    proc_scroll.set_bounds(rows_clip.h as f32, total_h, sb_track);
+    let scroll_px = proc_scroll.offset_i32().max(0);
+    let first_row = (scroll_px / PROC_ROW_H).max(0) as usize;
+    let vis_span = ((rows_clip.h + PROC_ROW_H - 1) / PROC_ROW_H + 1).max(1) as usize;
 
-    for (idx, proc) in slice.enumerate() {
-        let ry = table_r.y + th_h + idx as i32 * row_h;
-        let is_sel = selected_pid == Some(proc.pid);
-        let row_r = Rect::new(table_r.x + 2, ry, table_r.w - 4, row_h);
+    canvas.with_clip(rows_clip, |c| {
+        for (idx, proc) in filtered.iter().enumerate().skip(first_row).take(vis_span) {
+            let ry = rows_clip.y + idx as i32 * PROC_ROW_H - scroll_px;
+            if ry >= rows_clip.bottom() {
+                break;
+            }
+            let is_sel = selected_pid == Some(proc.pid);
+            let row_r = Rect::new(rows_clip.x + 2, ry, rows_clip.w - 4, PROC_ROW_H);
 
-        if is_sel {
-            canvas.rounded_rect(row_r, 4, theme.accent_soft, 1.0);
-            canvas.fill(
-                Rect::new(row_r.x, row_r.y + 4, 3, row_r.h - 8),
-                theme.accent,
+            if is_sel {
+                c.rounded_rect(row_r, 4, theme.accent_soft, 1.0);
+                c.fill(
+                    Rect::new(row_r.x, row_r.y + 4, 3, row_r.h - 8),
+                    theme.accent,
+                );
+            } else if idx % 2 == 1 {
+                c.fill(row_r, theme.window_alt);
+            }
+
+            let baseline = ry as f32 + 20.0;
+            let name_shown =
+                text.truncate(&proc.name, (col_pid - col_name - 16) as f32, 12.0, Face::Ui);
+            text.draw(
+                c,
+                &name_shown,
+                col_name as f32,
+                baseline,
+                12.0,
+                if is_sel { theme.accent } else { theme.text },
+                if is_sel { Face::Bold } else { Face::Ui },
             );
-        } else if idx % 2 == 1 {
-            canvas.fill(row_r, theme.window_alt);
+
+            text.draw(
+                c,
+                &proc.pid.to_string(),
+                col_pid as f32,
+                baseline,
+                12.0,
+                theme.text_dim,
+                Face::Ui,
+            );
+
+            let cpu_txt = format!("{:.1}%", proc.cpu_percent);
+            text.draw(
+                c,
+                &cpu_txt,
+                col_cpu as f32,
+                baseline,
+                12.0,
+                if proc.cpu_percent > 10.0 {
+                    theme.accent
+                } else {
+                    theme.text_dim
+                },
+                if proc.cpu_percent > 10.0 {
+                    Face::Bold
+                } else {
+                    Face::Ui
+                },
+            );
+
+            let rss_txt = format_kib(proc.rss_kib);
+            text.draw(
+                c,
+                &rss_txt,
+                col_rss as f32,
+                baseline,
+                12.0,
+                theme.text_dim,
+                Face::Ui,
+            );
+
+            let st_str = proc.state.to_string();
+            text.draw(
+                c,
+                &st_str,
+                col_st as f32,
+                baseline,
+                12.0,
+                theme.text_muted,
+                Face::Ui,
+            );
         }
+    });
 
-        let baseline = ry as f32 + 20.0;
-        let name_shown =
-            text.truncate(&proc.name, (col_pid - col_name - 16) as f32, 12.0, Face::Ui);
-        text.draw(
-            canvas,
-            &name_shown,
-            col_name as f32,
-            baseline,
-            12.0,
-            if is_sel { theme.accent } else { theme.text },
-            if is_sel { Face::Bold } else { Face::Ui },
-        );
-
-        text.draw(
-            canvas,
-            &proc.pid.to_string(),
-            col_pid as f32,
-            baseline,
-            12.0,
-            theme.text_dim,
-            Face::Ui,
-        );
-
-        let cpu_txt = format!("{:.1}%", proc.cpu_percent);
-        text.draw(
-            canvas,
-            &cpu_txt,
-            col_cpu as f32,
-            baseline,
-            12.0,
-            if proc.cpu_percent > 10.0 {
-                theme.accent
-            } else {
-                theme.text_dim
-            },
-            if proc.cpu_percent > 10.0 {
-                Face::Bold
-            } else {
-                Face::Ui
-            },
-        );
-
-        let rss_txt = format_kib(proc.rss_kib);
-        text.draw(
-            canvas,
-            &rss_txt,
-            col_rss as f32,
-            baseline,
-            12.0,
-            theme.text_dim,
-            Face::Ui,
-        );
-
-        let st_str = proc.state.to_string();
-        text.draw(
-            canvas,
-            &st_str,
-            col_st as f32,
-            baseline,
-            12.0,
-            theme.text_muted,
-            Face::Ui,
-        );
-    }
+    proc_scroll.draw_v(canvas, theme, sb_track, rows_clip.h as f32, total_h);
 }

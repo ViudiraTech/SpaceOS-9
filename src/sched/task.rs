@@ -11,7 +11,10 @@
 //! Only kernel threads exist today. User processes, fork, signals and VFS
 //! handles are deliberately absent until their resource ownership is implemented.
 
-use crate::{arch, fpu, sync::SpinLock};
+use crate::{
+    arch, fpu,
+    sync::{Mutex, SpinLock},
+};
 use alloc::{
     alloc::{alloc, dealloc},
     boxed::Box,
@@ -230,7 +233,7 @@ impl TaskRef {
             inner: Arc::downgrade(&self.0),
         }
     }
-    pub fn address_space(&self) -> Option<Arc<SpinLock<crate::user::UserAddressSpace>>> {
+    pub fn address_space(&self) -> Option<Arc<Mutex<crate::user::UserAddressSpace>>> {
         self.lock().address_space.clone()
     }
     pub fn files(&self) -> Arc<SpinLock<crate::vfs::FileDescriptorTable>> {
@@ -504,7 +507,7 @@ pub(crate) struct Task {
     pub(crate) fpu_state: UnsafeCell<Option<fpu::State>>,
     pub(crate) entry: Option<Box<dyn FnOnce() + Send>>,
     pub(crate) stack: Option<KernelStack>,
-    pub(crate) address_space: Option<Arc<SpinLock<crate::user::UserAddressSpace>>>,
+    pub(crate) address_space: Option<Arc<Mutex<crate::user::UserAddressSpace>>>,
     pub(crate) fd_table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>,
     pub(crate) fs: Arc<SpinLock<FsContext>>,
     pub(crate) signals: Arc<SignalState>,
@@ -559,10 +562,10 @@ impl Task {
     pub fn kernel_stack_top(&self) -> Option<usize> {
         self.stack.as_ref().map(|s| s.top())
     }
-    pub fn set_address_space(&mut self, space: Arc<SpinLock<crate::user::UserAddressSpace>>) {
+    pub fn set_address_space(&mut self, space: Arc<Mutex<crate::user::UserAddressSpace>>) {
         self.address_space = Some(space);
     }
-    pub fn address_space(&self) -> Option<Arc<SpinLock<crate::user::UserAddressSpace>>> {
+    pub fn address_space(&self) -> Option<Arc<Mutex<crate::user::UserAddressSpace>>> {
         self.address_space.clone()
     }
     pub(crate) fn become_zombie(&mut self, code: i32) {
@@ -753,7 +756,7 @@ pub(crate) struct UserTaskSpec {
     pub fs: Arc<SpinLock<FsContext>>,
     pub signals: Arc<SignalState>,
     pub thread_signals: Arc<SpinLock<ThreadSignals>>,
-    pub address_space: Arc<SpinLock<crate::user::UserAddressSpace>>,
+    pub address_space: Arc<Mutex<crate::user::UserAddressSpace>>,
 }
 extern "C" fn task_entry() -> ! {
     super::finish_switch();

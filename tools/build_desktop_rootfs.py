@@ -29,6 +29,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import urllib.error
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -132,6 +133,11 @@ BREEZE_ICONS = {
     "bell": "usr/share/icons/breeze/actions/22/notifications.svg",
     "bell-active": "usr/share/icons/breeze/actions/22/notification-active.svg",
     "info": "usr/share/icons/breeze/actions/22/help-about.svg",
+    "sound": "usr/share/icons/breeze/preferences/32/preferences-desktop-sound.svg",
+    "audio-volume-muted": "usr/share/icons/breeze/status/22/audio-volume-muted.svg",
+    "audio-volume-low": "usr/share/icons/breeze/status/22/audio-volume-low.svg",
+    "audio-volume-medium": "usr/share/icons/breeze/status/22/audio-volume-medium.svg",
+    "audio-volume-high": "usr/share/icons/breeze/status/22/audio-volume-high.svg",
 }
 PROVIDER_PREFERENCE = {
     "so:libudev.so.1": "libudev-zero",
@@ -372,6 +378,71 @@ def resolve_tar_symlink(names: dict[str, tarfile.TarInfo], start: str) -> tarfil
     raise SystemExit(f"symlink loop in breeze-icons: {start}")
 
 
+WALLPAPER_PALETTES = {
+    "alpine-peaks.jpg": ((18, 32, 62), (118, 158, 206), (26, 38, 60)),
+    "misty-pines.jpg": ((22, 42, 48), (124, 162, 168), (20, 36, 38)),
+    "coastal-horizon.jpg": ((16, 48, 82), (138, 188, 218), (24, 62, 92)),
+    "emerald-forest.jpg": ((16, 44, 30), (96, 152, 112), (14, 34, 22)),
+}
+
+
+def generate_fallback_wallpaper(filename: str, dest: pathlib.Path) -> None:
+    """Generate a 1920x1200 themed gradient JPEG when remote fetch fails."""
+    width, height = 1920, 1200
+    top, mid, ridge = WALLPAPER_PALETTES.get(
+        filename, ((20, 36, 64), (110, 150, 195), (24, 36, 56))
+    )
+    temp = dest.with_suffix(".jpg.part")
+    try:
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGB", (width, height))
+        draw = ImageDraw.Draw(img)
+        for y in range(height):
+            t = y / (height - 1)
+            color = tuple(int(top[i] * (1.0 - t) + mid[i] * t) for i in range(3))
+            draw.line([(0, y), (width, y)], fill=color)
+        horizon_y = int(height * 0.68)
+        points = [
+            (0, height),
+            (0, horizon_y + 80),
+            (int(width * 0.18), horizon_y - 60),
+            (int(width * 0.36), horizon_y + 40),
+            (int(width * 0.56), horizon_y - 110),
+            (int(width * 0.78), horizon_y + 20),
+            (width, horizon_y - 45),
+            (width, height),
+        ]
+        draw.polygon(points, fill=ridge)
+        img.save(temp, format="JPEG", quality=90)
+        temp.rename(dest)
+        return
+    except ImportError:
+        pass
+
+    # Fallback without Pillow: write a PPM gradient and convert via ppmtojpeg or convert.
+    ppm_temp = dest.with_suffix(".ppm.part")
+    rows = []
+    for y in range(height):
+        t = y / (height - 1)
+        rgb = bytes(int(top[i] * (1.0 - t) + mid[i] * t) for i in range(3))
+        rows.append(rgb * width)
+    ppm_temp.write_bytes(f"P6\n{width} {height}\n255\n".encode("ascii") + b"".join(rows))
+    try:
+        if shutil.which("ppmtojpeg"):
+            with open(ppm_temp, "rb") as src, open(temp, "wb") as out:
+                subprocess.run(["ppmtojpeg", "-quality=90"], stdin=src, stdout=out, check=True)
+        elif shutil.which("convert"):
+            subprocess.run(["convert", str(ppm_temp), "-quality", "90", str(temp)], check=True)
+        else:
+            raise SystemExit(
+                f"failed to fetch {filename} and no JPEG encoder (PIL, ppmtojpeg, convert) available"
+            )
+    finally:
+        ppm_temp.unlink(missing_ok=True)
+    temp.rename(dest)
+
+
 def install_spui_assets() -> None:
     if not (STAGE / "usr/share/icons/breeze_cursors/cursors/left_ptr").exists():
         log("installing breeze-cursors into stage")
@@ -411,9 +482,14 @@ def install_spui_assets() -> None:
             log(f"fetching wallpaper {filename}")
             req = urllib.request.Request(url, headers={"User-Agent": "SpaceOS-Build/9.0"})
             temp = cached.with_suffix(".jpg.part")
-            with urllib.request.urlopen(req, timeout=120) as resp, open(temp, "wb") as out:
-                shutil.copyfileobj(resp, out)
-            temp.rename(cached)
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp, open(temp, "wb") as out:
+                    shutil.copyfileobj(resp, out)
+                temp.rename(cached)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                temp.unlink(missing_ok=True)
+                log(f"warning: failed to fetch {filename} ({exc}); generating fallback wallpaper")
+                generate_fallback_wallpaper(filename, cached)
         install_binary(cached, f"/usr/share/spui/wallpapers/{filename}", 0o644)
 
     logo = ROOT / "docs" / "SpaceOS9.png"
@@ -706,7 +782,7 @@ EndSection
         if source.exists():
             install_binary(source, f"/sbin/{name}")
     for name in ("hello", "systemctl", "systemg-analyze", "journald", "journalctl", "dmesg",
-                 "mp3play"):
+                 "mp3play", "wavplay"):
         source = USERLAND / name
         if source.exists():
             install_binary(source, f"/bin/{name}")
@@ -748,9 +824,14 @@ EndSection
             if nm_sbin.is_symlink() or nm_sbin.exists():
                 nm_sbin.unlink()
             nm_sbin.symlink_to("/usr/bin/NetworkManager")
-    music = ROOT / "user" / "assets" / "music" / "spaceos-theme.mp3"
-    if music.exists():
-        install_binary(music, "/usr/share/music/spaceos-theme.mp3", 0o644)
+    music_dir = ROOT / "user" / "assets" / "music"
+    if music_dir.is_dir():
+        for track in sorted(music_dir.glob("*.mp3")):
+            install_binary(track, f"/usr/share/music/{track.name}", 0o644)
+    sounds_dir = ROOT / "user" / "assets" / "sounds"
+    if sounds_dir.is_dir():
+        for wav in sorted(sounds_dir.glob("*.wav")):
+            install_binary(wav, f"/usr/share/sounds/spui/{wav.name}", 0o644)
     assets = ROOT / "user" / "desktop" / "assets"
     if assets.is_dir():
         for path in assets.rglob("*"):
