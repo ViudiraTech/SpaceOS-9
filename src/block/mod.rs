@@ -86,6 +86,54 @@ pub trait BlockDevice: Send + Sync {
     fn flush(&self) -> Result<(), BlockError>;
 }
 
+/// Poll an MMIO/PIO readiness predicate with a microsecond-bounded timeout and brief
+/// CPU-local backoff so tight polling loops in KVM do not starve QEMU's main-loop BQL.
+pub(super) fn poll_until<T>(
+    timeout_micros: u64,
+    fallback_polls: usize,
+    mut check: impl FnMut() -> Result<Option<T>, BlockError>,
+) -> Result<T, BlockError> {
+    let has_clock = crate::time::counter_frequency().is_some();
+    let started = if has_clock {
+        crate::time::uptime_micros()
+    } else {
+        0
+    };
+    let mut polls = 0usize;
+
+    loop {
+        if let Some(value) = check()? {
+            return Ok(value);
+        }
+
+        if has_clock {
+            if crate::time::uptime_micros().saturating_sub(started) >= timeout_micros {
+                return Err(BlockError::Timeout);
+            }
+        } else if polls >= fallback_polls {
+            return Err(BlockError::Timeout);
+        }
+
+        if polls < 8 {
+            core::hint::spin_loop();
+        } else if has_clock {
+            let pause_us = if polls < 32 { 10 } else { 50 };
+            let pause_start = crate::time::uptime_micros();
+            for _ in 0..10_000 {
+                if crate::time::uptime_micros().saturating_sub(pause_start) >= pause_us {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        } else {
+            for _ in 0..256 {
+                core::hint::spin_loop();
+            }
+        }
+        polls = polls.saturating_add(1);
+    }
+}
+
 struct Entry {
     device: Arc<dyn BlockDevice>,
     /// The whole disk a partition belongs to.

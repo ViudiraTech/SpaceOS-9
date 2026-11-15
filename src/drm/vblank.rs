@@ -102,13 +102,16 @@ static THREAD_WAIT: WaitQueueHead = WaitQueueHead::new();
 fn kick() {
     GENERATION.fetch_add(1, Ordering::AcqRel);
     THREAD_WAIT.wake_all();
+    if !THREAD.load(Ordering::Acquire) {
+        start_thread();
+    }
 }
 
 pub(crate) fn start_thread() {
     if THREAD.swap(true, Ordering::AcqRel) {
         return;
     }
-    let _ = crate::sched::spawn(
+    if crate::sched::spawn(
         || loop {
             let seen = GENERATION.load(Ordering::Acquire);
             let now = crate::time::uptime_nanos();
@@ -131,7 +134,12 @@ pub(crate) fn start_thread() {
             );
         },
         -5, // timely events matter more than throughput here
-    );
+    )
+    .is_err()
+    {
+        // drm::register() can run before sched::init(); allow drm::start() or kick() to retry.
+        THREAD.store(false, Ordering::Release);
+    }
 }
 
 fn event_bytes(kind: Kind, user_data: u64, sequence: u64, time_ns: u64, crtc_id: u32) -> [u8; 32] {

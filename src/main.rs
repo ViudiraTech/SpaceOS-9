@@ -205,6 +205,7 @@ pub extern "C" fn kmain() -> ! {
         },
         None => shell::start(),
     }
+    drm::start();
     drm::virtio::start();
     #[cfg(feature = "boot-self-test")]
     self_test::spawn_late();

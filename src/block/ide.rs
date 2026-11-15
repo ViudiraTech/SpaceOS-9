@@ -60,6 +60,7 @@ const BMIDE_REG_PRDT: u16 = 0x04;
 // Bus Master IDE Command & Status Bits
 const BMIDE_CMD_START: u8 = 0x01;
 const BMIDE_CMD_READ: u8 = 0x08; // Read from disk (write to memory)
+const BMIDE_STATUS_ACTIVE: u8 = 0x01;
 const BMIDE_STATUS_ERR: u8 = 0x02;
 const BMIDE_STATUS_IRQ: u8 = 0x04;
 
@@ -140,34 +141,32 @@ impl IdeChannelState {
         }
     }
 
-    fn wait_not_busy(&self, timeout_loops: usize) -> Result<u8, BlockError> {
-        for _ in 0..timeout_loops {
+    fn wait_not_busy(&self, timeout_micros: u64, fallback_polls: usize) -> Result<u8, BlockError> {
+        super::poll_until(timeout_micros, fallback_polls, || {
             let status = unsafe { pio::inb(self.cmd_base + ATA_REG_STATUS) };
             if status == 0xFF {
                 return Err(BlockError::NotReady);
             }
             if (status & ATA_SR_BSY) == 0 {
-                return Ok(status);
+                return Ok(Some(status));
             }
-            core::hint::spin_loop();
-        }
-        Err(BlockError::Timeout)
+            Ok(None)
+        })
     }
 
-    fn wait_drq(&self, timeout_loops: usize) -> Result<(), BlockError> {
-        for _ in 0..timeout_loops {
+    fn wait_drq(&self, timeout_micros: u64, fallback_polls: usize) -> Result<(), BlockError> {
+        super::poll_until(timeout_micros, fallback_polls, || {
             let status = unsafe { pio::inb(self.cmd_base + ATA_REG_STATUS) };
             if (status & ATA_SR_BSY) == 0 {
                 if (status & (ATA_SR_ERR | ATA_SR_DF)) != 0 {
                     return Err(BlockError::DeviceFault);
                 }
                 if (status & ATA_SR_DRQ) != 0 {
-                    return Ok(());
+                    return Ok(Some(()));
                 }
             }
-            core::hint::spin_loop();
-        }
-        Err(BlockError::Timeout)
+            Ok(None)
+        })
     }
 
     fn setup_lba(&self, drive: u8, lba: u64, count: u16, lba48: bool) {
@@ -239,7 +238,7 @@ impl IdeChannelState {
             pio::outl(self.bm_base + BMIDE_REG_PRDT, self.dma_page_phys as u32);
         }
 
-        self.wait_not_busy(100_000)?;
+        self.wait_not_busy(1_000_000, 100_000)?;
         self.setup_lba(drive, lba, sector_count as u16, lba48);
         self.delay_400ns();
 
@@ -251,27 +250,25 @@ impl IdeChannelState {
         };
         let bm_dir = if write { 0 } else { BMIDE_CMD_READ };
 
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         unsafe {
             pio::outb(self.cmd_base + ATA_REG_COMMAND, ata_cmd);
             pio::outb(self.bm_base + BMIDE_REG_CMD, bm_dir | BMIDE_CMD_START);
         }
 
-        let mut completed = false;
-        for _ in 0..500_000 {
+        let poll_res = super::poll_until(5_000_000, 500_000, || {
             let bm_status = unsafe { pio::inb(self.bm_base + BMIDE_REG_STATUS) };
             let ata_status = unsafe { pio::inb(self.cmd_base + ATA_REG_STATUS) };
             if (bm_status & BMIDE_STATUS_ERR) != 0 || (ata_status & (ATA_SR_ERR | ATA_SR_DF)) != 0 {
-                unsafe {
-                    pio::outb(self.bm_base + BMIDE_REG_CMD, 0);
-                }
                 return Err(BlockError::IoError);
             }
-            if (bm_status & BMIDE_STATUS_IRQ) != 0 || (ata_status & ATA_SR_BSY) == 0 {
-                completed = true;
-                break;
+            if (bm_status & BMIDE_STATUS_IRQ) != 0
+                || ((bm_status & BMIDE_STATUS_ACTIVE) == 0 && (ata_status & ATA_SR_BSY) == 0)
+            {
+                return Ok(Some(()));
             }
-            core::hint::spin_loop();
-        }
+            Ok(None)
+        });
 
         unsafe {
             pio::outb(self.bm_base + BMIDE_REG_CMD, 0);
@@ -281,11 +278,10 @@ impl IdeChannelState {
             );
         }
 
-        if !completed {
-            return Err(BlockError::Timeout);
-        }
+        poll_res?;
 
         if !write {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             unsafe {
                 core::ptr::copy_nonoverlapping(data_ptr, buf.as_mut_ptr(), byte_len);
             }
@@ -301,7 +297,7 @@ impl IdeChannelState {
         write: bool,
         sector_buf: &mut [u8; SECTOR_SIZE],
     ) -> Result<(), BlockError> {
-        self.wait_not_busy(200_000)?;
+        self.wait_not_busy(1_000_000, 200_000)?;
         self.setup_lba(drive, lba, 1, lba48);
         self.delay_400ns();
 
@@ -316,7 +312,7 @@ impl IdeChannelState {
             pio::outb(self.cmd_base + ATA_REG_COMMAND, cmd);
         }
         self.delay_400ns();
-        self.wait_drq(200_000)?;
+        self.wait_drq(1_000_000, 200_000)?;
 
         unsafe {
             if write {
@@ -334,12 +330,12 @@ impl IdeChannelState {
             }
         }
         self.delay_400ns();
-        self.wait_not_busy(200_000)?;
+        self.wait_not_busy(1_000_000, 200_000)?;
         Ok(())
     }
 
     fn flush_drive(&mut self, drive: u8, lba48: bool) -> Result<(), BlockError> {
-        self.wait_not_busy(200_000)?;
+        self.wait_not_busy(1_000_000, 200_000)?;
         unsafe {
             pio::outb(self.cmd_base + ATA_REG_HDDEVSEL, 0xE0 | ((drive & 1) << 4));
             self.delay_400ns();
@@ -351,7 +347,7 @@ impl IdeChannelState {
             pio::outb(self.cmd_base + ATA_REG_COMMAND, cmd);
         }
         self.delay_400ns();
-        self.wait_not_busy(500_000)?;
+        self.wait_not_busy(5_000_000, 500_000)?;
         Ok(())
     }
 }
@@ -530,7 +526,7 @@ fn probe_drive(
             return None;
         }
 
-        if ch.wait_not_busy(100_000).is_err() {
+        if ch.wait_not_busy(1_000_000, 100_000).is_err() {
             return None;
         }
 
@@ -547,7 +543,7 @@ fn probe_drive(
             return None;
         }
 
-        if ch.wait_drq(100_000).is_err() {
+        if ch.wait_drq(1_000_000, 100_000).is_err() {
             return None;
         }
 

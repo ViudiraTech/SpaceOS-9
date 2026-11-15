@@ -482,6 +482,12 @@ pub fn unregister(device: &Arc<Device>) {
     *MINORS.lock() &= !(1u64 << device.minor);
 }
 
+pub fn start() {
+    if !DEVICES.lock().is_empty() {
+        vblank::start_thread();
+    }
+}
+
 pub fn devices() -> Vec<Arc<Device>> {
     DEVICES.lock().clone()
 }

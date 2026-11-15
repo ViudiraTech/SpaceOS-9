@@ -114,8 +114,9 @@ pub fn init_syscall_msrs() {
 
     // 2. IA32_STAR (0xc000_0081):
     // Bits 47:32 = Kernel CS (0x08), Kernel SS (0x10)
-    // Bits 63:48 = User Base (0x10) -> sysretq loads SS = 0x18 | 3 = 0x1b, CS = 0x20 | 3 = 0x23
-    let star_high: u32 = (0x0010 << 16) | 0x0008;
+    // Bits 63:48 = User Base (0x0010 | 3 = 0x0013) -> sysretq loads SS = 0x1b, CS = 0x23.
+    // Include RPL=3 here because AMD CPUs preserve STAR[49:48] in SS on 64-bit sysretq.
+    let star_high: u32 = (0x0013 << 16) | 0x0008;
     unsafe {
         core::arch::asm!(
             "wrmsr",
