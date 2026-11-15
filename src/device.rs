@@ -624,6 +624,86 @@ pub fn events_after(sequence: u64) -> Vec<Event> {
         })
         .unwrap_or_default()
 }
+/// Publish one devfs node (character or block device) in the device model:
+/// `/dev` node, `/sys/class/<subsystem>` entry and, for disks, the block
+/// queue/stat attributes.
+fn publish_legacy(name: &str, kind: InodeKind, backend: Arc<dyn Inode>) {
+    let subsystem = if kind == InodeKind::BlockDevice {
+        "block"
+    } else if matches!(
+        name,
+        "null" | "zero" | "full" | "random" | "urandom" | "kmsg"
+    ) {
+        "mem"
+    } else if name == "rtc0" {
+        "misc"
+    } else {
+        "tty"
+    };
+    let mut attrs: Vec<(&str, Arc<dyn Inode>)> = Vec::new();
+    if let Some((id, b)) = crate::block::find_device(name) {
+        attrs.push((
+            "size",
+            Attribute::text(format!("{}\n", b.info().capacity_bytes() / 512)),
+        ));
+        attrs.push((
+            "ro",
+            Attribute::text(format!("{}\n", u8::from(b.info().read_only))),
+        ));
+        attrs.push((
+            "stat",
+            Attribute::new(0o444, move || {
+                let s = crate::block::accounting::stats(id);
+                Ok(format!(
+                    "{} 0 {} {} {} 0 {} {} {} {} {}\n",
+                    s.reads,
+                    s.read_sectors,
+                    s.read_us / 1000,
+                    s.writes,
+                    s.write_sectors,
+                    s.write_us / 1000,
+                    s.inflight,
+                    s.busy_us / 1000,
+                    s.weighted_us / 1000
+                )
+                .into_bytes())
+            }),
+        ));
+        if let Some(parent_disk) = name
+            .strip_suffix("p1")
+            .or_else(|| name.strip_suffix('1').filter(|p| !p.ends_with('m')))
+        {
+            attrs.push(("partition", Attribute::text("1\n")));
+            attrs.push(("device", Symlink::new(&format!("../{}", parent_disk))));
+        }
+    }
+    let _ = register(name, subsystem, Some(name), Some(backend), attrs);
+}
+
+/// Publish a block device registered after boot (hot-plugged disks and their
+/// partitions). Before `init` the boot-time scan picks it up instead.
+pub fn publish_block(name: &str) {
+    if !INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
+    use crate::vfs::FileSystem;
+    let legacy = crate::vfs::devfs::DevFs::new().root_inode();
+    if let Ok(backend) = legacy.lookup(name) {
+        publish_legacy(name, InodeKind::BlockDevice, backend);
+    }
+}
+
+/// Remove a device published under `name` (and its uevent "remove").
+pub fn unpublish(name: &str) {
+    let id = MANAGER
+        .lock()
+        .as_ref()
+        .and_then(|m| m.records.iter().find(|d| d.name == name).map(|d| d.id));
+    if let Some(id) = id {
+        let _ = unregister(id);
+    }
+}
+
 pub fn init() {
     init_empty();
     if INITIALIZED.swap(true, Ordering::AcqRel) {
@@ -636,63 +716,7 @@ pub fn init() {
             continue;
         }
         if let Ok(backend) = legacy.lookup(&entry.name) {
-            let subsystem = if entry.kind == InodeKind::BlockDevice {
-                "block"
-            } else if matches!(
-                entry.name.as_str(),
-                "null" | "zero" | "full" | "random" | "urandom" | "kmsg"
-            ) {
-                "mem"
-            } else if entry.name == "rtc0" {
-                "misc"
-            } else {
-                "tty"
-            };
-            let mut attrs: Vec<(&str, Arc<dyn Inode>)> = Vec::new();
-            if let Some((id, b)) = crate::block::find_device(&entry.name) {
-                attrs.push((
-                    "size",
-                    Attribute::text(format!("{}\n", b.info().capacity_bytes() / 512)),
-                ));
-                attrs.push((
-                    "ro",
-                    Attribute::text(format!("{}\n", u8::from(b.info().read_only))),
-                ));
-                attrs.push((
-                    "stat",
-                    Attribute::new(0o444, move || {
-                        let s = crate::block::accounting::stats(id);
-                        Ok(format!(
-                            "{} 0 {} {} {} 0 {} {} {} {} {}\n",
-                            s.reads,
-                            s.read_sectors,
-                            s.read_us / 1000,
-                            s.writes,
-                            s.write_sectors,
-                            s.write_us / 1000,
-                            s.inflight,
-                            s.busy_us / 1000,
-                            s.weighted_us / 1000
-                        )
-                        .into_bytes())
-                    }),
-                ));
-                if let Some(parent_disk) = entry
-                    .name
-                    .strip_suffix("p1")
-                    .or_else(|| entry.name.strip_suffix('1').filter(|p| !p.ends_with('m')))
-                {
-                    attrs.push(("partition", Attribute::text("1\n")));
-                    attrs.push(("device", Symlink::new(&format!("../{}", parent_disk))));
-                }
-            }
-            let _ = register(
-                &entry.name,
-                subsystem,
-                Some(&entry.name),
-                Some(backend),
-                attrs,
-            );
+            publish_legacy(&entry.name, entry.kind, backend);
         }
     }
     for pci in crate::pci::devices() {

@@ -76,6 +76,9 @@ int memcmp(const void *left, const void *right, unsigned long count);
  */
 struct spk_pci_device;
 
+/* Matches any value in a vendor/device/subsystem field (Linux PCI_ANY_ID). */
+#define SPK_PCI_ANY_ID 0xffffffffu
+
 struct spk_pci_device_id {
     unsigned int vendor;
     unsigned int device;
@@ -227,6 +230,83 @@ void spk_netif_carrier_on(struct spk_netdev *device);
 void spk_netif_carrier_off(struct spk_netdev *device);
 void spk_netif_stop_queue(struct spk_netdev *device);
 void spk_netif_wake_queue(struct spk_netdev *device);
+
+/* ==== Hardware abstraction layer (HAL) ===================================
+ * Everything below is grouped by device class. A driver touches the kernel
+ * only through these calls; see docs/HAL.md. SPK_HAL_VERSION grows when
+ * calls are added and is never decremented, so a module can check
+ * spk_hal_version() >= the version it was written against.
+ */
+#define SPK_HAL_VERSION 1u
+unsigned int spk_hal_version(void);
+
+/* ---- HAL sync: completions and sleeping mutexes ------------------------
+ * spk_complete() may be called from any context, including interrupt
+ * handlers. Waiting and mutexes are for process context only.
+ * spk_wait_for_completion_timeout() returns 1 when completed, 0 on timeout;
+ * each spk_complete() satisfies exactly one wait. */
+struct spk_completion;
+struct spk_completion *spk_completion_alloc(void);
+void spk_completion_free(struct spk_completion *completion);
+void spk_completion_reinit(struct spk_completion *completion);
+void spk_complete(struct spk_completion *completion);
+int spk_wait_for_completion_timeout(struct spk_completion *completion,
+                                    unsigned long timeout_ms);
+
+struct spk_mutex;
+struct spk_mutex *spk_mutex_alloc(void);
+void spk_mutex_free(struct spk_mutex *mutex);
+void spk_mutex_lock(struct spk_mutex *mutex);
+void spk_mutex_unlock(struct spk_mutex *mutex);
+
+/* ---- HAL input class (Linux input/evdev event codes) -------------------
+ * Allocate, declare capabilities, register; then report events followed by
+ * spk_input_sync(). Reporting is allowed from interrupt context.
+ * spk_input_unregister() revokes open evdev clients and frees the device. */
+#define SPK_EV_SYN 0x00u
+#define SPK_EV_KEY 0x01u
+#define SPK_EV_REL 0x02u
+#define SPK_EV_ABS 0x03u
+#define SPK_EV_MSC 0x04u
+#define SPK_EV_LED 0x11u
+#define SPK_BUS_USB 0x03u
+
+struct spk_input_dev;
+struct spk_input_dev *spk_input_alloc(const char *name, const char *phys,
+                                      unsigned short bustype, unsigned short vendor,
+                                      unsigned short product);
+int spk_input_set_capability(struct spk_input_dev *device, unsigned int type,
+                             unsigned int code);
+int spk_input_set_abs(struct spk_input_dev *device, unsigned int code, int minimum,
+                      int maximum);
+int spk_input_register(struct spk_input_dev *device);
+void spk_input_event(struct spk_input_dev *device, unsigned int type, unsigned int code,
+                     int value);
+void spk_input_sync(struct spk_input_dev *device);
+void spk_input_unregister(struct spk_input_dev *device);
+void spk_input_free(struct spk_input_dev *device); /* never-registered devices */
+
+/* ---- HAL block class ---------------------------------------------------
+ * The kernel names the disk (<prefix><letter>, e.g. "sdb"), scans its
+ * MBR/GPT partitions and publishes /dev and sysfs nodes. Callbacks run in
+ * process context, may sleep, and return 0 or a negative errno.
+ * spk_blkdev_unregister() fails further I/O with ENODEV and removes the
+ * nodes; it waits for callbacks in flight to return. */
+struct spk_blkdev_ops {
+    int (*read)(void *priv, unsigned long long lba, unsigned int count, void *buffer);
+    int (*write)(void *priv, unsigned long long lba, unsigned int count,
+                 const void *buffer);
+    int (*flush)(void *priv);
+};
+
+struct spk_blkdev;
+struct spk_blkdev *spk_blkdev_register(const char *prefix, const char *model,
+                                       const char *serial, unsigned int block_size,
+                                       unsigned long long blocks, int removable,
+                                       int read_only, const struct spk_blkdev_ops *ops,
+                                       void *priv);
+int spk_blkdev_name(struct spk_blkdev *device, char *buffer, unsigned int length);
+void spk_blkdev_unregister(struct spk_blkdev *device);
 
 /*
  * Place exactly one metadata record in .spk_module. The loader reads it after

@@ -407,7 +407,7 @@ impl Inode for DevRootInode {
                 kind: InodeKind::CharDevice,
             });
         }
-        for (dev_id, dev) in block::devices().iter().enumerate() {
+        for (dev_id, dev) in block::devices_with_ids() {
             entries.push(DirEntry {
                 ino: 2000 + dev_id as u64,
                 name: dev.info().name,

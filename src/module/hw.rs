@@ -508,17 +508,22 @@ fn parse_ids(table: *const CDeviceId) -> Vec<CDeviceId> {
     ids
 }
 
+/// Linux `PCI_ANY_ID`. Zero is also accepted as "any" for older modules,
+/// but cannot express a class-only entry: vendor = device = 0 ends a table.
+const PCI_ANY_ID: u32 = 0xffff_ffff;
+
 fn matches(id: &CDeviceId, info: &DeviceInfo) -> bool {
-    if id.vendor != 0 && id.vendor != u32::from(info.vendor_id) {
+    let any = |value: u32| value == 0 || value == PCI_ANY_ID;
+    if !any(id.vendor) && id.vendor != u32::from(info.vendor_id) {
         return false;
     }
-    if id.device != 0 && id.device != u32::from(info.device_id) {
+    if !any(id.device) && id.device != u32::from(info.device_id) {
         return false;
     }
-    if id.subvendor != 0 && Some(id.subvendor as u16) != info.subsystem_vendor_id {
+    if !any(id.subvendor) && Some(id.subvendor as u16) != info.subsystem_vendor_id {
         return false;
     }
-    if id.subdevice != 0 && Some(id.subdevice as u16) != info.subsystem_device_id {
+    if !any(id.subdevice) && Some(id.subdevice as u16) != info.subsystem_device_id {
         return false;
     }
     if id.class != 0 && id.class_mask != 0 {

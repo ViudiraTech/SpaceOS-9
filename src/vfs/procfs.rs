@@ -275,7 +275,7 @@ fn system(name: &str) -> Result<String, VfsError> {
         }
         "partitions" => {
             let mut out = String::from("major minor  #blocks  name\n\n");
-            for (id, dev) in block::devices().iter().enumerate() {
+            for (id, dev) in block::devices_with_ids() {
                 let info = dev.info();
                 out.push_str(&format!(
                     "8 {} {} {}\n",
@@ -288,7 +288,7 @@ fn system(name: &str) -> Result<String, VfsError> {
         }
         "diskstats" => {
             let mut out = String::new();
-            for (id, dev) in block::devices().iter().enumerate() {
+            for (id, dev) in block::devices_with_ids() {
                 let s = block::accounting::stats(id);
                 out.push_str(&format!(
                     "8 {} {} {} 0 {} {} {} 0 {} {} {} {} {}\n",

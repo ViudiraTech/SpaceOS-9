@@ -44,6 +44,8 @@ pub enum BlockDeviceKind {
     Nvme,
     RamDisk,
     Partition,
+    /// A disk registered by a loadable driver through the HAL block class.
+    Hal,
 }
 
 impl BlockDeviceKind {
@@ -54,6 +56,7 @@ impl BlockDeviceKind {
             Self::Nvme => "nvme",
             Self::RamDisk => "ram",
             Self::Partition => "part",
+            Self::Hal => "hal",
         }
     }
 }
@@ -83,40 +86,103 @@ pub trait BlockDevice: Send + Sync {
     fn flush(&self) -> Result<(), BlockError>;
 }
 
-static REGISTRY: SpinLock<Vec<Arc<dyn BlockDevice>>> = SpinLock::new(Vec::new());
+struct Entry {
+    device: Arc<dyn BlockDevice>,
+    /// The whole disk a partition belongs to.
+    parent: Option<usize>,
+}
 
-/// Register a block device and automatically discover any MBR/GPT partitions on it.
-pub fn register_device(dev: Arc<dyn BlockDevice>) {
+/// Slot index is the device id used by accounting, the sector cache and
+/// devfs inode numbers. Removed devices leave an empty slot and ids are never
+/// reused, so nothing keyed by an old id can reach a new device.
+static REGISTRY: SpinLock<Vec<Option<Entry>>> = SpinLock::new(Vec::new());
+
+/// Register a block device and automatically discover any MBR/GPT partitions
+/// on it. Devices registered after boot are published to /dev and sysfs at
+/// once. Returns the device id.
+pub fn register_device(dev: Arc<dyn BlockDevice>) -> usize {
     let is_whole_disk = dev.info().kind != BlockDeviceKind::Partition;
-    {
+    let id = {
         let mut reg = REGISTRY.lock();
-        reg.push(dev.clone());
-    }
+        reg.push(Some(Entry {
+            device: dev.clone(),
+            parent: None,
+        }));
+        reg.len() - 1
+    };
+    let mut names = alloc::vec![dev.info().name];
     if is_whole_disk {
         let parts = partition::probe_partitions(&dev);
         if !parts.is_empty() {
             let mut reg = REGISTRY.lock();
             for p in parts {
-                reg.push(p);
+                names.push(p.info().name);
+                reg.push(Some(Entry {
+                    device: p,
+                    parent: Some(id),
+                }));
             }
         }
+    }
+    for name in names {
+        crate::device::publish_block(&name);
+    }
+    id
+}
+
+/// Remove a whole disk and its partitions (hot-unplug). Mounted filesystems
+/// keep their `Arc` and see the driver's errors from now on.
+pub fn unregister_device(id: usize) {
+    let removed: Vec<(usize, Arc<dyn BlockDevice>)> = {
+        let mut reg = REGISTRY.lock();
+        let mut removed = Vec::new();
+        for (index, slot) in reg.iter_mut().enumerate() {
+            let matches = index == id || slot.as_ref().is_some_and(|e| e.parent == Some(id));
+            if matches && let Some(entry) = slot.take() {
+                removed.push((index, entry.device));
+            }
+        }
+        removed
+    };
+    for (index, device) in removed.iter().rev() {
+        crate::device::unpublish(&device.info().name);
+        cache::invalidate_device(*index);
     }
 }
 
 /// Return a snapshot of all registered block devices and partitions.
 pub fn devices() -> Vec<Arc<dyn BlockDevice>> {
-    REGISTRY.lock().clone()
+    devices_with_ids().into_iter().map(|(_, dev)| dev).collect()
+}
+
+/// Registered devices with their stable ids.
+pub fn devices_with_ids() -> Vec<(usize, Arc<dyn BlockDevice>)> {
+    REGISTRY
+        .lock()
+        .iter()
+        .enumerate()
+        .filter_map(|(id, slot)| slot.as_ref().map(|e| (id, e.device.clone())))
+        .collect()
 }
 
 /// Look up a block device by name (`sda`, `nvme0n1`, `ram0p1`, etc.) and return `(dev_id, device)`.
 pub fn find_device(name: &str) -> Option<(usize, Arc<dyn BlockDevice>)> {
     let reg = REGISTRY.lock();
-    for (idx, dev) in reg.iter().enumerate() {
-        if dev.info().name == name {
-            return Some((idx, dev.clone()));
+    for (idx, slot) in reg.iter().enumerate() {
+        if let Some(entry) = slot
+            && entry.device.info().name == name
+        {
+            return Some((idx, entry.device.clone()));
         }
     }
     None
+}
+
+/// First unused `<prefix><letter>` disk name (`sda`, `sdb`, ...).
+pub fn allocate_name(prefix: &str) -> Option<String> {
+    (b'a'..=b'z')
+        .map(|letter| alloc::format!("{}{}", prefix, letter as char))
+        .find(|name| find_device(name).is_none())
 }
 
 /// Byte-granular cached read from a block device.
