@@ -116,6 +116,8 @@ pub const DISPLAY_TAKES_CONSOLE: c_int = 2;
 struct HalDriver {
     ops: DisplayOps,
     private: *mut c_void,
+    width: u32,
+    height: u32,
 }
 
 // SAFETY: the HAL contract makes callbacks callable from any CPU in process
@@ -136,9 +138,14 @@ impl Driver for HalDriver {
     fn check(
         &self,
         _pipe: usize,
-        _mode: Option<&Mode>,
+        mode: Option<&Mode>,
         update: &PlaneUpdate,
     ) -> Result<(), VfsError> {
+        if let Some(mode) = mode
+            && (u32::from(mode.hdisplay) != self.width || u32::from(mode.vdisplay) != self.height)
+        {
+            return Err(VfsError::InvalidArgument);
+        }
         match (self.ops.check, update.framebuffer) {
             // SAFETY: driver callback with its own private pointer.
             (Some(check), Some(fb)) => errno(unsafe { check(self.private, fb.format) }),
@@ -263,7 +270,12 @@ pub unsafe extern "C" fn spk_display_register(
     config.max_size = (mode.width.max(4096), mode.height.max(4096));
     config.prefer_shadow = flags & DISPLAY_PREFER_SHADOW != 0;
     config.takes_over_console = flags & DISPLAY_TAKES_CONSOLE != 0;
-    let driver = Arc::new(HalDriver { ops: *ops, private });
+    let driver = Arc::new(HalDriver {
+        ops: *ops,
+        private,
+        width: mode.width,
+        height: mode.height,
+    });
     match drm::register(config, driver) {
         Ok(device) => Box::into_raw(Box::new(DisplayHandle { device })),
         Err(error) => {

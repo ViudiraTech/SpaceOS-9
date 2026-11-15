@@ -180,12 +180,15 @@ impl Mode {
         (mode.hdisplay != 0 && mode.vdisplay != 0).then_some(mode)
     }
 
-    /// Same timing, ignoring the preferred flag.
+    /// Same timing, ignoring `vrefresh` and the `preferred` flag (userspace
+    /// mode conversion like Xorg `drmmode_ConvertToKMode` leaves `vrefresh == 0`).
     pub fn same_timing(&self, other: &Mode) -> bool {
         Mode {
+            vrefresh: 0,
             preferred: false,
             ..*self
         } == Mode {
+            vrefresh: 0,
             preferred: false,
             ..*other
         }

@@ -664,10 +664,13 @@ fn check(device: &Device, config: &Config) -> Result<(), VfsError> {
         if crtc.mode.is_some() && mode.is_none() {
             return Err(VfsError::InvalidArgument);
         }
-        if let Some(mode) = &mode
-            && !info.modes.iter().any(|m| m.same_timing(mode))
-        {
-            return Err(VfsError::InvalidArgument);
+        if let Some(mode) = &mode {
+            let (w, h) = (u32::from(mode.hdisplay), u32::from(mode.vdisplay));
+            let (min_w, min_h) = device.config.min_size;
+            let (max_w, max_h) = device.config.max_size;
+            if w < min_w || h < min_h || w > max_w || h > max_h {
+                return Err(VfsError::InvalidArgument);
+            }
         }
         if crtc.active && (mode.is_none() || connector.crtc != Some(pipe)) {
             return Err(VfsError::InvalidArgument);
