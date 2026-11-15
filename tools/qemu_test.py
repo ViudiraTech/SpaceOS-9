@@ -42,11 +42,15 @@ def main():
     parser.add_argument("--machine")
     parser.add_argument("--nic", help="QEMU -nic argument, e.g. user,model=e1000")
     parser.add_argument("--sound", choices=["sb16", "hda", "both"])
-    parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--timeout", type=float,
+                        help="seconds (default: 300 x86_64, 600 aarch64, 900 riscv64 under TCG)")
     parser.add_argument("--online-cpus", type=int)
     parser.add_argument("--require", action="append", default=[])
     parser.add_argument("--result", help="Write a machine-readable JSON result")
     parser.add_argument("--verbose", action="store_true", help="Print full log on success")
+    parser.add_argument("--gdb", type=int, metavar="PORT",
+                        help="Expose the QEMU gdbstub on this TCP port (build with "
+                             "CONFIG_KASLR=n so kernel symbols match)")
     args = parser.parse_args()
     arch, iso, firmware, cpus, memory_mib = args.arch, args.iso, args.firmware, args.cpus, args.memory_mib
     binary = {
@@ -55,10 +59,19 @@ def main():
         "riscv64": "qemu-system-riscv64",
     }[arch]
     machine = args.machine or ("q35" if arch == "x86_64" else "virt")
+    if args.timeout is None:
+        args.timeout = {"x86_64": 300, "aarch64": 600, "riscv64": 900}[arch]
     command = [binary, "-machine", machine, "-m", memory_mib, "-smp", cpus,
                "-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot",
-               "-drive", f"if=pflash,format=raw,readonly=on,file={firmware}",
-               "-cdrom", iso]
+               "-drive", f"if=pflash,format=raw,readonly=on,file={firmware}"]
+    if arch == "riscv64":
+        # The RISC-V virt machine has no controller for -cdrom's default
+        # interface in some QEMU releases (8.x), so EDK2 finds no boot device.
+        # The ISO is an isohybrid GPT image, which EDK2 boots as a disk.
+        command += ["-drive", f"file={iso},if=none,id=bootiso,format=raw,readonly=on",
+                    "-device", "virtio-blk-pci,drive=bootiso"]
+    else:
+        command += ["-cdrom", iso]
     if args.gpu == "2d":
         command += ["-device", "virtio-gpu-pci"]
     elif args.gpu in ("virgl", "venus"):
@@ -73,6 +86,8 @@ def main():
         command += ["-cpu", cpu]
     if args.accel:
         command += ["-accel", args.accel]
+    if args.gdb:
+        command += ["-gdb", f"tcp:127.0.0.1:{args.gdb}"]
     if args.nic:
         command += ["-nic", args.nic]
     if arch == "x86_64" and args.sound:

@@ -134,10 +134,12 @@ endif
 AUDIO_REQUIRES := $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULE_SB16)),$(filter sb16 both,$(QEMU_SOUND))),--require 'SB16_MODULE_OK' --require 'SB16_PCM_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULE_HDA)),$(filter hda both,$(QEMU_SOUND))),--require 'HDA_MODULE_OK' --require 'HDA_PCM_OK',)
 WITH_ROOTFS ?= 0
 ROOTFS_SELFTEST ?= 0
-ROOTFS_IMG := build/rootfs/fat32.img
+ROOTFS_IMG ?= build/rootfs/fat32.img
+# Set ROOTFS_BUILD=0 to package an image produced elsewhere (e.g. tools/bench.py).
+ROOTFS_BUILD ?= 1
 ROOTFS_MODULE := $(if $(filter 1,$(WITH_ROOTFS)),module_path: boot():/rootfs.img,)
 
-.PHONY: desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
+.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
 all: release-try
 
 defconfig:
@@ -200,7 +202,7 @@ rootfs-image: modules
 busybox:
 	tools/build_busybox.sh
 
-iso: kernel limine $(if $(filter 1,$(WITH_ROOTFS)),rootfs-image)
+iso: kernel limine $(if $(and $(filter 1,$(WITH_ROOTFS)),$(filter 1,$(ROOTFS_BUILD))),rootfs-image)
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/EFI/BOOT $(ISO_ROOT)/boot/limine
 	cp $(KERNEL) $(ISO_ROOT)/kernel.elf
@@ -290,6 +292,10 @@ test-drm-abi:
 	gcc tools/drm_abi_probe.c -o build/drm-abi-probe
 	build/drm-abi-probe > build/drm-abi-probe.out
 	@grep -F -f build/drm-abi-probe.out src/gpu/abi.rs > /dev/null || (echo "DRM ABI mismatch" && exit 1)
+
+# Boot a release kernel with spbench as PID 1 and print BENCH results.
+bench:
+	python3 tools/bench.py --arch $(ARCH) --cpus $(CPUS)
 
 test-host: test-sched-model test-subsystem-model test-drm-abi
 
