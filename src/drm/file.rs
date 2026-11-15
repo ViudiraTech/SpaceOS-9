@@ -12,15 +12,20 @@
 //! ioctls require master; GEM handles, framebuffers, blobs and events are
 //! per file and released on close; when the last file closes (`lastclose`)
 //! the display is switched off and given back to the console.
+//!
+//! Render nodes (renderD128+N) serve GPU clients: they never become master
+//! and may not use modeset or dumb-buffer ioctls. PRIME exports GEM objects
+//! as dma-buf fds; driver-specific ioctls go to the driver's per-file state.
 
 use super::{
-    Device, GemObject, gem,
+    Device, DriverFile, GemBacking, GemObject, gem,
     ioctl::{self, Ioctl},
     kms::{self, Caller},
+    syncobj,
 };
 use crate::{
     sched::WaitQueue,
-    sync::SpinLock,
+    sync::{Guard, SpinLock},
     user::UserAddressSpace,
     vfs::{Inode, InodeKind, Stat, VfsError, abi},
 };
@@ -36,17 +41,35 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const DRM_MAJOR: u64 = 226;
 /// Events a file may have queued before new ones are dropped (Linux limits
 /// event space to 4 KiB per file).
-const MAX_EVENTS: usize = 128;
+const MAX_EVENTS: usize = 256;
+/// Render node minors start here (renderD128).
+const RENDER_MINOR: u64 = 128;
+/// Enabled by the `drmtrace` kernel command line: log every DRM ioctl.
+static TRACE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn init_trace() {
+    let on = crate::boot::cmdline()
+        .split_ascii_whitespace()
+        .any(|w| w == "drmtrace");
+    TRACE.store(on, Ordering::Relaxed);
+}
+
+fn node_minor(device: &Device, render: bool) -> u64 {
+    device.minor as u64 + if render { RENDER_MINOR } else { 0 }
+}
 
 struct Node {
     device: Weak<Device>,
+    render: bool,
 }
 
 impl Inode for Node {
     fn metadata(&self) -> Result<Stat, VfsError> {
         let device = self.device.upgrade().ok_or(VfsError::NoDevice)?;
-        let mut stat = Stat::simple(0x900000 + device.minor as u64, InodeKind::CharDevice, 0o660, 0);
-        stat.rdev = (DRM_MAJOR << 8) | device.minor as u64;
+        let minor = node_minor(&device, self.render);
+        let mode = if self.render { 0o666 } else { 0o660 };
+        let mut stat = Stat::simple(0x900000 + minor, InodeKind::CharDevice, mode, 0);
+        stat.rdev = (DRM_MAJOR << 8) | minor;
         Ok(stat)
     }
 
@@ -57,41 +80,77 @@ impl Inode for Node {
         }
         let id = device.next_file.fetch_add(1, Ordering::Relaxed);
         // Linux: the first client of a primary node becomes master.
-        let _ = device
-            .master
-            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire);
+        if !self.render {
+            let _ = device
+                .master
+                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire);
+        }
         let file = Arc::new(File {
             device: device.clone(),
             id,
+            render: self.render,
             handles: SpinLock::new(gem::Handles::new()),
+            syncobjs: SpinLock::new(syncobj::Table::new()),
             events: SpinLock::new(VecDeque::new()),
             wait: WaitQueue::new(),
             atomic: AtomicBool::new(false),
             universal_planes: AtomicBool::new(false),
             nonblock: AtomicBool::new(flags & abi::O_NONBLOCK != 0),
+            driver: SpinLock::new(None),
         });
-        let mut files = device.files.lock();
-        files.retain(|f| f.strong_count() != 0);
-        files.push(Arc::downgrade(&file));
+        {
+            let mut files = device.files.lock();
+            files.retain(|f| f.strong_count() != 0);
+            files.push(Arc::downgrade(&file));
+        }
+        let private = device.driver.open(&file)?;
+        *file.driver.lock() = private;
         Ok(Some(file))
     }
 }
 
 /// Publish /dev/dri/cardN and the connector entries under /sys/class/drm.
 pub(crate) fn publish(device: &Arc<Device>) -> Result<(), VfsError> {
-    use crate::{device::register, vfs::tree::Attribute};
+    use crate::{
+        device::register,
+        vfs::tree::{Attribute, Symlink},
+    };
+    let config = &device.config;
     let name = format!("card{}", device.minor);
-    let node: Arc<dyn Inode> = Arc::new(Node {
-        device: Arc::downgrade(device),
-    });
-    let card = register(
-        &name,
-        "drm",
-        Some(&format!("dri/{}", name)),
-        Some(node),
-        vec![],
-    )?;
-    let mut ids = vec![card.id];
+    let mut ids = Vec::new();
+    // Keep what was registered so a failure can be unwound by the caller.
+    let record = |ids: &mut Vec<u64>, id: u64| {
+        ids.push(id);
+        *device.nodes.lock() = ids.clone();
+    };
+    let mut nodes = vec![(name.clone(), false)];
+    if config.render {
+        nodes.push((format!("renderD{}", node_minor(device, true)), true));
+    }
+    for (node_name, render) in nodes {
+        let node: Arc<dyn Inode> = Arc::new(Node {
+            device: Arc::downgrade(device),
+            render,
+        });
+        let attributes = config
+            .attributes
+            .iter()
+            .map(|(key, value)| (*key, Attribute::text(value.clone()) as Arc<dyn Inode>))
+            .collect();
+        let entry = register(
+            &node_name,
+            "drm",
+            Some(&format!("dri/{}", node_name)),
+            Some(node),
+            attributes,
+        )?;
+        record(&mut ids, entry.id);
+        if let Some(parent) = &config.parent {
+            let _ = entry
+                .directory
+                .insert("device", Symlink::new(&format!("../{}", parent)));
+        }
+    }
     for (pipe, info) in device.config.pipes.iter().enumerate() {
         let kind = match info.connector_type as u32 {
             1 => "VGA",
@@ -108,43 +167,65 @@ pub(crate) fn publish(device: &Arc<Device>) -> Result<(), VfsError> {
             .map(|m| format!("{}x{}\n", m.hdisplay, m.vdisplay))
             .collect();
         let weak = Arc::downgrade(device);
+        let status = if info.connected {
+            "connected\n"
+        } else {
+            "disconnected\n"
+        };
+        let mut attributes: Vec<(&str, Arc<dyn Inode>)> = vec![
+            ("status", Attribute::text(status)),
+            (
+                "enabled",
+                Attribute::new(0o444, move || {
+                    let on = weak.upgrade().is_some_and(|d| d.kms.lock().active(pipe));
+                    Ok(if on {
+                        b"enabled\n".to_vec()
+                    } else {
+                        b"disabled\n".to_vec()
+                    })
+                }),
+            ),
+            ("modes", Attribute::text(modes)),
+            ("dpms", Attribute::text("On\n")),
+        ];
+        if !info.edid.is_empty() {
+            let edid = info.edid.clone();
+            attributes.push((
+                "edid",
+                Attribute::new(0o444, move || Ok(edid.clone())) as Arc<dyn Inode>,
+            ));
+        }
         let connector = register(
             &format!("{}-{}-{}", name, kind, pipe + 1),
             "drm",
             None,
             None,
-            vec![
-                ("status", Attribute::text("connected\n")),
-                (
-                    "enabled",
-                    Attribute::new(0o444, move || {
-                        let on = weak.upgrade().is_some_and(|d| d.kms.lock().active(pipe));
-                        Ok(if on { b"enabled\n".to_vec() } else { b"disabled\n".to_vec() })
-                    }),
-                ),
-                ("modes", Attribute::text(modes)),
-                ("dpms", Attribute::text("On\n")),
-            ],
+            attributes,
         )?;
-        ids.push(connector.id);
+        record(&mut ids, connector.id);
+        let _ = connector
+            .directory
+            .insert("device", Symlink::new(&format!("../{}", name)));
     }
-    *device.nodes.lock() = ids;
     Ok(())
 }
 
 pub struct File {
     device: Arc<Device>,
     id: u64,
+    render: bool,
     handles: SpinLock<gem::Handles>,
-    events: SpinLock<VecDeque<[u8; 32]>>,
+    syncobjs: SpinLock<syncobj::Table>,
+    events: SpinLock<VecDeque<Vec<u8>>>,
     wait: WaitQueue,
     atomic: AtomicBool,
     universal_planes: AtomicBool,
     nonblock: AtomicBool,
+    driver: SpinLock<Option<Arc<dyn DriverFile>>>,
 }
 
 /// Queue an event for `file` and wake its readers and pollers.
-pub(crate) fn deliver(device: &Device, file: u64, event: &[u8; 32]) {
+pub fn deliver(device: &Device, file: u64, event: &[u8]) {
     let target = device
         .files
         .lock()
@@ -157,7 +238,7 @@ pub(crate) fn deliver(device: &Device, file: u64, event: &[u8; 32]) {
             if events.len() >= MAX_EVENTS {
                 return;
             }
-            events.push_back(*event);
+            events.push_back(event.to_vec());
         }
         target.wait.wake_all();
         crate::ipc::wake_object(Arc::as_ptr(&target));
@@ -172,7 +253,105 @@ pub(crate) fn wake_all(device: &Device) {
     }
 }
 
+/// A dma-buf: a GEM object shared through PRIME.
+pub struct DmaBuf {
+    object: Arc<GemObject>,
+}
+
+impl Inode for DmaBuf {
+    fn metadata(&self) -> Result<Stat, VfsError> {
+        Ok(Stat::simple(
+            0x9100_0000 + self.object.id,
+            InodeKind::Regular,
+            0o600,
+            self.object.size,
+        ))
+    }
+
+    fn mmap(
+        &self,
+        space: &mut UserAddressSpace,
+        address: u64,
+        length: u64,
+        offset: u64,
+        prot: u32,
+    ) -> Result<(), VfsError> {
+        self.object.map_user(space, address, length, offset, prot)
+    }
+
+    fn poll(&self) -> u32 {
+        self.object.backing.poll()
+    }
+}
+
 impl File {
+    // ---- interface for drivers ------------------------------------------------
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
+    pub fn is_render(&self) -> bool {
+        self.render
+    }
+
+    /// The object named by `handle`.
+    pub fn object(&self, handle: u32) -> Result<Arc<GemObject>, VfsError> {
+        self.handles.lock().get(handle)
+    }
+
+    /// Wrap driver storage in a GEM object visible to this file; returns
+    /// the new handle and the object.
+    pub fn add_object(
+        &self,
+        backing: Arc<dyn GemBacking>,
+    ) -> Result<(u32, Arc<GemObject>), VfsError> {
+        let object = GemObject::new(backing);
+        let handle = self.insert_object(object.clone())?;
+        Ok((handle, object))
+    }
+
+    fn insert_object(&self, object: Arc<GemObject>) -> Result<u32, VfsError> {
+        let mut handles = self.handles.lock();
+        if handles.len() >= 4096 {
+            return Err(VfsError::NoSpace);
+        }
+        self.device.gem.insert(&object);
+        Ok(handles.insert(object))
+    }
+
+    pub fn syncobjs(&self) -> Guard<'_, syncobj::Table> {
+        self.syncobjs.lock()
+    }
+
+    /// Queue a driver event (any `struct drm_event` length).
+    pub fn event(&self, bytes: &[u8]) -> Result<(), VfsError> {
+        {
+            let mut events = self.events.lock();
+            if events.len() >= MAX_EVENTS {
+                return Err(VfsError::NoSpace);
+            }
+            events.push_back(bytes.to_vec());
+        }
+        self.wait.wake_all();
+        crate::ipc::wake_object(self as *const Self);
+        Ok(())
+    }
+
+    pub fn pending_events(&self) -> usize {
+        self.events.lock().len()
+    }
+
+    fn driver_file(&self) -> Option<Arc<dyn DriverFile>> {
+        self.driver.lock().clone()
+    }
+
+    // ---- core ioctls ---------------------------------------------------------
+
     fn is_master(&self) -> bool {
         self.device.master.load(Ordering::Acquire) == self.id
     }
@@ -211,19 +390,26 @@ impl File {
         let config = &self.device.config;
         let cursor = config.pipes[0].cursor.unwrap_or((64, 64));
         let value = match arg.u64(0) {
-            0x1 => 1,                                // DUMB_BUFFER
-            0x2 => 1,                                // VBLANK_HIGH_CRTC
-            0x3 => 24,                               // DUMB_PREFERRED_DEPTH
-            0x4 => config.prefer_shadow as u64,      // DUMB_PREFER_SHADOW
-            0x5 => 0,                                // PRIME (not yet)
-            0x6 => 1,                                // TIMESTAMP_MONOTONIC
-            0x7 => 0,                                // ASYNC_PAGE_FLIP
-            0x8 => cursor.0 as u64,                  // CURSOR_WIDTH
-            0x9 => cursor.1 as u64,                  // CURSOR_HEIGHT
-            0x10 => 1,                               // ADDFB2_MODIFIERS (linear)
-            0x11 => 0,                               // PAGE_FLIP_TARGET
-            0x12 => 1,                               // CRTC_IN_VBLANK_EVENT
-            0x13 | 0x14 | 0x15 => 0,                 // SYNCOBJ*, ATOMIC_ASYNC_PAGE_FLIP
+            0x1 => 1,                           // DUMB_BUFFER
+            0x2 => 1,                           // VBLANK_HIGH_CRTC
+            0x3 => 24,                          // DUMB_PREFERRED_DEPTH
+            0x4 => config.prefer_shadow as u64, // DUMB_PREFER_SHADOW
+            0x5 => {
+                if config.prime {
+                    3
+                } else {
+                    0
+                }
+            } // PRIME import | export
+            0x6 => 1,                           // TIMESTAMP_MONOTONIC
+            0x7 => 0,                           // ASYNC_PAGE_FLIP
+            0x8 => cursor.0 as u64,             // CURSOR_WIDTH
+            0x9 => cursor.1 as u64,             // CURSOR_HEIGHT
+            0x10 => 1,                          // ADDFB2_MODIFIERS (linear)
+            0x11 => 0,                          // PAGE_FLIP_TARGET
+            0x12 => 1,                          // CRTC_IN_VBLANK_EVENT
+            0x13 | 0x14 => config.syncobj as u64, // SYNCOBJ, SYNCOBJ_TIMELINE
+            0x15 => 0,                          // ATOMIC_ASYNC_PAGE_FLIP
             _ => return Err(VfsError::InvalidArgument),
         };
         arg.set_u64(8, value);
@@ -253,17 +439,18 @@ impl File {
     fn create_dumb(&self, arg: &mut Ioctl) -> Result<(), VfsError> {
         let (height, width, bpp) = (arg.u32(0), arg.u32(4), arg.u32(8));
         let max = self.device.config.max_size;
-        if width == 0 || height == 0 || width > max.0 || height > max.1 || !matches!(bpp, 8 | 16 | 24 | 32) || arg.u32(12) != 0
+        if width == 0
+            || height == 0
+            || width > max.0
+            || height > max.1
+            || !matches!(bpp, 8 | 16 | 24 | 32)
+            || arg.u32(12) != 0
         {
             return Err(VfsError::InvalidArgument);
         }
-        // 64-byte aligned rows keep every line start cache-line aligned for
-        // the drivers' line-by-line copies.
-        let pitch = (width * bpp.div_ceil(8)).div_ceil(64) * 64;
-        let object = GemObject::new(pitch as u64 * height as u64)?;
-        self.device.gem.insert(&object);
+        let (backing, pitch) = self.device.driver.create_dumb(width, height, bpp)?;
+        let (handle, object) = self.add_object(backing)?;
         let size = object.size;
-        let handle = self.handles.lock().insert(object);
         arg.set_u32(16, handle);
         arg.set_u32(20, pitch);
         arg.set_u64(24, size);
@@ -292,6 +479,24 @@ impl File {
         if master_only && !self.is_master() {
             return Err(VfsError::PermissionDenied);
         }
+        // Render nodes: no modesetting, dumb buffers, master or auth.
+        let modeset =
+            (MODE_GETRESOURCES..=MODE_DESTROYPROPBLOB).contains(&arg.nr) || arg.nr == MODE_GETFB2;
+        if self.render
+            && (modeset || matches!(arg.nr, SET_MASTER | DROP_MASTER | GET_MAGIC | AUTH_MAGIC))
+        {
+            return Err(VfsError::PermissionDenied);
+        }
+        let config = &self.device.config;
+        if (matches!(arg.nr, PRIME_HANDLE_TO_FD | PRIME_FD_TO_HANDLE) && !config.prime)
+            || ((SYNCOBJ_CREATE..=SYNCOBJ_TIMELINE_SIGNAL).contains(&arg.nr) && !config.syncobj)
+        {
+            return Err(VfsError::InvalidArgument);
+        }
+        if (COMMAND_BASE..COMMAND_END).contains(&arg.nr) {
+            let driver = self.driver_file().ok_or(VfsError::InvalidArgument)?;
+            return driver.ioctl(self, arg);
+        }
         let c = self.caller();
         match arg.nr {
             VERSION => self.version(arg),
@@ -299,7 +504,10 @@ impl File {
                 let unique = format!("drm:card{}", self.device.minor);
                 let capacity = arg.u64(0) as usize;
                 if arg.u64(8) != 0 && capacity != 0 {
-                    crate::user::uaccess::write(arg.u64(8), &unique.as_bytes()[..capacity.min(unique.len())])?;
+                    crate::user::uaccess::write(
+                        arg.u64(8),
+                        &unique.as_bytes()[..capacity.min(unique.len())],
+                    )?;
                 }
                 arg.set_u64(0, unique.len() as u64);
                 Ok(())
@@ -327,7 +535,13 @@ impl File {
                 .master
                 .compare_exchange(0, self.id, Ordering::AcqRel, Ordering::Acquire)
                 .map(|_| ())
-                .or_else(|holder| if holder == self.id { Ok(()) } else { Err(VfsError::Busy) }),
+                .or_else(|holder| {
+                    if holder == self.id {
+                        Ok(())
+                    } else {
+                        Err(VfsError::Busy)
+                    }
+                }),
             DROP_MASTER => self
                 .device
                 .master
@@ -335,6 +549,30 @@ impl File {
                 .map(|_| ())
                 .map_err(|_| VfsError::InvalidArgument),
             GEM_CLOSE | MODE_DESTROY_DUMB => self.handles.lock().remove(arg.u32(0)),
+            PRIME_HANDLE_TO_FD => {
+                let object = self.object(arg.u32(0))?;
+                let flags = arg.u32(4);
+                if flags & !(abi::O_CLOEXEC | abi::O_RDWR) != 0 {
+                    return Err(VfsError::InvalidArgument);
+                }
+                let fd = syncobj::install_fd(Arc::new(DmaBuf { object }), flags)?;
+                arg.set_u32(8, fd);
+                Ok(())
+            }
+            PRIME_FD_TO_HANDLE => {
+                let inode: Arc<dyn core::any::Any + Send + Sync> = syncobj::fd_inode(arg.u32(8))?;
+                let buffer = inode
+                    .downcast::<DmaBuf>()
+                    .map_err(|_| VfsError::InvalidArgument)?;
+                // Only buffers of this device (no cross-device import).
+                if !self.device.gem.contains(&buffer.object) {
+                    return Err(VfsError::NotSupported);
+                }
+                let handle = self.insert_object(buffer.object.clone())?;
+                arg.set_u32(0, handle);
+                Ok(())
+            }
+            SYNCOBJ_CREATE..=SYNCOBJ_TIMELINE_SIGNAL => syncobj::ioctl(self, arg),
             MODE_CREATE_DUMB => self.create_dumb(arg),
             MODE_MAP_DUMB => {
                 let object = self.handles.lock().get(arg.u32(0))?;
@@ -384,19 +622,59 @@ impl File {
         let (fb_id, crtc_id, src_x, src_y, src_w, src_h, crtc_x, crtc_y, crtc_w, crtc_h) =
             (8, 9, 10, 11, 12, 13, 14, 15, 16, 17);
         let mut changes = vec![
-            Change { object: plane, prop: fb_id, value: fb as u64 },
-            Change { object: plane, prop: crtc_id, value: if fb == 0 { 0 } else { arg.u32(4) as u64 } },
+            Change {
+                object: plane,
+                prop: fb_id,
+                value: fb as u64,
+            },
+            Change {
+                object: plane,
+                prop: crtc_id,
+                value: if fb == 0 { 0 } else { arg.u32(4) as u64 },
+            },
         ];
         if fb != 0 {
             changes.extend([
-                Change { object: plane, prop: crtc_x, value: arg.i32(16) as i64 as u64 },
-                Change { object: plane, prop: crtc_y, value: arg.i32(20) as i64 as u64 },
-                Change { object: plane, prop: crtc_w, value: arg.u32(24) as u64 },
-                Change { object: plane, prop: crtc_h, value: arg.u32(28) as u64 },
-                Change { object: plane, prop: src_x, value: arg.u32(32) as u64 },
-                Change { object: plane, prop: src_y, value: arg.u32(36) as u64 },
-                Change { object: plane, prop: src_h, value: arg.u32(40) as u64 },
-                Change { object: plane, prop: src_w, value: arg.u32(44) as u64 },
+                Change {
+                    object: plane,
+                    prop: crtc_x,
+                    value: arg.i32(16) as i64 as u64,
+                },
+                Change {
+                    object: plane,
+                    prop: crtc_y,
+                    value: arg.i32(20) as i64 as u64,
+                },
+                Change {
+                    object: plane,
+                    prop: crtc_w,
+                    value: arg.u32(24) as u64,
+                },
+                Change {
+                    object: plane,
+                    prop: crtc_h,
+                    value: arg.u32(28) as u64,
+                },
+                Change {
+                    object: plane,
+                    prop: src_x,
+                    value: arg.u32(32) as u64,
+                },
+                Change {
+                    object: plane,
+                    prop: src_y,
+                    value: arg.u32(36) as u64,
+                },
+                Change {
+                    object: plane,
+                    prop: src_h,
+                    value: arg.u32(40) as u64,
+                },
+                Change {
+                    object: plane,
+                    prop: src_w,
+                    value: arg.u32(44) as u64,
+                },
             ]);
         }
         kms::commit(c.device, c.file, &changes, 0, 0)
@@ -405,20 +683,43 @@ impl File {
 
 impl Inode for File {
     fn metadata(&self) -> Result<Stat, VfsError> {
-        let mut stat = Stat::simple(0x900000 + self.device.minor as u64, InodeKind::CharDevice, 0o660, 0);
-        stat.rdev = (DRM_MAJOR << 8) | self.device.minor as u64;
+        let minor = node_minor(&self.device, self.render);
+        let mut stat = Stat::simple(0x900000 + minor, InodeKind::CharDevice, 0o660, 0);
+        stat.rdev = (DRM_MAJOR << 8) | minor;
         Ok(stat)
     }
 
     fn ioctl(&self, cmd: u64, address: u64) -> Result<u64, VfsError> {
-        let mut arg = Ioctl::new(cmd, address)?;
-        self.dispatch(&mut arg)?;
+        let driver = &self.device.driver;
+        let mut arg = Ioctl::new(cmd, address, |nr| driver.ioctl_descriptor(nr))?;
+        let trace = TRACE.load(Ordering::Relaxed);
+        if trace {
+            crate::kinfo!(
+                "drm: card{} file {} enter nr={:#04x}",
+                self.device.minor,
+                self.id,
+                arg.nr
+            );
+        }
+        let result = self.dispatch(&mut arg);
+        if trace {
+            crate::kinfo!(
+                "drm: file {} exit nr={:#04x} -> {:?}",
+                self.id,
+                arg.nr,
+                result
+            );
+        }
+        result?;
         arg.finish()?;
         Ok(0)
     }
 
     fn read_at(&self, _offset: u64, buffer: &mut [u8]) -> Result<usize, VfsError> {
         loop {
+            if let Some(driver) = self.driver_file() {
+                driver.poll(self);
+            }
             {
                 let mut events = self.events.lock();
                 if let Some(first) = events.front() {
@@ -443,7 +744,8 @@ impl Inode for File {
             if self.nonblock.load(Ordering::Acquire) {
                 return Err(VfsError::WouldBlock);
             }
-            let ready = || !self.events.lock().is_empty() || self.device.gone.load(Ordering::Acquire);
+            let ready =
+                || !self.events.lock().is_empty() || self.device.gone.load(Ordering::Acquire);
             if self.wait.wait_interruptible(ready) == crate::sched::WaitResult::Interrupted {
                 return Err(VfsError::Interrupted);
             }
@@ -452,6 +754,11 @@ impl Inode for File {
 
     fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
         sources.object(self as *const Self);
+        // Driver work that completes without an event wake-up (fences
+        // polled by the device) needs pollers to re-check.
+        if self.driver_file().is_some_and(|d| d.needs_tick()) {
+            sources.tick();
+        }
     }
 
     fn poll(&self) -> u32 {
@@ -461,7 +768,14 @@ impl Inode for File {
         if self.device.gone.load(Ordering::Acquire) {
             return POLLERR;
         }
-        let readable = if self.events.lock().is_empty() { 0 } else { POLLIN };
+        if let Some(driver) = self.driver_file() {
+            driver.poll(self);
+        }
+        let readable = if self.events.lock().is_empty() {
+            0
+        } else {
+            POLLIN
+        };
         readable | POLLOUT
     }
 
@@ -478,7 +792,11 @@ impl Inode for File {
         offset: u64,
         prot: u32,
     ) -> Result<(), VfsError> {
-        let (object, relative) = self.device.gem.by_offset(offset).ok_or(VfsError::InvalidArgument)?;
+        let (object, relative) = self
+            .device
+            .gem
+            .by_offset(offset)
+            .ok_or(VfsError::InvalidArgument)?;
         // Like drm_vma_node_is_allowed: only files holding a handle may map.
         if !self.handles.lock().contains(&object) {
             return Err(VfsError::PermissionDenied);

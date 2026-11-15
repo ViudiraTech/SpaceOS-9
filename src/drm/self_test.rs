@@ -55,7 +55,8 @@ impl Client {
     fn call(&self, number: u8, bytes: &mut [u8]) -> Result<(), VfsError> {
         self.space.lock().write_bytes(ARG, bytes)?;
         let (size, dir) = nr::descriptor(number).unwrap();
-        let cmd = ((dir as u64) << 30) | ((size as u64) << 16) | ((b'd' as u64) << 8) | number as u64;
+        let cmd =
+            ((dir as u64) << 30) | ((size as u64) << 16) | ((b'd' as u64) << 8) | number as u64;
         self.file.ioctl(cmd, ARG)?;
         self.space.lock().read_bytes(ARG, bytes)?;
         Ok(())
@@ -151,7 +152,13 @@ impl Client {
         assert!(pitch >= width * bpp / 8 && size >= pitch as u64 * height as u64);
         let offset = at64(&self.ioctl(nr::MODE_MAP_DUMB, |b| put32(b, 0, handle)), 8);
         self.file
-            .mmap(&mut self.space.lock(), address, size.next_multiple_of(4096), offset, 3)
+            .mmap(
+                &mut self.space.lock(),
+                address,
+                size.next_multiple_of(4096),
+                offset,
+                3,
+            )
             .expect("simpledrm self-test: dumb mmap");
         (handle, pitch)
     }
@@ -169,13 +176,21 @@ impl Client {
         )
     }
 
-    fn fill(&self, address: u64, pitch: u32, rect: (u32, u32, u32, u32), cpp: u32, pixel: impl Fn(u32, u32) -> u32) {
+    fn fill(
+        &self,
+        address: u64,
+        pitch: u32,
+        rect: (u32, u32, u32, u32),
+        cpp: u32,
+        pixel: impl Fn(u32, u32) -> u32,
+    ) {
         let (x0, y0, x1, y1) = rect;
         let mut row = vec![0u8; ((x1 - x0) * cpp) as usize];
         for y in y0..y1 {
             for x in x0..x1 {
                 let at = ((x - x0) * cpp) as usize;
-                row[at..at + cpp as usize].copy_from_slice(&pixel(x, y).to_le_bytes()[..cpp as usize]);
+                row[at..at + cpp as usize]
+                    .copy_from_slice(&pixel(x, y).to_le_bytes()[..cpp as usize]);
             }
             self.poke(address + y as u64 * pitch as u64 + (x0 * cpp) as u64, &row);
         }
@@ -196,7 +211,8 @@ impl Scanout {
         // SAFETY: inside the boot framebuffer mapping (checked by callers'
         // coordinates against the mode, which equals the framebuffer size).
         unsafe {
-            (self.base.add(y as usize * self.pitch + x as usize * 4) as *const u32).read_volatile() & 0x00ff_ffff
+            (self.base.add(y as usize * self.pitch + x as usize * 4) as *const u32).read_volatile()
+                & 0x00ff_ffff
         }
     }
 }
@@ -212,7 +228,7 @@ pub fn run() -> &'static str {
         if crate::boot::init_path().is_some() || SIMPLEFB.is_empty() {
             return "off";
         }
-        if crate::gpu::device().is_some() {
+        if super::firmware_fb_claimed() {
             return "skip(native-gpu)";
         }
         let Some(fb) = crate::boot::framebuffer() else {
@@ -224,14 +240,23 @@ pub fn run() -> &'static str {
             .find(|d| d.config.name == "simpledrm")
             .expect("simplefb did not register a DRM device");
         let xrgb_native = fb.bpp == 32
-            && (fb.red_mask_size, fb.red_mask_shift, fb.green_mask_shift, fb.blue_mask_shift) == (8, 16, 8, 0);
+            && (
+                fb.red_mask_size,
+                fb.red_mask_shift,
+                fb.green_mask_shift,
+                fb.blue_mask_shift,
+            ) == (8, 16, 8, 0);
         let status = exercise(&device, fb, xrgb_native);
         let minor = device.minor;
         drop(device);
         #[cfg(feature = "module-unload")]
         {
             crate::module::unload("simplefb", false).expect("simplefb failed to unload");
-            assert!(super::devices().iter().all(|d| d.config.name != "simpledrm"));
+            assert!(
+                super::devices()
+                    .iter()
+                    .all(|d| d.config.name != "simpledrm")
+            );
             assert!(
                 vfs::open_abs(&format!("/dev/dri/card{minor}"), vfs::abi::O_RDWR, 0).is_err(),
                 "card{minor} still present after unloading simplefb"
@@ -255,10 +280,16 @@ fn exercise(
     task.lock().set_address_space(space.clone());
     let path = format!("/dev/dri/card{}", device.minor);
     let client = Client {
-        file: vfs::open_abs(&path, vfs::abi::O_RDWR, 0).unwrap().inode.clone(),
+        file: vfs::open_abs(&path, vfs::abi::O_RDWR, 0)
+            .unwrap()
+            .inode
+            .clone(),
         space,
     };
-    let screen = Scanout { base: fb.address().cast_const().cast(), pitch: fb.pitch as usize };
+    let screen = Scanout {
+        base: fb.address().cast_const().cast(),
+        pitch: fb.pitch as usize,
+    };
 
     // Identification and capabilities.
     crate::kinfo!("simpledrm self-test: identification");
@@ -288,7 +319,11 @@ fn exercise(
         put32(b, 32, 1);
         put32(b, 48, connector);
     });
-    assert_eq!((at32(&info, 32), at32(&info, 60)), (1, 1), "one mode, connected");
+    assert_eq!(
+        (at32(&info, 32), at32(&info, 60)),
+        (1, 1),
+        "one mode, connected"
+    );
     let mode = client.peek(SCRATCH + 0x100, 68);
     let width = u16::from_le_bytes([mode[4], mode[5]]) as u32;
     let height = u16::from_le_bytes([mode[14], mode[15]]) as u32;
@@ -312,8 +347,16 @@ fn exercise(
         });
     };
     setcrtc(xrgb);
-    assert!(crate::tty::vt::scanout_claimed(), "SETCRTC did not take the console's scanout");
-    let corners = [(0, 0), (width - 1, 0), (width / 2, height / 2), (width - 1, height - 1)];
+    assert!(
+        crate::tty::vt::scanout_claimed(),
+        "SETCRTC did not take the console's scanout"
+    );
+    let corners = [
+        (0, 0),
+        (width - 1, 0),
+        (width / 2, height / 2),
+        (width - 1, height - 1),
+    ];
     if xrgb_native {
         for (x, y) in corners {
             assert_eq!(screen.pixel(x, y), pattern(x, y), "modeset pixel ({x},{y})");
@@ -331,8 +374,16 @@ fn exercise(
         put64(b, 16, SCRATCH + 0x300);
     });
     if xrgb_native {
-        assert_eq!(screen.pixel(20, 10), 0x00ff_0000, "DIRTYFB clip not presented");
-        assert_eq!(screen.pixel(210, 10), pattern(210, 10), "DIRTYFB touched pixels outside the clip");
+        assert_eq!(
+            screen.pixel(20, 10),
+            0x00ff_0000,
+            "DIRTYFB clip not presented"
+        );
+        assert_eq!(
+            screen.pixel(210, 10),
+            pattern(210, 10),
+            "DIRTYFB touched pixels outside the clip"
+        );
     }
 
     // Format conversion: RGB565 is emulated on an XRGB8888 scanout.
@@ -340,16 +391,26 @@ fn exercise(
     let mut converted = "native";
     if xrgb_native {
         let (handle565, pitch565) = client.dumb(width, height, 16, RGB565_MAP);
-        client.fill(RGB565_MAP, pitch565, (0, 0, width, height), 2, |x, _| match x % 3 {
-            0 => 0xf800,
-            1 => 0x07e0,
-            _ => 0x8410,
-        });
+        client.fill(
+            RGB565_MAP,
+            pitch565,
+            (0, 0, width, height),
+            2,
+            |x, _| match x % 3 {
+                0 => 0xf800,
+                1 => 0x07e0,
+                _ => 0x8410,
+            },
+        );
         let fb565 = client.addfb2(width, height, super::fourcc::RGB565, handle565, pitch565);
         setcrtc(fb565);
         assert_eq!(screen.pixel(0, 5), 0x00ff_0000, "RGB565 red");
         assert_eq!(screen.pixel(1, 5), 0x0000_ff00, "RGB565 green");
-        assert_eq!(screen.pixel(2, height - 1), 0x0084_8284, "RGB565 grey with bit replication");
+        assert_eq!(
+            screen.pixel(2, height - 1),
+            0x0084_8284,
+            "RGB565 grey with bit replication"
+        );
         setcrtc(xrgb);
         client.ioctl(nr::MODE_RMFB, |b| put32(b, 0, fb565));
         converted = "rgb565->xrgb8888";
@@ -358,7 +419,13 @@ fn exercise(
     // PAGE_FLIP with an event (second XRGB buffer).
     crate::kinfo!("simpledrm self-test: page-flip");
     let (handle2, pitch2) = client.dumb(width, height, 32, XRGB_MAP + 0x0800_0000);
-    client.fill(XRGB_MAP + 0x0800_0000, pitch2, (0, 0, width, height), 4, |x, y| pattern(y, x));
+    client.fill(
+        XRGB_MAP + 0x0800_0000,
+        pitch2,
+        (0, 0, width, height),
+        4,
+        |x, y| pattern(y, x),
+    );
     let flip_fb = client.addfb2(width, height, super::fourcc::XRGB8888, handle2, pitch2);
     client.ioctl(nr::MODE_PAGE_FLIP, |b| {
         put32(b, 0, crtc);
@@ -368,9 +435,17 @@ fn exercise(
     });
     let mut event = [0u8; 32];
     assert_eq!(client.file.read_at(0, &mut event).unwrap(), 32);
-    assert_eq!((at32(&event, 0), at64(&event, 8)), (2, 0x5ced), "flip-complete event");
+    assert_eq!(
+        (at32(&event, 0), at64(&event, 8)),
+        (2, 0x5ced),
+        "flip-complete event"
+    );
     if xrgb_native {
-        assert_eq!(screen.pixel(30, 70), pattern(70, 30), "page flip not presented");
+        assert_eq!(
+            screen.pixel(30, 70),
+            pattern(70, 30),
+            "page flip not presented"
+        );
     }
 
     // Atomic: plane lookup by property name, TEST_ONLY, damage clips.
@@ -390,7 +465,9 @@ fn exercise(
         .find(|&id| client.property(id, OBJ_PLANE, "type").map(|p| p.1) == Some(1))
         .expect("no primary plane");
     let (fb_prop, _) = client.property(primary, OBJ_PLANE, "FB_ID").unwrap();
-    let (damage_prop, _) = client.property(primary, OBJ_PLANE, "FB_DAMAGE_CLIPS").unwrap();
+    let (damage_prop, _) = client
+        .property(primary, OBJ_PLANE, "FB_DAMAGE_CLIPS")
+        .unwrap();
     let (_, in_formats) = client.property(primary, OBJ_PLANE, "IN_FORMATS").unwrap();
     let blob = client.ioctl(nr::MODE_GETPROPBLOB, |b| put32(b, 0, in_formats as u32));
     assert!(at32(&blob, 4) >= 24, "IN_FORMATS blob");
@@ -402,20 +479,41 @@ fn exercise(
         "TEST_ONLY accepted a bad framebuffer"
     );
     if xrgb_native {
-        assert_eq!(screen.pixel(30, 70), pattern(70, 30), "TEST_ONLY changed the screen");
+        assert_eq!(
+            screen.pixel(30, 70),
+            pattern(70, 30),
+            "TEST_ONLY changed the screen"
+        );
     }
-    client.atomic(0, primary, &[(fb_prop, xrgb as u64)]).expect("atomic flip");
+    client
+        .atomic(0, primary, &[(fb_prop, xrgb as u64)])
+        .expect("atomic flip");
     // Redraw two squares; damage only the first.
     client.fill(XRGB_MAP, pitch, (64, 40, 96, 72), 4, |_, _| 0x0000_ff00);
     client.fill(XRGB_MAP, pitch, (160, 40, 192, 72), 4, |_, _| 0x00ff_00ff);
-    let rect: Vec<u8> = [64i32, 40, 96, 72].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let rect: Vec<u8> = [64i32, 40, 96, 72]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
     let clips = client.create_blob(&rect);
     client
-        .atomic(0, primary, &[(fb_prop, xrgb as u64), (damage_prop, clips as u64)])
+        .atomic(
+            0,
+            primary,
+            &[(fb_prop, xrgb as u64), (damage_prop, clips as u64)],
+        )
         .expect("atomic damage commit");
     if xrgb_native {
-        assert_eq!(screen.pixel(70, 50), 0x0000_ff00, "damaged square not presented");
-        assert_eq!(screen.pixel(170, 50), pattern(170, 50), "undamaged square presented");
+        assert_eq!(
+            screen.pixel(70, 50),
+            0x0000_ff00,
+            "damaged square not presented"
+        );
+        assert_eq!(
+            screen.pixel(170, 50),
+            pattern(170, 50),
+            "undamaged square presented"
+        );
     }
     // Damage without clips covers the plane.
     client.ioctl(nr::MODE_DIRTYFB, |b| put32(b, 0, xrgb));
@@ -442,7 +540,10 @@ fn exercise(
     // goes away, or its freed root would still be loaded.
     let scratch = client.space.clone();
     drop(client);
-    assert!(!crate::tty::vt::scanout_claimed(), "lastclose did not release the console");
+    assert!(
+        !crate::tty::vt::scanout_claimed(),
+        "lastclose did not release the console"
+    );
 
     task.lock().address_space = old.clone();
     if let Some(old) = old {

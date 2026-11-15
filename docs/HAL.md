@@ -12,16 +12,21 @@
 | --- | --- | --- |
 | 总线与 I/O | PCI 驱动注册/匹配（含 `SPK_PCI_ANY_ID` 与类码匹配）、配置空间、BAR、MSI/MSI-X/INTx、一致性与流式 DMA、MMIO、端口 I/O | `module/hw.rs` |
 | 执行上下文 | 堆、时间、自旋锁、定时器、工作队列、内核线程；可睡眠的完成量与互斥锁 | `module/api.rs`、`hal/sync.rs` |
-| 设备类 | 网络（netdev/skb/NAPI）、声音（ALSA `snd_*`）、输入（evdev）、块设备 | `net/module_api.rs`、`sound/`、`hal/input.rs`、`hal/block.rs` |
+| 设备类 | 网络（netdev/skb/NAPI）、声音（ALSA `snd_*`）、输入（evdev）、块设备、显示（DRM/KMS） | `net/module_api.rs`、`sound/`、`hal/input.rs`、`hal/block.rs`、`hal/display.rs` |
 
 ## 版本
 
-`SPK_HAL_VERSION` / `spk_hal_version()` 只增不减；新增调用不改变既有调用，因此模块用 `spk_hal_version() >= N` 判断即可。当前为 1。
+`SPK_HAL_VERSION` / `spk_hal_version()` 只增不减；新增调用不改变既有调用，因此模块用 `spk_hal_version() >= N` 判断即可。当前为 2：
+
+| 版本 | 新增 |
+| --- | --- |
+| 1 | 完成量/互斥锁、输入类、块设备类 |
+| 2 | 显示类：`spk_sysfb_get`、`spk_display_register`/`spk_display_unregister`、`SPK_FORMAT_*` fourcc |
 
 ## 上下文约定
 
 - `spk_complete`、`spk_input_event`、`spk_input_sync`、自旋锁可在中断上下文调用。
-- 等待完成量、互斥锁、块设备回调、注册/注销只在进程上下文。
+- 等待完成量、互斥锁、块设备回调、显示回调、注册/注销只在进程上下文。
 - 完成量为计数语义：每次 `spk_complete` 满足一次等待。
 
 ## 设备类
@@ -29,6 +34,23 @@
 **输入**：`spk_input_alloc` → `spk_input_set_capability`/`spk_input_set_abs` → `spk_input_register`；事件码与 Linux 一致。`spk_input_unregister` 撤销所有打开的 evdev 客户端（阻塞读返回 ENODEV）并删除 `/dev/input/eventN` 与 sysfs 节点。
 
 **块设备**：`spk_blkdev_register(prefix, ...)` 由内核分配名字（如 `sdb`）、扫描 MBR/GPT 分区并立即发布 `/dev` 与 sysfs 节点。设备 id 为稳定槽位，注销后不复用。`spk_blkdev_unregister` 先拒绝新 I/O，再等待进行中的回调返回，之后驱动才可释放私有数据。当前块层缓存与分区扫描按 512 字节扇区工作，v1 只接受 512 字节逻辑块。
+
+**显示**：`spk_sysfb_get` 描述固件（UEFI GOP）帧缓冲：物理/内核地址、尺寸、pitch、bpp 与 RGB 掩码；原生 GPU 驱动接管显示后返回 `-EBUSY`，没有帧缓冲时返回 `-ENODEV`。`spk_display_register(name, desc, mode, formats, count, flags, ops, priv)` 创建一个单管线、固定模式的 DRM 设备（`/dev/dri/cardN`）；DRM 核心（见 [DRM.md](DRM.md)）实现全部用户态 ABI（atomic/传统 KMS、dumb 缓冲与 mmap、damage、模拟 vblank 事件），只在进程上下文串行回调驱动：
+
+| 回调 | 语义 |
+| --- | --- |
+| `check(format)` | 可选，拒绝某个帧缓冲格式 |
+| `enable` / `disable` | 管线开/关 |
+| `update(fb, src, clips, count)` | 呈现 `fb` 的 `clips`（帧缓冲像素坐标，位于 `src` 内）；像素 (x, y) 在屏幕上的位置是 (x − src.x1, y − src.y1) |
+| `lastclose` | 最后一个 DRM 客户端关闭 |
+
+`flags`：`SPK_DISPLAY_PREFER_SHADOW`（报告 `DUMB_PREFER_SHADOW`，客户端在影子缓冲绘制后 DIRTYFB）、`SPK_DISPLAY_TAKES_CONSOLE`（扫描输出与文本控制台共用帧缓冲，有活动管线时控制台让出，lastclose 后归还重绘）。`spk_display_unregister` 后，已打开的文件得到 ENODEV，节点消失，扫描输出停止。
+
+## 示例：`modules/simplefb`
+
+`simplefb.ko` 是 simpledrm：识别固件帧缓冲的原生格式，报告原生格式加模拟的 XRGB8888/ARGB8888，`update` 逐行把脏矩形转换写入扫描输出内存（详见 [DRM.md](DRM.md#simpledrmmodulessimplefb)）。
+
+验证：`python3 tools/qemu_test.py x86_64 ... --simplefb`（不挂 virtio-gpu；aarch64/riscv64 挂 ramfb），配合内核命令行 `selftest=drm` 只运行 DRM 套件，日志标记 `DRM_SIMPLEFB_OK`。
 
 ## 示例：`modules/usb`
 

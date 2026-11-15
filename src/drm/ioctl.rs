@@ -26,6 +26,8 @@ pub const GET_CAP: u8 = 0x0c;
 pub const SET_CLIENT_CAP: u8 = 0x0d;
 pub const AUTH_MAGIC: u8 = 0x11;
 pub const SET_MASTER: u8 = 0x1e;
+pub const PRIME_HANDLE_TO_FD: u8 = 0x2d;
+pub const PRIME_FD_TO_HANDLE: u8 = 0x2e;
 pub const DROP_MASTER: u8 = 0x1f;
 pub const WAIT_VBLANK: u8 = 0x3a;
 pub const CRTC_GET_SEQUENCE: u8 = 0x3b;
@@ -59,10 +61,24 @@ pub const MODE_CURSOR2: u8 = 0xbb;
 pub const MODE_ATOMIC: u8 = 0xbc;
 pub const MODE_CREATEPROPBLOB: u8 = 0xbd;
 pub const MODE_DESTROYPROPBLOB: u8 = 0xbe;
+pub const SYNCOBJ_CREATE: u8 = 0xbf;
+pub const SYNCOBJ_DESTROY: u8 = 0xc0;
+pub const SYNCOBJ_HANDLE_TO_FD: u8 = 0xc1;
+pub const SYNCOBJ_FD_TO_HANDLE: u8 = 0xc2;
+pub const SYNCOBJ_WAIT: u8 = 0xc3;
+pub const SYNCOBJ_RESET: u8 = 0xc4;
+pub const SYNCOBJ_SIGNAL: u8 = 0xc5;
+pub const SYNCOBJ_TIMELINE_WAIT: u8 = 0xca;
+pub const SYNCOBJ_QUERY: u8 = 0xcb;
+pub const SYNCOBJ_TRANSFER: u8 = 0xcc;
+pub const SYNCOBJ_TIMELINE_SIGNAL: u8 = 0xcd;
 pub const MODE_GETFB2: u8 = 0xce;
+/// Driver-specific ioctls (`DRM_COMMAND_BASE`..`DRM_COMMAND_END`).
+pub const COMMAND_BASE: u8 = 0x40;
+pub const COMMAND_END: u8 = 0xa0;
 
-const READ: u32 = 1; // user -> kernel (_IOW)
-const WRITE: u32 = 2; // kernel -> user (_IOR)
+pub const READ: u32 = 1; // user -> kernel (_IOW)
+pub const WRITE: u32 = 2; // kernel -> user (_IOR)
 
 /// `(size, direction)` of a core ioctl.
 pub fn descriptor(nr: u8) -> Option<(usize, u32)> {
@@ -77,6 +93,14 @@ pub fn descriptor(nr: u8) -> Option<(usize, u32)> {
         SET_CLIENT_CAP => (16, READ),
         AUTH_MAGIC => (4, READ),
         SET_MASTER | DROP_MASTER => (0, 0),
+        PRIME_HANDLE_TO_FD | PRIME_FD_TO_HANDLE => (12, rw),
+        SYNCOBJ_CREATE | SYNCOBJ_DESTROY => (8, rw),
+        SYNCOBJ_HANDLE_TO_FD | SYNCOBJ_FD_TO_HANDLE => (24, rw),
+        SYNCOBJ_WAIT => (40, rw),
+        SYNCOBJ_RESET | SYNCOBJ_SIGNAL => (16, rw),
+        SYNCOBJ_TIMELINE_WAIT => (48, rw),
+        SYNCOBJ_QUERY | SYNCOBJ_TIMELINE_SIGNAL => (24, rw),
+        SYNCOBJ_TRANSFER => (32, rw),
         WAIT_VBLANK => (24, rw),
         CRTC_GET_SEQUENCE => (24, rw),
         CRTC_QUEUE_SEQUENCE => (24, rw),
@@ -119,12 +143,22 @@ pub struct Ioctl {
 }
 
 impl Ioctl {
-    pub fn new(cmd: u64, address: u64) -> Result<Self, VfsError> {
+    /// Parse a DRM ioctl number; `driver` describes driver-specific ones.
+    pub fn new(
+        cmd: u64,
+        address: u64,
+        driver: impl FnOnce(u8) -> Option<(usize, u32)>,
+    ) -> Result<Self, VfsError> {
         if (cmd >> 8) & 0xff != b'd' as u64 || cmd >> 32 != 0 {
             return Err(VfsError::NotATty);
         }
         let nr = cmd as u8;
-        let (size, direction) = descriptor(nr).ok_or(VfsError::InvalidArgument)?;
+        let described = if (COMMAND_BASE..COMMAND_END).contains(&nr) {
+            driver(nr)
+        } else {
+            descriptor(nr)
+        };
+        let (size, direction) = described.ok_or(VfsError::InvalidArgument)?;
         let user_size = ((cmd >> 16) & 0x3fff) as usize;
         if size == 0 && user_size != 0 {
             return Err(VfsError::InvalidArgument);
@@ -171,6 +205,26 @@ impl Ioctl {
     }
     pub fn set_u64(&mut self, offset: usize, value: u64) {
         self.data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    // Checked accessors for driver code that validates layouts itself.
+    pub fn r32(&self, offset: usize) -> Result<u32, VfsError> {
+        self.data
+            .get(offset..offset + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .ok_or(VfsError::InvalidArgument)
+    }
+    pub fn r64(&self, offset: usize) -> Result<u64, VfsError> {
+        self.data
+            .get(offset..offset + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .ok_or(VfsError::InvalidArgument)
+    }
+    pub fn w32(&mut self, offset: usize, value: u32) {
+        self.set_u32(offset, value)
+    }
+    pub fn w64(&mut self, offset: usize, value: u64) {
+        self.set_u64(offset, value)
     }
 }
 

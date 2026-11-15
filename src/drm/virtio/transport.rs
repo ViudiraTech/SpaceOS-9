@@ -1,5 +1,5 @@
 /*
- *       src/gpu/transport.rs
+ *       src/drm/virtio/transport.rs
  *       Modern VirtIO PCI split queues with retained DMA and IRQ completion
  *       2026/10/24 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
@@ -455,7 +455,7 @@ impl Transport {
         }
         if retired != 0 {
             self.completed.wake_all();
-            super::syncobj::fence_event();
+            crate::drm::syncobj::fence_event();
         }
     }
     pub fn interrupt(&self) {
@@ -535,7 +535,7 @@ impl Transport {
             }
         }
         self.completed.wake_all();
-        super::syncobj::fence_event();
+        crate::drm::syncobj::fence_event();
     }
 }
 fn irq(_irq: u32) {

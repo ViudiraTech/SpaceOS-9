@@ -301,7 +301,11 @@ fn widen(current: u64, sequence: u32) -> u64 {
 }
 
 /// DRM_IOCTL_WAIT_VBLANK.
-pub(crate) fn wait_vblank(device: &Arc<Device>, file: u64, arg: &mut Ioctl) -> Result<(), VfsError> {
+pub(crate) fn wait_vblank(
+    device: &Arc<Device>,
+    file: u64,
+    arg: &mut Ioctl,
+) -> Result<(), VfsError> {
     const RELATIVE: u32 = 0x1;
     const EVENT: u32 = 0x0400_0000;
     const NEXTONMISS: u32 = 0x1000_0000;
@@ -340,13 +344,22 @@ pub(crate) fn wait_vblank(device: &Arc<Device>, file: u64, arg: &mut Ioctl) -> R
         target = current + 1;
     }
     if request & EVENT != 0 {
-        queue(device, pipe, target.max(current), Kind::Vblank, file, arg.u64(8));
+        queue(
+            device,
+            pipe,
+            target.max(current),
+            Kind::Vblank,
+            file,
+            arg.u64(8),
+        );
         arg.set_u32(4, target as u32);
         return Ok(());
     }
     wait_sequence(device, pipe, target);
     let inner = crtc.inner.lock();
-    let reached = inner.count(crate::time::uptime_nanos()).min(target.max(current));
+    let reached = inner
+        .count(crate::time::uptime_nanos())
+        .min(target.max(current));
     let micros = inner.time_of(reached) / 1000;
     drop(inner);
     arg.set_u32(4, reached as u32);
@@ -367,7 +380,11 @@ pub(crate) fn get_sequence(device: &Arc<Device>, arg: &mut Ioctl) -> Result<(), 
 }
 
 /// DRM_IOCTL_CRTC_QUEUE_SEQUENCE.
-pub(crate) fn queue_sequence(device: &Arc<Device>, file: u64, arg: &mut Ioctl) -> Result<(), VfsError> {
+pub(crate) fn queue_sequence(
+    device: &Arc<Device>,
+    file: u64,
+    arg: &mut Ioctl,
+) -> Result<(), VfsError> {
     const RELATIVE: u32 = 1;
     const NEXT_ON_MISS: u32 = 2;
     let pipe = pipe_of(device, arg.u32(0))?;
@@ -390,7 +407,14 @@ pub(crate) fn queue_sequence(device: &Arc<Device>, file: u64, arg: &mut Ioctl) -
     if flags & NEXT_ON_MISS != 0 && target <= current {
         target = current + 1;
     }
-    queue(device, pipe, target.max(current), Kind::Sequence, file, arg.u64(16));
+    queue(
+        device,
+        pipe,
+        target.max(current),
+        Kind::Sequence,
+        file,
+        arg.u64(16),
+    );
     arg.set_u64(8, target);
     Ok(())
 }

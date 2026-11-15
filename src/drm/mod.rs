@@ -14,7 +14,12 @@
 //! describes its pipes and programs hardware from the validated state.
 //!
 //! * [`Driver`] is the Rust driver interface; `hal::display` wraps it for
-//!   loadable C modules (simplefb).
+//!   loadable C modules (simplefb) and [`virtio`] is the in-tree virtio-gpu
+//!   driver (3D contexts, blobs and execbuffer through driver ioctls).
+//! * The core also provides GEM handles with pluggable backing storage,
+//!   PRIME dma-bufs, syncobj/sync_file fences, render nodes and
+//!   driver-private per-file state, so a render-capable driver only adds
+//!   its own command submission.
 //! * Every legacy modeset entry point (SETCRTC, SETPLANE, PAGE_FLIP,
 //!   DIRTYFB, DPMS) is translated into an atomic commit, as Linux's atomic
 //!   helpers do, so drivers implement one update path.
@@ -26,15 +31,19 @@ pub mod file;
 pub mod gem;
 pub mod ioctl;
 pub mod kms;
-pub mod vblank;
 #[cfg(feature = "boot-self-test")]
 pub mod self_test;
+pub mod syncobj;
+pub mod vblank;
+pub mod virtio;
 
 use crate::{sync::SpinLock, vfs::VfsError};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub use gem::GemObject;
+pub use file::File;
+pub use gem::{GemBacking, GemObject};
+pub use ioctl::Ioctl;
 pub use kms::{Framebuffer, Rect};
 
 /// DRM fourcc codes the core knows how to describe.
@@ -200,6 +209,8 @@ pub enum ConnectorType {
 #[derive(Clone)]
 pub struct PipeConfig {
     pub connector_type: ConnectorType,
+    /// A monitor is attached (modes are only reported when connected).
+    pub connected: bool,
     pub modes: Vec<Mode>,
     pub width_mm: u32,
     pub height_mm: u32,
@@ -227,6 +238,43 @@ pub struct DeviceConfig {
     /// Scanout comes from the firmware framebuffer the text console uses;
     /// the console yields while userspace drives the display.
     pub takes_over_console: bool,
+    /// A native display driver: from now on the firmware framebuffer is not
+    /// available to simpledrm (Linux aperture removal of sysfb devices).
+    pub claims_firmware_fb: bool,
+    /// Publish /dev/dri/renderD(128+N) (DRIVER_RENDER).
+    pub render: bool,
+    /// PRIME import/export of GEM objects as dma-buf fds (DRIVER_PRIME).
+    pub prime: bool,
+    /// syncobj ioctls, binary and timeline (DRIVER_SYNCOBJ[_TIMELINE]).
+    pub syncobj: bool,
+    /// Bus parent for /sys/class/drm/*/device (e.g. a PCI address).
+    pub parent: Option<String>,
+    /// Extra read-only sysfs attributes of the card (vendor, device, ...).
+    pub attributes: Vec<(&'static str, String)>,
+}
+
+impl DeviceConfig {
+    /// A configuration with the core defaults for everything but the name
+    /// and pipes.
+    pub fn new(name: &str, description: &str, date: &str, pipes: Vec<PipeConfig>) -> Self {
+        Self {
+            name: String::from(name),
+            description: String::from(description),
+            date: String::from(date),
+            version: (1, 0, 0),
+            pipes,
+            min_size: (1, 1),
+            max_size: (8192, 8192),
+            prefer_shadow: false,
+            takes_over_console: false,
+            claims_firmware_fb: false,
+            render: false,
+            prime: false,
+            syncobj: false,
+            parent: None,
+            attributes: Vec::new(),
+        }
+    }
 }
 
 /// What one pipe should display after a commit (all values validated).
@@ -256,7 +304,12 @@ pub struct CursorUpdate<'a> {
 pub trait Driver: Send + Sync {
     /// Reject a configuration the hardware cannot show (beyond the core's
     /// generic checks of formats, sizes and coverage).
-    fn check(&self, _pipe: usize, _mode: Option<&Mode>, _update: &PlaneUpdate) -> Result<(), VfsError> {
+    fn check(
+        &self,
+        _pipe: usize,
+        _mode: Option<&Mode>,
+        _update: &PlaneUpdate,
+    ) -> Result<(), VfsError> {
         Ok(())
     }
     /// Turn a pipe on with `mode`, or off (`None`).
@@ -271,6 +324,61 @@ pub trait Driver: Send + Sync {
     fn lastclose(&self) {}
     /// The device is being unregistered.
     fn release(&self) {}
+
+    /// Allocate a dumb buffer; returns the backing and the row pitch. The
+    /// default is shmem with 64-byte aligned rows, which keeps every line
+    /// start cache-line aligned for line-by-line copies.
+    fn create_dumb(
+        &self,
+        width: u32,
+        height: u32,
+        bpp: u32,
+    ) -> Result<(Arc<dyn GemBacking>, u32), VfsError> {
+        let pitch = (width * bpp.div_ceil(8)).div_ceil(64) * 64;
+        Ok((
+            Arc::new(gem::Shmem::new(pitch as u64 * height as u64)?),
+            pitch,
+        ))
+    }
+    /// Reject a framebuffer the hardware cannot scan out (ADDFB time).
+    fn check_framebuffer(&self, _fb: &Framebuffer) -> Result<(), VfsError> {
+        Ok(())
+    }
+    /// Size and direction of driver-specific ioctl `nr` (0x40..0xa0).
+    fn ioctl_descriptor(&self, _nr: u8) -> Option<(usize, u32)> {
+        None
+    }
+    /// Per-open driver state; it handles the driver-specific ioctls.
+    fn open(&self, _file: &Arc<File>) -> Result<Option<Arc<dyn DriverFile>>, VfsError> {
+        Ok(None)
+    }
+    /// Make progress on outstanding fences (called while waiting on them).
+    fn kick(&self) {}
+}
+
+/// Driver state of one open file (Linux `drm_file::driver_priv` plus the
+/// driver's ioctl table).
+pub trait DriverFile: Send + Sync {
+    /// A driver-specific ioctl (`arg.nr` in 0x40..0xa0).
+    fn ioctl(&self, file: &File, arg: &mut Ioctl) -> Result<(), VfsError>;
+    /// Called before the file reports poll/read readiness: turn completed
+    /// work into events.
+    fn poll(&self, _file: &File) {}
+    /// Whether `poll` has work that completes without an event wake-up, so
+    /// pollers must re-check periodically.
+    fn needs_tick(&self) -> bool {
+        false
+    }
+}
+
+/// Set once a native display driver owns the firmware framebuffer.
+static FIRMWARE_FB_CLAIMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether a native driver took the display from the firmware framebuffer
+/// (simpledrm must not bind then).
+pub fn firmware_fb_claimed() -> bool {
+    FIRMWARE_FB_CLAIMED.load(Ordering::Acquire)
 }
 
 pub struct Device {
@@ -298,10 +406,6 @@ static MINORS: SpinLock<u64> = SpinLock::new(0);
 
 fn allocate_minor() -> Option<u32> {
     let mut used = MINORS.lock();
-    // The legacy virtio-gpu stack registers card0 itself.
-    if crate::gpu::device().is_some() {
-        *used |= 1;
-    }
     let minor = (0..64).find(|&m| *used & (1 << m) == 0)?;
     *used |= 1 << minor;
     Some(minor as u32)
@@ -309,9 +413,16 @@ fn allocate_minor() -> Option<u32> {
 
 /// Register a device and publish /dev/dri/cardN with its sysfs connectors.
 pub fn register(config: DeviceConfig, driver: Arc<dyn Driver>) -> Result<Arc<Device>, VfsError> {
-    if config.pipes.is_empty() || config.pipes.iter().any(|p| p.modes.is_empty() || p.formats.is_empty())
+    if config.pipes.is_empty()
+        || config
+            .pipes
+            .iter()
+            .any(|p| p.modes.is_empty() || p.formats.is_empty())
     {
         return Err(VfsError::InvalidArgument);
+    }
+    if config.claims_firmware_fb {
+        FIRMWARE_FB_CLAIMED.store(true, Ordering::Release);
     }
     let minor = allocate_minor().ok_or(VfsError::NoSpace)?;
     let pipes = config.pipes.len();
@@ -331,7 +442,13 @@ pub fn register(config: DeviceConfig, driver: Arc<dyn Driver>) -> Result<Arc<Dev
         nodes: SpinLock::new(Vec::new()),
         gone: core::sync::atomic::AtomicBool::new(false),
     });
-    file::publish(&device)?;
+    if let Err(error) = file::publish(&device) {
+        for node in device.nodes.lock().drain(..) {
+            let _ = crate::device::unregister(node);
+        }
+        *MINORS.lock() &= !(1u64 << minor);
+        return Err(error);
+    }
     vblank::start_thread();
     DEVICES.lock().push(device.clone());
     crate::kinfo!(

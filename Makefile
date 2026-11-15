@@ -293,7 +293,7 @@ test-drm-abi:
 	mkdir -p build
 	gcc tools/drm_abi_probe.c -o build/drm-abi-probe
 	build/drm-abi-probe > build/drm-abi-probe.out
-	@grep -F -f build/drm-abi-probe.out src/gpu/abi.rs > /dev/null || (echo "DRM ABI mismatch" && exit 1)
+	python3 tools/check_drm_abi.py build/drm-abi-probe.out
 
 # Boot a release kernel with spbench as PID 1 and print BENCH results.
 bench:

@@ -24,7 +24,6 @@ pub mod cpuid;
 pub mod device;
 pub mod drm;
 pub mod fpu;
-pub mod gpu;
 #[cfg(feature = "modules")]
 pub mod hal;
 mod hardware;
@@ -188,7 +187,7 @@ pub extern "C" fn kmain() -> ! {
     module::init();
     #[cfg(feature = "sound")]
     sound::init();
-    gpu::init();
+    drm::virtio::init();
     input::init();
     #[cfg(feature = "boot-self-test")]
     self_test::run_early();
@@ -206,7 +205,7 @@ pub extern "C" fn kmain() -> ! {
         },
         None => shell::start(),
     }
-    gpu::start();
+    drm::virtio::start();
     #[cfg(feature = "boot-self-test")]
     self_test::spawn_late();
     #[cfg(not(feature = "boot-self-test"))]

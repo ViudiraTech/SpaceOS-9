@@ -19,8 +19,9 @@
 use super::{
     CursorUpdate, Device, Mode, PlaneUpdate,
     ioctl::{self, Ioctl},
+    syncobj::{self, Fence},
 };
-use crate::vfs::VfsError;
+use crate::{user::uaccess, vfs::VfsError};
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 
 // ---- object and property identifiers --------------------------------------
@@ -90,9 +91,10 @@ enum Prop {
     InFormats,
     Damage,
     InFence,
+    OutFencePtr,
 }
 
-const ALL_PROPS: [Prop; 20] = [
+const ALL_PROPS: [Prop; 21] = [
     Prop::ConnectorCrtc,
     Prop::Dpms,
     Prop::Edid,
@@ -113,6 +115,7 @@ const ALL_PROPS: [Prop; 20] = [
     Prop::InFormats,
     Prop::Damage,
     Prop::InFence,
+    Prop::OutFencePtr,
 ];
 
 impl Prop {
@@ -141,6 +144,7 @@ impl Prop {
             Prop::InFormats => "IN_FORMATS",
             Prop::Damage => "FB_DAMAGE_CLIPS",
             Prop::InFence => "IN_FENCE_FD",
+            Prop::OutFencePtr => "OUT_FENCE_PTR",
         }
     }
 
@@ -156,6 +160,7 @@ impl Prop {
             Prop::SrcX | Prop::SrcY | Prop::SrcW | Prop::SrcH => PROP_RANGE | PROP_ATOMIC,
             Prop::CrtcX | Prop::CrtcY | Prop::InFence => PROP_SIGNED_RANGE | PROP_ATOMIC,
             Prop::CrtcW | Prop::CrtcH => PROP_RANGE | PROP_ATOMIC,
+            Prop::OutFencePtr => PROP_RANGE | PROP_ATOMIC,
         }
     }
 
@@ -169,6 +174,7 @@ impl Prop {
             Prop::CrtcX | Prop::CrtcY => vec![i32::MIN as i64 as u64, i32::MAX as u64],
             Prop::CrtcW | Prop::CrtcH => vec![0, i32::MAX as u64],
             Prop::InFence => vec![-1i64 as u64, i32::MAX as u64],
+            Prop::OutFencePtr => vec![0, u64::MAX],
             Prop::Dpms => vec![0, 1, 2, 3],
             Prop::Type => vec![0, 1, 2],
             _ => Vec::new(),
@@ -270,10 +276,12 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
-    /// Kernel address of pixel (0, 0).
-    pub fn pixels(&self) -> *const u8 {
+    /// Kernel address of pixel (0, 0), when the CPU can read the object.
+    pub fn pixels(&self) -> Option<*const u8> {
         // SAFETY: `offset` was validated against the object size.
-        unsafe { self.object.vaddr().add(self.offset as usize) }
+        self.object
+            .vaddr()
+            .map(|base| unsafe { base.add(self.offset as usize).cast_const() })
     }
 }
 
@@ -292,12 +300,16 @@ pub(crate) struct PlaneState {
     crtc_pos: [i32; 2],
     crtc_size: [u32; 2],
     damage: Option<Arc<Blob>>,
+    /// IN_FENCE_FD of this commit: wait before showing the new image.
+    in_fence: Option<Arc<Fence>>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct CrtcState {
     active: bool,
     mode: Option<Arc<Blob>>,
+    /// OUT_FENCE_PTR of this commit (user address of an s32), or 0.
+    out_fence: u64,
 }
 
 #[derive(Clone, Default)]
@@ -345,7 +357,11 @@ fn format_blob(formats: &[u32]) -> Vec<u8> {
         let at = formats_offset as usize + 4 * i;
         blob[at..at + 4].copy_from_slice(&format.to_le_bytes());
     }
-    let mask: u64 = if formats.len() >= 64 { u64::MAX } else { (1u64 << formats.len()) - 1 };
+    let mask: u64 = if formats.len() >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << formats.len()) - 1
+    };
     let at = modifiers_offset as usize;
     blob[at..at + 8].copy_from_slice(&mask.to_le_bytes());
     // offset 0, modifier 0 (DRM_FORMAT_MOD_LINEAR) already zero.
@@ -417,8 +433,13 @@ impl State {
 /// (the kms lock is not reentrant, so this never locks).
 fn object_props(state: &State, pipe: usize, kind: u32, atomic: bool) -> Vec<Prop> {
     let props: &[Prop] = match kind {
-        KIND_CONNECTOR => &[Prop::Dpms, Prop::Edid, Prop::NonDesktop, Prop::ConnectorCrtc],
-        KIND_CRTC => &[Prop::Active, Prop::ModeId],
+        KIND_CONNECTOR => &[
+            Prop::Dpms,
+            Prop::Edid,
+            Prop::NonDesktop,
+            Prop::ConnectorCrtc,
+        ],
+        KIND_CRTC => &[Prop::Active, Prop::ModeId, Prop::OutFencePtr],
         KIND_PRIMARY | KIND_CURSOR => &[
             Prop::Type,
             Prop::FbId,
@@ -457,9 +478,20 @@ fn prop_value(state: &State, pipe: usize, kind: u32, prop: Prop) -> u64 {
         (KIND_CONNECTOR, Prop::Edid) => state.edid_blob[pipe] as u64,
         (KIND_CRTC, Prop::Active) => state.config.crtcs[pipe].active as u64,
         (KIND_CRTC, Prop::ModeId) => state.blob_id(&state.config.crtcs[pipe].mode),
-        (_, Prop::Type) => if kind == KIND_PRIMARY { 1 } else { 2 },
-        (_, Prop::FbId) => plane(state, pipe, kind).fb.as_ref().map_or(0, |fb| fb.id as u64),
-        (_, Prop::PlaneCrtc) => plane(state, pipe, kind).crtc.map_or(0, |c| object_id(c, KIND_CRTC) as u64),
+        (_, Prop::Type) => {
+            if kind == KIND_PRIMARY {
+                1
+            } else {
+                2
+            }
+        }
+        (_, Prop::FbId) => plane(state, pipe, kind)
+            .fb
+            .as_ref()
+            .map_or(0, |fb| fb.id as u64),
+        (_, Prop::PlaneCrtc) => plane(state, pipe, kind)
+            .crtc
+            .map_or(0, |c| object_id(c, KIND_CRTC) as u64),
         (_, Prop::SrcX) => plane(state, pipe, kind).src[0] as u64,
         (_, Prop::SrcY) => plane(state, pipe, kind).src[1] as u64,
         (_, Prop::SrcW) => plane(state, pipe, kind).src[2] as u64,
@@ -470,7 +502,11 @@ fn prop_value(state: &State, pipe: usize, kind: u32, prop: Prop) -> u64 {
         (_, Prop::CrtcH) => plane(state, pipe, kind).crtc_size[1] as u64,
         (_, Prop::InFormats) => {
             let (primary, cursor) = state.formats_blob[pipe];
-            if kind == KIND_PRIMARY { primary as u64 } else { cursor as u64 }
+            if kind == KIND_PRIMARY {
+                primary as u64
+            } else {
+                cursor as u64
+            }
         }
         (_, Prop::InFence) => -1i64 as u64,
         _ => 0,
@@ -491,7 +527,12 @@ pub(crate) struct Change {
 }
 
 /// Apply one property change to `config` (state lock held).
-fn apply(device: &Device, state: &State, config: &mut Config, change: &Change) -> Result<(), VfsError> {
+fn apply(
+    device: &Device,
+    state: &State,
+    config: &mut Config,
+    change: &Change,
+) -> Result<(), VfsError> {
     let (pipe, kind) = decode_object(device, change.object).ok_or(VfsError::NotFound)?;
     let prop = Prop::from_id(change.prop).ok_or(VfsError::NotFound)?;
     if !object_props(state, pipe, kind, true).contains(&prop) {
@@ -539,6 +580,8 @@ fn apply(device: &Device, state: &State, config: &mut Config, change: &Change) -
         },
         KIND_CRTC => match prop {
             Prop::Active => config.crtcs[pipe].active = range(value, 0, 1)? == 1,
+            // Validated when the fence fd is written (outside the lock).
+            Prop::OutFencePtr => config.crtcs[pipe].out_fence = value,
             Prop::ModeId => {
                 let blob = blob_of(value)?;
                 if let Some(blob) = &blob
@@ -557,7 +600,13 @@ fn apply(device: &Device, state: &State, config: &mut Config, change: &Change) -
                     plane.fb = if value == 0 {
                         None
                     } else {
-                        Some(state.fbs.get(&(value as u32)).cloned().ok_or(VfsError::InvalidArgument)?)
+                        Some(
+                            state
+                                .fbs
+                                .get(&(value as u32))
+                                .cloned()
+                                .ok_or(VfsError::InvalidArgument)?,
+                        )
                     }
                 }
                 Prop::PlaneCrtc => plane.crtc = crtc_of(value)?,
@@ -565,13 +614,20 @@ fn apply(device: &Device, state: &State, config: &mut Config, change: &Change) -
                 Prop::SrcY => plane.src[1] = range(value, 0, u32::MAX as i64)? as u32,
                 Prop::SrcW => plane.src[2] = range(value, 0, u32::MAX as i64)? as u32,
                 Prop::SrcH => plane.src[3] = range(value, 0, u32::MAX as i64)? as u32,
-                Prop::CrtcX => plane.crtc_pos[0] = range(value, i32::MIN as i64, i32::MAX as i64)? as i32,
-                Prop::CrtcY => plane.crtc_pos[1] = range(value, i32::MIN as i64, i32::MAX as i64)? as i32,
+                Prop::CrtcX => {
+                    plane.crtc_pos[0] = range(value, i32::MIN as i64, i32::MAX as i64)? as i32
+                }
+                Prop::CrtcY => {
+                    plane.crtc_pos[1] = range(value, i32::MIN as i64, i32::MAX as i64)? as i32
+                }
                 Prop::CrtcW => plane.crtc_size[0] = range(value, 0, i32::MAX as i64)? as u32,
                 Prop::CrtcH => plane.crtc_size[1] = range(value, 0, i32::MAX as i64)? as u32,
                 Prop::Damage => plane.damage = blob_of(value)?,
-                // Explicit fences need sync_file support; -1 means none.
-                Prop::InFence if value as i64 == -1 => {}
+                Prop::InFence if value as i64 == -1 => plane.in_fence = None,
+                Prop::InFence => {
+                    let fd = u32::try_from(value).map_err(|_| VfsError::InvalidArgument)?;
+                    plane.in_fence = Some(syncobj::fence_fd(fd)?);
+                }
                 _ => return Err(VfsError::InvalidArgument),
             }
         }
@@ -625,9 +681,7 @@ fn check(device: &Device, config: &Config) -> Result<(), VfsError> {
                 return Err(VfsError::InvalidArgument);
             }
             let mode = mode.unwrap();
-            if !info.formats.contains(&fb.format)
-                || primary.src.iter().any(|v| v & 0xffff != 0)
-            {
+            if !info.formats.contains(&fb.format) || primary.src.iter().any(|v| v & 0xffff != 0) {
                 return Err(VfsError::InvalidArgument);
             }
             let (source, destination) = plane_rects(primary);
@@ -693,6 +747,41 @@ fn damage_for(old: &PlaneState, new: &PlaneState, full: bool) -> Vec<Rect> {
     coalesce(clips, &source)
 }
 
+/// Install one sync_file fd per OUT_FENCE_PTR and store it to user memory;
+/// on failure every fd made so far is closed and its pointer reset to -1.
+fn create_out_fences(config: &Config) -> Result<Vec<(u32, u64, Arc<Fence>)>, VfsError> {
+    let mut made: Vec<(u32, u64, Arc<Fence>)> = Vec::new();
+    let undo = |made: &[(u32, u64, Arc<Fence>)]| {
+        for (fd, pointer, _) in made {
+            syncobj::close_fd(*fd);
+            let _ = uaccess::write_value(*pointer, &-1i32);
+        }
+    };
+    for crtc in &config.crtcs {
+        if crtc.out_fence == 0 {
+            continue;
+        }
+        let fence = Fence::pending();
+        let file = Arc::new(syncobj::SyncFile {
+            fence: fence.clone(),
+        });
+        let fd = match syncobj::install_fd(file, crate::vfs::abi::O_CLOEXEC) {
+            Ok(fd) => fd,
+            Err(error) => {
+                undo(&made);
+                return Err(error);
+            }
+        };
+        if let Err(error) = uaccess::write_value(crtc.out_fence, &(fd as i32)) {
+            syncobj::close_fd(fd);
+            undo(&made);
+            return Err(error);
+        }
+        made.push((fd, crtc.out_fence, fence));
+    }
+    Ok(made)
+}
+
 /// Validate and apply `changes`; `flags` are DRM_MODE_ATOMIC_* bits.
 pub(crate) fn commit(
     device: &Arc<Device>,
@@ -715,8 +804,13 @@ fn commit_locked(
         let state = device.kms.lock();
         let old = state.config.clone();
         let mut new = old.clone();
+        // Damage and explicit fences apply to one commit only.
         for plane in &mut new.planes {
-            plane.damage = None; // damage applies to one commit only
+            plane.damage = None;
+            plane.in_fence = None;
+        }
+        for crtc in &mut new.crtcs {
+            crtc.out_fence = 0;
         }
         for change in changes {
             apply(device, &state, &mut new, change)?;
@@ -729,17 +823,23 @@ fn commit_locked(
     let mut touched = vec![false; pipes];
     for pipe in 0..pipes {
         let mode_changed = old.crtcs[pipe].active != new.crtcs[pipe].active
-            || old.crtcs[pipe].mode.as_ref().map(|b| &b.data) != new.crtcs[pipe].mode.as_ref().map(|b| &b.data)
+            || old.crtcs[pipe].mode.as_ref().map(|b| &b.data)
+                != new.crtcs[pipe].mode.as_ref().map(|b| &b.data)
             || old.connectors[pipe].crtc != new.connectors[pipe].crtc;
         modeset[pipe] = mode_changed;
         touched[pipe] = mode_changed
-            || changes.iter().any(|c| decode_object(device, c.object).is_some_and(|(p, _)| p == pipe));
+            || changes
+                .iter()
+                .any(|c| decode_object(device, c.object).is_some_and(|(p, _)| p == pipe));
     }
     if modeset.iter().any(|&m| m) && flags & ATOMIC_ALLOW_MODESET == 0 {
         return Err(VfsError::InvalidArgument);
     }
     for pipe in 0..pipes {
-        let mode = new.crtcs[pipe].mode.as_ref().and_then(|b| Mode::decode(&b.data));
+        let mode = new.crtcs[pipe]
+            .mode
+            .as_ref()
+            .and_then(|b| Mode::decode(&b.data));
         let primary = &new.planes[2 * pipe];
         let damage = damage_for(&old.planes[2 * pipe], primary, modeset[pipe]);
         device
@@ -760,48 +860,83 @@ fn commit_locked(
         return Ok(());
     }
 
-    // Program the hardware. Turn off first, then modes, then planes.
-    for pipe in 0..pipes {
-        if modeset[pipe] && !new.crtcs[pipe].active {
-            device.driver.set_mode(pipe, None)?;
-            super::vblank::crtc_off(device, pipe);
+    // Explicit fencing: the new images may only be shown once their
+    // IN_FENCE_FDs signalled; OUT_FENCE_PTR receives a sync_file fd that
+    // signals when the commit reached the hardware.
+    for plane in &new.planes {
+        if let Some(fence) = &plane.in_fence {
+            fence.wait()?;
         }
     }
-    for pipe in 0..pipes {
-        if !new.crtcs[pipe].active {
-            continue;
+    let out_fences = create_out_fences(&new)?;
+    let programmed = (|| -> Result<(), VfsError> {
+        // Program the hardware. Turn off first, then modes, then planes.
+        for pipe in 0..pipes {
+            if modeset[pipe] && !new.crtcs[pipe].active {
+                device.driver.set_mode(pipe, None)?;
+                super::vblank::crtc_off(device, pipe);
+            }
         }
-        let mode = new.crtcs[pipe].mode.as_ref().and_then(|b| Mode::decode(&b.data));
-        if modeset[pipe] {
-            device.driver.set_mode(pipe, mode.as_ref())?;
-            super::vblank::crtc_on(device, pipe, mode.as_ref().unwrap());
+        for pipe in 0..pipes {
+            if !new.crtcs[pipe].active {
+                continue;
+            }
+            let mode = new.crtcs[pipe]
+                .mode
+                .as_ref()
+                .and_then(|b| Mode::decode(&b.data));
+            if modeset[pipe] {
+                device.driver.set_mode(pipe, mode.as_ref())?;
+                super::vblank::crtc_on(device, pipe, mode.as_ref().unwrap());
+            }
+            let primary = &new.planes[2 * pipe];
+            let damage = damage_for(&old.planes[2 * pipe], primary, modeset[pipe]);
+            if !damage.is_empty()
+                || modeset[pipe]
+                || primary.fb.is_none() != old.planes[2 * pipe].fb.is_none()
+            {
+                device
+                    .driver
+                    .update_plane(pipe, &update_for(primary, &damage))?;
+            }
+            let cursor = &new.planes[2 * pipe + 1];
+            let old_cursor = &old.planes[2 * pipe + 1];
+            let cursor_changed = cursor.crtc_pos != old_cursor.crtc_pos
+                || match (&cursor.fb, &old_cursor.fb) {
+                    (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                    (None, None) => false,
+                    _ => true,
+                };
+            if device.config.pipes[pipe].cursor.is_some() && (cursor_changed || modeset[pipe]) {
+                let hot = device.kms.lock().cursor_hot[pipe];
+                let _ = device.driver.update_cursor(
+                    pipe,
+                    &CursorUpdate {
+                        framebuffer: cursor.fb.as_deref(),
+                        x: cursor.crtc_pos[0],
+                        y: cursor.crtc_pos[1],
+                        hot_x: hot.0,
+                        hot_y: hot.1,
+                    },
+                );
+            }
         }
-        let primary = &new.planes[2 * pipe];
-        let damage = damage_for(&old.planes[2 * pipe], primary, modeset[pipe]);
-        if !damage.is_empty() || modeset[pipe] || primary.fb.is_none() != old.planes[2 * pipe].fb.is_none() {
-            device.driver.update_plane(pipe, &update_for(primary, &damage))?;
+        Ok(())
+    })();
+    for (fd, pointer, fence) in out_fences {
+        fence.complete(if programmed.is_ok() { 1 } else { -5 });
+        if programmed.is_err() {
+            syncobj::close_fd(fd);
+            let _ = uaccess::write_value(pointer, &-1i32);
         }
-        let cursor = &new.planes[2 * pipe + 1];
-        let old_cursor = &old.planes[2 * pipe + 1];
-        let cursor_changed = cursor.crtc_pos != old_cursor.crtc_pos
-            || match (&cursor.fb, &old_cursor.fb) {
-                (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
-                (None, None) => false,
-                _ => true,
-            };
-        if device.config.pipes[pipe].cursor.is_some() && (cursor_changed || modeset[pipe]) {
-            let hot = device.kms.lock().cursor_hot[pipe];
-            let _ = device.driver.update_cursor(
-                pipe,
-                &CursorUpdate {
-                    framebuffer: cursor.fb.as_deref(),
-                    x: cursor.crtc_pos[0],
-                    y: cursor.crtc_pos[1],
-                    hot_x: hot.0,
-                    hot_y: hot.1,
-                },
-            );
-        }
+    }
+    programmed?;
+    let mut new = new;
+    for plane in &mut new.planes {
+        plane.in_fence = None;
+    }
+    for crtc in &mut new.crtcs {
+        crtc.out_fence = 0;
     }
     let any_active = new.crtcs.iter().any(|c| c.active);
     device.kms.lock().config = new;
@@ -816,7 +951,8 @@ fn commit_locked(
     let mut waits = Vec::new();
     for pipe in (0..pipes).filter(|&p| touched[p]) {
         if device.kms.lock().active(pipe) {
-            let target = super::vblank::queue_flip(device, pipe, event.then_some((file, user_data)));
+            let target =
+                super::vblank::queue_flip(device, pipe, event.then_some((file, user_data)));
             waits.push((pipe, target));
         }
     }
@@ -853,7 +989,12 @@ pub(crate) fn get_resources(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError>
     let crtcs: Vec<u32> = (0..pipes).map(|p| object_id(p, KIND_CRTC)).collect();
     let connectors: Vec<u32> = (0..pipes).map(|p| object_id(p, KIND_CONNECTOR)).collect();
     let encoders: Vec<u32> = (0..pipes).map(|p| object_id(p, KIND_ENCODER)).collect();
-    for (pointer, count, values) in [(0, 32, &fbs), (8, 36, &crtcs), (16, 40, &connectors), (24, 44, &encoders)] {
+    for (pointer, count, values) in [
+        (0, 32, &fbs),
+        (8, 36, &crtcs),
+        (16, 40, &connectors),
+        (24, 44, &encoders),
+    ] {
         ioctl::copy_out_u32(arg.u64(pointer), arg.u32(count), values)?;
         arg.set_u32(count, values.len() as u32);
     }
@@ -895,7 +1036,12 @@ pub(crate) fn get_encoder(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
         return Err(VfsError::NotFound);
     }
     let routed = c.device.kms.lock().config.connectors[pipe].crtc;
-    arg.set_u32(4, 0); // DRM_MODE_ENCODER_NONE, as simpledrm
+    // DRM_MODE_ENCODER_VIRTUAL for virtual outputs, else NONE (simpledrm).
+    let virtual_output = matches!(
+        c.device.config.pipes[pipe].connector_type,
+        super::ConnectorType::Virtual
+    );
+    arg.set_u32(4, if virtual_output { 5 } else { 0 });
     arg.set_u32(8, routed.map_or(0, |p| object_id(p, KIND_CRTC)));
     arg.set_u32(12, 1 << pipe);
     arg.set_u32(16, 0);
@@ -911,11 +1057,13 @@ pub(crate) fn get_connector(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError>
     let encoders = [object_id(pipe, KIND_ENCODER)];
     ioctl::copy_out_u32(arg.u64(0), arg.u32(40), &encoders)?;
     arg.set_u32(40, 1);
-    if arg.u64(8) != 0 && arg.u32(32) as usize >= info.modes.len() {
-        let bytes: Vec<u8> = info.modes.iter().flat_map(|m| m.encode()).collect();
+    // A disconnected output reports no modes (Linux probe helpers).
+    let modes: &[Mode] = if info.connected { &info.modes } else { &[] };
+    if arg.u64(8) != 0 && !modes.is_empty() && arg.u32(32) as usize >= modes.len() {
+        let bytes: Vec<u8> = modes.iter().flat_map(|m| m.encode()).collect();
         crate::user::uaccess::write(arg.u64(8), &bytes)?;
     }
-    arg.set_u32(32, info.modes.len() as u32);
+    arg.set_u32(32, modes.len() as u32);
     let (ids, values): (Vec<u32>, Vec<u64>) = {
         let state = c.device.kms.lock();
         object_props(&state, pipe, KIND_CONNECTOR, c.atomic)
@@ -929,8 +1077,8 @@ pub(crate) fn get_connector(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError>
     let routed = c.device.kms.lock().config.connectors[pipe].crtc;
     arg.set_u32(44, if routed.is_some() { encoders[0] } else { 0 });
     arg.set_u32(52, info.connector_type as u32);
-    arg.set_u32(56, 1);
-    arg.set_u32(60, 1); // connected
+    arg.set_u32(56, pipe as u32 + 1); // connector_type_id
+    arg.set_u32(60, if info.connected { 1 } else { 2 }); // connected / disconnected
     arg.set_u32(64, info.width_mm);
     arg.set_u32(68, info.height_mm);
     arg.set_u32(72, 1); // subpixel unknown
@@ -1037,7 +1185,14 @@ pub(crate) fn obj_get_properties(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsE
 }
 
 pub(crate) fn get_blob(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
-    let blob = c.device.kms.lock().blobs.get(&arg.u32(0)).cloned().ok_or(VfsError::NotFound)?;
+    let blob = c
+        .device
+        .kms
+        .lock()
+        .blobs
+        .get(&arg.u32(0))
+        .cloned()
+        .ok_or(VfsError::NotFound)?;
     if arg.u64(8) != 0 && arg.u32(4) as usize >= blob.data.len() && !blob.data.is_empty() {
         crate::user::uaccess::write(arg.u64(8), &blob.data)?;
     }
@@ -1068,7 +1223,15 @@ pub(crate) fn destroy_blob(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> 
     }
 }
 
-fn add_fb(c: &Caller, width: u32, height: u32, format: u32, handle: u32, pitch: u32, offset: u32) -> Result<u32, VfsError> {
+fn add_fb(
+    c: &Caller,
+    width: u32,
+    height: u32,
+    format: u32,
+    handle: u32,
+    pitch: u32,
+    offset: u32,
+) -> Result<u32, VfsError> {
     let (min, max) = (c.device.config.min_size, c.device.config.max_size);
     let cpp = super::fourcc::cpp(format).ok_or(VfsError::InvalidArgument)?;
     if width < min.0 || width > max.0 || height < min.1 || height > max.1 {
@@ -1080,28 +1243,40 @@ fn add_fb(c: &Caller, width: u32, height: u32, format: u32, handle: u32, pitch: 
     if (pitch as u64) < row || end > object.size {
         return Err(VfsError::InvalidArgument);
     }
+    let mut framebuffer = Framebuffer {
+        id: 0,
+        owner: c.file,
+        object,
+        width,
+        height,
+        format,
+        pitch,
+        offset,
+    };
+    c.device.driver.check_framebuffer(&framebuffer)?;
     let mut state = c.device.kms.lock();
+    if state.fbs.len() >= 4096 {
+        return Err(VfsError::NoSpace);
+    }
     let id = state.next_fb;
     state.next_fb += 1;
-    state.fbs.insert(
-        id,
-        Arc::new(Framebuffer {
-            id,
-            owner: c.file,
-            object,
-            width,
-            height,
-            format,
-            pitch,
-            offset,
-        }),
-    );
+    framebuffer.id = id;
+    state.fbs.insert(id, Arc::new(framebuffer));
     Ok(id)
 }
 
 pub(crate) fn addfb(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
-    let format = super::fourcc::from_legacy(arg.u32(16), arg.u32(20)).ok_or(VfsError::InvalidArgument)?;
-    let id = add_fb(c, arg.u32(4), arg.u32(8), format, arg.u32(24), arg.u32(12), 0)?;
+    let format =
+        super::fourcc::from_legacy(arg.u32(16), arg.u32(20)).ok_or(VfsError::InvalidArgument)?;
+    let id = add_fb(
+        c,
+        arg.u32(4),
+        arg.u32(8),
+        format,
+        arg.u32(24),
+        arg.u32(12),
+        0,
+    )?;
     arg.set_u32(0, id);
     Ok(())
 }
@@ -1116,7 +1291,15 @@ pub(crate) fn addfb2(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
     if (1..4).any(|i| arg.u32(20 + 4 * i) != 0) || (flags & FB_MODIFIERS != 0 && arg.u64(72) != 0) {
         return Err(VfsError::InvalidArgument);
     }
-    let id = add_fb(c, arg.u32(4), arg.u32(8), arg.u32(12), arg.u32(20), arg.u32(36), arg.u32(52))?;
+    let id = add_fb(
+        c,
+        arg.u32(4),
+        arg.u32(8),
+        arg.u32(12),
+        arg.u32(20),
+        arg.u32(36),
+        arg.u32(52),
+    )?;
     arg.set_u32(0, id);
     Ok(())
 }
@@ -1174,8 +1357,22 @@ pub(crate) fn rmfb(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
 }
 
 pub(crate) fn get_fb(c: &Caller, arg: &mut Ioctl, v2: bool) -> Result<(), VfsError> {
-    let fb = c.device.kms.lock().fbs.get(&arg.u32(0)).cloned().ok_or(VfsError::NotFound)?;
-    let handle = c.handles.lock().insert(fb.object.clone());
+    let fb = c
+        .device
+        .kms
+        .lock()
+        .fbs
+        .get(&arg.u32(0))
+        .cloned()
+        .ok_or(VfsError::NotFound)?;
+    // Like Linux, only the owner or the master may get a handle to another
+    // client's buffer; others see the metadata with handle 0.
+    let master = c.device.master.load(core::sync::atomic::Ordering::Acquire) == c.file;
+    let handle = if fb.owner == c.file || master {
+        c.handles.lock().insert(fb.object.clone())
+    } else {
+        0
+    };
     arg.set_u32(4, fb.width);
     arg.set_u32(8, fb.height);
     if v2 {
@@ -1213,7 +1410,11 @@ pub(crate) fn set_crtc(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
     let connector = object_id(pipe, KIND_CONNECTOR);
     let crtc = object_id(pipe, KIND_CRTC);
     let primary = object_id(pipe, KIND_PRIMARY);
-    let change = |object, prop: Prop, value| Change { object, prop: prop as u32, value };
+    let change = |object, prop: Prop, value| Change {
+        object,
+        prop: prop as u32,
+        value,
+    };
     if !mode_valid {
         let changes = [
             change(primary, Prop::FbId, 0),
@@ -1231,7 +1432,10 @@ pub(crate) fn set_crtc(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
     }
     let fb = if fb_id == u32::MAX {
         let state = c.device.kms.lock();
-        state.config.planes[2 * pipe].fb.as_ref().map_or(0, |fb| fb.id)
+        state.config.planes[2 * pipe]
+            .fb
+            .as_ref()
+            .map_or(0, |fb| fb.id)
     } else {
         fb_id
     };
@@ -1242,7 +1446,11 @@ pub(crate) fn set_crtc(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
         change(crtc, Prop::Active, 1),
         change(connector, Prop::ConnectorCrtc, crtc as u64),
         change(primary, Prop::FbId, fb as u64),
-        change(primary, Prop::PlaneCrtc, if fb != 0 { crtc as u64 } else { 0 }),
+        change(
+            primary,
+            Prop::PlaneCrtc,
+            if fb != 0 { crtc as u64 } else { 0 },
+        ),
         change(primary, Prop::SrcX, (x as u64) << 16),
         change(primary, Prop::SrcY, (y as u64) << 16),
         change(primary, Prop::SrcW, (mode.hdisplay as u64) << 16),
@@ -1271,19 +1479,39 @@ pub(crate) fn page_flip(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
     }
     {
         let state = c.device.kms.lock();
-        let current = state.config.planes[2 * pipe].fb.clone().ok_or(VfsError::Busy)?;
+        let current = state.config.planes[2 * pipe]
+            .fb
+            .clone()
+            .ok_or(VfsError::Busy)?;
         let next = state.fbs.get(&arg.u32(4)).ok_or(VfsError::NotFound)?;
-        if next.format != current.format || next.width != current.width || next.height != current.height {
+        if next.format != current.format
+            || next.width != current.width
+            || next.height != current.height
+        {
             return Err(VfsError::InvalidArgument);
         }
     }
     let primary = object_id(pipe, KIND_PRIMARY);
-    let changes = [Change { object: primary, prop: Prop::FbId as u32, value: arg.u32(4) as u64 }];
-    let event = if flags & FLIP_EVENT != 0 { ATOMIC_PAGE_FLIP_EVENT } else { 0 };
+    let changes = [Change {
+        object: primary,
+        prop: Prop::FbId as u32,
+        value: arg.u32(4) as u64,
+    }];
+    let event = if flags & FLIP_EVENT != 0 {
+        ATOMIC_PAGE_FLIP_EVENT
+    } else {
+        0
+    };
     if c.device.vblank[pipe].flip_pending() {
         return Err(VfsError::Busy);
     }
-    commit(c.device, c.file, &changes, event | ATOMIC_NONBLOCK, arg.u64(16))
+    commit(
+        c.device,
+        c.file,
+        &changes,
+        event | ATOMIC_NONBLOCK,
+        arg.u64(16),
+    )
 }
 
 /// DIRTYFB: present damaged regions of `fb` wherever it is scanned out.
@@ -1304,7 +1532,12 @@ pub(crate) fn dirty_fb(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
         .chunks_exact(8)
         .map(|c| {
             let v = |o: usize| u16::from_le_bytes([c[o], c[o + 1]]) as i32;
-            Rect { x1: v(0), y1: v(2), x2: v(4), y2: v(6) }
+            Rect {
+                x1: v(0),
+                y1: v(2),
+                x2: v(4),
+                y2: v(6),
+            }
         })
         .collect();
     c.device.modeset(|| {
@@ -1324,9 +1557,15 @@ pub(crate) fn dirty_fb(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
         drop(state);
         for (pipe, plane) in targets {
             let (source, _) = plane_rects(&plane);
-            let damage = if clips.is_empty() { vec![source] } else { coalesce(clips.clone(), &source) };
+            let damage = if clips.is_empty() {
+                vec![source]
+            } else {
+                coalesce(clips.clone(), &source)
+            };
             if !damage.is_empty() {
-                c.device.driver.update_plane(pipe, &update_for(&plane, &damage))?;
+                c.device
+                    .driver
+                    .update_plane(pipe, &update_for(&plane, &damage))?;
             }
         }
         Ok(())
@@ -1363,19 +1602,55 @@ pub(crate) fn cursor(c: &Caller, arg: &mut Ioctl, v2: bool) -> Result<(), VfsErr
         if v2 {
             c.device.kms.lock().cursor_hot[pipe] = (arg.i32(28), arg.i32(32));
         }
-        let (w, h) = if fb == 0 { (0, 0) } else { (arg.u32(16), arg.u32(20)) };
+        let (w, h) = if fb == 0 {
+            (0, 0)
+        } else {
+            (arg.u32(16), arg.u32(20))
+        };
         changes.extend([
-            Change { object: plane, prop: Prop::FbId as u32, value: fb as u64 },
-            Change { object: plane, prop: Prop::PlaneCrtc as u32, value: if fb != 0 { crtc as u64 } else { 0 } },
-            Change { object: plane, prop: Prop::SrcW as u32, value: (w as u64) << 16 },
-            Change { object: plane, prop: Prop::SrcH as u32, value: (h as u64) << 16 },
-            Change { object: plane, prop: Prop::CrtcW as u32, value: w as u64 },
-            Change { object: plane, prop: Prop::CrtcH as u32, value: h as u64 },
+            Change {
+                object: plane,
+                prop: Prop::FbId as u32,
+                value: fb as u64,
+            },
+            Change {
+                object: plane,
+                prop: Prop::PlaneCrtc as u32,
+                value: if fb != 0 { crtc as u64 } else { 0 },
+            },
+            Change {
+                object: plane,
+                prop: Prop::SrcW as u32,
+                value: (w as u64) << 16,
+            },
+            Change {
+                object: plane,
+                prop: Prop::SrcH as u32,
+                value: (h as u64) << 16,
+            },
+            Change {
+                object: plane,
+                prop: Prop::CrtcW as u32,
+                value: w as u64,
+            },
+            Change {
+                object: plane,
+                prop: Prop::CrtcH as u32,
+                value: h as u64,
+            },
         ]);
     }
     if flags & CURSOR_MOVE != 0 {
-        changes.push(Change { object: plane, prop: Prop::CrtcX as u32, value: arg.i32(8) as i64 as u64 });
-        changes.push(Change { object: plane, prop: Prop::CrtcY as u32, value: arg.i32(12) as i64 as u64 });
+        changes.push(Change {
+            object: plane,
+            prop: Prop::CrtcX as u32,
+            value: arg.i32(8) as i64 as u64,
+        });
+        changes.push(Change {
+            object: plane,
+            prop: Prop::CrtcY as u32,
+            value: arg.i32(12) as i64 as u64,
+        });
     }
     commit(c.device, c.file, &changes, ATOMIC_NONBLOCK, 0)
 }
@@ -1388,7 +1663,11 @@ pub(crate) fn set_property(c: &Caller, object: u32, prop: u32, value: u64) -> Re
             return Err(VfsError::InvalidArgument);
         }
         let has_mode = c.device.kms.lock().config.crtcs[pipe].mode.is_some();
-        let mut changes = vec![Change { object, prop, value }];
+        let mut changes = vec![Change {
+            object,
+            prop,
+            value,
+        }];
         if has_mode {
             changes.push(Change {
                 object: object_id(pipe, KIND_CRTC),
@@ -1398,7 +1677,17 @@ pub(crate) fn set_property(c: &Caller, object: u32, prop: u32, value: u64) -> Re
         }
         return commit(c.device, c.file, &changes, ATOMIC_ALLOW_MODESET, 0);
     }
-    commit(c.device, c.file, &[Change { object, prop, value }], ATOMIC_ALLOW_MODESET, 0)
+    commit(
+        c.device,
+        c.file,
+        &[Change {
+            object,
+            prop,
+            value,
+        }],
+        ATOMIC_ALLOW_MODESET,
+        0,
+    )
 }
 
 /// DRM_IOCTL_MODE_ATOMIC.
@@ -1420,7 +1709,11 @@ pub(crate) fn atomic(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError> {
     let mut index = 0;
     for (object, count) in objects.iter().zip(counts) {
         for _ in 0..count {
-            changes.push(Change { object: *object, prop: props[index], value: values[index] });
+            changes.push(Change {
+                object: *object,
+                prop: props[index],
+                value: values[index],
+            });
             index += 1;
         }
     }

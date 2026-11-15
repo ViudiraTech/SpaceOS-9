@@ -44,7 +44,7 @@ pub unsafe extern "C" fn spk_sysfb_get(out: *mut Sysfb) -> c_int {
     if out.is_null() {
         return -(crate::vfs::abi::EINVAL as c_int);
     }
-    if crate::gpu::device().is_some() {
+    if drm::firmware_fb_claimed() {
         return -(crate::vfs::abi::EBUSY as c_int);
     }
     let Some(fb) = crate::boot::framebuffer() else {
@@ -99,7 +99,13 @@ pub struct DisplayOps {
     enable: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     disable: Option<unsafe extern "C" fn(*mut c_void)>,
     update: Option<
-        unsafe extern "C" fn(*mut c_void, *const DisplayFb, *const drm::Rect, *const drm::Rect, c_uint),
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const DisplayFb,
+            *const drm::Rect,
+            *const drm::Rect,
+            c_uint,
+        ),
     >,
     lastclose: Option<unsafe extern "C" fn(*mut c_void)>,
 }
@@ -127,7 +133,12 @@ fn errno(result: c_int) -> Result<(), VfsError> {
 }
 
 impl Driver for HalDriver {
-    fn check(&self, _pipe: usize, _mode: Option<&Mode>, update: &PlaneUpdate) -> Result<(), VfsError> {
+    fn check(
+        &self,
+        _pipe: usize,
+        _mode: Option<&Mode>,
+        update: &PlaneUpdate,
+    ) -> Result<(), VfsError> {
         match (self.ops.check, update.framebuffer) {
             // SAFETY: driver callback with its own private pointer.
             (Some(check), Some(fb)) => errno(unsafe { check(self.private, fb.format) }),
@@ -139,7 +150,10 @@ impl Driver for HalDriver {
         // SAFETY: as above.
         unsafe {
             match mode {
-                Some(_) => self.ops.enable.map_or(Ok(()), |enable| errno(enable(self.private))),
+                Some(_) => self
+                    .ops
+                    .enable
+                    .map_or(Ok(()), |enable| errno(enable(self.private))),
                 None => {
                     if let Some(disable) = self.ops.disable {
                         disable(self.private);
@@ -154,8 +168,10 @@ impl Driver for HalDriver {
         let (Some(fb), Some(callback)) = (update.framebuffer, self.ops.update) else {
             return Ok(());
         };
+        // HAL devices allocate shmem dumb buffers, which are CPU mapped.
+        let pixels = fb.pixels().ok_or(VfsError::InvalidArgument)?;
         let view = DisplayFb {
-            pixels: fb.pixels().cast(),
+            pixels: pixels.cast(),
             pitch: fb.pitch,
             format: fb.format,
             width: fb.width,
@@ -215,19 +231,24 @@ pub unsafe extern "C" fn spk_display_register(
         return core::ptr::null_mut();
     }
     // SAFETY: caller contract.
-    let formats: Vec<u32> = unsafe { core::slice::from_raw_parts(formats, count as usize) }.to_vec();
+    let formats: Vec<u32> =
+        unsafe { core::slice::from_raw_parts(formats, count as usize) }.to_vec();
     let fixed = Mode::fixed(
         mode.width.min(u16::MAX as u32) as u16,
         mode.height.min(u16::MAX as u32) as u16,
-        if mode.refresh_hz == 0 { 60 } else { mode.refresh_hz },
+        if mode.refresh_hz == 0 {
+            60
+        } else {
+            mode.refresh_hz
+        },
     );
-    let config = DeviceConfig {
-        name: text(name),
-        description: text(description),
-        date: String::from("20261115"),
-        version: (1, 0, 0),
-        pipes: alloc::vec![PipeConfig {
+    let mut config = DeviceConfig::new(
+        &text(name),
+        &text(description),
+        "20261115",
+        alloc::vec![PipeConfig {
             connector_type: ConnectorType::Unknown,
+            connected: true,
             modes: alloc::vec![fixed],
             width_mm: mode.width_mm,
             height_mm: mode.height_mm,
@@ -235,13 +256,13 @@ pub unsafe extern "C" fn spk_display_register(
             formats,
             cursor: None,
         }],
-        // A fixed scanout size, as simpledrm: framebuffers may be larger
-        // (panning via SRC_X/Y) but not smaller than the mode.
-        min_size: (mode.width, mode.height),
-        max_size: (mode.width.max(4096), mode.height.max(4096)),
-        prefer_shadow: flags & DISPLAY_PREFER_SHADOW != 0,
-        takes_over_console: flags & DISPLAY_TAKES_CONSOLE != 0,
-    };
+    );
+    // A fixed scanout size, as simpledrm: framebuffers may be larger
+    // (panning via SRC_X/Y) but not smaller than the mode.
+    config.min_size = (mode.width, mode.height);
+    config.max_size = (mode.width.max(4096), mode.height.max(4096));
+    config.prefer_shadow = flags & DISPLAY_PREFER_SHADOW != 0;
+    config.takes_over_console = flags & DISPLAY_TAKES_CONSOLE != 0;
     let driver = Arc::new(HalDriver { ops: *ops, private });
     match drm::register(config, driver) {
         Ok(device) => Box::into_raw(Box::new(DisplayHandle { device })),

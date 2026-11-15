@@ -67,7 +67,7 @@ pub fn spawn_late() {
             crate::vfs::dcache::self_test();
             crate::user::self_test::syscalls();
             crate::user::self_test::ipc_advanced();
-            let gpu_status = crate::gpu::self_test::run();
+            let gpu_status = crate::drm::virtio::self_test::run();
             let drm_status = crate::drm::self_test::run();
             #[cfg(all(feature = "sound", feature = "sound-dummy"))]
             let sound_status = crate::sound::self_test::run_late();
