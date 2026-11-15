@@ -547,7 +547,7 @@ pub(crate) struct Task {
     pub vfork_done: Option<Arc<super::Completion>>,
     pub(crate) context: UnsafeCell<arch::Context>,
     pub(crate) fpu_state: UnsafeCell<Option<fpu::State>>,
-    pub(crate) entry: Option<Box<dyn FnOnce() + Send>>,
+    pub(crate) entry: Option<Entry>,
     pub(crate) stack: Option<KernelStack>,
     pub(crate) address_space: Option<Arc<Mutex<crate::user::UserAddressSpace>>>,
     pub(crate) fd_table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>,
@@ -615,14 +615,14 @@ impl Task {
         self.exit_code = code;
     }
     pub(crate) fn create(
-        entry: Option<Box<dyn FnOnce() + Send>>,
+        entry: Option<Entry>,
         cpu: usize,
         affinity: CpuMask,
     ) -> Result<TaskRef, &'static str> {
         Self::create_with_fds(entry, cpu, affinity, None)
     }
     pub(crate) fn create_with_fds(
-        entry: Option<Box<dyn FnOnce() + Send>>,
+        entry: Option<Entry>,
         cpu: usize,
         affinity: CpuMask,
         fd_table: Option<Arc<SpinLock<crate::vfs::FileDescriptorTable>>>,
@@ -710,7 +710,7 @@ impl Task {
     /// Create a Linux user task with identity, shared resources and address
     /// space installed before the task can run on another CPU.
     pub(crate) fn create_user(
-        entry: Box<dyn FnOnce() + Send>,
+        entry: Entry,
         cpu: usize,
         affinity: CpuMask,
         spec: UserTaskSpec,
@@ -808,6 +808,40 @@ pub(crate) struct UserTaskSpec {
     /// Set for CLONE_VFORK children before they can run.
     pub vfork_done: Option<Arc<super::Completion>>,
 }
+/// A task's first code: a monomorphized runner and its boxed closure.
+///
+/// Calling a `Box<dyn FnOnce()>` frees the box only after the closure
+/// returns, and user-mode entry closures never return, so every fork leaked
+/// its closure allocation. The runner instead moves the closure onto the
+/// stack, which frees the box, before calling it.
+pub(crate) struct Entry {
+    run: unsafe fn(*mut ()),
+    closure: *mut (),
+}
+
+// SAFETY: built only from `Send` closures and run exactly once by the task.
+unsafe impl Send for Entry {}
+
+impl Entry {
+    pub(crate) fn new<F: FnOnce() + Send + 'static>(closure: F) -> Self {
+        unsafe fn run<F: FnOnce()>(closure: *mut ()) {
+            // SAFETY: `closure` came from Box::into_raw::<F> in `new` and is
+            // consumed once; the box is freed at the end of this statement.
+            let closure: F = *unsafe { Box::from_raw(closure.cast::<F>()) };
+            closure();
+        }
+        Self {
+            run: run::<F>,
+            closure: Box::into_raw(Box::new(closure)).cast(),
+        }
+    }
+
+    fn call(self) {
+        // SAFETY: `run` matches the type `closure` was created from.
+        unsafe { (self.run)(self.closure) }
+    }
+}
+
 extern "C" fn task_entry() -> ! {
     super::finish_switch();
     let entry = super::current()
@@ -817,6 +851,6 @@ extern "C" fn task_entry() -> ! {
         .take()
         .expect("task entered twice");
     arch::enable_interrupts();
-    entry();
+    entry.call();
     super::exit(0)
 }

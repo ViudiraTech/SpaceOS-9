@@ -365,7 +365,7 @@ pub fn spawn_with_fds(
     let sched = try_scheduler().ok_or("scheduler not initialized")?;
     let cpu = loadbalance::select_cpu(sched, affinity, smp::current_cpu())
         .ok_or("no online CPU in affinity")?;
-    let task = Task::create_with_fds(Some(Box::new(entry)), cpu, affinity, fd_table)?;
+    let task = Task::create_with_fds(Some(task::Entry::new(entry)), cpu, affinity, fd_table)?;
     let tid = {
         let mut guard = task.lock();
         guard.nice = nice.clamp(-20, 19);
@@ -387,7 +387,7 @@ pub(crate) fn spawn_user(
     let sched = try_scheduler().ok_or("scheduler not initialized")?;
     let cpu = loadbalance::select_cpu(sched, affinity, smp::current_cpu())
         .ok_or("no online CPU in affinity")?;
-    let task = Task::create_user(Box::new(entry), cpu, affinity, spec)?;
+    let task = Task::create_user(task::Entry::new(entry), cpu, affinity, spec)?;
     {
         let mut guard = task.lock();
         guard.nice = nice.clamp(-20, 19);
@@ -1022,7 +1022,7 @@ fn spawn_placed(
     nice: i32,
     affinity: CpuMask,
 ) -> Result<u64, &'static str> {
-    let task = Task::create(Some(Box::new(entry)), cpu, affinity)?;
+    let task = Task::create(Some(task::Entry::new(entry)), cpu, affinity)?;
     let tid = {
         let mut guard = task.lock();
         guard.nice = nice.clamp(-20, 19);

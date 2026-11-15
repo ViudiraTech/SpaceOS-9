@@ -83,9 +83,10 @@ class StalledBoot(Exception):
     """QEMU printed nothing at all: the firmware stalled before the kernel."""
 
 
-# Firmware and kernel print within a second; silence this long means QEMU or
-# OVMF hung before SpaceKernel ran (seen occasionally under TCG).
-FIRST_OUTPUT_SECONDS = 60
+# No output for this long: before the kernel starts it means QEMU/OVMF hung
+# (seen occasionally under TCG, sometimes after a few escape sequences), so
+# the boot is retried; once the kernel runs it means the benchmark hung.
+SILENCE_SECONDS = 90
 
 
 def boot_once(arch: str, iso: pathlib.Path, cpus: int, memory: int, timeout: float,
@@ -103,7 +104,8 @@ def boot_once(arch: str, iso: pathlib.Path, cpus: int, memory: int, timeout: flo
     started = time.monotonic()
     deadline = started + timeout
     pending = b""
-    seen_output = False
+    last_activity = started
+    kernel_started = False
     with open(log, "w") as transcript:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    stdin=subprocess.DEVNULL)
@@ -115,14 +117,17 @@ def boot_once(arch: str, iso: pathlib.Path, cpus: int, memory: int, timeout: flo
                 now = time.monotonic()
                 if now > deadline:
                     break
-                if not seen_output and now - started > FIRST_OUTPUT_SECONDS:
-                    raise StalledBoot()
+                if now - last_activity > SILENCE_SECONDS:
+                    if not kernel_started:
+                        raise StalledBoot()
+                    break
                 if not selector.select(timeout=0.5):
                     continue
                 chunk = process.stdout.read1(4096)
                 if not chunk:
                     break
-                seen_output = True
+                last_activity = time.monotonic()
+                kernel_started = kernel_started or b"SpaceKernel" in chunk or b"BENCH" in chunk
                 pending += chunk
                 *lines, pending = pending.split(b"\n")
                 for raw in lines:
@@ -152,7 +157,7 @@ def boot(arch: str, iso: pathlib.Path, cpus: int, memory: int, timeout: float,
         try:
             return boot_once(arch, iso, cpus, memory, timeout, accel, log)
         except StalledBoot:
-            print(f"-- QEMU printed nothing for {FIRST_OUTPUT_SECONDS}s "
+            print(f"-- QEMU silent for {SILENCE_SECONDS}s before the kernel started "
                   f"(firmware stall, attempt {attempt + 1}); retrying", flush=True)
     raise SystemExit(f"QEMU stalled before the kernel on every attempt; see {log}")
 

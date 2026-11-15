@@ -585,6 +585,11 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
                 crate::arch::disable_interrupts();
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             }
+            // enter_user_context never returns, so a capture still alive here
+            // is never dropped: this Arc kept every exited child's address
+            // space (page tables and private pages) allocated forever. The
+            // task's own reference keeps the space alive.
+            drop(child_space_for_tid);
             // SAFETY: the child owns this address space and the captured user
             // context; it never returns to kernel mode here.
             unsafe { crate::arch::syscall::enter_user_context(&child_context) }

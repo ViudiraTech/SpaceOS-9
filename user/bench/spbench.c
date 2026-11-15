@@ -642,7 +642,14 @@ int main(int argc, char **argv)
 	for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
 		if (filter && !strstr(filter, tests[i].name))
 			continue;
+		long before = mem_free_kib();
 		tests[i].fn();
+		long after = mem_free_kib();
+		if (before >= 0 && after >= 0) {
+			char label[48];
+			snprintf(label, sizeof(label), "memlost_%s", tests[i].name);
+			report(label, (double)(before - after), "KiB");
+		}
 	}
 	long free_after = mem_free_kib();
 	if (free_before >= 0 && free_after >= 0) {
