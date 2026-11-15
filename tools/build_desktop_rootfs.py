@@ -77,10 +77,22 @@ PACKAGES = [
     "fastfetch",
 ]
 WALLPAPERS = (
-    ("alpine-peaks.jpg", "https://picsum.photos/id/29/1920/1200.jpg"),
-    ("misty-pines.jpg", "https://picsum.photos/id/10/1920/1200.jpg"),
-    ("coastal-horizon.jpg", "https://picsum.photos/id/16/1920/1200.jpg"),
-    ("emerald-forest.jpg", "https://picsum.photos/id/28/1920/1200.jpg"),
+    (
+        "alpine-peaks.jpg",
+        "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?w=1920&h=1200&fit=crop&fm=jpg&q=85",
+    ),
+    (
+        "misty-pines.jpg",
+        "https://images.unsplash.com/photo-1506744038136-46273834b3fb?w=1920&h=1200&fit=crop&fm=jpg&q=85",
+    ),
+    (
+        "coastal-horizon.jpg",
+        "https://images.unsplash.com/photo-1589969047472-e0a396a46418?w=1920&h=1200&fit=crop&fm=jpg&q=85",
+    ),
+    (
+        "emerald-forest.jpg",
+        "https://images.unsplash.com/photo-1690818724100-79eb61f715f6?w=1920&h=1200&fit=crop&fm=jpg&q=85",
+    ),
 )
 BREEZE_ICONS = {
     "terminal": "usr/share/icons/breeze/apps/48/utilities-terminal.svg",
@@ -476,21 +488,46 @@ def install_spui_assets() -> None:
 
     wallpaper_cache = ROOT / "build" / "downloads" / "wallpapers"
     wallpaper_cache.mkdir(parents=True, exist_ok=True)
+    wp_manifest_path = wallpaper_cache / ".manifest.json"
+    try:
+        wp_manifest = json.loads(wp_manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(wp_manifest, dict):
+            wp_manifest = {}
+    except (OSError, json.JSONDecodeError):
+        wp_manifest = {}
+
     for filename, url in WALLPAPERS:
         cached = wallpaper_cache / filename
-        if not cached.exists():
+        entry = wp_manifest.get(filename)
+        needs_fetch = (
+            not cached.exists()
+            or not isinstance(entry, dict)
+            or entry.get("url") != url
+            or entry.get("fallback", True)
+        )
+        if needs_fetch:
             log(f"fetching wallpaper {filename}")
             req = urllib.request.Request(url, headers={"User-Agent": "SpaceOS-Build/9.0"})
             temp = cached.with_suffix(".jpg.part")
             try:
                 with urllib.request.urlopen(req, timeout=15) as resp, open(temp, "wb") as out:
                     shutil.copyfileobj(resp, out)
+                with open(temp, "rb") as check_f:
+                    magic = check_f.read(3)
+                if magic != b"\xff\xd8\xff":
+                    raise OSError(f"unexpected JPEG header {magic!r}")
                 temp.rename(cached)
+                wp_manifest[filename] = {"url": url, "fallback": False}
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 temp.unlink(missing_ok=True)
                 log(f"warning: failed to fetch {filename} ({exc}); generating fallback wallpaper")
                 generate_fallback_wallpaper(filename, cached)
+                wp_manifest[filename] = {"url": url, "fallback": True}
         install_binary(cached, f"/usr/share/spui/wallpapers/{filename}", 0o644)
+
+    wp_manifest_path.write_text(
+        json.dumps(wp_manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
     logo = ROOT / "docs" / "SpaceOS9.png"
     if logo.exists():

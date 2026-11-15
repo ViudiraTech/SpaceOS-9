@@ -9,7 +9,7 @@
  */
 
 //! Loads and caches KDE Breeze multi-color & symbolic SVGs (`/usr/share/spui/icons/breeze/`),
-//! the official `SpaceOS9.png` logo (`/usr/share/spui/logo.png`) and `picsum.photos`
+//! the official `SpaceOS9.png` logo (`/usr/share/spui/logo.png`) and Unsplash
 //! landscape JPEGs (`/usr/share/spui/wallpapers/`).
 
 use crate::draw::{Canvas, Rect, Sprite};
