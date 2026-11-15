@@ -623,6 +623,22 @@ impl Gpu {
         self.console_visible.store(true, Ordering::Release);
         Ok(())
     }
+    /// While the text console owns the display, its framebuffer is flushed to
+    /// the host at display refresh rate (deferred I/O); with a DRM master the
+    /// service thread needs no timer at all.
+    fn console_refresh_deadline(&self) -> Option<u64> {
+        if self.transport.failed.load(Ordering::Acquire) || self.master.load(Ordering::Acquire) != 0
+        {
+            return None;
+        }
+        Some(
+            self.console_tick
+                .load(Ordering::Relaxed)
+                .saturating_add(16_000)
+                .max(crate::time::uptime_micros().saturating_add(1_000)),
+        )
+    }
+
     fn console_service(&self) {
         if self.transport.failed.load(Ordering::Acquire) {
             return;
@@ -766,6 +782,8 @@ impl Drop for Resource {
                 host: self.host.as_ref().map(|h| (h.offset, self.size, h.kernel)),
                 context: false,
             });
+            // The service thread releases host resources.
+            syncobj::fence_event();
         }
     }
 }
@@ -885,6 +903,7 @@ impl Inode for DeviceNode {
             id,
             render: self.render,
             busy: AtomicBool::new(false),
+            busy_wait: crate::sched::WaitQueue::new(),
             state: SpinLock::new(Some(SessionState::new())),
             events: Arc::new(SpinLock::new(VecDeque::new())),
             pending_events: SpinLock::new(Vec::new()),
@@ -898,7 +917,11 @@ pub struct Session {
     pub gpu: Arc<Gpu>,
     pub id: u64,
     pub render: bool,
+    /// Serializes ioctls on one DRM file. A contender sleeps on `busy_wait`
+    /// and the releaser wakes one, like a mutex that `unlocked` can drop and
+    /// retake around blocking work.
     busy: AtomicBool,
+    busy_wait: crate::sched::WaitQueue,
     state: SpinLock<Option<SessionState>>,
     events: Arc<SpinLock<VecDeque<Vec<u8>>>>,
     pending_events: SpinLock<Vec<Arc<syncobj::Fence>>>,
@@ -958,18 +981,32 @@ impl SessionState {
     }
 }
 impl Session {
-    pub fn unlocked<R>(&self, state: &mut SessionState, work: impl FnOnce() -> R) -> R {
-        let local = core::mem::replace(state, SessionState::new());
-        *self.state.lock() = Some(local);
-        self.busy.store(false, Ordering::Release);
-        let result = work();
+    fn acquire_busy(&self) {
         while self
             .busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            crate::sched::sleep_micros(100);
+            if crate::sched::current().is_some() {
+                self.busy_wait
+                    .wait_until(|| !self.busy.load(Ordering::Acquire));
+            } else {
+                core::hint::spin_loop();
+            }
         }
+    }
+
+    fn release_busy(&self) {
+        self.busy.store(false, Ordering::Release);
+        self.busy_wait.wake_one();
+    }
+
+    pub fn unlocked<R>(&self, state: &mut SessionState, work: impl FnOnce() -> R) -> R {
+        let local = core::mem::replace(state, SessionState::new());
+        *self.state.lock() = Some(local);
+        self.release_busy();
+        let result = work();
+        self.acquire_busy();
         *state = self
             .state
             .lock()
@@ -1085,6 +1122,8 @@ impl Session {
                 {
                     return Err(VfsError::PermissionDenied);
                 }
+                // The text console takes the display back: restart its refresh.
+                syncobj::fence_event();
                 Ok(())
             }
             0x2d => {
@@ -1422,23 +1461,13 @@ impl Inode for Session {
         if trace {
             crate::kinfo!("drm: enter nr={:#04x} arg={:#x}", cmd as u8, address);
         }
-        while self
-            .busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            if crate::sched::current().is_some() {
-                crate::sched::sleep_micros(100);
-            } else {
-                core::hint::spin_loop();
-            }
-        }
+        self.acquire_busy();
         let mut state = self.state.lock().take().expect("DRM session serialized");
         let result = self.dispatch(&mut state, cmd as u8, &mut arg);
         let handles = state.handles.clone();
         *self.map_handles.lock() = handles;
         *self.state.lock() = Some(state);
-        self.busy.store(false, Ordering::Release);
+        self.release_busy();
         if trace {
             crate::kinfo!("drm: exit nr={:#04x} -> {:?}", cmd as u8, result);
         }
@@ -1525,6 +1554,7 @@ impl Drop for Session {
                     host: None,
                     context: true,
                 });
+                syncobj::fence_event();
             }
         }
     }
@@ -1694,8 +1724,12 @@ pub fn start() {
     if let Some(gpu) = device() {
         let _ = crate::sched::spawn(
             move || loop {
+                // Fence completions, queued KMS commits and retired resources
+                // all post a fence event; read it before servicing so none is
+                // missed.
+                let seen = syncobj::fence_events();
                 gpu.service();
-                crate::sched::sleep_micros(1000);
+                syncobj::wait_fence_event(seen, gpu.console_refresh_deadline());
             },
             0,
         );

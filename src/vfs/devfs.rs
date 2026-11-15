@@ -260,7 +260,12 @@ impl Inode for SpecialCharInode {
                 Ok(buf.len())
             }
             SpecialCharKind::Urandom => {
-                crate::random::fill(buf)?;
+                // /dev/random (minor 8) waits for CRNG initialization;
+                // /dev/urandom (minor 9) never blocks, as on Linux.
+                if self.rdev == (1 << 8) | 8 {
+                    crate::random::wait_ready(false)?;
+                }
+                crate::random::get_random_bytes(buf);
                 Ok(buf.len())
             }
         }

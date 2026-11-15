@@ -96,6 +96,8 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
         }
     }
     UserAddressSpace::activate_shared(&space);
+    // The new image no longer borrows a vfork parent's address space.
+    task.complete_vfork();
     drop(old);
     // enter_user_mode never returns, so anything still owned by this frame would
     // never be dropped; a leaked space would keep every page of this image alive.
@@ -199,34 +201,44 @@ pub fn ppoll(pointer: u64, count: u64, timeout: u64, sigmask: u64, setsize: u64)
     };
     poll(pointer, count, millis)
 }
+/// `getrandom(2)` with Linux 5.18+ semantics: block until the CRNG is
+/// initialized unless GRND_NONBLOCK (EAGAIN) or GRND_INSECURE is given.
+/// GRND_RANDOM is accepted and behaves like the default pool.
 pub fn getrandom(pointer: u64, count: usize, flags: u32) -> i64 {
-    if flags & !3 != 0 {
+    const GRND_NONBLOCK: u32 = 1;
+    const GRND_RANDOM: u32 = 2;
+    const GRND_INSECURE: u32 = 4;
+    /// Linux caps one call at MAX_RW_COUNT >> 8 ... keep a generous bound.
+    const MAX_BYTES: usize = 32 << 20;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
+        || flags & (GRND_INSECURE | GRND_RANDOM) == (GRND_INSECURE | GRND_RANDOM)
+    {
         return -abi::EINVAL;
     }
-    let length = count.min(65536);
+    let length = count.min(MAX_BYTES);
     if let Err(e) = uaccess::check(pointer, length, true) {
         return e.to_errno();
     }
     if length == 0 {
         return 0;
     }
-    if !crate::random::supported() {
-        return VfsError::WouldBlock.to_errno();
+    if flags & GRND_INSECURE == 0
+        && let Err(error) = crate::random::wait_ready(flags & GRND_NONBLOCK != 0)
+    {
+        return error.to_errno();
     }
-    let mut bytes = alloc::vec![0; length];
-    for _ in 0..64 {
-        match crate::random::fill(&mut bytes) {
-            Ok(()) => {
-                return match uaccess::write(pointer, &bytes) {
-                    Ok(()) => length as i64,
-                    Err(e) => e.to_errno(),
-                };
-            }
-            Err(VfsError::WouldBlock) if flags & 1 == 0 => sched::sleep_micros(1000),
-            Err(e) => return e.to_errno(),
+    let mut chunk = [0u8; 4096];
+    let mut done = 0;
+    while done < length {
+        let take = (length - done).min(chunk.len());
+        crate::random::get_random_bytes(&mut chunk[..take]);
+        if let Err(e) = uaccess::write(pointer + done as u64, &chunk[..take]) {
+            return if done == 0 { e.to_errno() } else { done as i64 };
         }
+        done += take;
     }
-    VfsError::WouldBlock.to_errno()
+    chunk.fill(0);
+    length as i64
 }
 
 /// Return the parent task id of the current process.
@@ -296,7 +308,10 @@ pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
         }
     };
     let mut rechecked = false;
+    let signals = current.signals();
     loop {
+        // Read before scanning: a child event after this point ends the wait.
+        let seen = signals.child_events();
         for zombie in crate::sched::zombies() {
             let stats = zombie.stats();
             if stats.ppid != parent
@@ -395,7 +410,8 @@ pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
             return -abi::EINTR;
         }
         rechecked = false;
-        crate::sched::sleep_micros(1000);
+        // An interrupted wait loops back to the signal check above.
+        let _ = signals.wait_child_event(seen);
     }
 }
 
@@ -536,7 +552,9 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
     };
     let child_space_for_tid = child_space.clone();
 
+    let vfork_done = (flags & CLONE_VFORK != 0).then(|| Arc::new(crate::sched::Completion::new()));
     let spec = crate::sched::UserTaskSpec {
+        vfork_done: vfork_done.clone(),
         tgid,
         ltid,
         ppid,
@@ -578,21 +596,10 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
     match result {
         Ok(_) => {
             crate::syscall::inherit_limits(parent_stats.tgid, tgid);
-            if flags & CLONE_VFORK != 0 {
+            if let Some(done) = &vfork_done {
                 // The parent stays suspended until the child gives the address
-                // space back, by exec or by exit.
-                // `ltid` is the Linux thread id; `find_task` takes the kernel tid.
-                // Mixing them up finds the parent itself whenever the two id
-                // spaces collide, which suspended it forever.
-                while let Some(child) = crate::sched::find_by_ltid(ltid) {
-                    let shared = child
-                        .address_space()
-                        .is_some_and(|space| Arc::ptr_eq(&space, &parent_space));
-                    if !shared {
-                        break;
-                    }
-                    crate::sched::sleep_micros(50);
-                }
+                // space back, by exec or by exit (both complete `vfork_done`).
+                done.wait();
             }
             ltid as i64
         }
@@ -755,7 +762,10 @@ pub fn waitid(idtype: u32, id: u32, info: u64, options: u32, rusage: u64) -> i64
         }
     };
     let mut rechecked = false;
+    let signals = current.signals();
     loop {
+        // Read before scanning: a child event after this point ends the wait.
+        let seen = signals.child_events();
         if options & WEXITED != 0 {
             for zombie in crate::sched::zombies() {
                 let stats = zombie.stats();
@@ -866,7 +876,8 @@ pub fn waitid(idtype: u32, id: u32, info: u64, options: u32, rusage: u64) -> i64
             return -abi::EINTR;
         }
         rechecked = false;
-        crate::sched::sleep_micros(1000);
+        // An interrupted wait loops back to the signal check above.
+        let _ = signals.wait_child_event(seen);
     }
 }
 
@@ -914,6 +925,15 @@ struct IntervalTimer {
 static ALARMS: SpinLock<alloc::collections::BTreeMap<u64, IntervalTimer>> =
     SpinLock::new(alloc::collections::BTreeMap::new());
 static ALARM_THREAD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Bumped by setitimer; the alarm thread parks until the earliest expiry or
+/// until the set of timers changes.
+static ALARM_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ALARM_WAIT: sched::WaitQueueHead = sched::WaitQueueHead::new();
+
+fn alarms_changed() {
+    ALARM_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    ALARM_WAIT.wake_all();
+}
 
 fn start_alarm_thread() {
     if ALARM_THREAD.swap(true, core::sync::atomic::Ordering::AcqRel) {
@@ -922,7 +942,21 @@ fn start_alarm_thread() {
     let _ = sched::spawn(
         || {
             loop {
-                sched::sleep_micros(1000);
+                let seen = ALARM_GENERATION.load(core::sync::atomic::Ordering::Acquire);
+                let next = ALARMS
+                    .lock()
+                    .values()
+                    .map(|timer| timer.expiry)
+                    .filter(|&expiry| expiry != 0)
+                    .min();
+                if next.is_none_or(|next| next > crate::time::uptime_micros()) {
+                    ALARM_WAIT.wait_event(
+                        || ALARM_GENERATION.load(core::sync::atomic::Ordering::Acquire) != seen,
+                        false,
+                        next,
+                    );
+                    continue;
+                }
                 let now = crate::time::uptime_micros();
                 let mut fired = alloc::vec::Vec::new();
                 {
@@ -998,6 +1032,7 @@ pub fn setitimer(which: u32, new_value: u64, old_value: u64) -> i64 {
         previous
     };
     start_alarm_thread();
+    alarms_changed();
     if old_value != 0 {
         return match uaccess::write_value(old_value, &previous) {
             Ok(()) => 0,
@@ -1037,5 +1072,6 @@ pub fn alarm(seconds: u32) -> i64 {
     }
     drop(alarms);
     start_alarm_thread();
+    alarms_changed();
     previous as i64
 }

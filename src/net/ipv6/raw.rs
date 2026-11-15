@@ -115,6 +115,9 @@ struct State {
 }
 
 struct Raw6Inner {
+    /// Bumped by `notify` when a packet is queued.
+    events: AtomicU64,
+    wait: crate::sched::WaitQueue,
     ino: u64,
     protocol: u8,
     is_ping: bool,
@@ -126,6 +129,24 @@ struct Raw6Inner {
     bound_ifindex: AtomicU32,
     peer: SpinLock<Option<(Ipv6Addr, u16, u32)>>,
     state: SpinLock<State>,
+}
+
+impl Raw6Inner {
+    /// Wake blocked receivers and poll/epoll waiters of this socket only.
+    fn notify(&self) {
+        self.events.fetch_add(1, Ordering::AcqRel);
+        self.wait.wake_all();
+        crate::ipc::wake_object(self as *const Self);
+    }
+
+    /// Sleep until `notify` after `seen`, the deadline, or a signal.
+    fn wait_change(&self, seen: u64, deadline: Option<u64>) {
+        let _ = self.wait.wait_event(
+            || self.events.load(Ordering::Acquire) != seen,
+            true,
+            deadline,
+        );
+    }
 }
 
 pub struct Raw6Socket {
@@ -164,6 +185,8 @@ impl Raw6Socket {
 
     fn new_inner(protocol: u8, is_ping: bool, nonblock: bool) -> Result<Arc<Self>, VfsError> {
         let inner = Arc::new(Raw6Inner {
+            events: AtomicU64::new(0),
+            wait: crate::sched::WaitQueue::new(),
             ino: vfs::tree::ino(),
             protocol,
             is_ping,
@@ -379,6 +402,7 @@ impl Raw6Socket {
         let deadline =
             (timeout_us != 0).then(|| crate::time::uptime_micros().saturating_add(timeout_us));
         loop {
+            let seen = self.inner.events.load(Ordering::Acquire);
             {
                 let mut state = self.inner.state.lock();
                 if let Some(error) = state.error.take() {
@@ -464,7 +488,7 @@ impl Raw6Socket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            self.inner.wait_change(seen, deadline);
         }
     }
 
@@ -877,6 +901,7 @@ impl Raw6Socket {
         let deadline =
             (timeout_us != 0).then(|| crate::time::uptime_micros().saturating_add(timeout_us));
         loop {
+            let seen = self.inner.events.load(Ordering::Acquire);
             {
                 let mut state = self.inner.state.lock();
                 if let Some(error) = state.error.take() {
@@ -904,7 +929,7 @@ impl Raw6Socket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            self.inner.wait_change(seen, deadline);
         }
     }
 
@@ -1038,11 +1063,12 @@ pub fn deliver(dev: &Arc<NetDevice>, meta: &Ip6Meta, skb: &SkBuff) {
                 timestamp_us,
             });
             delivered = true;
+            drop(state);
+            inner.notify();
         }
     }
     if delivered {
         DELIVERED.fetch_add(1, Ordering::Relaxed);
-        crate::ipc::wake_pollers();
     }
 }
 

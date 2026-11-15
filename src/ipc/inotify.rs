@@ -66,6 +66,8 @@ struct State {
 pub struct Inotify {
     state: SpinLock<State>,
     ino: u64,
+    /// Readers blocked on an empty event queue.
+    wait: crate::sched::WaitQueue,
 }
 
 static INSTANCES: SpinLock<Vec<Weak<Inotify>>> = SpinLock::new(Vec::new());
@@ -81,6 +83,7 @@ impl Inotify {
                 nonblock,
             }),
             ino: vfs::tree::ino(),
+            wait: crate::sched::WaitQueue::new(),
         });
         let mut instances = INSTANCES.lock();
         instances.retain(|weak| weak.strong_count() != 0);
@@ -140,6 +143,8 @@ impl Inotify {
             mask: IN_IGNORED,
             name: String::new(),
         });
+        drop(state);
+        self.wait.wake_all();
         Ok(())
     }
 
@@ -214,6 +219,7 @@ pub fn notify(path: &str, mask: u32) {
     let instances: Vec<Arc<Inotify>> = INSTANCES.lock().iter().filter_map(Weak::upgrade).collect();
     for instance in instances {
         instance.record(&directory, &name, path, mask);
+        instance.wait.wake_all();
     }
     crate::ipc::wake_pollers();
 }
@@ -247,10 +253,10 @@ impl Inode for Inotify {
                     return Err(VfsError::WouldBlock);
                 }
             }
-            if crate::signal::pending_for_current() {
+            let ready = || !self.state.lock().queue.is_empty();
+            if self.wait.wait_interruptible(ready) == crate::sched::WaitResult::Interrupted {
                 return Err(VfsError::Interrupted);
             }
-            crate::sched::sleep_micros(1000);
         }
     }
 

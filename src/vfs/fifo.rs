@@ -30,11 +30,7 @@ pub struct FifoInode {
 impl FifoInode {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            shared: Arc::new(SpinLock::new(PipeBuffer {
-                queue: Default::default(),
-                readers: 0,
-                writers: 0,
-            })),
+            shared: Arc::new(SpinLock::new(PipeBuffer::new(0, 0))),
             ino: super::tree::ino(),
         })
     }
@@ -143,6 +139,7 @@ impl Drop for FifoEndInode {
         if self.can_write {
             pipe.writers = pipe.writers.saturating_sub(1);
         }
-        crate::ipc::poll_kick();
+        drop(pipe);
+        super::fd::pipe_ends_changed(&self.shared);
     }
 }

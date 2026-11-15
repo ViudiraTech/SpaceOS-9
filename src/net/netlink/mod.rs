@@ -325,6 +325,9 @@ pub struct NetlinkSocket {
     ino: u64,
     state: SpinLock<State>,
     me: Weak<NetlinkSocket>,
+    /// Bumped by `notify` when a message or error is queued.
+    events: core::sync::atomic::AtomicU64,
+    wait: crate::sched::WaitQueue,
 }
 
 /// Rover for portids taken by autobind (`netlink_autobind`): starts at
@@ -363,6 +366,8 @@ impl NetlinkSocket {
                 dumping: false,
             }),
             me: me.clone(),
+            events: core::sync::atomic::AtomicU64::new(0),
+            wait: crate::sched::WaitQueue::new(),
         }))
     }
 
@@ -557,8 +562,17 @@ impl NetlinkSocket {
     }
 
     /// `netlink_recvmsg`: `(sender portid, group mask, payload)`.
+    /// Wake blocked receivers and poll/epoll waiters of this socket only.
+    fn notify(&self) {
+        self.events
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        self.wait.wake_all();
+        crate::ipc::wake_object(self as *const Self);
+    }
+
     pub fn receive(&self, dontwait: bool) -> Result<(u32, u32, Vec<u8>), VfsError> {
         loop {
+            let seen = self.events.load(core::sync::atomic::Ordering::Acquire);
             let resume = {
                 let mut state = self.state.lock();
                 if let Some(error) = state.error.take() {
@@ -584,7 +598,9 @@ impl NetlinkSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            let _ = self.wait.wait_interruptible(|| {
+                self.events.load(core::sync::atomic::Ordering::Acquire) != seen
+            });
         }
     }
 
@@ -845,13 +861,13 @@ fn enqueue(
                 state.error = Some(ENOBUFS_ERRNO);
             }
             drop(state);
-            crate::ipc::wake_pollers();
+            socket.notify();
             return Err(VfsError::NoBuffers);
         }
         state.rmem += charge;
         state.queue.push_back(datagram);
     }
-    crate::ipc::wake_pollers();
+    socket.notify();
     Ok(())
 }
 
@@ -995,8 +1011,8 @@ impl Inode for NetlinkSocket {
         self.send(&[], buffer)
     }
 
-    fn poll_sources(&self, _sources: &mut crate::ipc::pollwait::PollSources) {
-        // Delivery announces itself through wake_pollers.
+    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
+        sources.object(self as *const Self);
     }
 
     fn poll(&self) -> u32 {

@@ -762,13 +762,19 @@ pub fn syscalls() {
         assert_eq!(dispatch(SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0), 0);
     }
 
-    // Verify getrandom matches hardware RNG support without hanging
-    let gr = dispatch(SYS_GETRANDOM, 0x10200, 16, 0, 0, 0, 0);
-    if crate::random::supported() {
+    // getrandom: GRND_NONBLOCK reports EAGAIN only before CRNG init, and
+    // GRND_INSECURE never waits; invalid flag combinations are rejected.
+    let gr = dispatch(SYS_GETRANDOM, 0x10200, 16, 1, 0, 0, 0);
+    if crate::random::ready() {
         assert_eq!(gr, 16);
     } else {
         assert_eq!(gr, -abi::EAGAIN);
     }
+    assert_eq!(dispatch(SYS_GETRANDOM, 0x10200, 16, 4, 0, 0, 0), 16);
+    assert_eq!(
+        dispatch(SYS_GETRANDOM, 0x10200, 16, 6, 0, 0, 0),
+        -abi::EINVAL
+    );
 
     vfs::write_file("/tmp/invalid-exec", b"not ELF").unwrap();
     vfs::lookup_abs("/tmp/invalid-exec", true)
@@ -1102,7 +1108,13 @@ pub fn ipc_advanced() {
         }
         total += count;
     }
-    assert_eq!(total, 65536 - 4096);
+    // Only the x86_64 poll check above drained one 4 KiB chunk.
+    let drained = if cfg!(target_arch = "x86_64") {
+        4096
+    } else {
+        0
+    };
+    assert_eq!(total, 65536 - drained);
     assert_eq!(
         dispatch(SYS_READ, pipefds[0] as u64, 0x10800, 4096, 0, 0, 0),
         0

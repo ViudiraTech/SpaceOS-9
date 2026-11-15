@@ -40,8 +40,22 @@ pub fn last_user_exit_code() -> i32 {
     LAST_USER_EXIT_CODE.load(Ordering::Acquire)
 }
 
+/// Boot self-tests sleep here until a user test program reports its exit.
+static EXIT_CODE_WAIT: sched::WaitQueueHead = sched::WaitQueueHead::new();
+
+/// Called from the exit syscall and user-fault paths, never with a scheduler
+/// lock held.
 pub fn set_last_user_exit_code(code: i32) {
     LAST_USER_EXIT_CODE.store(code, Ordering::Release);
+    EXIT_CODE_WAIT.wake_all();
+}
+
+/// Self-test helper: wait until a user program exits with `code`, or the
+/// wall-clock timeout passes. Returns whether the code was observed.
+pub fn wait_user_exit_code(code: i32, timeout_micros: u64) -> bool {
+    let deadline = crate::time::uptime_micros().saturating_add(timeout_micros);
+    EXIT_CODE_WAIT.wait_event(|| last_user_exit_code() == code, false, Some(deadline))
+        == sched::WaitResult::Ready
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -125,7 +139,7 @@ pub fn current_syscall(tid: u64) -> Option<(u64, u64, u64)> {
 }
 
 pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
-    let slot = sched::current().map_or(0, |task| task.stats().tid as usize % CURRENT_SLOTS);
+    let slot = sched::current().map_or(0, |task| task.tid() as usize % CURRENT_SLOTS);
     CURRENT_ARG[slot][0].store(arg0, core::sync::atomic::Ordering::Relaxed);
     CURRENT_ARG[slot][1].store(arg1, core::sync::atomic::Ordering::Relaxed);
     CURRENT_NR[slot].store(num, core::sync::atomic::Ordering::Relaxed);
@@ -1698,17 +1712,19 @@ fn sys_nanosleep(req_ptr: u64) -> i64 {
     if sec > i64::MAX as u64 || nsec >= 1_000_000_000 {
         return -abi::EINVAL;
     }
-    let micros = sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000);
-    let mut remaining = micros;
-    while remaining != 0 {
+    let micros = sec
+        .saturating_mul(1_000_000)
+        .saturating_add(nsec.div_ceil(1_000));
+    let deadline = crate::time::uptime_micros().saturating_add(micros);
+    loop {
+        if crate::time::uptime_micros() >= deadline {
+            return 0;
+        }
         if crate::signal::pending_for_current() {
             return -abi::EINTR;
         }
-        let slice = remaining.min(1000);
-        sched::sleep_micros(slice);
-        remaining -= slice;
+        sched::park(Some(deadline));
     }
-    0
 }
 
 fn sys_exit(code: i32, group: bool) -> i64 {

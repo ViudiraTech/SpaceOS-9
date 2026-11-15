@@ -256,6 +256,8 @@ pub struct InputDevice {
 struct Client {
     id: u64,
     state: SpinLock<ClientState>,
+    /// Readers blocked on an empty queue; woken from the reporting IRQ.
+    wait: crate::sched::WaitQueue,
 }
 
 static NEXT_DEVICE: AtomicU32 = AtomicU32::new(0);
@@ -404,6 +406,7 @@ impl InputDevice {
             }
             state.queue.push_back(event);
             drop(state);
+            client.wait.wake_all();
             crate::ipc::wake_object(Arc::as_ptr(client));
         }
         drop(clients);
@@ -555,6 +558,7 @@ impl Inode for EvdevNode {
                 masks: vec![None; EV_MAX + 1],
                 revoked: false,
             }),
+            wait: crate::sched::WaitQueue::new(),
         });
         self.device.clients.lock().push(client.clone());
         Ok(Some(Arc::new(EvdevFile {
@@ -667,10 +671,13 @@ impl Inode for EvdevFile {
             if *self.nonblock.lock() {
                 return Err(VfsError::WouldBlock);
             }
-            if crate::signal::pending_for_current() {
+            let ready = || {
+                let state = self.client.state.lock();
+                state.revoked || !state.queue.is_empty()
+            };
+            if self.client.wait.wait_interruptible(ready) == crate::sched::WaitResult::Interrupted {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
         }
     }
 
@@ -823,6 +830,7 @@ impl Inode for EvdevFile {
                     live.grabbed_by = None;
                 }
                 drop(live);
+                self.client.wait.wake_all();
                 crate::ipc::wake_pollers();
                 Ok(0)
             }

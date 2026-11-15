@@ -91,6 +91,8 @@ pub enum Feature {
     RiscvF,
     RiscvD,
     RiscvV,
+    /// RISC-V Zkr: entropy source `seed` CSR.
+    RiscvZkr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

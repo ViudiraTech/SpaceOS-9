@@ -294,6 +294,10 @@ pub struct TcpSocket {
     nonblock: AtomicBool,
     state: SpinLock<State>,
     me: Weak<TcpSocket>,
+    /// Bumped by `notify` after every segment, timer failure or user-side
+    /// state change; blocked callers sleep on `wait` until it moves.
+    events: core::sync::atomic::AtomicU64,
+    wait: crate::sched::WaitQueue,
 }
 
 struct Connection {
@@ -404,6 +408,8 @@ impl TcpSocket {
                 need_ack: false,
             }),
             me: me.clone(),
+            events: core::sync::atomic::AtomicU64::new(0),
+            wait: crate::sched::WaitQueue::new(),
         });
         arm_timer();
         socket
@@ -499,9 +505,27 @@ impl TcpSocket {
         Ok(())
     }
 
+    fn events(&self) -> u64 {
+        self.events.load(Ordering::Acquire)
+    }
+
+    /// Announce a state change to blocked callers and poll/epoll waiters.
+    /// Must be called without this socket's state lock held.
+    fn notify(&self) {
+        self.events.fetch_add(1, Ordering::AcqRel);
+        self.wait.wake_all();
+        crate::ipc::wake_object(self as *const Self);
+    }
+
+    /// Sleep until `notify` runs after `seen` was read, or a signal arrives.
+    fn wait_change(&self, seen: u64) {
+        let _ = self.wait.wait_interruptible(|| self.events() != seen);
+    }
+
     /// `inet_accept`: take the next completed connection.
     pub fn accept(&self, nonblock: bool) -> Result<Arc<TcpSocket>, VfsError> {
         loop {
+            let seen = self.events();
             {
                 let mut state = self.state.lock();
                 if state.status != Status::Listen {
@@ -517,7 +541,7 @@ impl TcpSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            self.wait_change(seen);
         }
     }
 
@@ -586,6 +610,7 @@ impl TcpSocket {
             return Ok(());
         }
         loop {
+            let seen = self.events();
             {
                 let mut state = self.state.lock();
                 match state.status {
@@ -603,7 +628,7 @@ impl TcpSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            self.wait_change(seen);
         }
     }
 
@@ -617,6 +642,7 @@ impl TcpSocket {
         }
         let mut written = 0usize;
         loop {
+            let seen = self.events();
             let (accepted, plans) = {
                 let mut state = self.state.lock();
                 if let Some(error) = state.error.take() {
@@ -635,9 +661,7 @@ impl TcpSocket {
                 }
                 let room = state.sndbuf.saturating_sub(state.snd_buf.len());
                 let take = room.min(data.len() - written);
-                for byte in &data[written..written + take] {
-                    state.snd_buf.push_back(*byte);
-                }
+                state.snd_buf.extend(&data[written..written + take]);
                 if take != 0 {
                     state.need_ack = true;
                 }
@@ -664,7 +688,7 @@ impl TcpSocket {
                     Ok(written)
                 };
             }
-            crate::ipc::block_briefly();
+            self.wait_change(seen);
         }
     }
 
@@ -676,6 +700,7 @@ impl TcpSocket {
         let peek = flags & MSG_PEEK != 0;
         let mut collected = Vec::new();
         loop {
+            let seen = self.events();
             let (chunk, eof, plans) = {
                 let mut state = self.state.lock();
                 if let Some(error) = state.error.take() {
@@ -691,9 +716,7 @@ impl TcpSocket {
                     let take = (max - collected.len()).min(state.rcv_buf.len());
                     let chunk: Vec<u8> = state.rcv_buf.iter().take(take).copied().collect();
                     if !peek {
-                        for _ in 0..take {
-                            state.rcv_buf.pop_front();
-                        }
+                        state.rcv_buf.drain(..take);
                         state.need_ack = true;
                     }
                     let mut plans = Vec::new();
@@ -745,7 +768,7 @@ impl TcpSocket {
                 }
                 return Ok((collected, false));
             }
-            crate::ipc::block_briefly();
+            self.wait_change(seen);
         }
     }
 
@@ -774,6 +797,7 @@ impl TcpSocket {
             }
         }
         execute(tx_ctx(self), plans);
+        self.notify();
         crate::ipc::wake_pollers();
         Ok(())
     }
@@ -1481,6 +1505,9 @@ pub fn receive(dev: &Arc<NetDevice>, meta: &IpMeta, mut skb: SkBuff) {
         return;
     };
     on_segment(&socket, local_address, remote, &header, &payload);
+    // Data, acknowledged send space, FIN, RST or establishment: let blocked
+    // readers, writers and connecters re-check.
+    socket.notify();
     let _ = dev;
 }
 
@@ -1705,6 +1732,7 @@ fn on_segment(
                             parent_state.syn_pending = parent_state.syn_pending.saturating_sub(1);
                             parent_state.pending.push_back(socket.clone());
                             drop(parent_state);
+                            parent.notify();
                             crate::ipc::wake_pollers();
                         }
                         state = socket.state.lock();
@@ -1906,6 +1934,7 @@ impl TcpSocket {
             execute(ctx, plans);
         }
         if failed.is_some() {
+            self.notify();
             crate::ipc::wake_pollers();
         }
     }
@@ -1942,6 +1971,7 @@ pub fn error(event: &icmp::IcmpError<'_>) {
             reset_connection(&mut state, error);
         }
     }
+    socket.notify();
     crate::ipc::wake_pollers();
 }
 

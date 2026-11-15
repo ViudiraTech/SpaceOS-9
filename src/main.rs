@@ -74,6 +74,7 @@ pub extern "C" fn kmain() -> ! {
     arch::install_cpu_index(boot::bsp_cpu_index());
     fpu::init().expect("extended CPU state initialization failed");
     time::init();
+    random::init();
     tty::init();
     kinfo!("SpaceKernel: Limine entry");
     kinfo!("{}", spk::banner());

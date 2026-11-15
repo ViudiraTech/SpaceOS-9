@@ -38,6 +38,7 @@ fn extension(features: &mut Features, name: &str) {
         "f" => Feature::RiscvF,
         "d" => Feature::RiscvD,
         "v" => Feature::RiscvV,
+        "zkr" => Feature::RiscvZkr,
         _ => return,
     };
     features.insert(feature);
@@ -54,6 +55,10 @@ pub(crate) fn parse_isa(isa: &str) -> Features {
             let tail = name.get(1..).unwrap_or("");
             if tail.bytes().all(|b| b.is_ascii_digit() || b == b'p') {
                 extension(&mut features, name.get(..1).unwrap_or(""));
+            } else if name.starts_with('z') {
+                // Named extension with an optional version, e.g. "zkr1p0".
+                let base = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == 'p');
+                extension(&mut features, base);
             }
         }
         for byte in rest

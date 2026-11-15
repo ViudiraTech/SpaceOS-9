@@ -5,7 +5,28 @@
  *       Copyright (C) 2026 ViudiraTech.
  */
 use super::*;
-use core::sync::atomic::AtomicI32;
+use core::sync::atomic::{AtomicI32, AtomicU64};
+
+/// Bumped whenever any fence may have changed state: a GPU command retired,
+/// a fence was signalled or bound, or a point was attached to a syncobj.
+/// Fence waiters sleep on FENCE_WAIT until it moves and then re-check.
+static FENCE_EVENTS: AtomicU64 = AtomicU64::new(0);
+static FENCE_WAIT: crate::sched::WaitQueueHead = crate::sched::WaitQueueHead::new();
+
+pub fn fence_event() {
+    FENCE_EVENTS.fetch_add(1, Ordering::AcqRel);
+    FENCE_WAIT.wake_all();
+}
+
+pub(super) fn fence_events() -> u64 {
+    FENCE_EVENTS.load(Ordering::Acquire)
+}
+
+/// Sleep until a fence event after `seen` or the deadline (uptime micros).
+pub(super) fn wait_fence_event(seen: u64, deadline: Option<u64>) {
+    let _ = FENCE_WAIT.wait_event(|| fence_events() != seen, true, deadline);
+}
+
 pub struct Fence {
     request: SpinLock<Option<Arc<Request>>>,
     manual: AtomicI32,
@@ -26,9 +47,11 @@ impl Fence {
     pub fn bind(&self, other: &Fence) {
         let request = other.request.lock().clone();
         *self.request.lock() = request;
+        fence_event();
     }
     pub fn complete(&self, status: i32) {
         self.manual.store(status, Ordering::Release);
+        fence_event();
     }
     pub fn signaled() -> Arc<Self> {
         Arc::new(Self {
@@ -60,11 +83,15 @@ impl Fence {
             gpu.transport.wait(&request)?;
         }
         let deadline = crate::time::uptime_micros().saturating_add(5_000_000);
-        while self.status() == 0 {
+        loop {
+            let seen = fence_events();
+            if self.status() != 0 {
+                break;
+            }
             if crate::time::uptime_micros() >= deadline {
                 return Err(VfsError::TimedOut);
             }
-            crate::sched::sleep_micros(100);
+            wait_fence_event(seen, Some(deadline));
         }
         if self.status() < 0 {
             Err(VfsError::IoError)
@@ -110,6 +137,9 @@ impl SyncObject {
             return Err(VfsError::NoSpace);
         }
         points.insert(point, fence);
+        drop(points);
+        // WAIT_FOR_SUBMIT waiters may be waiting for this point to appear.
+        fence_event();
         Ok(())
     }
     pub fn reset(&self) {
@@ -338,6 +368,7 @@ pub fn ioctl(
             let timeout = arg.r64(if timeline { 16 } else { 8 })? as i64;
             let first = session.unlocked(state, || {
                 loop {
+                    let seen = fence_events();
                     let mut ready = 0;
                     let mut first = 0;
                     for (index, (object, point)) in objects.iter().zip(&points).enumerate() {
@@ -361,7 +392,12 @@ pub fn ioctl(
                         return Err(VfsError::TimedOut);
                     }
                     session.gpu.transport.poll();
-                    crate::sched::sleep_micros(100);
+                    if crate::signal::pending_for_current() {
+                        return Err(VfsError::Interrupted);
+                    }
+                    // DRM timeouts are absolute CLOCK_MONOTONIC nanoseconds.
+                    let deadline = (timeout >= 0).then(|| (timeout as u64).div_ceil(1000));
+                    wait_fence_event(seen, deadline);
                 }
             })?;
             arg.w32(if timeline { 32 } else { 24 }, first as u32);

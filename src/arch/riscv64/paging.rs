@@ -90,6 +90,12 @@ pub fn flush_table(_virtual_address: u64) {
     unsafe { asm!("sfence.vma x0, x0", options(nostack)) }
 }
 
+/// The broadcast invalidation already reaches every CPU; no per-space
+/// tracking is needed.
+pub fn tlb_shootdown_root(_root: u64, virtual_address: u64, pages: usize) {
+    tlb_shootdown(virtual_address, pages);
+}
+
 pub fn tlb_shootdown(virtual_address: u64, pages: usize) {
     let size = if pages == 0 { 0 } else { pages * 4096 };
     let (err, _) = super::clint::sbi_call_ext(

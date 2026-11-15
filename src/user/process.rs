@@ -64,6 +64,7 @@ pub fn spawn_init(path: &str) -> Result<u64, &'static str> {
     let entry_va = loaded.initial_pc;
     let tls_tp = loaded.tls_tp;
     let spec = sched::UserTaskSpec {
+        vfork_done: None,
         tgid: 1,
         ltid: 1,
         ppid: 0,
@@ -116,6 +117,7 @@ pub fn spawn_user_elf(data: &[u8], name: &str) -> Result<u64, &'static str> {
     let tls_tp = loaded.tls_tp;
     let pid = sched::alloc_pid();
     let spec = sched::UserTaskSpec {
+        vfork_done: None,
         tgid: pid,
         ltid: pid,
         ppid: 1,

@@ -55,11 +55,8 @@ pub fn spawn_late() {
             let sound_status = crate::sound::self_test::run_late();
             #[cfg(not(all(feature = "sound", feature = "sound-dummy")))]
             let sound_status = "off";
-            let rng_status = if crate::random::supported() {
-                "hw"
-            } else {
-                "unsupported(unverified)"
-            };
+            crate::random::self_test().expect("random self-test failed");
+            let rng_status = crate::random::status();
             let arch_name = if cfg!(target_arch = "x86_64") {
                 "x86_64"
             } else if cfg!(target_arch = "aarch64") {

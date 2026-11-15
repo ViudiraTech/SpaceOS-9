@@ -145,14 +145,62 @@ pub struct SignalState {
     // signal makes the receiving sibling exit itself instead of zapping the
     // whole group.
     exec_leader: SpinLock<Option<u64>>,
+    /// Bumped whenever a child of this process exits, stops or continues;
+    /// wait4/waitid sleep on `child_wait` until it moves.
+    child_events: core::sync::atomic::AtomicU64,
+    child_wait: sched::WaitQueue,
+    /// Linux `signalfd_wqh`: bumped and woken on every signal queued to any
+    /// thread of the process, blocked or not.
+    signal_events: core::sync::atomic::AtomicU64,
+    signal_wait: sched::WaitQueue,
 }
 
 impl SignalState {
+    /// Sequence number of child state changes, read before scanning children.
+    pub fn child_events(&self) -> u64 {
+        self.child_events
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Sleep until a child event after `seen`, or a signal is pending.
+    pub fn wait_child_event(&self, seen: u64) -> sched::WaitResult {
+        self.child_wait
+            .wait_interruptible(|| self.child_events() != seen)
+    }
+
+    /// Sequence number of queued signals, read before checking for one.
+    pub fn signal_events(&self) -> u64 {
+        self.signal_events
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Sleep until a signal is queued after `seen`, or one is deliverable.
+    pub fn wait_signal_event(&self, seen: u64) -> sched::WaitResult {
+        self.signal_wait
+            .wait_interruptible(|| self.signal_events() != seen)
+    }
+
+    fn signal_queued(&self) {
+        self.signal_events
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        self.signal_wait.wake_all();
+    }
+
+    fn child_changed(&self) {
+        self.child_events
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        self.child_wait.wake_all();
+    }
+
     pub fn new() -> Self {
         Self {
             actions: SpinLock::new([SigAction::default(); 65]),
             shared: SpinLock::new(Vec::new()),
             exec_leader: SpinLock::new(None),
+            child_events: core::sync::atomic::AtomicU64::new(0),
+            child_wait: sched::WaitQueue::new(),
+            signal_events: core::sync::atomic::AtomicU64::new(0),
+            signal_wait: sched::WaitQueue::new(),
         }
     }
 
@@ -162,6 +210,10 @@ impl SignalState {
             actions: SpinLock::new(actions),
             shared: SpinLock::new(Vec::new()),
             exec_leader: SpinLock::new(None),
+            child_events: core::sync::atomic::AtomicU64::new(0),
+            child_wait: sched::WaitQueue::new(),
+            signal_events: core::sync::atomic::AtomicU64::new(0),
+            signal_wait: sched::WaitQueue::new(),
         }
     }
 
@@ -278,6 +330,9 @@ pub fn send_to_thread(task: &sched::TaskRef, signal: Signal) {
     let mut state = thread.lock();
     enqueue(&mut state.pending, signal);
     drop(state);
+    // Linux signal_wake_up: end an interruptible wait of the target now.
+    sched::wake_task(task);
+    task.signals().signal_queued();
     sched::set_need_resched();
 }
 
@@ -354,6 +409,8 @@ pub fn send_to_process(pid: u64, signal: Signal) -> bool {
     let shared = members[0].signals();
     let mut queue = shared.shared_pending();
     enqueue(&mut queue, signal);
+    drop(queue);
+    shared.signal_queued();
     true
 }
 
@@ -437,7 +494,13 @@ pub fn rt_sigtimedwait(set: u64, info: u64, timeout: u64, sigsetsize: u64) -> i6
                 .saturating_add((value[1] as u64).div_ceil(1000)),
         )
     };
+    let Some(task) = sched::current() else {
+        return -abi::ESRCH;
+    };
     loop {
+        // Signal delivery wakes this task after queueing, so the dequeue
+        // below always observes a signal whose wakeup ends the park.
+        sched::prepare_wait(&task);
         if let Some(signal) = take_pending_masked(mask) {
             if info != 0 {
                 let mut raw = [0u8; 128];
@@ -454,7 +517,7 @@ pub fn rt_sigtimedwait(set: u64, info: u64, timeout: u64, sigsetsize: u64) -> i6
         if pending_for_current() {
             return -abi::EINTR;
         }
-        crate::sched::sleep_micros(1000);
+        sched::park(deadline);
     }
 }
 
@@ -499,10 +562,18 @@ fn is_stop_signal(number: u32) -> bool {
     matches!(number, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
 }
 
+/// Wake wait4/waitid callers in process `ppid` after a child state change.
+fn wake_child_waiters(ppid: u64) {
+    if let Some(parent) = sched::find_tgid(ppid) {
+        parent.signals().child_changed();
+    }
+}
+
 fn notify_parent_event(ppid: u64, pid: u64, code: i32, status: i32) {
     if ppid == 0 {
         return;
     }
+    wake_child_waiters(ppid);
     let signal = Signal {
         number: SIGCHLD,
         code,
@@ -1060,8 +1131,12 @@ fn stop_current(task: &sched::TaskRef, signal: u32) {
     notify_parent_event(stats.ppid, stats.tgid, CLD_STOPPED, signal as i32);
     // SIGCONT clears `stopped` from the sender side; a fatal pending signal
     // also ends the park so the delivery loop can terminate the task.
-    while thread.lock().stopped && !pending_for_current() {
-        crate::sched::sleep_micros(1000);
+    loop {
+        sched::prepare_wait(task);
+        if !thread.lock().stopped || pending_for_current() {
+            break;
+        }
+        sched::park(None);
     }
 }
 
@@ -1367,10 +1442,11 @@ pub fn pause() -> i64 {
         return -abi::ESRCH;
     };
     loop {
+        sched::prepare_wait(&task);
         if has_deliverable(&task) {
             return -abi::EINTR;
         }
-        crate::sched::sleep_micros(1000);
+        sched::park(None);
     }
 }
 
@@ -1387,10 +1463,11 @@ pub fn rt_sigsuspend(mask: u64, sigsetsize: u64) -> i64 {
     };
     install_wait_mask(mask);
     loop {
+        sched::prepare_wait(&task);
         if has_deliverable(&task) {
             break;
         }
-        crate::sched::sleep_micros(1000);
+        sched::park(None);
     }
     -abi::EINTR
 }
@@ -1464,7 +1541,12 @@ pub fn prepare_exec(task: &sched::TaskRef) -> Result<(), VfsError> {
                 send_to_thread(&member, Signal::kernel(SIGKILL));
             }
         }
+        // Exiting threads wake the exec leader from finish_switch.
+        let me = sched::current();
         loop {
+            if let Some(me) = &me {
+                sched::prepare_wait(me);
+            }
             let live_other = sched::tasks_in_group(stats.tgid)
                 .into_iter()
                 .any(|member| member.stats().ltid != stats.ltid);
@@ -1475,7 +1557,7 @@ pub fn prepare_exec(task: &sched::TaskRef) -> Result<(), VfsError> {
                 signals.set_exec_leader(None);
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
+            sched::park(None);
         }
         signals.set_exec_leader(None);
         if stats.ltid != stats.tgid {
@@ -1523,6 +1605,7 @@ pub fn notify_child_exit(ppid: u64, pid: u64, code: i32, status: i32) {
     if ppid == 0 {
         return;
     }
+    wake_child_waiters(ppid);
     let signal = Signal {
         number: SIGCHLD,
         code,

@@ -68,6 +68,9 @@ struct State {
 }
 
 struct RawInner {
+    /// Bumped by `notify` when a packet is queued.
+    events: AtomicU64,
+    wait: crate::sched::WaitQueue,
     ino: u64,
     protocol: u8,
     is_ping: bool,
@@ -78,6 +81,24 @@ struct RawInner {
     bound_ifindex: AtomicU32,
     peer: SpinLock<Option<(Ipv4Addr, u16)>>,
     state: SpinLock<State>,
+}
+
+impl RawInner {
+    /// Wake blocked receivers and poll/epoll waiters of this socket only.
+    fn notify(&self) {
+        self.events.fetch_add(1, Ordering::AcqRel);
+        self.wait.wake_all();
+        crate::ipc::wake_object(self as *const Self);
+    }
+
+    /// Sleep until `notify` after `seen`, the deadline, or a signal.
+    fn wait_change(&self, seen: u64, deadline: Option<u64>) {
+        let _ = self.wait.wait_event(
+            || self.events.load(Ordering::Acquire) != seen,
+            true,
+            deadline,
+        );
+    }
 }
 
 pub struct RawSocket {
@@ -120,6 +141,8 @@ impl RawSocket {
             ip_opts.hdrincl = true;
         }
         let inner = Arc::new(RawInner {
+            events: AtomicU64::new(0),
+            wait: crate::sched::WaitQueue::new(),
             ino: vfs::tree::ino(),
             protocol,
             is_ping,
@@ -353,6 +376,7 @@ impl RawSocket {
         let deadline =
             (timeout_us != 0).then(|| crate::time::uptime_micros().saturating_add(timeout_us));
         loop {
+            let seen = self.inner.events.load(Ordering::Acquire);
             {
                 let mut state = self.inner.state.lock();
                 if let Some(error) = state.error.take() {
@@ -394,7 +418,7 @@ impl RawSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            self.inner.wait_change(seen, deadline);
         }
     }
 
@@ -407,6 +431,7 @@ impl RawSocket {
         let deadline =
             (timeout_us != 0).then(|| crate::time::uptime_micros().saturating_add(timeout_us));
         loop {
+            let seen = self.inner.events.load(Ordering::Acquire);
             {
                 let mut state = self.inner.state.lock();
                 if let Some(error) = state.error.take() {
@@ -430,7 +455,7 @@ impl RawSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            self.inner.wait_change(seen, deadline);
         }
     }
 
@@ -622,7 +647,7 @@ impl RawSocket {
             meta: rx_meta,
         });
         drop(state);
-        crate::ipc::wake_pollers();
+        self.inner.notify();
     }
 }
 

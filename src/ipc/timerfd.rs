@@ -15,7 +15,6 @@
 //! has no wall-clock source yet.
 
 use crate::{
-    sched,
     sync::SpinLock,
     vfs::{self, Inode, InodeKind, Stat, VfsError},
 };
@@ -33,6 +32,9 @@ struct TimerState {
 
 pub struct TimerFd {
     state: SpinLock<TimerState>,
+    /// Readers park until the current deadline; `settime` wakes them to
+    /// pick up a changed one.
+    wait: crate::sched::WaitQueue,
     nonblock: AtomicBool,
     clockid: u32,
     ino: u64,
@@ -46,6 +48,7 @@ impl TimerFd {
                 interval: 0,
                 ticks: 0,
             }),
+            wait: crate::sched::WaitQueue::new(),
             nonblock: AtomicBool::new(nonblock),
             clockid,
             ino: vfs::tree::ino(),
@@ -120,6 +123,9 @@ impl TimerFd {
         } else {
             state.deadline = Some(now.saturating_add(value));
         }
+        drop(state);
+        // Readers parked on the previous deadline recompute it.
+        self.wait.wake_all();
         Ok(old)
     }
 
@@ -174,10 +180,11 @@ impl Inode for TimerFd {
             if self.nonblock.load(Ordering::Acquire) {
                 return Err(VfsError::WouldBlock);
             }
-            if crate::signal::pending_for_current() {
+            let deadline = self.state.lock().deadline;
+            let result = self.wait.wait_event(|| self.readable(), true, deadline);
+            if result == crate::sched::WaitResult::Interrupted {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
         }
     }
 

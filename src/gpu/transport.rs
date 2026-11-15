@@ -233,6 +233,9 @@ pub struct Transport {
     queues: [SpinLock<Queue>; 2],
     pub failed: AtomicBool,
     pub irq_count: AtomicU32,
+    /// Command waiters; woken when `poll` retires used descriptors (normally
+    /// from the completion interrupt) and when the device fails.
+    completed: crate::sched::WaitQueue,
 }
 unsafe impl Send for Transport {}
 unsafe impl Sync for Transport {}
@@ -387,6 +390,7 @@ impl Transport {
             queues: [SpinLock::new(control), SpinLock::new(cursor)],
             failed: AtomicBool::new(false),
             irq_count: AtomicU32::new(0),
+            completed: crate::sched::WaitQueue::new(),
         };
         wr8(common + 20, 15);
         Ok(result)
@@ -438,12 +442,20 @@ impl Transport {
         if self.failed.load(Ordering::Acquire) {
             return;
         }
+        let mut retired = 0;
         for queue in &self.queues {
-            let failed = queue.lock().complete().is_err();
-            if failed {
-                self.fail();
-                return;
+            let result = queue.lock().complete();
+            match result {
+                Ok(count) => retired += count,
+                Err(_) => {
+                    self.fail();
+                    return;
+                }
             }
+        }
+        if retired != 0 {
+            self.completed.wake_all();
+            super::syncobj::fence_event();
         }
     }
     pub fn interrupt(&self) {
@@ -452,26 +464,31 @@ impl Transport {
         self.poll();
     }
     pub fn wait(&self, request: &Request) -> Result<Vec<u8>, VfsError> {
+        /// The host usually answers within tens of microseconds; spinning
+        /// that long is cheaper than a sleep/wake round trip.
+        const SPIN_MICROS: u64 = 50;
         let started = crate::time::uptime_micros();
         let deadline = started.saturating_add(5_000_000);
-        let mut iterations = 0usize;
-        while !request.done.load(Ordering::Acquire) {
+        loop {
             self.poll();
-            if crate::time::uptime_micros() > deadline || iterations > 100_000_000 {
+            if request.done.load(Ordering::Acquire) {
+                break;
+            }
+            let now = crate::time::uptime_micros();
+            if now > deadline {
                 self.fail();
                 return Err(VfsError::TimedOut);
             }
-            iterations += 1;
-            // The host normally answers within tens of microseconds, but a
-            // sleep rounds up to a scheduler tick (~1 ms), which made every
-            // command cost a full tick. Spin briefly before sleeping.
-            if crate::time::uptime_micros().saturating_sub(started) < 400 {
+            if now.saturating_sub(started) < SPIN_MICROS || crate::sched::current().is_none() {
                 core::hint::spin_loop();
-            } else if crate::sched::current().is_some() {
-                crate::sched::sleep_micros(100);
-            } else {
-                core::hint::spin_loop();
+                continue;
             }
+            // The completion interrupt polls the rings and wakes this queue.
+            let _ = self.completed.wait_event(
+                || request.done.load(Ordering::Acquire),
+                false,
+                Some(deadline),
+            );
         }
         request.response()
     }
@@ -517,6 +534,8 @@ impl Transport {
                 }
             }
         }
+        self.completed.wake_all();
+        super::syncobj::fence_event();
     }
 }
 fn irq(_irq: u32) {

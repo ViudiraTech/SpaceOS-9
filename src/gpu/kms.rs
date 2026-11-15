@@ -449,6 +449,8 @@ fn commit(
             user_data: data,
         });
     }
+    // Hand the queued commit to the GPU service thread.
+    super::syncobj::fence_event();
     if flags & 0x200 == 0 {
         session.unlocked(state, || completion.wait(&session.gpu))?;
     }
