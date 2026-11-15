@@ -43,7 +43,7 @@ QEMU := qemu-system-aarch64
 FIRMWARE := /usr/share/AAVMF/AAVMF_CODE.fd
 MACHINE := virt
 QEMU_CPU := -cpu max
-DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB)
+DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB) -nic none
 DTB_LINE = dtb_path: boot():/boot/limine/dtb.dtb
 else ifeq ($(ARCH),riscv64)
 TARGET := riscv64imac-unknown-none-elf
@@ -51,7 +51,7 @@ EFI := BOOTRISCV64.EFI
 QEMU := qemu-system-riscv64
 FIRMWARE := /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd
 MACHINE := virt
-DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB)
+DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB) -nic none
 DTB_LINE = dtb_path: boot():/boot/limine/dtb.dtb
 else
 $(error Unsupported ARCH=$(ARCH))

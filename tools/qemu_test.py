@@ -127,8 +127,7 @@ def main():
         command += ["-gdb", f"tcp:127.0.0.1:{args.gdb}"]
         if args.gdb_wait:
             command += ["-S"]
-    if args.nic:
-        command += ["-nic", args.nic]
+    command += ["-nic", args.nic or "none"]
     if arch == "x86_64" and args.sound:
         command += ["-audiodev", "none,id=snd0"]
     if arch == "x86_64" and args.sound in ("hda", "both"):
