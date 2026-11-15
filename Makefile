@@ -111,7 +111,8 @@ MODULE_LIST := $(strip \
   $(if $(filter y,$(CONFIG_MODULE_HELLO_RUST)),hello-rust) \
   $(if $(and $(filter y,$(CONFIG_MODULE_SB16)),$(filter x86_64,$(ARCH))),sb16) \
   $(if $(filter y,$(CONFIG_MODULE_HDA)),hda) \
-  $(if $(filter y,$(CONFIG_MODULE_USB)),usb))
+  $(if $(filter y,$(CONFIG_MODULE_USB)),usb) \
+  $(if $(filter y,$(CONFIG_MODULE_SIMPLEFB)),simplefb))
 
 OUT := build/$(ARCH)/$(PROFILE)
 MODULE_OUT := build/modules/$(ARCH)

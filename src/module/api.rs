@@ -271,6 +271,9 @@ pub static EXPORTS: &[Export] = &[
         crate::hal::block::spk_blkdev_unregister
     ),
     export!("spk_complete", crate::hal::sync::spk_complete),
+    export!("spk_display_register", crate::hal::display::spk_display_register),
+    export!("spk_display_unregister", crate::hal::display::spk_display_unregister),
+    export!("spk_sysfb_get", crate::hal::display::spk_sysfb_get),
     export!(
         "spk_completion_alloc",
         crate::hal::sync::spk_completion_alloc

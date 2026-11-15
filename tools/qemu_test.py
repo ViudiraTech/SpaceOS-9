@@ -58,6 +58,9 @@ def main():
     parser.add_argument("--accel", choices=["tcg", "kvm"])
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--gpu", choices=["2d", "virgl", "venus"])
+    parser.add_argument("--simplefb", action="store_true",
+                        help="no virtio-gpu: test simpledrm on the firmware framebuffer "
+                             "(ramfb on aarch64/riscv64)")
     parser.add_argument("--cpu")
     parser.add_argument("--machine")
     parser.add_argument("--nic", help="QEMU -nic argument, e.g. user,model=e1000")
@@ -103,6 +106,12 @@ def main():
             device += ",hostmem=256M,blob=true,venus=true"
             command += ["-object", f"memory-backend-memfd,id=mem,size={memory_mib}M,share=on", "-numa", "node,memdev=mem"]
         command += ["-device", device]
+    if args.simplefb:
+        if args.gpu:
+            parser.error("--simplefb needs the firmware framebuffer; drop --gpu")
+        if arch != "x86_64":
+            command += ["-device", "ramfb"]
+        args.require.append("DRM_SIMPLEFB_OK")
     cpu = args.cpu or ("max" if arch == "aarch64" else None)
     if cpu:
         command += ["-cpu", cpu]

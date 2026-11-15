@@ -237,7 +237,7 @@ void spk_netif_wake_queue(struct spk_netdev *device);
  * calls are added and is never decremented, so a module can check
  * spk_hal_version() >= the version it was written against.
  */
-#define SPK_HAL_VERSION 1u
+#define SPK_HAL_VERSION 2u
 unsigned int spk_hal_version(void);
 
 /* ---- HAL sync: completions and sleeping mutexes ------------------------
@@ -307,6 +307,72 @@ struct spk_blkdev *spk_blkdev_register(const char *prefix, const char *model,
                                        void *priv);
 int spk_blkdev_name(struct spk_blkdev *device, char *buffer, unsigned int length);
 void spk_blkdev_unregister(struct spk_blkdev *device);
+
+/* ---- HAL display class (HAL >= 2) -----------------------------------------
+ * spk_sysfb_get() describes the framebuffer the bootloader/firmware set up;
+ * it returns -EBUSY while a native GPU driver owns the display and -ENODEV
+ * without one. `virt` is the kernel mapping the text console also uses.
+ *
+ * spk_display_register() creates /dev/dri/cardN with one pipe of the given
+ * fixed mode. The DRM core implements the full userspace ABI (atomic and
+ * legacy KMS, dumb buffers, mmap, damage clips, simulated vblank events) and
+ * calls back in process context, serialized:
+ *   check(format)   optional, reject a framebuffer format
+ *   enable/disable  pipe on/off
+ *   update(fb, src, clips, count)  present `clips` (framebuffer pixel
+ *                   coordinates, inside `src`) of `fb`; screen position of a
+ *                   pixel is (x - src->x1, y - src->y1)
+ *   lastclose       the last DRM client closed
+ */
+struct spk_sysfb {
+    unsigned long long physical;
+    void *virt;
+    unsigned long long size;
+    unsigned int width, height, pitch, bpp;
+    unsigned char red_size, red_shift, green_size, green_shift, blue_size, blue_shift;
+    unsigned char reserved[2];
+};
+int spk_sysfb_get(struct spk_sysfb *info);
+
+struct spk_display_mode {
+    unsigned int width, height, refresh_hz, width_mm, height_mm;
+};
+struct spk_rect {
+    int x1, y1, x2, y2; /* half-open */
+};
+struct spk_display_fb {
+    const void *pixels; /* pixel (0, 0) */
+    unsigned int pitch, format, width, height;
+};
+struct spk_display_ops {
+    int (*check)(void *priv, unsigned int format);
+    int (*enable)(void *priv);
+    void (*disable)(void *priv);
+    void (*update)(void *priv, const struct spk_display_fb *fb, const struct spk_rect *src,
+                   const struct spk_rect *clips, unsigned int count);
+    void (*lastclose)(void *priv);
+};
+#define SPK_DISPLAY_PREFER_SHADOW 1
+#define SPK_DISPLAY_TAKES_CONSOLE 2
+
+struct spk_display;
+struct spk_display *spk_display_register(const char *name, const char *description,
+                                         const struct spk_display_mode *mode,
+                                         const unsigned int *formats, unsigned int count,
+                                         int flags, const struct spk_display_ops *ops,
+                                         void *priv);
+void spk_display_unregister(struct spk_display *display);
+
+/* DRM fourcc codes (drm_fourcc.h). */
+#define SPK_FOURCC(a, b, c, d) \
+    ((unsigned int)(a) | (unsigned int)(b) << 8 | (unsigned int)(c) << 16 | (unsigned int)(d) << 24)
+#define SPK_FORMAT_XRGB8888 SPK_FOURCC('X', 'R', '2', '4')
+#define SPK_FORMAT_ARGB8888 SPK_FOURCC('A', 'R', '2', '4')
+#define SPK_FORMAT_XBGR8888 SPK_FOURCC('X', 'B', '2', '4')
+#define SPK_FORMAT_RGB565 SPK_FOURCC('R', 'G', '1', '6')
+#define SPK_FORMAT_RGB888 SPK_FOURCC('R', 'G', '2', '4')
+#define SPK_FORMAT_BGR888 SPK_FOURCC('B', 'G', '2', '4')
+#define SPK_FORMAT_XRGB2101010 SPK_FOURCC('X', 'R', '3', '0')
 
 /*
  * Place exactly one metadata record in .spk_module. The loader reads it after

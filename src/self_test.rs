@@ -53,6 +53,7 @@ pub fn spawn_late() {
             crate::user::self_test::syscalls();
             crate::user::self_test::ipc_advanced();
             let gpu_status = crate::gpu::self_test::run();
+            let drm_status = crate::drm::self_test::run();
             #[cfg(all(feature = "sound", feature = "sound-dummy"))]
             let sound_status = crate::sound::self_test::run_late();
             #[cfg(not(all(feature = "sound", feature = "sound-dummy")))]
@@ -69,10 +70,11 @@ pub fn spawn_late() {
                 "unknown"
             };
             crate::kinfo!(
-                "SELFTEST_OK arch={} cpu_fpu=ok mm_irq_fdt=ok block=ok vfs_abi=ok vfs_cache=ok dev_sys_proc=ok user_elf=ok sched=ok rng={} gpu={} sound={}",
+                "SELFTEST_OK arch={} cpu_fpu=ok mm_irq_fdt=ok block=ok vfs_abi=ok vfs_cache=ok dev_sys_proc=ok user_elf=ok sched=ok rng={} gpu={} drm={} sound={}",
                 arch_name,
                 rng_status,
                 gpu_status,
+                drm_status,
                 sound_status,
             );
             crate::kinfo!("BOOT_OK");

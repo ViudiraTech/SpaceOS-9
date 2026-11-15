@@ -101,8 +101,29 @@ pub fn keyboard_to_tty() -> bool {
     KEYBOARD_TO_TTY.load(Ordering::Acquire)
 }
 
+/// A DRM device scanning out of the boot framebuffer owns the screen.
+static SCANOUT_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 pub fn graphics_active() -> bool {
-    GRAPHICS_ACTIVE.load(Ordering::Acquire)
+    GRAPHICS_ACTIVE.load(Ordering::Acquire) || SCANOUT_CLAIMED.load(Ordering::Acquire)
+}
+
+pub fn scanout_claimed() -> bool {
+    SCANOUT_CLAIMED.load(Ordering::Acquire)
+}
+
+/// A DRM client enabled a display on the console's framebuffer: stop
+/// drawing text into it (simpledrm and fbcon share the firmware buffer).
+pub fn claim_scanout() {
+    SCANOUT_CLAIMED.store(true, Ordering::Release);
+}
+
+/// The DRM display was switched off or its last client closed: redraw the
+/// active terminal, as Linux restores fbcon on lastclose.
+pub fn release_scanout() {
+    if SCANOUT_CLAIMED.swap(false, Ordering::AcqRel) {
+        let _ = super::console::repaint(active_vt());
+    }
 }
 
 fn active_vt() -> usize {

@@ -22,6 +22,7 @@ pub mod block;
 mod boot;
 pub mod cpuid;
 pub mod device;
+pub mod drm;
 pub mod fpu;
 pub mod gpu;
 #[cfg(feature = "modules")]

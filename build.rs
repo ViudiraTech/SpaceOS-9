@@ -35,6 +35,7 @@ fn main() {
         ("SPK_SB16_KO", "sb16.ko"),
         ("SPK_HDA_KO", "hda.ko"),
         ("SPK_USB_KO", "usb.ko"),
+        ("SPK_SIMPLEFB_KO", "simplefb.ko"),
     ] {
         let candidate = modules.join(file);
         let path = if want_self_test && candidate.is_file() {

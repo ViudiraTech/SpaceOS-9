@@ -512,7 +512,9 @@ fn register_inner(
         };
         devices.insert_node(name, Symlink::new(&format!("../../../devices/{}", name)))?;
     }
-    if subsystem == "drm" {
+    // Only the built-in virtio-gpu stack is a PCI DRM device here; drivers
+    // on the generic DRM core (simpledrm) have no bus parent.
+    if subsystem == "drm" && crate::gpu::device().is_some() {
         if name == "card0" || name == "renderD128" {
             if let Some(pci_dev) = m.records.iter().find(|d| d.subsystem == "pci") {
                 let _ = directory.insert("device", Symlink::new(&format!("../{}", pci_dev.name)));
