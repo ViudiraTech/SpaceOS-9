@@ -176,7 +176,18 @@ x86_64 先验收现代 PCI 传输；AArch64/RISC-V 按其 QEMU 机器配置分�
 
 ## 当前实现与验收状态
 
-以下状态以 2026-10-25 工作区的实际代码和本轮实际执行的命令为准。未执行过的项目不写成已验证；`make test` 的每一行由 `tools/test_matrix.py` 从子进程真实退出码和 `qemu_test.py --result` 生成的 JSON 汇总，不再使用硬编码 PASS。测试宿主为 QEMU 11.1.2、libvirglrenderer 1.3.0；x86_64 使用 OVMF，AArch64 使用 AAVMF，RISC-V 使用 RISCV_VIRT。QEMU 只提供虚拟 GPU，不能代替真机验收。
+下面先列 2026-11-15 一轮的变更与验证；其后的三张表是 2026-10-25 的记录，凡被本轮重构替换的实现已逐条标注。以下状态以当时工作区的实际代码和实际执行的命令为准。未执行过的项目不写成已验证；`make test` 的每一行由 `tools/test_matrix.py` 从子进程真实退出码和 `qemu_test.py --result` 生成的 JSON 汇总，不再使用硬编码 PASS。测试宿主为 QEMU 11.1.2、libvirglrenderer 1.3.0；x86_64 使用 OVMF，AArch64 使用 AAVMF，RISC-V 使用 RISCV_VIRT。QEMU 只提供虚拟 GPU，不能代替真机验收。
+
+### 2026-11-15 更新
+
+| 范围 | 变更 | 验证 |
+| --- | --- | --- |
+| 等待与调度 | 新的 `prepare_wait`/`park`/`wake_task` 等待队列原语（`WaitQueueHead`、`WaitQueue`、`Completion`），pipe/FIFO、futex、wait4/waitid、vfork、信号等待、unix/TCP/UDP/raw/netlink socket、eventfd/signalfd/timerfd/inotify、poll、evdev、VT 切换、flock、nanosleep 改为事件驱动；修复 clone 闭包持有地址空间导致的泄漏 | 当时三架构自测通过；`tools/bench.py`（QEMU TCG，交替对比）：同核 pipe 往返约 930→50 µs、futex 往返约 690→63 µs、pipe 带宽约 40→620 MiB/s、线程创建约 2150→340 µs、fork 约 2985→785 µs |
+| 熵源 | BLAKE2s 熵池 + ChaCha20 CRNG（快速密钥擦除）；RDSEED/RDRAND、ARMv8.5 RNDR、RISC-V Zkr、中断时序与 CPU 抖动；`getrandom` 按 Linux 5.18 语义（初始化后不再阻塞） | 当时三架构自测 `rng=crng(jitter)`/`crng(cpu)`/`crng(jitter)` 与 BLAKE2s/ChaCha20 已知答案测试；熵质量未做统计验收 |
+| 内存管理 | PMM 按 64 位字扫描；按已加载根页表定向 TLB shootdown | 当时三架构自测通过 |
+| 驱动 HAL 与 USB | HAL v1/v2（[HAL.md](HAL.md)）；`usb.ko`：xHCI、HID 启动协议键鼠、Bulk-Only 大容量存储 | x86_64 `qemu_test.py --usb`：`USB_HID_OK`、`USB_MSC_OK`、`USB_MSC_FS_OK`、`USB_UNLOAD_OK` |
+| DRM 重构 | 通用 DRM 核心 `src/drm`（KMS、GEM、PRIME、syncobj、render 节点、模拟 vblank、显式 fence）；`simplefb.ko`（simpledrm）；virtio-gpu 从 `src/gpu` 迁到 `src/drm/virtio`，成为核心之上的驱动（[DRM.md](DRM.md)） | 三目标编译零告警；`make test-drm-abi` 逐条比对通过；simpledrm 在 x86_64 `selftest=drm --simplefb` 通过（提交 9b99014，之后核心又有扩展，未复跑）；**virtio-gpu 迁移后未在 QEMU 运行** |
+| 测试工具 | CI（check、host 测试、三架构自测启动）；`selftest=<套件>` 单套件启动；`qemu_test.py --gdb/--gdb-wait/--qemu-log/--simplefb/--usb`；`tools/bench.py` | — |
 
 ### 实现且已验证
 
@@ -186,15 +197,15 @@ x86_64 先验收现代 PCI 传输；AArch64/RISC-V 按其 QEMU 机器配置分�
 | 三架构启动与 SMP | QEMU 启动、4/4 CPU online、自测和 `BOOT_OK` | `make test`：host 3/3 + x86_64/aarch64/riscv64 3/3 PASS（2026-10-25） |
 | 调度模型 | EEVDF 纯模型测试 | `make test-sched-model`：1/1 |
 | ELF/用户内存模型 | 头部/程序头校验、PIE load bias、PT_INTERP、RELRO/TLS、越界和截断拒绝 | `make test-subsystem-model`：11/11 |
-| Linux DRM ABI 布局 | UAPI 编号和结构尺寸探针 | `make test-drm-abi` |
+| Linux DRM ABI 布局 | UAPI 编号和结构尺寸探针 | `make test-drm-abi`（2026-11-15 起由 `tools/check_drm_abi.py` 逐条比对核心与 virtio-gpu 两张表） |
 | Linux ABI 用户态 | 静态 ELF 执行、退出码 42、PIE/PT_INTERP 交接、用户内存边界 | 三架构 `SELFTEST_OK ... user_elf=ok` |
 | 设备与虚拟文件系统 | devtmpfs/sysfs/procfs、设备注册/注销、节点读写 | `SELFTEST_OK ... vfs_abi=ok dev_sys_proc=ok`；这是内核自测，不是 Linux 工具兼容验收 |
 | 块设备与文件系统 | IDE/AHCI/NVMe、分区扫描、FAT32 挂载 | 启动日志和 `block=ok` |
 | 三架构 FPU/上下文 | 上下文切换、FPU 状态、soft-float 构建 | `cpu_fpu=ok`、`tools/check_no_simd.py` |
-| x86_64 VirtIO GPU 2D/KMS | 控制/光标队列、IRQ、GEM/PRIME、syncobj、KMS atomic `TEST_ONLY`/commit/event/out-fence、dumb/fb/cursor、blob、资源回收 | `python3 tools/qemu_test.py ... --gpu 2d` 连续 5 次 PASS（`gpu=virtio-gpu(kms+reclaim)`） |
-| x86_64 VirGL | capset/context、3D 资源、命令提交、host fence、host 渲染 clear 回读红色 | `--gpu virgl` 连续 3 次 PASS（`gpu=virtio-gpu(kms+virgl+reclaim)`） |
-| x86_64 Venus 内核 ABI | Venus capset、context-init、host-visible blob 创建/映射/回读、ring 0 时间线 fence、ring 越界拒绝 | `--gpu venus` 连续 5 次 PASS（`gpu=virtio-gpu(kms+virgl+venus-abi+blob+reclaim)`） |
-| GPU 资源生命周期 | 会话关闭后 `live_resources` 回到基线、`retired`/`host_ranges` 清空、无 live session；临时设备节点注销后读取返回 `NoDevice` | GPU 自测中的 `wait_idle`/`live_resources`/session 断言；`make test` 稳定通过 |
+| x86_64 VirtIO GPU 2D/KMS | 控制/光标队列、IRQ、GEM/PRIME、syncobj、KMS atomic `TEST_ONLY`/commit/event/out-fence、dumb/fb/cursor、blob、资源回收 | `python3 tools/qemu_test.py ... --gpu 2d` 连续 5 次 PASS（`gpu=virtio-gpu(kms+reclaim)`）；**证据属于已删除的 `src/gpu` 实现，迁移到 `src/drm/virtio` 后未复跑** |
+| x86_64 VirGL | capset/context、3D 资源、命令提交、host fence、host 渲染 clear 回读红色 | `--gpu virgl` 连续 3 次 PASS（`gpu=virtio-gpu(kms+virgl+reclaim)`）；**证据属于已删除的 `src/gpu` 实现，迁移到 `src/drm/virtio` 后未复跑** |
+| x86_64 Venus 内核 ABI | Venus capset、context-init、host-visible blob 创建/映射/回读、ring 0 时间线 fence、ring 越界拒绝 | `--gpu venus` 连续 5 次 PASS（`gpu=virtio-gpu(kms+virgl+venus-abi+blob+reclaim)`）；**证据属于已删除的 `src/gpu` 实现，迁移到 `src/drm/virtio` 后未复跑** |
+| GPU 资源生命周期 | 会话关闭后 `live_resources` 回到基线、`retired`/`host_ranges` 清空、无 live session；临时设备节点注销后读取返回 `NoDevice`（该子测试依赖旧 `DeviceNode`，已随迁移删除） | GPU 自测中的 `wait_idle`/`live_resources`/session 断言；`make test` 稳定通过；**证据属于已删除的 `src/gpu` 实现，迁移到 `src/drm/virtio` 后未复跑** |
 
 时间边界：三架构 `make test` 矩阵在 2026-10-25 01:52 通过。之后只修改了 GPU 的 `create_2d`/`create_3d` 错误回滚和 `create_blob` 的 `abort_blob` 清理路径；最终代码在 x86_64 重跑了 2D 5/5、Venus 5/5、VirGL 3/3，并重跑了 `make check` 的三目标编译。aarch64/riscv64 的启动矩阵没有在该清理后重跑（清理只触及 GPU 错误路径，且这两个架构的启动矩阵未添加 virtio-gpu 设备），因此它们的 GPU 路径仍按“未验收”处理。`verbose` 内核命令行 ISO 已成功构建；最后一次 2D 启动通过，但测试脚本未带 `--verbose`，没有捕获完整串口日志，所以 verbose 子项不标为已验证。
 
@@ -206,9 +217,10 @@ x86_64 先验收现代 PCI 传输；AArch64/RISC-V 按其 QEMU 机器配置分�
 - **跨架构 GPU**：x86_64 的 2D/VirGL/Venus 已实际运行；aarch64/riscv64 的启动矩阵没有添加 virtio-gpu 设备（`gpu=none`），其 GPU 传输和 DRM 链路未验收。核心代码可编译不等同于设备链路已验证。
 - **真机显卡**：未在物理 GPU 上运行；QEMU virglrenderer 结果不能外推到 NVIDIA/AMD/Intel 驱动。
 - **故障注入**：`Transport::fail` 的重置/quiesce/quarantine 路径已实现，自测也验证了 fence 成功路径和 ring 越界拒绝；但没有注入 host reset、DMA 永不完成、队列耗尽或低内存故障，不能宣称所有 reset 竞态已覆盖。
-- **KMS 时间语义**：事件时间戳来自内核 uptime；没有真实 vblank/硬件时间戳，page flip 的垂直同步语义未验收。
+- **KMS 时间语义**：DRM 核心按模式刷新率模拟 vblank，事件时间戳来自 `CLOCK_MONOTONIC`；没有硬件 vblank/扫描时间戳。
+- **DRM 重构后的 virtio-gpu**：功能按原实现迁移（资源、blob、3D 上下文、execbuffer、扫描输出、光标、控制台），但 KMS 提交路径换成了核心的同步编程 + 模拟 vblank 完成，所有 GPU 自测在迁移后都还没有运行。
 - **VFS 兼容性**：procfs/sysfs/devtmpfs 通过内核自测；未用 Linux 工具、libdrm 或 udev 验证完整语义。
-- **熵与随机化**：x86_64 和 riscv64 当前没有可靠熵源，`getrandom` 返回 EAGAIN，ASLR 未验收；aarch64 自测报告 `rng=hw`，只表示检测到硬件源，未做熵质量或统计验收。Limine 的 KASLR 配置项也未被独立验证随机化质量。
+- **熵与随机化**：2026-11-15 起三架构都由 CRNG 提供 `getrandom`（见上表）；熵估计是保守计数，没有做统计质量验收，ASLR 与 Limine KASLR 的随机化质量也未独立验证。
 - **同步对象错误语义**：时间线 wait 对成功和失败的 fence 都报告“ready”；自测通过 `sync_file` poll 的 error bit 区分两者。其他用户态调用者不能只依赖 wait 返回值判断 host fence 成功。
 - **verbose 详细日志**：`verbose`/`selftest=verbose` 的 `verbose_log` 路径已实现，带 `verbose` 的 x86_64 ISO 也能构建；但最后一次启动没有捕获完整串口日志，`verbose` 子项未完成验收。
 
@@ -216,7 +228,7 @@ x86_64 先验收现代 PCI 传输；AArch64/RISC-V 按其 QEMU 机器配置分�
 
 - 用户态 libc、ld.so、动态链接执行、Mesa、Vulkan loader、libdrm 用户库和窗口系统。
 - Venus 用户态驱动、host ring>0 绑定、真实 Venus 命令流和 Vulkan 渲染。
-- Linux DRM/KMS 的完整 ioctl 面；当前只实现并测试 `src/gpu/abi.rs` 中列出的子集，未列出的请求走真实错误路径，不返回成功占位。
+- Linux DRM/KMS 的完整 ioctl 面；当前只实现 `src/drm/ioctl.rs`（核心）与 `src/drm/virtio/mod.rs`（VIRTGPU）表中列出的子集，未列出的请求走真实错误路径，不返回成功占位。无 gamma LUT、overlay 平面、writeback、异步翻页。
 - AArch64/RISC-V 的 GPU 设备链路验收，以及任何真机 GPU 驱动。
 - udev/netlink 设备事件、完整 Linux VFS 工具兼容、动态链接器和用户态文件系统工具。
 - 硬件 vblank、真实显示时序、GPU 调度器和显存管理器的完整 Linux 语义。
@@ -227,3 +239,5 @@ x86_64 先验收现代 PCI 传输；AArch64/RISC-V 按其 QEMU 机器配置分�
 ## 当前交付边界
 
 2026-10-24 完成了远端更名与私有化、工作区调查、上游调研和选型。2026-10-25 的实现轮次新增了 `src/gpu/`、设备注册、devtmpfs/sysfs/procfs、用户内存/ELF 支持和对应的自测；这些改动的验收边界以“当前实现与验收状态”一节为准。不能把“三目标编译通过”或“单次 BOOT_OK”当成 M0–M5 全部完成；也不能把 QEMU 虚拟 GPU 的结果当成真机、Mesa 或 Vulkan 应用的验收。
+
+2026-11-15 的轮次把 `src/gpu/` 拆成通用 DRM 核心（`src/drm/`）与 virtio-gpu 驱动（`src/drm/virtio/`），新增 simpledrm 模块、驱动 HAL v2 与 USB 模块、等待队列化的调度原语和 CRNG。virtio-gpu 在本轮只验证到编译与 ABI 表层面，下一步应先在 x86_64 以 `--gpu 2d`/`virgl`/`venus` 复跑其自测，再跑完整三架构矩阵。

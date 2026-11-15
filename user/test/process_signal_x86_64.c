@@ -252,9 +252,26 @@ int main(void) {
     if (thread_waiting == 0) {
         fail("E:futex_gate\n");
     }
+    /* `thread_waiting` is published just before the child's FUTEX_WAIT, so
+     * a single wake can run before the child is queued and legitimately
+     * find no waiter.  Retry until a wake reaches it, or the child saw the
+     * gate itself and finished; a wake that can never reach a queued waiter
+     * still fails once the bound runs out. */
     futex_gate = 1;
-    if (sys_futex((u64)&futex_gate, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0) != 1) {
-        fail("E:futex_wake\n");
+    {
+        i64 woken = 0;
+        for (long i = 0; i < 200000 && woken == 0 && thread_done == 0; i++) {
+            woken = sys_futex((u64)&futex_gate, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+            if (woken < 0 || woken > 1) {
+                fail("E:futex_wake\n");
+            }
+            if (woken == 0) {
+                sys_sched_yield();
+            }
+        }
+        if (woken == 0 && thread_done == 0) {
+            fail("E:futex_wake\n");
+        }
     }
     for (long i = 0; i < 200000 && thread_done == 0; i++) {
         sys_sched_yield();

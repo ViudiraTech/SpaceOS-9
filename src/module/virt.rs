@@ -46,8 +46,20 @@ fn init(state: &mut State) -> Result<(), i32> {
     if kernel == 0 {
         return Err(-(crate::vfs::abi::ENODEV as i32));
     }
-    let start = (kernel + WINDOW_OFFSET) & !(PAGE - 1);
-    let end = (kernel + WINDOW_OFFSET + WINDOW_SIZE) & !(PAGE - 1);
+    // With KASLR the image can sit within 96 MiB of the top of the address
+    // space, where the window above it would wrap. Place it the same distance
+    // below the image instead; every kernel symbol stays inside the +/-128 MiB
+    // branch range either way (window span + offset + image < 128 MiB).
+    let (start, end) = match kernel.checked_add(WINDOW_OFFSET + WINDOW_SIZE) {
+        Some(end) => (kernel + WINDOW_OFFSET, end),
+        None => {
+            let end = kernel
+                .checked_sub(WINDOW_OFFSET)
+                .ok_or(-(crate::vfs::abi::ENOMEM as i32))?;
+            (end - WINDOW_SIZE, end)
+        }
+    };
+    let (start, end) = (start & !(PAGE - 1), end & !(PAGE - 1));
     if start >= end {
         return Err(-(crate::vfs::abi::ENOMEM as i32));
     }

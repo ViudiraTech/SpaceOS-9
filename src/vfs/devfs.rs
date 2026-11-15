@@ -260,7 +260,12 @@ impl Inode for SpecialCharInode {
                 Ok(buf.len())
             }
             SpecialCharKind::Urandom => {
-                crate::random::fill(buf)?;
+                // /dev/random (minor 8) waits for CRNG initialization;
+                // /dev/urandom (minor 9) never blocks, as on Linux.
+                if self.rdev == (1 << 8) | 8 {
+                    crate::random::wait_ready(false)?;
+                }
+                crate::random::get_random_bytes(buf);
                 Ok(buf.len())
             }
         }
@@ -402,7 +407,7 @@ impl Inode for DevRootInode {
                 kind: InodeKind::CharDevice,
             });
         }
-        for (dev_id, dev) in block::devices().iter().enumerate() {
+        for (dev_id, dev) in block::devices_with_ids() {
             entries.push(DirEntry {
                 ino: 2000 + dev_id as u64,
                 name: dev.info().name,

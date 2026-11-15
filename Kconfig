@@ -294,6 +294,35 @@ config MODULE_HDA
 
 endmenu
 
+menu "Display drivers"
+
+config MODULE_SIMPLEFB
+	bool "simpledrm: DRM/KMS on the firmware framebuffer"
+	depends on MODULES
+	default y
+	help
+	  Build simplefb.ko, which exposes the framebuffer set up by the
+	  firmware (UEFI GOP) as /dev/dri/cardN with atomic and legacy KMS,
+	  dumb buffers, damage clipping, format conversion and simulated
+	  vblank events, like Linux simpledrm. It steps aside (-EBUSY) when a
+	  native GPU driver owns the display. Uses only the module HAL.
+
+endmenu
+
+menu "USB drivers"
+
+config MODULE_USB
+	bool "USB stack (xHCI, HID boot keyboard/mouse, mass storage)"
+	depends on PCI
+	default y
+	help
+	  Build usb.ko: an xHCI host controller driver with device
+	  enumeration, HID boot-protocol keyboards and mice (evdev) and
+	  Bulk-Only mass storage (block devices with partition scan). It
+	  uses only the module HAL; see docs/HAL.md.
+
+endmenu
+
 menu "Sample modules"
 
 config MODULE_HELLO

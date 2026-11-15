@@ -84,7 +84,6 @@ impl Waiter {
 }
 
 static WAITERS: SpinLock<Vec<Arc<Waiter>>> = SpinLock::new(Vec::new());
-static NEXT_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 static KICK: AtomicBool = AtomicBool::new(false);
 
 /// One blocking operation. The fast path allocates and registers nothing:
@@ -130,8 +129,8 @@ impl PollWait {
         for (word, value) in waiter.mask.iter().zip(sources.mask) {
             word.store(value, Ordering::Release);
         }
+        // `sleep` parks with this deadline; no tick scan is involved.
         waiter.deadline.store(deadline, Ordering::Release);
-        NEXT_DEADLINE.fetch_min(deadline, Ordering::AcqRel);
     }
 
     /// `arm` for the common case of waiting on one object.
@@ -143,11 +142,18 @@ impl PollWait {
         }
     }
 
+    /// Sleep until an armed source announces a change, the armed deadline
+    /// passes, or a signal arrives (signal delivery unparks the task).
     pub fn sleep(&mut self) {
         match &self.waiter {
-            Some(waiter) => waiter
-                .queue
-                .wait_until(|| waiter.woken.load(Ordering::Acquire)),
+            Some(waiter) => {
+                let deadline = waiter.deadline.load(Ordering::Acquire);
+                let _ = waiter.queue.wait_event(
+                    || waiter.woken.load(Ordering::Acquire),
+                    true,
+                    (deadline != u64::MAX).then_some(deadline),
+                );
+            }
             None => {
                 let waiter = Arc::new(Waiter {
                     woken: AtomicBool::new(false),
@@ -194,25 +200,15 @@ pub fn poll_kick() {
     KICK.store(true, Ordering::Release);
 }
 
-/// Serve deadlines and deferred wakeups; called from one CPU's scheduler tick.
-pub fn timer_tick(now: u64) {
-    let kicked = KICK.load(Ordering::Acquire) && KICK.swap(false, Ordering::AcqRel);
-    if !kicked && now < NEXT_DEADLINE.load(Ordering::Acquire) {
+/// Serve wakeups deferred by `poll_kick`; called from one CPU's scheduler
+/// tick. Deadlines are handled by the scheduler's timed park.
+pub fn timer_tick(_now: u64) {
+    if !(KICK.load(Ordering::Acquire) && KICK.swap(false, Ordering::AcqRel)) {
         return;
     }
-    let waiters = WAITERS.lock();
-    let mut next = u64::MAX;
-    for waiter in waiters.iter() {
-        let deadline = waiter.deadline.load(Ordering::Acquire);
-        if kicked || deadline <= now {
-            // The woken task re-arms with a fresh deadline before sleeping again.
-            waiter.deadline.store(u64::MAX, Ordering::Release);
-            waiter.wake();
-        } else {
-            next = next.min(deadline);
-        }
+    for waiter in WAITERS.lock().iter() {
+        waiter.wake();
     }
-    NEXT_DEADLINE.store(next, Ordering::Release);
 }
 
 /// Back off for blocking paths whose state changes rarely and are not announced.

@@ -139,6 +139,12 @@ pub fn flush_table(_virtual_address: u64) {
     }
 }
 
+/// The broadcast invalidation already reaches every CPU; no per-space
+/// tracking is needed.
+pub fn tlb_shootdown_root(_root: u64, virtual_address: u64, pages: usize) {
+    tlb_shootdown(virtual_address, pages);
+}
+
 pub fn tlb_shootdown(virtual_address: u64, pages: usize) {
     if pages == 0 || pages > 32 {
         flush_table(virtual_address);

@@ -24,6 +24,11 @@ pub mod uaccess;
 pub use address_space::UserAddressSpace;
 pub use process::{spawn_init, spawn_user_elf};
 
+/// Wall-clock bound for each user-mode boot self-test. Generous because a
+/// debug kernel under TCG emulation runs the yield-heavy tests slowly; a
+/// genuine hang still fails, with `dump_user_tasks` naming the stuck wait.
+const SELF_TEST_TIMEOUT_MICROS: u64 = 60_000_000;
+
 /// Execute the architecture-specific built-in user ELF test binary and verify
 /// that it exits with code 42 via the Linux ABI.
 pub fn run_self_test() -> Result<(), &'static str> {
@@ -32,13 +37,8 @@ pub fn run_self_test() -> Result<(), &'static str> {
     crate::verbose::log(format_args!("Spawned user test task (tid={})", tid));
 
     // Wait for the user task to finish and check its exit code
-    let mut loops = 0;
-    while crate::syscall::last_user_exit_code() != 42 {
-        crate::sched::sleep_micros(10_000);
-        loops += 1;
-        if loops > 1000 {
-            return Err("user mode self-test timed out waiting for exit code 42");
-        }
+    if !crate::syscall::wait_user_exit_code(42, SELF_TEST_TIMEOUT_MICROS) {
+        return Err("user mode self-test timed out waiting for exit code 42");
     }
     let _ = crate::sched::take_zombie(tid);
     crate::verbose::log(format_args!("user self-test passed: exit code 42 verified"));
@@ -69,15 +69,12 @@ pub fn run_self_test() -> Result<(), &'static str> {
     main[152..160].copy_from_slice(&(path.len() as u64).to_le_bytes());
     crate::syscall::set_last_user_exit_code(-1);
     let interpreter_tid = spawn_user_elf(&main, "interpreter_test")?;
-    for _ in 0..1000 {
-        if crate::syscall::last_user_exit_code() == 42 {
-            let _ = crate::sched::take_zombie(interpreter_tid);
-            crate::verbose::log(format_args!(
-                "ELF PT_INTERP/PIE user handoff self-test passed"
-            ));
-            return Ok(());
-        }
-        crate::sched::sleep_micros(1000);
+    if crate::syscall::wait_user_exit_code(42, SELF_TEST_TIMEOUT_MICROS) {
+        let _ = crate::sched::take_zombie(interpreter_tid);
+        crate::verbose::log(format_args!(
+            "ELF PT_INTERP/PIE user handoff self-test passed"
+        ));
+        return Ok(());
     }
     Err("ELF interpreter handoff timed out")
 }
@@ -94,17 +91,37 @@ pub fn process_signal_self_test() -> Result<(), &'static str> {
         .map_err(|_| "cannot chmod exec target")?;
     crate::syscall::set_last_user_exit_code(-1);
     let pid = spawn_user_elf(test_binaries::PROCESS_SIGNAL_TEST_ELF, "process_signal")?;
-    for _ in 0..8000 {
-        if crate::syscall::last_user_exit_code() == 43 {
-            let _ = crate::sched::take_zombie(pid);
-            crate::verbose::log(format_args!(
-                "thread/signal/process-group user self-test passed"
-            ));
-            return Ok(());
-        }
-        crate::sched::sleep_micros(1000);
+    if crate::syscall::wait_user_exit_code(43, SELF_TEST_TIMEOUT_MICROS) {
+        let _ = crate::sched::take_zombie(pid);
+        crate::verbose::log(format_args!(
+            "thread/signal/process-group user self-test passed"
+        ));
+        return Ok(());
     }
+    dump_user_tasks();
     Err("process/signal user self-test failed or timed out")
+}
+
+/// Print every user task with its state and the syscall it is blocked in, so
+/// a hung self-test names the wait it is stuck on.
+#[cfg(target_arch = "x86_64")]
+fn dump_user_tasks() {
+    for stats in crate::sched::task_list() {
+        if !stats.user {
+            continue;
+        }
+        let syscall = crate::syscall::current_syscall(stats.tid);
+        crate::kwarn!(
+            "selftest task tid={} tgid={} ltid={} ppid={} state={:?} cpu={} syscall={:?}",
+            stats.tid,
+            stats.tgid,
+            stats.ltid,
+            stats.ppid,
+            stats.state,
+            stats.cpu,
+            syscall
+        );
+    }
 }
 
 /// x86_64 vertical-slice test: fork, COW stack/data write, wait4, zombie reap.
@@ -112,12 +129,10 @@ pub fn process_signal_self_test() -> Result<(), &'static str> {
 pub fn fork_wait_self_test() -> Result<(), &'static str> {
     crate::syscall::set_last_user_exit_code(-1);
     spawn_user_elf(test_binaries::FORK_TEST_ELF, "fork_wait")?;
-    for _ in 0..3000 {
-        if crate::syscall::last_user_exit_code() == 42 {
-            crate::verbose::log(format_args!("fork/wait4/CoW user self-test passed"));
-            return Ok(());
-        }
-        crate::sched::sleep_micros(1000);
+    if crate::syscall::wait_user_exit_code(42, SELF_TEST_TIMEOUT_MICROS) {
+        crate::verbose::log(format_args!("fork/wait4/CoW user self-test passed"));
+        return Ok(());
     }
+    dump_user_tasks();
     Err("fork/wait4 user self-test failed or timed out")
 }

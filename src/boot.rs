@@ -121,6 +121,15 @@ pub fn cmdline() -> &'static str {
     CMDLINE.response().map_or("", |response| response.cmdline())
 }
 
+/// `selftest=<name>` on the kernel command line restricts the boot self-test
+/// to one suite (`drm`), so a failing area can be iterated in seconds
+/// instead of running every suite under software emulation.
+pub fn selftest_filter() -> Option<&'static str> {
+    cmdline()
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix("selftest="))
+}
+
 /// Link-time request base reported by Limine. The kernel ELF is relocatable
 /// and the symbol table in the kallsyms blob is relative to this base.
 pub fn kernel_virtual() -> u64 {

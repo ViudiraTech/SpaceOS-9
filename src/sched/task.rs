@@ -224,6 +224,38 @@ pub struct TaskStats {
     pub child_subreaper: bool,
 }
 impl TaskRef {
+    /// Release a vfork parent, once. Must be called without this task's lock.
+    pub fn complete_vfork(&self) {
+        let done = self.lock().vfork_done.take();
+        if let Some(done) = done {
+            done.complete();
+        }
+    }
+
+    /// Kernel thread id without taking the task lock (it never changes).
+    pub fn tid(&self) -> u64 {
+        // SAFETY: `tid` is written once before the task is shared and is
+        // immutable afterwards; no reference to the locked value is formed.
+        unsafe { core::ptr::addr_of!((*self.0.as_ptr()).tid).read() }
+    }
+
+    /// Raw identity for the per-CPU current-task slot.
+    pub(super) fn as_raw(&self) -> *const SpinLock<Task> {
+        Arc::as_ptr(&self.0)
+    }
+
+    /// Take a new reference from a pointer published by `as_raw`.
+    ///
+    /// # Safety
+    /// Some other reference must keep the task alive for the whole call.
+    pub(super) unsafe fn clone_from_raw(raw: *const SpinLock<Task>) -> Self {
+        // SAFETY: the caller guarantees a live strong reference exists.
+        unsafe {
+            Arc::increment_strong_count(raw);
+            Self(Arc::from_raw(raw))
+        }
+    }
+
     pub(crate) fn lock(&self) -> crate::sync::Guard<'_, Task> {
         self.0.lock()
     }
@@ -467,6 +499,9 @@ impl CpuMask {
     }
 }
 
+/// The lock-wrapped task a `TaskRef` points to.
+pub(crate) type TaskLock = SpinLock<Task>;
+
 pub(crate) struct Task {
     pub tid: u64,
     pub tgid: u64,
@@ -503,9 +538,16 @@ pub(crate) struct Task {
     pub dumpable: bool,
     pub no_new_privs: bool,
     pub child_subreaper: bool,
+    /// Key of this task's entity in the scheduler's park tree while parked
+    /// (`i128::MAX` for an untimed park). Guarded by the park-tree lock.
+    pub park_key: Option<i128>,
+    /// A wakeup that arrived before the task parked; consumed by `park`.
+    pub wake_token: bool,
+    /// Linux `vfork_done`: completed when this vfork child execs or exits.
+    pub vfork_done: Option<Arc<super::Completion>>,
     pub(crate) context: UnsafeCell<arch::Context>,
     pub(crate) fpu_state: UnsafeCell<Option<fpu::State>>,
-    pub(crate) entry: Option<Box<dyn FnOnce() + Send>>,
+    pub(crate) entry: Option<Entry>,
     pub(crate) stack: Option<KernelStack>,
     pub(crate) address_space: Option<Arc<Mutex<crate::user::UserAddressSpace>>>,
     pub(crate) fd_table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>,
@@ -573,14 +615,14 @@ impl Task {
         self.exit_code = code;
     }
     pub(crate) fn create(
-        entry: Option<Box<dyn FnOnce() + Send>>,
+        entry: Option<Entry>,
         cpu: usize,
         affinity: CpuMask,
     ) -> Result<TaskRef, &'static str> {
         Self::create_with_fds(entry, cpu, affinity, None)
     }
     pub(crate) fn create_with_fds(
-        entry: Option<Box<dyn FnOnce() + Send>>,
+        entry: Option<Entry>,
         cpu: usize,
         affinity: CpuMask,
         fd_table: Option<Arc<SpinLock<crate::vfs::FileDescriptorTable>>>,
@@ -641,6 +683,9 @@ impl Task {
             dumpable: true,
             no_new_privs: false,
             child_subreaper: false,
+            park_key: None,
+            wake_token: false,
+            vfork_done: None,
             context: UnsafeCell::new(context),
             fpu_state: UnsafeCell::new(fpu_state),
             entry,
@@ -665,7 +710,7 @@ impl Task {
     /// Create a Linux user task with identity, shared resources and address
     /// space installed before the task can run on another CPU.
     pub(crate) fn create_user(
-        entry: Box<dyn FnOnce() + Send>,
+        entry: Entry,
         cpu: usize,
         affinity: CpuMask,
         spec: UserTaskSpec,
@@ -721,6 +766,9 @@ impl Task {
             dumpable: true,
             no_new_privs: spec.no_new_privs,
             child_subreaper: false,
+            park_key: None,
+            wake_token: false,
+            vfork_done: spec.vfork_done,
             context: UnsafeCell::new(context),
             fpu_state: UnsafeCell::new(fpu_state),
             entry: Some(entry),
@@ -757,7 +805,43 @@ pub(crate) struct UserTaskSpec {
     pub signals: Arc<SignalState>,
     pub thread_signals: Arc<SpinLock<ThreadSignals>>,
     pub address_space: Arc<Mutex<crate::user::UserAddressSpace>>,
+    /// Set for CLONE_VFORK children before they can run.
+    pub vfork_done: Option<Arc<super::Completion>>,
 }
+/// A task's first code: a monomorphized runner and its boxed closure.
+///
+/// Calling a `Box<dyn FnOnce()>` frees the box only after the closure
+/// returns, and user-mode entry closures never return, so every fork leaked
+/// its closure allocation. The runner instead moves the closure onto the
+/// stack, which frees the box, before calling it.
+pub(crate) struct Entry {
+    run: unsafe fn(*mut ()),
+    closure: *mut (),
+}
+
+// SAFETY: built only from `Send` closures and run exactly once by the task.
+unsafe impl Send for Entry {}
+
+impl Entry {
+    pub(crate) fn new<F: FnOnce() + Send + 'static>(closure: F) -> Self {
+        unsafe fn run<F: FnOnce()>(closure: *mut ()) {
+            // SAFETY: `closure` came from Box::into_raw::<F> in `new` and is
+            // consumed once; the box is freed at the end of this statement.
+            let closure: F = *unsafe { Box::from_raw(closure.cast::<F>()) };
+            closure();
+        }
+        Self {
+            run: run::<F>,
+            closure: Box::into_raw(Box::new(closure)).cast(),
+        }
+    }
+
+    fn call(self) {
+        // SAFETY: `run` matches the type `closure` was created from.
+        unsafe { (self.run)(self.closure) }
+    }
+}
+
 extern "C" fn task_entry() -> ! {
     super::finish_switch();
     let entry = super::current()
@@ -767,6 +851,6 @@ extern "C" fn task_entry() -> ! {
         .take()
         .expect("task entered twice");
     arch::enable_interrupts();
-    entry();
+    entry.call();
     super::exit(0)
 }

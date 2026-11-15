@@ -58,6 +58,84 @@ impl State {
         self.bit(self.usable_addr, frame) && !self.bit(self.used_addr, frame)
     }
 
+    /// Free-frame mask for frames `64 * word .. 64 * word + 64`, bit `i` set
+    /// when frame `64 * word + i` is allocatable (little-endian byte order,
+    /// as on every supported target). Frames past `frames` read as used.
+    fn free_word(&self, word: usize) -> u64 {
+        let offset = word * 8;
+        // SAFETY: both bitmaps lie inside the permanently reserved metadata
+        // pages, which continue past each bitmap (the usable bitmap, then the
+        // refcount array), so an 8-byte read at any word start stays mapped.
+        let (usable, used) = unsafe {
+            (
+                ((self.usable_addr + offset) as *const u64).read_unaligned(),
+                ((self.used_addr + offset) as *const u64).read_unaligned(),
+            )
+        };
+        let mut free = u64::from_le(usable) & !u64::from_le(used);
+        let base = word * 64;
+        if base + 64 > self.frames {
+            let valid = self.frames.saturating_sub(base);
+            free &= if valid == 0 {
+                0
+            } else {
+                u64::MAX >> (64 - valid)
+            };
+        }
+        free
+    }
+
+    /// First run of `pages` free frames in `[start, end)`, scanning a word
+    /// (64 frames) at a time like Linux `find_next_zero_bit`: fully used
+    /// words are skipped and fully free words counted whole, instead of
+    /// testing two bitmap bits per frame.
+    fn find_run(&self, start: usize, end: usize, pages: usize) -> Option<usize> {
+        let mut frame = start;
+        let mut run = 0usize;
+        let mut run_start = start;
+        while frame < end {
+            let bit = frame % 64;
+            let span = (64 - bit).min(end - frame);
+            let mask = if span == 64 {
+                u64::MAX
+            } else {
+                (1u64 << span) - 1
+            };
+            let free = (self.free_word(frame / 64) >> bit) & mask;
+            if pages == 1 {
+                if free != 0 {
+                    return Some(frame + free.trailing_zeros() as usize);
+                }
+            } else if free == mask {
+                if run == 0 {
+                    run_start = frame;
+                }
+                run += span;
+                if run >= pages {
+                    return Some(run_start);
+                }
+            } else if free == 0 {
+                run = 0;
+            } else {
+                for index in 0..span {
+                    if (free >> index) & 1 != 0 {
+                        if run == 0 {
+                            run_start = frame + index;
+                        }
+                        run += 1;
+                        if run == pages {
+                            return Some(run_start);
+                        }
+                    } else {
+                        run = 0;
+                    }
+                }
+            }
+            frame += span;
+        }
+        None
+    }
+
     fn refs(&self) -> *mut u16 {
         self.refs_addr as *mut u16
     }
@@ -201,24 +279,17 @@ pub fn alloc(pages: usize) -> Option<u64> {
             // Include runs straddling the hint; it is not an allocation boundary.
             (1, state.frames)
         };
-        let mut run = 0;
-        for frame in start..end {
-            if state.free_frame(frame) {
-                run += 1;
-            } else {
-                run = 0;
+        if let Some(first) = state.find_run(start.max(1), end, pages) {
+            let last = first + pages - 1;
+            for index in first..=last {
+                debug_assert!(state.free_frame(index));
+                state.set_bit(state.used_addr, index, true);
+                debug_assert_eq!(state.ref_count(index), 0);
+                state.set_ref_count(index, 1);
             }
-            if run == pages {
-                let first = frame + 1 - pages;
-                for index in first..=frame {
-                    state.set_bit(state.used_addr, index, true);
-                    debug_assert_eq!(state.ref_count(index), 0);
-                    state.set_ref_count(index, 1);
-                }
-                state.free -= pages;
-                state.hint = (frame + 1).min(state.frames);
-                return Some(first as u64 * PAGE_SIZE);
-            }
+            state.free -= pages;
+            state.hint = (last + 1).min(state.frames);
+            return Some(first as u64 * PAGE_SIZE);
         }
     }
     None

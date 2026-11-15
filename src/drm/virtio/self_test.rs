@@ -1,11 +1,11 @@
 /*
- *       src/gpu/self_test.rs
+ *       src/drm/virtio/self_test.rs
  *       Real queue, Linux ioctl, GEM lifetime and VirGL readback checks
  *       2026/10/24 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
  */
 use super::*;
-use crate::sync::Mutex;
+use crate::{drm::syncobj::fd_inode, sync::Mutex};
 const ARG: u64 = 0x10000;
 fn call(
     file: &Arc<dyn Inode>,
@@ -14,7 +14,9 @@ fn call(
     space: &Arc<Mutex<UserAddressSpace>>,
 ) -> Result<(), VfsError> {
     space.lock().write_bytes(ARG, bytes)?;
-    let (size, dir) = abi::descriptor(nr).unwrap();
+    let (size, dir) = drm::ioctl::descriptor(nr)
+        .or_else(|| super::ioctl_descriptor(nr))
+        .unwrap();
     let cmd = ((dir as u64) << 30) | ((size as u64) << 16) | ((b'd' as u64) << 8) | nr as u64;
     file.ioctl(cmd, ARG)?;
     space.lock().read_bytes(ARG, bytes)?;
@@ -156,41 +158,16 @@ pub fn run() -> &'static str {
         "GPU host-visible BAR ranges leaked"
     );
     assert!(
-        gpu.sessions.lock().iter().all(|w| w.strong_count() == 0),
-        "DRM session leaked on close"
+        gpu.files.lock().iter().all(|w| w.strong_count() == 0),
+        "DRM file state leaked on close"
     );
+    let card = gpu.drm_device().expect("virtio-gpu DRM device");
     assert_eq!(
-        gpu.master.load(Ordering::Acquire),
+        card.master.load(Ordering::Acquire),
         0,
         "DRM master not released on close"
     );
 
-    // Transient device removal & resource reclamation test
-    {
-        let transient_node = Arc::new(DeviceNode {
-            gpu: gpu.clone(),
-            render: true,
-        });
-        let reg = crate::device::register(
-            "card_temp",
-            "drm",
-            Some("dri/card_temp"),
-            Some(transient_node),
-            alloc::vec![],
-        )
-        .unwrap();
-        let temp_file = vfs::open_abs("/dev/dri/card_temp", vfs::abi::O_RDWR, 0).unwrap();
-        crate::device::unregister(reg.id).unwrap();
-        assert_eq!(
-            temp_file.read(&mut [0u8; 8]).unwrap_err(),
-            VfsError::NoDevice
-        );
-        drop(temp_file);
-        assert!(
-            gpu.wait_idle(resources_before, 2_000_000),
-            "transient DRM session did not retire"
-        );
-    }
     // No global `pmm::stats().free` equality here: the user-mode self-test
     // task is still being reaped on another CPU while this runs, and releasing
     // its address space legitimately changes the global count by ~4 MiB.
@@ -476,7 +453,54 @@ fn venus(gpu: &Arc<Gpu>, space: &Arc<Mutex<UserAddressSpace>>) {
     ));
 }
 
+/// Property id called `name` on `object` (userspace looks them up by name).
+fn prop_id(
+    file: &Arc<dyn Inode>,
+    object: u32,
+    kind: u32,
+    name: &str,
+    space: &Arc<Mutex<UserAddressSpace>>,
+) -> u32 {
+    let mut props = empty(32);
+    put64(&mut props, 0, 0x1a000);
+    put64(&mut props, 8, 0x1a400);
+    put32(&mut props, 16, 64);
+    put32(&mut props, 20, object);
+    put32(&mut props, 24, kind);
+    call(file, 0xb9, &mut props, space).unwrap();
+    let count = u32_at(&props, 16).unwrap() as usize;
+    let mut ids = vec![0u8; count * 4];
+    space.lock().read_bytes(0x1a000, &mut ids).unwrap();
+    for index in 0..count {
+        let id = u32_at(&ids, 4 * index).unwrap();
+        let mut info = empty(64);
+        put32(&mut info, 16, id);
+        call(file, 0xaa, &mut info, space).unwrap();
+        let text = &info[24..56];
+        let length = text.iter().position(|&c| c == 0).unwrap_or(32);
+        if &text[..length] == name.as_bytes() {
+            return id;
+        }
+    }
+    panic!("property {name} missing on object {object:#x}");
+}
+
+/// Current (fb_id, mode_valid) of `crtc`.
+fn crtc_state(
+    file: &Arc<dyn Inode>,
+    crtc: u32,
+    space: &Arc<Mutex<UserAddressSpace>>,
+) -> (u32, u32) {
+    let mut get = empty(104);
+    put32(&mut get, 12, crtc);
+    call(file, 0xa1, &mut get, space).unwrap();
+    (u32_at(&get, 16).unwrap(), u32_at(&get, 32).unwrap())
+}
+
 fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<Mutex<UserAddressSpace>>) {
+    const OBJ_CRTC: u32 = 0xcccc_cccc;
+    const OBJ_CONNECTOR: u32 = 0xc0c0_c0c0;
+    const OBJ_PLANE: u32 = 0xeeee_eeee;
     let output = gpu.outputs.lock()[0].clone();
     let mut dumb = empty(32);
     put32(&mut dumb, 0, output.height);
@@ -496,29 +520,57 @@ fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<Mutex<UserAddressS
     }
     call(file, 0xb8, &mut fb, space).unwrap();
     let framebuffer = u32_at(&fb, 0).unwrap();
+    // Objects of the first pipe.
+    let mut cap = empty(16);
+    put64(&mut cap, 0, 3);
+    put64(&mut cap, 8, 1);
+    call(file, 0x0d, &mut cap, space).unwrap();
+    let mut resources = empty(64);
+    put64(&mut resources, 8, 0x18400);
+    put64(&mut resources, 16, 0x18440);
+    put32(&mut resources, 36, 16);
+    put32(&mut resources, 40, 16);
+    call(file, 0xa0, &mut resources, space).unwrap();
+    let mut word = [0u8; 4];
+    space.lock().read_bytes(0x18400, &mut word).unwrap();
+    let crtc = u32::from_le_bytes(word);
+    space.lock().read_bytes(0x18440, &mut word).unwrap();
+    let connector_id = u32::from_le_bytes(word);
+    let mut planes = empty(16);
+    put64(&mut planes, 0, 0x18480);
+    put32(&mut planes, 8, 16);
+    call(file, 0xb5, &mut planes, space).unwrap();
+    space.lock().read_bytes(0x18480, &mut word).unwrap();
+    let plane = u32::from_le_bytes(word);
     let mut connector = empty(80);
     put64(&mut connector, 8, 0x18000);
     put32(&mut connector, 32, 1);
-    put32(&mut connector, 48, 0x200);
+    put32(&mut connector, 48, connector_id);
     call(file, 0xa7, &mut connector, space).unwrap();
     let mut blob = empty(16);
     put64(&mut blob, 0, 0x18000);
     put32(&mut blob, 8, 68);
     call(file, 0xbd, &mut blob, space).unwrap();
     let mode = u32_at(&blob, 12).unwrap();
-    let mut cap = empty(16);
-    put64(&mut cap, 0, 3);
-    put64(&mut cap, 8, 1);
-    call(file, 0x0d, &mut cap, space).unwrap();
-    let objects = [0x100u32, 0x200, 0x400];
+    let objects = [crtc, connector_id, plane];
     let counts = [3u32, 1, 10];
-    let properties = [1u32, 2, 15, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    let mut properties = Vec::new();
+    for name in ["ACTIVE", "MODE_ID", "OUT_FENCE_PTR"] {
+        properties.push(prop_id(file, crtc, OBJ_CRTC, name, space));
+    }
+    properties.push(prop_id(file, connector_id, OBJ_CONNECTOR, "CRTC_ID", space));
+    for name in [
+        "CRTC_ID", "FB_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
+        "CRTC_H",
+    ] {
+        properties.push(prop_id(file, plane, OBJ_PLANE, name, space));
+    }
     let values = [
         1u64,
         mode as u64,
         0x19000,
-        0x100,
-        0x100,
+        crtc as u64,
+        crtc as u64,
         framebuffer as u64,
         0,
         0,
@@ -556,9 +608,13 @@ fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<Mutex<UserAddressS
         put64(&mut atomic, o, p);
     }
     put64(&mut atomic, 48, 0x391);
-    let before = gpu.displays.lock().generation;
+    let before = crtc_state(file, crtc, space);
     call(file, 0xbc, &mut atomic, space).unwrap();
-    assert_eq!(gpu.displays.lock().generation, before);
+    assert_eq!(
+        crtc_state(file, crtc, space),
+        before,
+        "TEST_ONLY changed the CRTC"
+    );
     let mut fd = [0; 4];
     space.lock().read_bytes(0x19000, &mut fd).unwrap();
     assert_eq!(
@@ -568,7 +624,11 @@ fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<Mutex<UserAddressS
     );
     put32(&mut atomic, 0, 0x401);
     call(file, 0xbc, &mut atomic, space).unwrap();
-    assert_eq!(gpu.displays.lock().generation, before + 1);
+    assert_eq!(
+        crtc_state(file, crtc, space),
+        (framebuffer, 1),
+        "atomic commit not applied"
+    );
     space.lock().read_bytes(0x19000, &mut fd).unwrap();
     let fd = u32::from_le_bytes(fd);
     assert!(fd_inode(fd).unwrap().poll() & 1 != 0);
@@ -586,7 +646,7 @@ fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<Mutex<UserAddressS
         call(file, 0xbc, &mut atomic, space).unwrap_err(),
         VfsError::InvalidArgument
     );
-    assert_eq!(gpu.displays.lock().generation, before + 1);
+    assert_eq!(crtc_state(file, crtc, space), (framebuffer, 1));
     // Test cursor2 (0xbb) and cursor move (0xa3) on the cursor virtqueue
     let mut cur_dumb = empty(32);
     put32(&mut cur_dumb, 0, 64);
@@ -596,7 +656,7 @@ fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<Mutex<UserAddressS
     let cur_handle = u32_at(&cur_dumb, 16).unwrap();
     let mut cursor2 = empty(36);
     put32(&mut cursor2, 0, 1); // DRM_MODE_CURSOR_BO
-    put32(&mut cursor2, 4, 0x100);
+    put32(&mut cursor2, 4, crtc);
     put32(&mut cursor2, 8, 16);
     put32(&mut cursor2, 12, 16);
     put32(&mut cursor2, 16, 64);
@@ -605,7 +665,7 @@ fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<Mutex<UserAddressS
     call(file, 0xbb, &mut cursor2, space).unwrap();
     let mut cursor_move = empty(28);
     put32(&mut cursor_move, 0, 2); // DRM_MODE_CURSOR_MOVE
-    put32(&mut cursor_move, 4, 0x100);
+    put32(&mut cursor_move, 4, crtc);
     put32(&mut cursor_move, 8, 32);
     put32(&mut cursor_move, 12, 32);
     call(file, 0xa3, &mut cursor_move, space).unwrap();

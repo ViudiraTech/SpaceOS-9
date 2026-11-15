@@ -30,6 +30,7 @@ pub use exceptions::{init_bsp as init_exceptions, load_cpu as load_exceptions};
 pub use paging::{
     flush_page, flush_table, page_root, paging_geometry, pte_is_table, pte_kernel, pte_leaf,
     pte_phys, pte_present, pte_table, set_page_root, sync_instruction_cache, tlb_shootdown,
+    tlb_shootdown_root,
 };
 pub use serial::{SERIAL_PHYS, serial_enable_irq, serial_init, serial_try_read, serial_write};
 

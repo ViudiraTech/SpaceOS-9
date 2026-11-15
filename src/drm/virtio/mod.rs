@@ -1,36 +1,60 @@
 /*
- *       src/gpu/mod.rs
- *       DRM sessions, GEM resources and VirtIO VirGL/Venus dispatch
+ *
+ *       src/drm/virtio/mod.rs
+ *       virtio-gpu DRM driver: resources, 3D contexts, blobs and execbuffer
+ *
  *       2026/10/24 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
+ *
  */
-mod abi;
-mod kms;
+
+//! Linux `drivers/gpu/drm/virtio` on top of the generic DRM core. The core
+//! owns /dev/dri/card0 and renderD128, KMS, GEM handles, PRIME, syncobj and
+//! events; this driver provides:
+//!
+//! * GEM storage: virtio resources ([`Resource`]) — 2D dumb buffers, 3D
+//!   resources and blobs (guest pages or host-visible BAR memory);
+//! * the VIRTGPU ioctls (MAP, EXECBUFFER, GETPARAM, RESOURCE_CREATE[_BLOB],
+//!   RESOURCE_INFO, TRANSFER_{TO,FROM}_HOST, WAIT, GET_CAPS, CONTEXT_INIT)
+//!   for VirGL and Venus (per-file 3D context, rings, fence events);
+//! * display programming (`display.rs`): scanouts, transfers/flushes of
+//!   damage and the hardware cursor;
+//! * the text console on a virtio scanout when there is no firmware
+//!   framebuffer, refreshed by the service thread while no DRM client owns
+//!   the display.
+
+mod display;
 #[cfg(feature = "boot-self-test")]
 pub mod self_test;
-mod syncobj;
 mod transport;
+
+use super::{
+    self as drm, DeviceConfig, DriverFile, File, GemBacking, Ioctl,
+    syncobj::{self, Fence, FenceSource},
+};
 use crate::{
     sync::SpinLock,
     user::{UserAddressSpace, uaccess},
-    vfs::{self, FdEntry, Inode, InodeKind, OpenFile, Stat, VfsError, tree::Attribute},
+    vfs::{self, Inode, InodeKind, Stat, VfsError},
 };
 use alloc::{
-    collections::{BTreeMap, VecDeque},
     format,
-    string::String,
     sync::{Arc, Weak},
     vec,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::{
+    any::Any,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+};
 use transport::{Dma, Request, Transport};
+
 static GPU: SpinLock<Option<Arc<Gpu>>> = SpinLock::new(None);
-/// Enabled by the `drmtrace` kernel command line; traces every DRM request.
-static DRM_TRACE: AtomicBool = AtomicBool::new(false);
+
 pub fn device() -> Option<Arc<Gpu>> {
     GPU.lock().clone()
 }
+
 pub fn u32_at(b: &[u8], o: usize) -> Result<u32, VfsError> {
     Ok(u32::from_le_bytes(
         b.get(o..o + 4)
@@ -53,6 +77,7 @@ pub fn put32(b: &mut [u8], o: usize, v: u32) {
 pub fn put64(b: &mut [u8], o: usize, v: u64) {
     b[o..o + 8].copy_from_slice(&v.to_le_bytes());
 }
+/// A control-queue command: header (type, flags, fence, ctx) and words.
 pub fn command(kind: u32, context: u32, words: &[u32]) -> Vec<u8> {
     let mut bytes = vec![0; 24 + words.len() * 4];
     put32(&mut bytes, 0, kind);
@@ -62,173 +87,97 @@ pub fn command(kind: u32, context: u32, words: &[u32]) -> Vec<u8> {
     }
     bytes
 }
-pub fn install_fd(inode: Arc<dyn Inode>, flags: u32) -> Result<u32, VfsError> {
-    let file = Arc::new(OpenFile::new(
-        inode,
-        String::from("anon_inode:[drm]"),
-        flags & 3,
-    ));
-    let fd = vfs::current_fd_table().lock().alloc_fd(
-        0,
-        FdEntry {
-            file,
-            cloexec: flags & vfs::abi::O_CLOEXEC != 0,
-        },
-    )?;
-    Ok(fd as u32)
-}
-pub fn fd_inode(fd: u32) -> Result<Arc<dyn Inode>, VfsError> {
-    Ok(vfs::current_fd_table()
-        .lock()
-        .get(fd as usize)
-        .ok_or(VfsError::BadFileDescriptor)?
-        .file
-        .inode
-        .clone())
-}
-pub fn array32(address: u64, count: usize) -> Result<Vec<u32>, VfsError> {
-    let bytes = uaccess::read_vec(
-        address,
-        count.checked_mul(4).ok_or(VfsError::InvalidArgument)?,
-        1024 * 1024,
-    )?;
-    bytes.chunks_exact(4).map(|c| u32_at(c, 0)).collect()
-}
-pub fn array64(address: u64, count: usize) -> Result<Vec<u64>, VfsError> {
-    let bytes = uaccess::read_vec(
-        address,
-        count.checked_mul(8).ok_or(VfsError::InvalidArgument)?,
-        1024 * 1024,
-    )?;
-    bytes.chunks_exact(8).map(|c| u64_at(c, 0)).collect()
-}
-pub fn write32(address: u64, values: &[u32]) -> Result<(), VfsError> {
-    for (i, value) in values.iter().enumerate() {
-        uaccess::write_value(
-            address.checked_add(i as u64 * 4).ok_or(VfsError::Fault)?,
-            value,
-        )?;
-    }
-    Ok(())
-}
-pub fn write64(address: u64, values: &[u64]) -> Result<(), VfsError> {
-    for (i, value) in values.iter().enumerate() {
-        uaccess::write_value(
-            address.checked_add(i as u64 * 8).ok_or(VfsError::Fault)?,
-            value,
-        )?;
-    }
-    Ok(())
-}
-pub struct Ioctl {
-    pub data: Vec<u8>,
-    address: u64,
-    user_size: usize,
-    dir: u32,
-}
-impl Ioctl {
-    fn new(cmd: u64, address: u64) -> Result<Self, VfsError> {
-        if (cmd >> 8) & 255 != b'd' as u64 || cmd >> 32 != 0 {
-            return Err(VfsError::NotATty);
-        }
-        let (size, dir) = abi::descriptor(cmd as u8).ok_or(VfsError::NotATty)?;
-        let user_size = ((cmd >> 16) & 0x3fff) as usize;
-        let user_dir = ((cmd >> 30) & 3) as u32;
-        if user_size > 4096 {
-            return Err(VfsError::InvalidArgument);
-        }
-        if (size == 0 && (user_dir != 0 || user_size != 0))
-            || (size != 0 && (user_dir & dir == 0 || user_size == 0))
-        {
-            return Err(VfsError::NotATty);
-        }
-        let mut data = vec![0; size];
-        let copy = user_size.min(size);
-        if dir & 1 != 0 {
-            uaccess::read(address, &mut data[..copy])?;
-            if user_size > size {
-                let extra = uaccess::read_vec(
-                    address.checked_add(size as u64).ok_or(VfsError::Fault)?,
-                    user_size - size,
-                    4096,
-                )?;
-                if extra.iter().any(|&b| b != 0) {
-                    return Err(VfsError::InvalidArgument);
-                }
-            }
-        }
-        if dir & 2 != 0 {
-            uaccess::check(address, user_size, true)?;
-        }
-        Ok(Self {
-            data,
-            address,
-            user_size,
-            dir,
-        })
-    }
-    pub fn r32(&self, o: usize) -> Result<u32, VfsError> {
-        u32_at(&self.data, o)
-    }
-    pub fn r64(&self, o: usize) -> Result<u64, VfsError> {
-        u64_at(&self.data, o)
-    }
-    pub fn w32(&mut self, o: usize, v: u32) {
-        put32(&mut self.data, o, v)
-    }
-    pub fn w64(&mut self, o: usize, v: u64) {
-        put64(&mut self.data, o, v)
-    }
-    fn finish(&self) -> Result<(), VfsError> {
-        if self.dir & 2 != 0 {
-            let copy = self.user_size.min(self.data.len());
-            uaccess::write(self.address, &self.data[..copy])?;
-            if self.user_size > copy {
-                let zeroes = vec![0u8; self.user_size - copy];
-                uaccess::write(
-                    self.address
-                        .checked_add(copy as u64)
-                        .ok_or(VfsError::Fault)?,
-                    &zeroes,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
+
 pub struct Capset {
     pub id: u32,
     pub version: u32,
     pub size: u32,
 }
+
 struct Retirement {
     id: u32,
     pages: Vec<Dma>,
     host: Option<(u64, u64, u64)>,
     context: bool,
 }
+
 pub struct Gpu {
     transport: Transport,
     next_resource: AtomicU32,
     next_context: AtomicU32,
-    next_session: AtomicU64,
     next_fence: AtomicU64,
-    pub master: AtomicU64,
     pub capsets: SpinLock<Vec<Capset>>,
-    pub outputs: SpinLock<Vec<kms::Output>>,
+    pub outputs: SpinLock<Vec<display::Output>>,
     host_ranges: SpinLock<Vec<(u64, u64)>>,
     retired: SpinLock<Vec<Retirement>>,
-    sessions: SpinLock<Vec<Weak<Session>>>,
-    pub displays: SpinLock<kms::DisplayState>,
+    files: SpinLock<Vec<Weak<VirtFile>>>,
     console: SpinLock<Option<Arc<ConsoleBacking>>>,
     console_version: AtomicU64,
     console_tick: AtomicU64,
     console_visible: AtomicBool,
+    /// A DRM client programmed a scanout: the console stays hidden until
+    /// lastclose.
+    display_owned: AtomicBool,
     servicing: AtomicBool,
     live_resources: AtomicU32,
+    /// What each scanout shows, to reprogram only on change.
+    scanouts: SpinLock<Vec<Option<display::Scanout>>>,
+    /// Framebuffer id of each pipe's hardware cursor image.
+    cursors: SpinLock<Vec<u32>>,
+    /// The DRM device registered for this GPU.
+    drm: SpinLock<Weak<drm::Device>>,
 }
+
+/// A submitted command as a DRM fence source.
+struct RequestFence {
+    gpu: Weak<Gpu>,
+    request: Arc<Request>,
+}
+
+impl FenceSource for RequestFence {
+    fn status(&self) -> i32 {
+        let request = &self.request;
+        if !request.done.load(Ordering::Acquire) {
+            0
+        } else if request.error.load(Ordering::Acquire) != 0 {
+            -5
+        } else {
+            // SAFETY: the response buffer is owned by the completed request.
+            let kind = unsafe { (request.response.pointer() as *const u32).read_volatile() };
+            if (0x1100..=0x1106).contains(&u32::from_le(kind)) {
+                1
+            } else {
+                -5
+            }
+        }
+    }
+
+    fn wait(&self) -> Result<(), VfsError> {
+        match self.gpu.upgrade() {
+            Some(gpu) => gpu.transport.wait(&self.request).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
 impl Gpu {
-    fn submit_call(
+    fn request_fence(self: &Arc<Self>, request: Arc<Request>) -> Arc<Fence> {
+        Fence::from_source(Arc::new(RequestFence {
+            gpu: Arc::downgrade(self),
+            request,
+        }))
+    }
+
+    /// The registered DRM device (for tests and diagnostics).
+    pub fn drm_device(&self) -> Option<Arc<drm::Device>> {
+        self.drm.lock().upgrade()
+    }
+
+    /// Whether the transport has failed (device reset or timeout).
+    pub fn failed(&self) -> bool {
+        self.transport.failed.load(Ordering::Acquire)
+    }
+    pub(super) fn submit_call(
         &self,
         kind: u32,
         context: u32,
@@ -244,7 +193,7 @@ impl Gpu {
         );
         self.transport.submit(false, &bytes, size, Vec::new())
     }
-    fn call(
+    pub(super) fn call(
         &self,
         kind: u32,
         context: u32,
@@ -284,7 +233,11 @@ impl Gpu {
         self.transport.call(&cmd, 24)?;
         Ok(())
     }
-    pub fn create_2d(self: &Arc<Self>, width: u32, height: u32) -> Result<Arc<Resource>, VfsError> {
+    pub(super) fn create_2d(
+        self: &Arc<Self>,
+        width: u32,
+        height: u32,
+    ) -> Result<Arc<Resource>, VfsError> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return Err(VfsError::InvalidArgument);
         }
@@ -315,7 +268,7 @@ impl Gpu {
     }
     fn create_3d(
         self: &Arc<Self>,
-        state: &mut SessionState,
+        state: &mut VirtState,
         arg: &mut Ioctl,
     ) -> Result<Arc<Resource>, VfsError> {
         self.ensure_context(state)?;
@@ -385,7 +338,7 @@ impl Gpu {
     }
     fn create_blob(
         self: &Arc<Self>,
-        state: &mut SessionState,
+        state: &mut VirtState,
         arg: &mut Ioctl,
     ) -> Result<Arc<Resource>, VfsError> {
         if self.transport.features & 8 == 0 {
@@ -411,7 +364,7 @@ impl Gpu {
         }
         if arg.r32(28)? != 0 {
             let bytes = uaccess::read_vec(arg.r64(32)?, arg.r32(28)? as usize, 1024 * 1024)?;
-            self.submit_bytes(state, bytes, 0, Vec::new())?.wait(self)?;
+            self.submit_bytes(state, bytes, 0, Vec::new())?.wait()?;
         }
         let pages = if memory == 2 {
             Vec::new()
@@ -532,7 +485,7 @@ impl Gpu {
         self.host_ranges.lock().retain(|&(o, _)| o != offset);
         let _ = self.call(0x102, 0, &[id, 0], 24);
     }
-    fn ensure_context(&self, state: &mut SessionState) -> Result<(), VfsError> {
+    fn ensure_context(&self, state: &mut VirtState) -> Result<(), VfsError> {
         if self.transport.features & 1 == 0 {
             return Err(VfsError::NotSupported);
         }
@@ -555,12 +508,12 @@ impl Gpu {
         Ok(())
     }
     fn submit_bytes(
-        &self,
-        state: &mut SessionState,
+        self: &Arc<Self>,
+        state: &mut VirtState,
         bytes: Vec<u8>,
         ring: u32,
         retain: Vec<Arc<dyn Inode>>,
-    ) -> Result<Arc<syncobj::Fence>, VfsError> {
+    ) -> Result<Arc<Fence>, VfsError> {
         self.ensure_context(state)?;
         if ring >= state.rings || bytes.len() > 1024 * 1024 || bytes.len() % 4 != 0 {
             return Err(VfsError::InvalidArgument);
@@ -576,7 +529,7 @@ impl Gpu {
         put64(&mut cmd, 8, self.next_fence.fetch_add(1, Ordering::Relaxed));
         cmd[20] = ring as u8;
         let request = self.transport.submit(false, &cmd, 24, retain)?;
-        Ok(syncobj::Fence::request(request))
+        Ok(self.request_fence(request))
     }
     fn install_console(self: &Arc<Self>) -> Result<(), VfsError> {
         let output = self
@@ -618,16 +571,32 @@ impl Gpu {
             width,
             height
         ));
-        kms::install_console(self, &resource);
         *self.console.lock() = Some(backing);
         self.console_visible.store(true, Ordering::Release);
         Ok(())
     }
+    /// While the text console owns the display, its framebuffer is flushed to
+    /// the host at display refresh rate (deferred I/O); once a DRM client has
+    /// programmed a scanout the service thread needs no timer at all.
+    fn console_refresh_deadline(&self) -> Option<u64> {
+        if self.transport.failed.load(Ordering::Acquire)
+            || self.display_owned.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        Some(
+            self.console_tick
+                .load(Ordering::Relaxed)
+                .saturating_add(16_000)
+                .max(crate::time::uptime_micros().saturating_add(1_000)),
+        )
+    }
+
     fn console_service(&self) {
         if self.transport.failed.load(Ordering::Acquire) {
             return;
         }
-        if self.master.load(Ordering::Acquire) != 0 {
+        if self.display_owned.load(Ordering::Acquire) {
             self.console_visible.store(false, Ordering::Release);
             return;
         }
@@ -653,9 +622,6 @@ impl Gpu {
             if !visible {
                 let _ = self.call(0x103, 0, &[0, 0, r.width, r.height, 0, r.id], 24);
             }
-            if !visible {
-                kms::restore_console(self, &backing.resource);
-            }
             self.console_visible.store(true, Ordering::Release);
             self.console_version.store(version, Ordering::Relaxed);
         }
@@ -672,17 +638,16 @@ impl Gpu {
             return;
         }
         self.transport.poll();
-        let sessions: Vec<_> = {
-            let mut list = self.sessions.lock();
+        let files: Vec<_> = {
+            let mut list = self.files.lock();
             list.retain(|w| w.strong_count() != 0);
             list.iter().filter_map(|w| w.upgrade()).collect()
         };
-        for session in sessions {
-            session.complete_events();
+        for file in files {
+            file.complete_events();
         }
-        kms::service(self);
         self.console_service();
-        // Completing an earlier request can drop its retained BufferFile and
+        // Completing an earlier request can drop its retained resources and
         // therefore queue another Resource in `retired`.  Drain until the list
         // stays empty instead of dropping the second generation on the floor.
         for _ in 0..64 {
@@ -737,12 +702,15 @@ impl Gpu {
 fn super_align(size: u64) -> Result<u64, VfsError> {
     crate::user::address_space::align_up(size).ok_or(VfsError::InvalidArgument)
 }
+
 struct HostMapping {
     physical: u64,
     kernel: u64,
     cache: u32,
     offset: u64,
 }
+
+/// A virtio-gpu resource (Linux `virtio_gpu_object`).
 pub struct Resource {
     gpu: Weak<Gpu>,
     pub id: u32,
@@ -754,8 +722,10 @@ pub struct Resource {
     pub height: u32,
     pub stride: u32,
     pub format: u32,
-    pub last: SpinLock<Option<Arc<syncobj::Fence>>>,
+    /// Fence of the last command that used this resource (implicit sync).
+    pub last: SpinLock<Option<Arc<Fence>>>,
 }
+
 impl Drop for Resource {
     fn drop(&mut self) {
         if let Some(gpu) = self.gpu.upgrade() {
@@ -766,40 +736,30 @@ impl Drop for Resource {
                 host: self.host.as_ref().map(|h| (h.offset, self.size, h.kernel)),
                 context: false,
             });
+            // The service thread releases host resources.
+            syncobj::fence_event();
         }
     }
 }
-pub struct BufferFile {
-    pub resource: Arc<Resource>,
-}
-impl Inode for BufferFile {
-    fn metadata(&self) -> Result<Stat, VfsError> {
-        Ok(Stat::simple(
-            0x8000_0000 + self.resource.id as u64,
-            InodeKind::Regular,
-            0o600,
-            self.resource.size,
-        ))
+
+/// GEM storage of a resource.
+pub struct ResourceObject(pub Arc<Resource>);
+
+impl GemBacking for ResourceObject {
+    fn size(&self) -> u64 {
+        self.0.size
     }
-    fn mmap(
+
+    fn map_user(
         &self,
         space: &mut UserAddressSpace,
         address: u64,
         length: u64,
         offset: u64,
         prot: u32,
+        owner: Arc<dyn Inode>,
     ) -> Result<(), VfsError> {
-        let resource = &self.resource;
-        if offset & 4095 != 0
-            || length & 4095 != 0
-            || offset.checked_add(length).is_none_or(|e| e > resource.size)
-            || prot & 4 != 0
-        {
-            return Err(VfsError::InvalidArgument);
-        }
-        let owner: Arc<dyn Inode> = Arc::new(BufferFile {
-            resource: resource.clone(),
-        });
+        let resource = &self.0;
         for done in (0..length).step_by(4096) {
             let result = if let Some(host) = &resource.host {
                 space.map_external_at(
@@ -824,19 +784,54 @@ impl Inode for BufferFile {
         }
         Ok(())
     }
+
     fn poll(&self) -> u32 {
-        self.resource
+        self.0
             .last
             .lock()
             .as_ref()
             .map_or(1 | 4, |f| if f.status() != 0 { 1 | 4 } else { 0 })
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
+
+/// Keeps resources alive while the host may still use them (a submitted
+/// command's retain list).
+struct Retain(Arc<Resource>);
+
+impl Inode for Retain {
+    fn metadata(&self) -> Result<Stat, VfsError> {
+        Ok(Stat::simple(
+            0x8000_0000 + self.0.id as u64,
+            InodeKind::Regular,
+            0o600,
+            self.0.size,
+        ))
+    }
+}
+
+/// The resource behind a GEM handle of `file`.
+fn resource(file: &File, handle: u32) -> Result<Arc<Resource>, VfsError> {
+    file.object(handle)?
+        .backing::<ResourceObject>()
+        .map(|r| r.0.clone())
+        .ok_or(VfsError::InvalidArgument)
+}
+
+/// Give `file` a handle for `resource`.
+fn add(file: &File, resource: Arc<Resource>) -> Result<u32, VfsError> {
+    Ok(file.add_object(Arc::new(ResourceObject(resource)))?.0)
+}
+
 struct ConsoleBacking {
     resource: Arc<Resource>,
     base: u64,
     pages: usize,
 }
+
 impl Inode for ConsoleBacking {
     fn metadata(&self) -> Result<Stat, VfsError> {
         Ok(Stat::simple(
@@ -847,275 +842,99 @@ impl Inode for ConsoleBacking {
         ))
     }
 }
+
 impl Drop for ConsoleBacking {
     fn drop(&mut self) {
         let _ = crate::mm::vmm::unmap(self.base, self.pages);
     }
 }
 
-struct DeviceNode {
-    gpu: Arc<Gpu>,
-    render: bool,
-}
-impl Inode for DeviceNode {
-    fn deactivate(&self) -> Result<(), VfsError> {
-        self.gpu.transport.fail();
-        Ok(())
-    }
-    fn metadata(&self) -> Result<Stat, VfsError> {
-        let mut s = Stat::simple(
-            0x800000,
-            InodeKind::CharDevice,
-            if self.render { 0o666 } else { 0o660 },
-            0,
-        );
-        s.rdev = (226 << 8) | if self.render { 128 } else { 0 };
-        Ok(s)
-    }
-    fn open(&self, _flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
-        let id = self.gpu.next_session.fetch_add(1, Ordering::Relaxed);
-        if !self.render {
-            let _ = self
-                .gpu
-                .master
-                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire);
-        }
-        let session = Arc::new(Session {
-            gpu: self.gpu.clone(),
-            id,
-            render: self.render,
-            busy: AtomicBool::new(false),
-            state: SpinLock::new(Some(SessionState::new())),
-            events: Arc::new(SpinLock::new(VecDeque::new())),
-            pending_events: SpinLock::new(Vec::new()),
-            map_handles: SpinLock::new(BTreeMap::new()),
-        });
-        self.gpu.sessions.lock().push(Arc::downgrade(&session));
-        Ok(Some(session))
-    }
-}
-pub struct Session {
-    pub gpu: Arc<Gpu>,
-    pub id: u64,
-    pub render: bool,
-    busy: AtomicBool,
-    state: SpinLock<Option<SessionState>>,
-    events: Arc<SpinLock<VecDeque<Vec<u8>>>>,
-    pending_events: SpinLock<Vec<Arc<syncobj::Fence>>>,
-    map_handles: SpinLock<BTreeMap<u32, Arc<Resource>>>,
-}
-pub struct SessionState {
-    pub handles: BTreeMap<u32, Arc<Resource>>,
-    pub syncs: BTreeMap<u32, Arc<syncobj::SyncObject>>,
-    pub next_handle: u32,
-    pub next_sync: u32,
+// ---- per-file state -------------------------------------------------------------
+
+/// 3D context state of one DRM file.
+pub struct VirtState {
     pub context: u32,
     pub capset: u32,
     pub rings: u32,
     pub poll_rings: u64,
     pub initialized: bool,
     pub created: bool,
-    pub atomic: bool,
-    pub universal: bool,
-    pub blobs: BTreeMap<u32, Vec<u8>>,
-    pub next_blob: u32,
-    pub framebuffers: BTreeMap<u32, kms::Framebuffer>,
 }
-impl SessionState {
+
+impl VirtState {
     fn new() -> Self {
         Self {
-            handles: BTreeMap::new(),
-            syncs: BTreeMap::new(),
-            next_handle: 1,
-            next_sync: 1,
             context: 0,
             capset: 0,
             rings: 1,
             poll_rings: 0,
             initialized: false,
             created: false,
-            atomic: false,
-            universal: false,
-            blobs: BTreeMap::new(),
-            next_blob: 1000,
-            framebuffers: BTreeMap::new(),
         }
-    }
-    pub fn add(&mut self, resource: Arc<Resource>) -> Result<u32, VfsError> {
-        if self.handles.len() >= 4096 {
-            return Err(VfsError::NoSpace);
-        }
-        if let Some((&h, _)) = self.handles.iter().find(|(_, r)| Arc::ptr_eq(r, &resource)) {
-            return Ok(h);
-        }
-        let id = self.next_handle;
-        self.next_handle = self.next_handle.checked_add(1).ok_or(VfsError::NoSpace)?;
-        self.handles.insert(id, resource);
-        Ok(id)
-    }
-    pub fn resource(&self, handle: u32) -> Result<Arc<Resource>, VfsError> {
-        self.handles.get(&handle).cloned().ok_or(VfsError::NotFound)
     }
 }
-impl Session {
-    pub fn unlocked<R>(&self, state: &mut SessionState, work: impl FnOnce() -> R) -> R {
-        let local = core::mem::replace(state, SessionState::new());
-        *self.state.lock() = Some(local);
-        self.busy.store(false, Ordering::Release);
-        let result = work();
+
+/// Driver side of one open DRM file (Linux `virtio_gpu_fpriv`).
+pub struct VirtFile {
+    gpu: Arc<Gpu>,
+    device: Weak<drm::Device>,
+    file: u64,
+    /// Serializes this file's driver ioctls. A contender sleeps on
+    /// `busy_wait`; `unlocked` drops and retakes it around blocking work.
+    busy: AtomicBool,
+    busy_wait: crate::sched::WaitQueue,
+    state: SpinLock<Option<VirtState>>,
+    pending_events: SpinLock<Vec<Arc<Fence>>>,
+}
+
+impl VirtFile {
+    fn acquire_busy(&self) {
         while self
             .busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            crate::sched::sleep_micros(100);
+            if crate::sched::current().is_some() {
+                self.busy_wait
+                    .wait_until(|| !self.busy.load(Ordering::Acquire));
+            } else {
+                core::hint::spin_loop();
+            }
         }
+    }
+
+    fn release_busy(&self) {
+        self.busy.store(false, Ordering::Release);
+        self.busy_wait.wake_one();
+    }
+
+    pub fn unlocked<R>(&self, state: &mut VirtState, work: impl FnOnce() -> R) -> R {
+        let local = core::mem::replace(state, VirtState::new());
+        *self.state.lock() = Some(local);
+        self.release_busy();
+        let result = work();
+        self.acquire_busy();
         *state = self
             .state
             .lock()
             .take()
-            .expect("DRM wait reacquired session");
+            .expect("virtio-gpu file state reacquired");
         result
     }
-    fn dispatch(&self, state: &mut SessionState, nr: u8, arg: &mut Ioctl) -> Result<(), VfsError> {
-        match nr {
-            0x00 => {
-                arg.w32(0, 0);
-                arg.w32(4, 1);
-                arg.w32(8, 0);
-                for (length, pointer, text) in [
-                    (16, 24, "virtio_gpu"),
-                    (32, 40, "20261024"),
-                    (48, 56, "SpaceKernel VirtIO GPU"),
-                ] {
-                    let capacity = arg.r64(length)? as usize;
-                    let dst = arg.r64(pointer)?;
-                    let n = capacity.min(text.len());
-                    // Linux copies a field only when the caller supplied a
-                    // buffer; a NULL pointer just reports the required length.
-                    if n != 0 && dst != 0 {
-                        uaccess::write(dst, &text.as_bytes()[..n])?;
-                    }
-                    arg.w64(length, text.len() as u64);
-                }
-                Ok(())
-            }
-            0x01 => {
-                arg.w64(0, 0);
-                Ok(())
-            }
-            0x02 => Err(VfsError::NotSupported),
-            0x07 => {
-                arg.w32(0, 1);
-                arg.w32(4, 4);
-                arg.w32(8, 0);
-                arg.w32(12, 1);
-                Ok(())
-            }
-            0x09 => {
-                if arg.r32(4)? != 0 {
-                    return Err(VfsError::InvalidArgument);
-                }
-                state
-                    .handles
-                    .remove(&arg.r32(0)?)
-                    .ok_or(VfsError::NotFound)?;
-                Ok(())
-            }
-            0x0c => {
-                let value = match arg.r64(0)? {
-                    1 => 1,
-                    2 => 0,
-                    3 => 24,
-                    4 => 1,
-                    5 => 3,
-                    6 => 1,
-                    7 => 0,
-                    8 | 9 => 64,
-                    0x10 => 0,
-                    0x11 => 0,
-                    0x12 => 1,
-                    0x13 => 1,
-                    0x14 => 1,
-                    0x15 => 0,
-                    _ => return Err(VfsError::InvalidArgument),
-                };
-                arg.w64(8, value);
-                Ok(())
-            }
-            0x0d => {
-                let cap = arg.r64(0)?;
-                let value = arg.r64(8)?;
-                if value > 1 {
-                    return Err(VfsError::InvalidArgument);
-                }
-                match cap {
-                    2 => state.universal = value != 0,
-                    3 => {
-                        state.atomic = value != 0;
-                        state.universal |= value != 0;
-                    }
-                    1 | 4 | 5 => {}
-                    _ => return Err(VfsError::NotSupported),
-                }
-                Ok(())
-            }
-            0x1e => {
-                if self.render {
-                    return Err(VfsError::PermissionDenied);
-                }
-                match self.gpu.master.compare_exchange(
-                    0,
-                    self.id,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => Ok(()),
-                    Err(id) if id == self.id => Ok(()),
-                    _ => Err(VfsError::Busy),
-                }
-            }
-            0x1f => {
-                if self.render
-                    || self
-                        .gpu
-                        .master
-                        .compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                {
-                    return Err(VfsError::PermissionDenied);
-                }
-                Ok(())
-            }
-            0x2d => {
-                let resource = state.resource(arg.r32(0)?)?;
-                let flags = arg.r32(4)?;
-                if flags & !(vfs::abi::O_CLOEXEC | vfs::abi::O_RDWR) != 0 {
-                    return Err(VfsError::InvalidArgument);
-                }
-                let fd = install_fd(Arc::new(BufferFile { resource }), flags)?;
-                arg.w32(8, fd);
-                Ok(())
-            }
-            0x2e => {
-                let inode: Arc<dyn core::any::Any + Send + Sync> = fd_inode(arg.r32(8)?)?;
-                let file = inode
-                    .downcast::<BufferFile>()
-                    .map_err(|_| VfsError::InvalidArgument)?;
-                let owner = file.resource.gpu.upgrade().ok_or(VfsError::NoDevice)?;
-                if !Arc::ptr_eq(&owner, &self.gpu) {
-                    return Err(VfsError::NotSupported);
-                }
-                let handle = state.add(file.resource.clone())?;
-                arg.w32(0, handle);
-                Ok(())
-            }
+    fn dispatch(
+        &self,
+        file: &File,
+        state: &mut VirtState,
+        arg: &mut Ioctl,
+    ) -> Result<(), VfsError> {
+        match arg.nr {
             0x41 => {
-                let resource = state.resource(arg.r32(8)?)?;
+                // VIRTGPU_MAP: the object's fake offset on this file.
+                let object = file.object(arg.r32(8)?)?;
                 if arg.r32(12)? != 0 {
                     return Err(VfsError::InvalidArgument);
                 }
-                arg.w64(0, (resource.id as u64) << 32);
+                arg.w64(0, object.mmap_offset());
                 Ok(())
             }
             0x43 => {
@@ -1147,20 +966,20 @@ impl Session {
             0x44 => {
                 let resource = self.gpu.create_3d(state, arg)?;
                 let id = resource.id;
-                let handle = state.add(resource)?;
+                let handle = add(file, resource)?;
                 arg.w32(40, handle);
                 arg.w32(44, id);
                 Ok(())
             }
             0x45 => {
-                let resource = state.resource(arg.r32(0)?)?;
+                let resource = resource(file, arg.r32(0)?)?;
                 arg.w32(4, resource.id);
                 arg.w32(8, resource.size.min(u32::MAX as u64) as u32);
                 arg.w32(12, resource.blob_mem);
                 Ok(())
             }
             0x46 | 0x47 => {
-                let resource = state.resource(arg.r32(0)?)?;
+                let resource = resource(file, arg.r32(0)?)?;
                 self.gpu.ensure_context(state)?;
                 let mut words = Vec::new();
                 for o in (4..28).step_by(4) {
@@ -1175,7 +994,7 @@ impl Session {
                     arg.r32(40)?,
                 ]);
                 self.gpu.call(
-                    if nr == 0x46 { 0x206 } else { 0x205 },
+                    if arg.nr == 0x46 { 0x206 } else { 0x205 },
                     state.context,
                     &words,
                     24,
@@ -1183,7 +1002,7 @@ impl Session {
                 Ok(())
             }
             0x48 => {
-                let resource = state.resource(arg.r32(0)?)?;
+                let resource = resource(file, arg.r32(0)?)?;
                 let flags = arg.r32(4)?;
                 if flags & !1 != 0 {
                     return Err(VfsError::InvalidArgument);
@@ -1193,7 +1012,7 @@ impl Session {
                     if flags & 1 != 0 && fence.status() == 0 {
                         return Err(VfsError::Busy);
                     }
-                    self.unlocked(state, || fence.wait(&self.gpu))?;
+                    self.unlocked(state, || fence.wait())?;
                 }
                 Ok(())
             }
@@ -1216,7 +1035,7 @@ impl Session {
             0x4a => {
                 let resource = self.gpu.create_blob(state, arg)?;
                 let id = resource.id;
-                let handle = state.add(resource)?;
+                let handle = add(file, resource)?;
                 arg.w32(8, handle);
                 arg.w32(12, id);
                 Ok(())
@@ -1273,18 +1092,12 @@ impl Session {
                 state.initialized = true;
                 Ok(())
             }
-            0x42 => self.exec(state, arg),
-            0xbf..=0xc5 | 0xca..=0xcd => syncobj::ioctl(self, state, nr, arg),
-            0xa0..=0xbe | 0xce => {
-                if self.render {
-                    return Err(VfsError::PermissionDenied);
-                }
-                kms::ioctl(self, state, nr, arg)
-            }
-            _ => Err(VfsError::NotATty),
+            0x42 => self.exec(file, state, arg),
+            _ => Err(VfsError::InvalidArgument),
         }
     }
-    fn exec(&self, state: &mut SessionState, arg: &mut Ioctl) -> Result<(), VfsError> {
+
+    fn exec(&self, file: &File, state: &mut VirtState, arg: &mut Ioctl) -> Result<(), VfsError> {
         let flags = arg.r32(0)?;
         if flags & !7 != 0 {
             return Err(VfsError::InvalidArgument);
@@ -1293,30 +1106,30 @@ impl Session {
         if ring >= state.rings || ring >= 64 {
             return Err(VfsError::InvalidArgument);
         }
-        let handles = array32(arg.r64(16)?, arg.r32(24)? as usize)?;
+        let handles = drm::ioctl::read_u32s(arg.r64(16)?, arg.r32(24)? as usize)?;
         let mut resources = Vec::new();
         for h in handles {
-            resources.push(state.resource(h)?);
+            resources.push(resource(file, h)?);
         }
         if flags & 1 != 0 {
             let fence = syncobj::fence_fd(arg.r32(28)?)?;
-            self.unlocked(state, || fence.wait(&self.gpu))?;
+            self.unlocked(state, || fence.wait())?;
         }
         let ins = syncobj::exec_syncs(
-            state,
+            file,
             arg.r64(48)?,
             arg.r32(40)? as usize,
             arg.r32(36)? as usize,
         )?;
         let outs = syncobj::exec_syncs(
-            state,
+            file,
             arg.r64(56)?,
             arg.r32(44)? as usize,
             arg.r32(36)? as usize,
         )?;
         for (sync, point, reset) in &ins {
             if let Some(f) = sync.fence(*point) {
-                self.unlocked(state, || f.wait(&self.gpu))?;
+                self.unlocked(state, || f.wait())?;
             } else {
                 return Err(VfsError::InvalidArgument);
             }
@@ -1331,19 +1144,15 @@ impl Session {
         }
         let retain: Vec<Arc<dyn Inode>> = resources
             .iter()
-            .map(|r| {
-                Arc::new(BufferFile {
-                    resource: r.clone(),
-                }) as Arc<dyn Inode>
-            })
+            .map(|r| Arc::new(Retain(r.clone())) as Arc<dyn Inode>)
             .collect();
         let notify = state.poll_rings & (1u64 << ring) != 0;
-        if notify && self.pending_events.lock().len() + self.events.lock().len() >= 256 {
+        if notify && self.pending_events.lock().len() + file.pending_events() >= 256 {
             return Err(VfsError::NoSpace);
         }
         let reserved = if flags & 2 != 0 {
-            let placeholder = syncobj::Fence::pending();
-            let fd = install_fd(
+            let placeholder = Fence::pending();
+            let fd = syncobj::install_fd(
                 Arc::new(syncobj::SyncFile {
                     fence: placeholder.clone(),
                 }),
@@ -1359,7 +1168,7 @@ impl Session {
             Err(e) => {
                 if let Some((fd, placeholder)) = reserved {
                     placeholder.complete(-5);
-                    let _ = vfs::current_fd_table().lock().close(fd as usize);
+                    syncobj::close_fd(fd);
                 }
                 return Err(e);
             }
@@ -1380,6 +1189,8 @@ impl Session {
         }
         Ok(())
     }
+    /// Turn signalled ring fences into VIRTGPU_EVENT_FENCE_SIGNALED events
+    /// for rings the client asked to poll (CONTEXT_INIT poll_rings_mask).
     fn complete_events(&self) {
         let ready = {
             let mut pending = self.pending_events.lock();
@@ -1387,155 +1198,98 @@ impl Session {
             pending.retain(|f| f.status() == 0);
             count
         };
+        let Some(device) = self.device.upgrade() else {
+            return;
+        };
         for _ in 0..ready {
-            let mut event = vec![0; 8];
-            put32(&mut event, 0, 0x90000000);
+            let mut event = [0u8; 8];
+            put32(&mut event, 0, 0x9000_0000);
             put32(&mut event, 4, 8);
-            let _ = self.event(event);
+            drm::file::deliver(&device, self.file, &event);
         }
-    }
-    pub fn event(&self, bytes: Vec<u8>) -> Result<(), VfsError> {
-        let mut queue = self.events.lock();
-        if queue.len() >= 256 {
-            return Err(VfsError::NoSpace);
-        }
-        queue.push_back(bytes);
-        drop(queue);
-        crate::ipc::wake_object(Arc::as_ptr(&self.events));
-        Ok(())
     }
 }
-impl Inode for Session {
-    fn metadata(&self) -> Result<Stat, VfsError> {
-        let mut s = Stat::simple(self.id + 0x810000, InodeKind::CharDevice, 0o660, 0);
-        s.rdev = (226 << 8) | if self.render { 128 } else { 0 };
-        Ok(s)
-    }
-    fn ioctl(&self, cmd: u64, address: u64) -> Result<u64, VfsError> {
-        if self.gpu.transport.failed.load(Ordering::Acquire)
-            && !matches!(cmd as u8, 9 | 0xb4 | 0xc0 | 0xbe)
-        {
+
+impl DriverFile for VirtFile {
+    fn ioctl(&self, file: &File, arg: &mut Ioctl) -> Result<(), VfsError> {
+        if self.gpu.failed() {
             return Err(VfsError::NoDevice);
         }
-        let mut arg = Ioctl::new(cmd, address)?;
-        let trace = DRM_TRACE.load(Ordering::Relaxed);
-        if trace {
-            crate::kinfo!("drm: enter nr={:#04x} arg={:#x}", cmd as u8, address);
-        }
-        while self
-            .busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            if crate::sched::current().is_some() {
-                crate::sched::sleep_micros(100);
-            } else {
-                core::hint::spin_loop();
-            }
-        }
-        let mut state = self.state.lock().take().expect("DRM session serialized");
-        let result = self.dispatch(&mut state, cmd as u8, &mut arg);
-        let handles = state.handles.clone();
-        *self.map_handles.lock() = handles;
-        *self.state.lock() = Some(state);
-        self.busy.store(false, Ordering::Release);
-        if trace {
-            crate::kinfo!("drm: exit nr={:#04x} -> {:?}", cmd as u8, result);
-        }
-        result?;
-        arg.finish()?;
-        Ok(0)
-    }
-    fn mmap(
-        &self,
-        space: &mut UserAddressSpace,
-        address: u64,
-        length: u64,
-        offset: u64,
-        prot: u32,
-    ) -> Result<(), VfsError> {
-        let resource = self
-            .map_handles
+        self.acquire_busy();
+        let mut state = self
+            .state
             .lock()
-            .values()
-            .find(|r| offset >= ((r.id as u64) << 32) && offset < ((r.id as u64) << 32) + r.size)
-            .cloned()
-            .ok_or(VfsError::PermissionDenied)?;
-        let file = BufferFile {
-            resource: resource.clone(),
-        };
-        file.mmap(
-            space,
-            address,
-            length,
-            offset - ((resource.id as u64) << 32),
-            prot,
-        )
+            .take()
+            .expect("virtio-gpu file serialized");
+        let result = self.dispatch(file, &mut state, arg);
+        *self.state.lock() = Some(state);
+        self.release_busy();
+        result
     }
-    fn read_at(&self, _: u64, dst: &mut [u8]) -> Result<usize, VfsError> {
-        let mut queue = self.events.lock();
-        let Some(first) = queue.front() else {
-            return Err(VfsError::WouldBlock);
-        };
-        if dst.len() < first.len() {
-            return Err(VfsError::InvalidArgument);
-        }
-        let mut written = 0;
-        while queue
-            .front()
-            .is_some_and(|e| written + e.len() <= dst.len())
-        {
-            let event = queue.pop_front().unwrap();
-            dst[written..written + event.len()].copy_from_slice(&event);
-            written += event.len();
-        }
-        Ok(written)
-    }
-    fn poll_sources(&self, sources: &mut crate::ipc::pollwait::PollSources) {
-        sources.object(Arc::as_ptr(&self.events));
-        // Fence completion only becomes an event when poll collects it.
-        if !self.pending_events.lock().is_empty() {
-            sources.tick();
-        }
-    }
-    fn poll(&self) -> u32 {
+
+    fn poll(&self, _file: &File) {
         self.complete_events();
-        if self.gpu.transport.failed.load(Ordering::Acquire) {
-            8 | 16
-        } else if self.events.lock().is_empty() {
-            0
-        } else {
-            1
-        }
+    }
+
+    fn needs_tick(&self) -> bool {
+        // Fence completion only becomes an event when poll collects it.
+        !self.pending_events.lock().is_empty()
     }
 }
-impl Drop for Session {
+
+impl Drop for VirtFile {
     fn drop(&mut self) {
-        kms::close_session(&self.gpu, self.id);
-        self.gpu.console_visible.store(false, Ordering::Release);
-        let _ = self
-            .gpu
-            .master
-            .compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
-        if let Some(state) = self.state.lock().take() {
-            if state.created {
-                self.gpu.retired.lock().push(Retirement {
-                    id: state.context,
-                    pages: Vec::new(),
-                    host: None,
-                    context: true,
-                });
-            }
+        if let Some(state) = self.state.lock().take()
+            && state.created
+        {
+            self.gpu.retired.lock().push(Retirement {
+                id: state.context,
+                pages: Vec::new(),
+                host: None,
+                context: true,
+            });
+            syncobj::fence_event();
         }
     }
 }
+
+impl Gpu {
+    fn open_file(self: &Arc<Self>, file: &Arc<File>) -> Arc<VirtFile> {
+        let private = Arc::new(VirtFile {
+            gpu: self.clone(),
+            device: Arc::downgrade(file.device()),
+            file: file.id(),
+            busy: AtomicBool::new(false),
+            busy_wait: crate::sched::WaitQueue::new(),
+            state: SpinLock::new(Some(VirtState::new())),
+            pending_events: SpinLock::new(Vec::new()),
+        });
+        self.files.lock().push(Arc::downgrade(&private));
+        private
+    }
+}
+
+/// Size and direction of the VIRTGPU ioctls (Linux `virtgpu_drm.h`).
+fn ioctl_descriptor(nr: u8) -> Option<(usize, u32)> {
+    let rw = drm::ioctl::READ | drm::ioctl::WRITE;
+    Some(match nr {
+        0x41 => (16, rw), // MAP
+        0x42 => (64, rw), // EXECBUFFER
+        0x43 => (16, rw), // GETPARAM
+        0x44 => (56, rw), // RESOURCE_CREATE
+        0x45 => (16, rw), // RESOURCE_INFO
+        0x46 => (44, rw), // TRANSFER_FROM_HOST
+        0x47 => (44, rw), // TRANSFER_TO_HOST
+        0x48 => (8, rw),  // WAIT
+        0x49 => (24, rw), // GET_CAPS
+        0x4a => (56, rw), // RESOURCE_CREATE_BLOB
+        0x4b => (16, rw), // CONTEXT_INIT
+        _ => return None,
+    })
+}
+
 pub fn init() {
-    DRM_TRACE.store(
-        crate::boot::cmdline()
-            .split_ascii_whitespace()
-            .any(|word| word == "drmtrace"),
-        Ordering::Relaxed,
-    );
+    drm::file::init_trace();
     let Some(pci) = crate::pci::devices().iter().find(|d| {
         d.vendor_id == 0x1af4 && matches!(d.device_id, 0x1050 | 0x1040..=0x1040) && d.class == 3
     }) else {
@@ -1552,21 +1306,22 @@ pub fn init() {
         transport,
         next_resource: AtomicU32::new(1),
         next_context: AtomicU32::new(1),
-        next_session: AtomicU64::new(1),
         next_fence: AtomicU64::new(1),
-        master: AtomicU64::new(0),
         capsets: SpinLock::new(Vec::new()),
         outputs: SpinLock::new(Vec::new()),
         host_ranges: SpinLock::new(Vec::new()),
         retired: SpinLock::new(Vec::with_capacity(8192)),
-        sessions: SpinLock::new(Vec::new()),
-        displays: SpinLock::new(kms::DisplayState::new()),
+        files: SpinLock::new(Vec::new()),
         console: SpinLock::new(None),
         console_version: AtomicU64::new(0),
         console_tick: AtomicU64::new(0),
         console_visible: AtomicBool::new(false),
+        display_owned: AtomicBool::new(false),
         servicing: AtomicBool::new(false),
         live_resources: AtomicU32::new(0),
+        scanouts: SpinLock::new(Vec::new()),
+        cursors: SpinLock::new(Vec::new()),
+        drm: SpinLock::new(Weak::new()),
     });
     *GPU.lock() = Some(gpu.clone());
     let result = (|| -> Result<(), VfsError> {
@@ -1584,7 +1339,10 @@ pub fn init() {
             }
             gpu.capsets.lock().push(Capset { id, version, size });
         }
-        kms::discover(&gpu)?;
+        let outputs = display::discover(&gpu)?;
+        *gpu.scanouts.lock() = vec![None; outputs.len()];
+        *gpu.cursors.lock() = vec![0; outputs.len()];
+        *gpu.outputs.lock() = outputs;
         // The firmware framebuffer usually belongs to the primary display
         // device.  Taking the console over to the virtio-gpu scanout would
         // leave that visible display frozen, so only do it when there is no
@@ -1601,80 +1359,27 @@ pub fn init() {
         {
             gpu.install_console()?;
         }
-        for (name, node, render) in [
-            ("card0", "dri/card0", false),
-            ("renderD128", "dri/renderD128", true),
-        ] {
-            let backend: Arc<dyn Inode> = Arc::new(DeviceNode {
-                gpu: gpu.clone(),
-                render,
-            });
-            crate::device::register(
-                name,
-                "drm",
-                Some(node),
-                Some(backend),
-                vec![
-                    ("vendor", Attribute::text("0x1af4\n")),
-                    (
-                        "device",
-                        Attribute::text(format!("0x{:04x}\n", pci.device_id)),
-                    ),
-                ],
-            )?;
-        }
-        for record in crate::device::records()
-            .into_iter()
-            .filter(|d| d.subsystem == "drm")
-        {
-            let _ = record.directory.insert(
-                "device",
-                vfs::tree::Symlink::new(&format!("../{}", pci.address)),
-            );
-        }
-        for index in 0..gpu.outputs.lock().len() {
-            let weak = Arc::downgrade(&gpu);
-            let status = Attribute::new(0o444, move || {
-                let gpu = weak.upgrade().ok_or(VfsError::NoDevice)?;
-                let connected = gpu
-                    .outputs
-                    .lock()
-                    .get(index)
-                    .ok_or(VfsError::NoDevice)?
-                    .connected;
-                Ok(if connected {
-                    b"connected\n".to_vec()
-                } else {
-                    b"disconnected\n".to_vec()
-                })
-            });
-            let weak = Arc::downgrade(&gpu);
-            let modes = Attribute::new(0o444, move || {
-                let gpu = weak.upgrade().ok_or(VfsError::NoDevice)?;
-                let outputs = gpu.outputs.lock();
-                let o = outputs.get(index).ok_or(VfsError::NoDevice)?;
-                Ok(format!("{}x{}\n", o.width, o.height).into_bytes())
-            });
-            let weak = Arc::downgrade(&gpu);
-            let edid = Attribute::new(0o444, move || {
-                let gpu = weak.upgrade().ok_or(VfsError::NoDevice)?;
-                let value = gpu
-                    .outputs
-                    .lock()
-                    .get(index)
-                    .ok_or(VfsError::NoDevice)?
-                    .edid
-                    .clone();
-                Ok(value)
-            });
-            crate::device::register(
-                &format!("card0-Virtual-{}", index + 1),
-                "drm",
-                None,
-                None,
-                vec![("status", status), ("modes", modes), ("edid", edid)],
-            )?;
-        }
+        let mut config = DeviceConfig::new(
+            "virtio_gpu",
+            "SpaceKernel VirtIO GPU",
+            "20261024",
+            display::pipes(&gpu.outputs.lock()),
+        );
+        config.version = (0, 1, 0);
+        // Like Linux virtio-gpu: dumb buffers live in guest memory and are
+        // transferred to the host on DIRTYFB, so clients should shadow.
+        config.prefer_shadow = true;
+        config.claims_firmware_fb = true;
+        config.render = true;
+        config.prime = true;
+        config.syncobj = true;
+        config.parent = Some(format!("{}", pci.address));
+        config.attributes = vec![
+            ("vendor", alloc::string::String::from("0x1af4\n")),
+            ("device", format!("0x{:04x}\n", pci.device_id)),
+        ];
+        let registered = drm::register(config, gpu.clone())?;
+        *gpu.drm.lock() = Arc::downgrade(&registered);
         Ok(())
     })();
     match result {
@@ -1694,8 +1399,12 @@ pub fn start() {
     if let Some(gpu) = device() {
         let _ = crate::sched::spawn(
             move || loop {
+                // Fence completions, queued KMS commits and retired resources
+                // all post a fence event; read it before servicing so none is
+                // missed.
+                let seen = syncobj::fence_events();
                 gpu.service();
-                crate::sched::sleep_micros(1000);
+                syncobj::wait_fence_event(seen, gpu.console_refresh_deadline());
             },
             0,
         );

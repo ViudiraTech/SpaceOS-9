@@ -13,6 +13,9 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::verbose::log as verbose_log;
 
 pub fn run_early() {
+    if crate::boot::selftest_filter().is_some() {
+        return;
+    }
     crate::net::self_test::run();
     run();
     crate::user::self_test::run();
@@ -37,6 +40,18 @@ pub fn spawn_late() {
     crate::sched::spawn_on(
         crate::boot::bsp_cpu_index(),
         || {
+            if let Some(suite) = crate::boot::selftest_filter() {
+                // Single-suite mode: only the named area runs.
+                match suite {
+                    "drm" => {
+                        let status = crate::drm::self_test::run();
+                        crate::kinfo!("SELFTEST_OK suite=drm drm={}", status);
+                        crate::kinfo!("BOOT_OK");
+                    }
+                    other => panic!("unknown selftest suite '{other}'"),
+                }
+                return;
+            }
             crate::sched::sched_test::run();
             crate::user::run_self_test().expect("user self-test failed");
             #[cfg(target_arch = "x86_64")]
@@ -46,20 +61,20 @@ pub fn spawn_late() {
                 .expect("process/signal self-test failed");
             #[cfg(feature = "modules")]
             crate::module::self_test::network_late();
+            #[cfg(feature = "modules")]
+            crate::module::self_test::usb_late();
             crate::vfs::pseudo_test::processes();
             crate::vfs::dcache::self_test();
             crate::user::self_test::syscalls();
             crate::user::self_test::ipc_advanced();
-            let gpu_status = crate::gpu::self_test::run();
+            let gpu_status = crate::drm::virtio::self_test::run();
+            let drm_status = crate::drm::self_test::run();
             #[cfg(all(feature = "sound", feature = "sound-dummy"))]
             let sound_status = crate::sound::self_test::run_late();
             #[cfg(not(all(feature = "sound", feature = "sound-dummy")))]
             let sound_status = "off";
-            let rng_status = if crate::random::supported() {
-                "hw"
-            } else {
-                "unsupported(unverified)"
-            };
+            crate::random::self_test().expect("random self-test failed");
+            let rng_status = crate::random::status();
             let arch_name = if cfg!(target_arch = "x86_64") {
                 "x86_64"
             } else if cfg!(target_arch = "aarch64") {
@@ -70,10 +85,11 @@ pub fn spawn_late() {
                 "unknown"
             };
             crate::kinfo!(
-                "SELFTEST_OK arch={} cpu_fpu=ok mm_irq_fdt=ok block=ok vfs_abi=ok vfs_cache=ok dev_sys_proc=ok user_elf=ok sched=ok rng={} gpu={} sound={}",
+                "SELFTEST_OK arch={} cpu_fpu=ok mm_irq_fdt=ok block=ok vfs_abi=ok vfs_cache=ok dev_sys_proc=ok user_elf=ok sched=ok rng={} gpu={} drm={} sound={}",
                 arch_name,
                 rng_status,
                 gpu_status,
+                drm_status,
                 sound_status,
             );
             crate::kinfo!("BOOT_OK");

@@ -1,0 +1,141 @@
+#
+#       .github/workflows/ci.yml
+#       Format, three-architecture check, host model tests and QEMU boot matrix
+#
+#       2026/11/15 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      bench:
+        description: "Also run tools/bench.py (x86_64, 3 boots, median)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + cargo check + host tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain
+          rustup component add rust-src rustfmt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: check-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: make check
+        run: make check
+      - name: Host model and ABI tests
+        run: make test-host
+
+  boot:
+    name: boot ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            packages: qemu-system-x86 ovmf
+            firmware: /usr/share/OVMF/OVMF_CODE_4M.fd
+            machine: q35
+            extra: --gpu 2d
+          - arch: aarch64
+            packages: qemu-system-arm qemu-efi-aarch64
+            firmware: /usr/share/AAVMF/AAVMF_CODE.fd
+            machine: virt
+            extra: --cpu max
+          - arch: riscv64
+            packages: qemu-system-misc qemu-efi-riscv64
+            firmware: /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd
+            machine: virt
+            extra: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU, firmware and ISO tools
+        run: |
+          sudo apt-get update
+          # llvm: tools/check_no_simd.py audits the kernel with llvm-objdump.
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }} xorriso mtools dosfstools llvm
+      - name: Enable KVM when the runner exposes it
+        id: kvm
+        run: |
+          if [ "${{ matrix.arch }}" = x86_64 ] && [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+            echo "accel=--accel kvm" >> "$GITHUB_OUTPUT"
+          else
+            echo "accel=" >> "$GITHUB_OUTPUT"
+          fi
+      - run: rustup component add rust-src
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/downloads
+          key: boot-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Build self-test ISO
+        run: make iso ARCH=${{ matrix.arch }} CONFIG_BOOT_SELF_TEST=y
+      - name: Boot in QEMU
+        run: |
+          python3 tools/check_no_simd.py ${{ matrix.arch }} \
+            target/$(case ${{ matrix.arch }} in \
+              x86_64) echo x86_64-unknown-none;; \
+              aarch64) echo aarch64-unknown-none-softfloat;; \
+              riscv64) echo riscv64imac-unknown-none-elf;; esac)/debug/spacekernel
+          python3 tools/qemu_test.py ${{ matrix.arch }} \
+            build/${{ matrix.arch }}/debug/SpaceKernel-${{ matrix.arch }}.iso \
+            ${{ matrix.firmware }} 4 512 --machine ${{ matrix.machine }} \
+            ${{ matrix.extra }} ${{ steps.kvm.outputs.accel }} \
+            --online-cpus 4 --require SELFTEST_OK --require BOOT_OK \
+            --timeout 900 --result build/boot-${{ matrix.arch }}.json --verbose
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-${{ matrix.arch }}
+          path: build/boot-${{ matrix.arch }}.json
+          if-no-files-found: ignore
+
+  bench:
+    name: bench x86_64
+    if: github.event_name == 'workflow_dispatch' && inputs.bench
+    runs-on: ubuntu-24.04
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU, firmware, ISO tools and musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf xorriso \
+            mtools dosfstools musl-tools
+      - run: rustup component add rust-src
+      - name: Run spbench (median of 3 boots)
+        run: python3 tools/bench.py --repeat 3 --json build/bench/ci.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-x86_64
+          path: build/bench/ci.json

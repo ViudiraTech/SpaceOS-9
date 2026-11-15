@@ -15,13 +15,56 @@ use crate::{arch, boot};
 static FREQUENCY: AtomicU64 = AtomicU64::new(0);
 static ORIGIN: AtomicU64 = AtomicU64::new(0);
 static REALTIME_BASE: AtomicU64 = AtomicU64::new(0);
+// Linux clocksource-style scaling: units = (ticks * mult) >> shift, with the
+// largest shift whose multiplier still fits in 64 bits. The 64x64->128
+// multiply replaces a 128-bit software division on every clock read, which
+// the scheduler performs several times per context switch.
+static MICROS_MULT: AtomicU64 = AtomicU64::new(0);
+static MICROS_SHIFT: AtomicU64 = AtomicU64::new(0);
+static NANOS_MULT: AtomicU64 = AtomicU64::new(0);
+static NANOS_SHIFT: AtomicU64 = AtomicU64::new(0);
+
+/// `(mult, shift)` with `ticks * unit / frequency == (ticks * mult) >> shift`
+/// to a relative error below 2^-63.
+fn scale_factor(unit: u64, frequency: u64) -> (u64, u32) {
+    let mut shift = 0;
+    while shift < 127 {
+        let next = shift + 1;
+        if (unit as u128).leading_zeros() <= next {
+            break;
+        }
+        if ((unit as u128) << next) / frequency as u128 > u64::MAX as u128 {
+            break;
+        }
+        shift = next;
+    }
+    (
+        (((unit as u128) << shift) / frequency as u128) as u64,
+        shift,
+    )
+}
+
+#[inline]
+fn scale(ticks: u64, mult: &AtomicU64, shift: &AtomicU64) -> u64 {
+    let product = ticks as u128 * mult.load(Ordering::Relaxed) as u128;
+    (product >> shift.load(Ordering::Relaxed)).min(u64::MAX as u128) as u64
+}
 
 pub fn init() {
     let frequency = boot::counter_frequency()
         .or_else(|| crate::cpuid::info().and_then(|cpu| cpu.counter_hz))
         .filter(|value| *value != 0)
         .unwrap_or(0);
+    if frequency != 0 {
+        let (mult, shift) = scale_factor(1_000_000, frequency);
+        MICROS_MULT.store(mult, Ordering::Relaxed);
+        MICROS_SHIFT.store(u64::from(shift), Ordering::Relaxed);
+        let (mult, shift) = scale_factor(1_000_000_000, frequency);
+        NANOS_MULT.store(mult, Ordering::Relaxed);
+        NANOS_SHIFT.store(u64::from(shift), Ordering::Relaxed);
+    }
     ORIGIN.store(arch::counter(), Ordering::Release);
+    // Publishes the scale factors above together with the frequency.
     FREQUENCY.store(frequency, Ordering::Release);
     if let Some(seconds) = read_rtc_seconds() {
         REALTIME_BASE.store(seconds * 1_000_000, Ordering::Release);
@@ -34,7 +77,16 @@ pub fn uptime_micros() -> u64 {
         return 0;
     }
     let ticks = arch::counter().wrapping_sub(ORIGIN.load(Ordering::Acquire));
-    ((ticks as u128 * 1_000_000) / frequency as u128).min(u64::MAX as u128) as u64
+    scale(ticks, &MICROS_MULT, &MICROS_SHIFT)
+}
+
+/// Monotonic nanoseconds since boot, at the full counter resolution.
+pub fn uptime_nanos() -> u64 {
+    if FREQUENCY.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let ticks = arch::counter().wrapping_sub(ORIGIN.load(Ordering::Acquire));
+    scale(ticks, &NANOS_MULT, &NANOS_SHIFT)
 }
 
 /// Wall-clock microseconds since the Unix epoch.

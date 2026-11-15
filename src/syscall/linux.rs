@@ -50,7 +50,7 @@ pub fn clock_now(clock: u32) -> Result<u64, VfsError> {
     Ok(match clock {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => crate::time::realtime_micros() * 1000,
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
-            crate::time::uptime_micros() * 1000
+            crate::time::uptime_nanos()
         }
         CLOCK_PROCESS_CPUTIME | CLOCK_THREAD_CPUTIME => {
             let task = sched::current().ok_or(VfsError::InvalidArgument)?;
@@ -184,7 +184,8 @@ pub fn clock_nanosleep(clock: u32, flags: u32, request: u64, remaining: u64) -> 
             }
             return -abi::EINTR;
         }
-        sched::sleep_micros((deadline - now).min(1000));
+        // Signal delivery unparks the task, so EINTR is reported at once.
+        sched::park(Some(deadline));
     }
 }
 
@@ -645,6 +646,15 @@ struct FlockState {
 }
 
 static FLOCKS: SpinLock<BTreeMap<(u64, u64), FlockState>> = SpinLock::new(BTreeMap::new());
+/// Bumped whenever a lock is released or downgraded; blocked flock callers
+/// sleep on FLOCK_WAIT until it moves and then re-check the table.
+static FLOCK_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FLOCK_WAIT: sched::WaitQueueHead = sched::WaitQueueHead::new();
+
+fn flock_changed() {
+    FLOCK_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    FLOCK_WAIT.wake_all();
+}
 
 /// `flock(2)`. Ownership is the open file description, as on Linux.
 pub fn flock(fd: i32, operation: u32) -> i64 {
@@ -663,7 +673,10 @@ pub fn flock(fd: i32, operation: u32) -> i64 {
         return -abi::EINVAL;
     }
     loop {
-        {
+        let seen = FLOCK_GENERATION.load(core::sync::atomic::Ordering::Acquire);
+        // Converting or dropping our own lock may admit other waiters.
+        let mut released = false;
+        let acquired = {
             let mut locks = FLOCKS.lock();
             let state = locks.entry(key).or_insert(FlockState {
                 exclusive: None,
@@ -671,35 +684,46 @@ pub fn flock(fd: i32, operation: u32) -> i64 {
             });
             if state.exclusive == Some(owner) {
                 state.exclusive = None;
+                released = true;
             }
+            let held = state.shared.len();
             state.shared.retain(|&holder| holder != owner);
+            released |= state.shared.len() != held;
             match mode {
                 LOCK_UN => {
                     if state.exclusive.is_none() && state.shared.is_empty() {
                         locks.remove(&key);
                     }
-                    return 0;
+                    true
                 }
                 LOCK_SH if state.exclusive.is_none() => {
                     state.shared.push(owner);
                     entry.file.track_flock(key);
-                    return 0;
+                    true
                 }
                 LOCK_EX if state.exclusive.is_none() && state.shared.is_empty() => {
                     state.exclusive = Some(owner);
                     entry.file.track_flock(key);
-                    return 0;
+                    true
                 }
-                _ => {}
+                _ => false,
             }
+        };
+        if released {
+            flock_changed();
+        }
+        if acquired {
+            return 0;
         }
         if operation & LOCK_NB != 0 {
             return -abi::EAGAIN;
         }
-        if crate::signal::pending_for_current() {
+        let result = FLOCK_WAIT.wait_interruptible(|| {
+            FLOCK_GENERATION.load(core::sync::atomic::Ordering::Acquire) != seen
+        });
+        if result == sched::WaitResult::Interrupted {
             return -abi::EINTR;
         }
-        sched::sleep_micros(1000);
     }
 }
 
@@ -715,6 +739,8 @@ pub fn flock_release(key: (u64, u64), owner: u64) {
             locks.remove(&key);
         }
     }
+    drop(locks);
+    flock_changed();
 }
 
 fn read_iovec(pointer: u64, count: u64) -> Result<Vec<abi::IoVec>, VfsError> {

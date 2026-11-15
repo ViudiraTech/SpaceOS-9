@@ -251,11 +251,15 @@ pub struct InputDevice {
     clients: SpinLock<Vec<Arc<Client>>>,
     /// Driver hook for output events such as LED changes.
     output: SpinLock<Option<fn(u16, u16, i32)>>,
+    /// Device-model ids of `inputN` and its `eventN` child, for removal.
+    nodes: SpinLock<Option<(u64, u64)>>,
 }
 
 struct Client {
     id: u64,
     state: SpinLock<ClientState>,
+    /// Readers blocked on an empty queue; woken from the reporting IRQ.
+    wait: crate::sched::WaitQueue,
 }
 
 static NEXT_DEVICE: AtomicU32 = AtomicU32::new(0);
@@ -404,6 +408,7 @@ impl InputDevice {
             }
             state.queue.push_back(event);
             drop(state);
+            client.wait.wake_all();
             crate::ipc::wake_object(Arc::as_ptr(client));
         }
         drop(clients);
@@ -430,13 +435,31 @@ pub fn register(capabilities: Capabilities) -> Result<Arc<InputDevice>, VfsError
         live: SpinLock::new(live),
         clients: SpinLock::new(Vec::new()),
         output: SpinLock::new(None),
+        nodes: SpinLock::new(None),
     });
-    publish(&device)?;
+    let nodes = publish(&device)?;
+    *device.nodes.lock() = Some(nodes);
     DEVICES.lock().push(device.clone());
     Ok(device)
 }
 
-fn publish(device: &Arc<InputDevice>) -> Result<(), VfsError> {
+/// Remove a device (hot-unplug): open evdev clients are revoked, so blocked
+/// readers return ENODEV, and the sysfs and /dev nodes disappear.
+pub fn unregister(device: &Arc<InputDevice>) {
+    DEVICES.lock().retain(|entry| !Arc::ptr_eq(entry, device));
+    let clients: Vec<Arc<Client>> = device.clients.lock().drain(..).collect();
+    for client in clients {
+        client.state.lock().revoked = true;
+        client.wait.wake_all();
+        crate::ipc::wake_object(Arc::as_ptr(&client));
+    }
+    if let Some((parent, child)) = device.nodes.lock().take() {
+        let _ = crate::device::unregister(child);
+        let _ = crate::device::unregister(parent);
+    }
+}
+
+fn publish(device: &Arc<InputDevice>) -> Result<(u64, u64), VfsError> {
     let caps = &device.capabilities;
     let identifier = Directory::new(0o555, false);
     identifier.insert(
@@ -511,7 +534,7 @@ fn publish(device: &Arc<InputDevice>) -> Result<(), VfsError> {
     });
     let event_name = format!("event{}", device.index);
     let node = format!("input/{}", event_name);
-    crate::device::register_child(
+    let child = crate::device::register_child(
         &parent,
         &event_name,
         "input",
@@ -519,7 +542,7 @@ fn publish(device: &Arc<InputDevice>) -> Result<(), VfsError> {
         Some(backend),
         vec![],
     )?;
-    Ok(())
+    Ok((parent.id, child.id))
 }
 
 /// One open of `/dev/input/eventN`.
@@ -555,6 +578,7 @@ impl Inode for EvdevNode {
                 masks: vec![None; EV_MAX + 1],
                 revoked: false,
             }),
+            wait: crate::sched::WaitQueue::new(),
         });
         self.device.clients.lock().push(client.clone());
         Ok(Some(Arc::new(EvdevFile {
@@ -667,10 +691,13 @@ impl Inode for EvdevFile {
             if *self.nonblock.lock() {
                 return Err(VfsError::WouldBlock);
             }
-            if crate::signal::pending_for_current() {
+            let ready = || {
+                let state = self.client.state.lock();
+                state.revoked || !state.queue.is_empty()
+            };
+            if self.client.wait.wait_interruptible(ready) == crate::sched::WaitResult::Interrupted {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
         }
     }
 
@@ -823,6 +850,7 @@ impl Inode for EvdevFile {
                     live.grabbed_by = None;
                 }
                 drop(live);
+                self.client.wait.wake_all();
                 crate::ipc::wake_pollers();
                 Ok(0)
             }

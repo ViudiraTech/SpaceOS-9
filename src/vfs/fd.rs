@@ -185,6 +185,34 @@ pub(crate) struct PipeBuffer {
     pub(crate) queue: VecDeque<u8>,
     pub(crate) readers: u32,
     pub(crate) writers: u32,
+    /// Readers sleep here for data or for the last writer to close.
+    readable: crate::sched::WaitQueue,
+    /// Writers sleep here for space or for the last reader to close.
+    writable: crate::sched::WaitQueue,
+}
+
+impl PipeBuffer {
+    pub(crate) fn new(readers: u32, writers: u32) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            readers,
+            writers,
+            readable: crate::sched::WaitQueue::new(),
+            writable: crate::sched::WaitQueue::new(),
+        }
+    }
+}
+
+/// An endpoint opened or closed: blocked readers may now see EOF and blocked
+/// writers EPIPE. Must be called without the pipe lock held.
+pub(crate) fn pipe_ends_changed(shared: &SpinLock<PipeBuffer>) {
+    let (readable, writable) = {
+        let pipe = shared.lock();
+        (pipe.readable.clone(), pipe.writable.clone())
+    };
+    readable.wake_all();
+    writable.wake_all();
+    crate::ipc::wake_object(shared as *const SpinLock<PipeBuffer>);
 }
 
 pub(crate) const PIPE_CAPACITY: usize = 64 * 1024;
@@ -202,24 +230,32 @@ pub(crate) fn pipe_read(
         let mut pipe = shared.lock();
         if !pipe.queue.is_empty() {
             let count = buf.len().min(pipe.queue.len());
-            for slot in &mut buf[..count] {
-                *slot = pipe.queue.pop_front().unwrap();
-            }
+            let (front, back) = pipe.queue.as_slices();
+            let first = count.min(front.len());
+            buf[..first].copy_from_slice(&front[..first]);
+            buf[first..count].copy_from_slice(&back[..count - first]);
+            pipe.queue.drain(..count);
+            let writable = pipe.writable.clone();
             drop(pipe);
+            writable.wake_all();
             crate::ipc::wake_object(shared as *const SpinLock<PipeBuffer>);
             return Ok(count);
         }
         if pipe.writers == 0 {
             return Ok(0);
         }
+        let readable = pipe.readable.clone();
         drop(pipe);
         if nonblock {
             return Err(VfsError::WouldBlock);
         }
-        if crate::signal::pending_for_current() {
+        let result = readable.wait_interruptible(|| {
+            let pipe = shared.lock();
+            !pipe.queue.is_empty() || pipe.writers == 0
+        });
+        if result == crate::sched::WaitResult::Interrupted {
             return Err(VfsError::Interrupted);
         }
-        crate::sched::sleep_micros(1000);
     }
 }
 
@@ -245,21 +281,27 @@ pub(crate) fn pipe_write(
             available.min(buf.len())
         };
         if count != 0 {
-            for &byte in &buf[..count] {
-                pipe.queue.push_back(byte);
-            }
+            pipe.queue.extend(&buf[..count]);
+            let readable = pipe.readable.clone();
             drop(pipe);
+            readable.wake_all();
             crate::ipc::wake_object(shared as *const SpinLock<PipeBuffer>);
             return Ok(count);
         }
+        let writable = pipe.writable.clone();
         drop(pipe);
         if nonblock {
             return Err(VfsError::WouldBlock);
         }
-        if crate::signal::pending_for_current() {
+        // Wait for the space this write needs (atomic writes need it all).
+        let needed = buf.len().min(PIPE_BUF);
+        let result = writable.wait_interruptible(|| {
+            let pipe = shared.lock();
+            pipe.readers == 0 || PIPE_CAPACITY - pipe.queue.len() >= needed
+        });
+        if result == crate::sched::WaitResult::Interrupted {
             return Err(VfsError::Interrupted);
         }
-        crate::sched::sleep_micros(1000);
     }
 }
 
@@ -330,7 +372,8 @@ impl Drop for PipeEndInode {
         } else {
             pipe.readers = pipe.readers.saturating_sub(1);
         }
-        crate::ipc::poll_kick();
+        drop(pipe);
+        pipe_ends_changed(&self.shared);
     }
 }
 
@@ -340,11 +383,7 @@ pub fn create_pipe_pair() -> (Arc<OpenFile>, Arc<OpenFile>) {
 
 pub fn create_pipe_pair_with_flags(extra_flags: u32) -> (Arc<OpenFile>, Arc<OpenFile>) {
     let status_flags = extra_flags & abi::O_NONBLOCK;
-    let shared = Arc::new(SpinLock::new(PipeBuffer {
-        queue: VecDeque::with_capacity(4096),
-        readers: 1,
-        writers: 1,
-    }));
+    let shared = Arc::new(SpinLock::new(PipeBuffer::new(1, 1)));
     let r_ino = super::tree::ino();
     let w_ino = super::tree::ino();
     let nonblock = status_flags & abi::O_NONBLOCK != 0;

@@ -101,8 +101,29 @@ pub fn keyboard_to_tty() -> bool {
     KEYBOARD_TO_TTY.load(Ordering::Acquire)
 }
 
+/// A DRM device scanning out of the boot framebuffer owns the screen.
+static SCANOUT_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 pub fn graphics_active() -> bool {
-    GRAPHICS_ACTIVE.load(Ordering::Acquire)
+    GRAPHICS_ACTIVE.load(Ordering::Acquire) || SCANOUT_CLAIMED.load(Ordering::Acquire)
+}
+
+pub fn scanout_claimed() -> bool {
+    SCANOUT_CLAIMED.load(Ordering::Acquire)
+}
+
+/// A DRM client enabled a display on the console's framebuffer: stop
+/// drawing text into it (simpledrm and fbcon share the firmware buffer).
+pub fn claim_scanout() {
+    SCANOUT_CLAIMED.store(true, Ordering::Release);
+}
+
+/// The DRM display was switched off or its last client closed: redraw the
+/// active terminal, as Linux restores fbcon on lastclose.
+pub fn release_scanout() {
+    if SCANOUT_CLAIMED.swap(false, Ordering::AcqRel) {
+        let _ = super::console::repaint(active_vt());
+    }
 }
 
 fn active_vt() -> usize {
@@ -122,6 +143,9 @@ fn send_signal(owner: u64, signal: i16) {
 }
 
 /// Finish switching to `target` and notify a `VT_PROCESS` owner.
+/// VT_WAITACTIVE callers sleep here until the active console changes.
+static SWITCH_WAIT: crate::sched::WaitQueueHead = crate::sched::WaitQueueHead::new();
+
 fn complete_switch(state: &mut State, target: usize) {
     console::switch_to(target);
     publish(state, target);
@@ -129,6 +153,7 @@ fn complete_switch(state: &mut State, target: usize) {
     if mode.mode == VT_PROCESS {
         send_signal(mode.owner, mode.acqsig);
     }
+    SWITCH_WAIT.wake_all();
     crate::ipc::wake_pollers();
 }
 
@@ -275,14 +300,9 @@ pub fn ioctl(vt: usize, command: u64, arg: u64) -> Option<Result<u64, VfsError>>
             if !(1..=VT_COUNT).contains(&(arg as usize)) {
                 Err(VfsError::NoSuchDeviceOrAddress)
             } else {
-                loop {
-                    if active_vt() == arg as usize {
-                        break Ok(0);
-                    }
-                    if crate::signal::pending_for_current() {
-                        break Err(VfsError::Interrupted);
-                    }
-                    crate::ipc::block_briefly();
+                match SWITCH_WAIT.wait_interruptible(|| active_vt() == arg as usize) {
+                    crate::sched::WaitResult::Ready => Ok(0),
+                    _ => Err(VfsError::Interrupted),
                 }
             }
         }

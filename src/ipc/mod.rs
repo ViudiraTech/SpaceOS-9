@@ -37,6 +37,8 @@ const MAX_COUNTER: u64 = u64::MAX - 1;
 
 pub struct EventFd {
     counter: SpinLock<u64>,
+    /// Readers wait for a non-zero counter, writers for room to add.
+    wait: sched::WaitQueue,
     semaphore: bool,
     nonblock: bool,
     ino: u64,
@@ -63,6 +65,7 @@ impl Inode for EventFd {
                     value
                 };
                 drop(counter);
+                self.wait.wake_all();
                 wake_object(self as *const Self);
                 buf[..8].copy_from_slice(&value.to_le_bytes());
                 return Ok(8);
@@ -71,10 +74,11 @@ impl Inode for EventFd {
             if self.nonblock {
                 return Err(VfsError::WouldBlock);
             }
-            if crate::signal::pending_for_current() {
+            if self.wait.wait_interruptible(|| *self.counter.lock() != 0)
+                == sched::WaitResult::Interrupted
+            {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
         }
     }
 
@@ -94,6 +98,7 @@ impl Inode for EventFd {
             {
                 *counter += value;
                 drop(counter);
+                self.wait.wake_all();
                 wake_object(self as *const Self);
                 return Ok(8);
             }
@@ -101,10 +106,15 @@ impl Inode for EventFd {
             if self.nonblock {
                 return Err(VfsError::WouldBlock);
             }
-            if crate::signal::pending_for_current() {
+            let fits = || {
+                self.counter
+                    .lock()
+                    .checked_add(value)
+                    .is_some_and(|next| next <= MAX_COUNTER)
+            };
+            if self.wait.wait_interruptible(fits) == sched::WaitResult::Interrupted {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
         }
     }
 
@@ -132,6 +142,7 @@ pub fn eventfd2(initval: u32, flags: u32) -> i64 {
     let nonblock = flags & O_NONBLOCK != 0;
     let inode = Arc::new(EventFd {
         counter: SpinLock::new(initval as u64),
+        wait: sched::WaitQueue::new(),
         semaphore: flags & EFD_SEMAPHORE != 0,
         nonblock,
         ino: vfs::tree::ino(),

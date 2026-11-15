@@ -151,26 +151,24 @@ impl AhciPortState {
     }
 
     fn stop_cmd(&self) {
-        let mut cmd = self.read_reg(PORT_CMD);
-        cmd &= !(PORT_CMD_ST | PORT_CMD_FRE);
-        self.write_reg(PORT_CMD, cmd);
+        // Clear PxCMD.ST and wait for CR=0 before clearing PxCMD.FRE (AHCI 1.3.1 §10.1.2).
+        let cmd = self.read_reg(PORT_CMD);
+        self.write_reg(PORT_CMD, cmd & !PORT_CMD_ST);
+        let _ = super::poll_until(1_000_000, 500_000, || {
+            Ok(((self.read_reg(PORT_CMD) & PORT_CMD_CR) == 0).then_some(()))
+        });
 
-        for _ in 0..500_000 {
-            let status = self.read_reg(PORT_CMD);
-            if (status & (PORT_CMD_FR | PORT_CMD_CR)) == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        let cmd = self.read_reg(PORT_CMD);
+        self.write_reg(PORT_CMD, cmd & !PORT_CMD_FRE);
+        let _ = super::poll_until(1_000_000, 500_000, || {
+            Ok(((self.read_reg(PORT_CMD) & PORT_CMD_FR) == 0).then_some(()))
+        });
     }
 
     fn start_cmd(&self) {
-        for _ in 0..500_000 {
-            if (self.read_reg(PORT_CMD) & PORT_CMD_CR) == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        let _ = super::poll_until(1_000_000, 500_000, || {
+            Ok(((self.read_reg(PORT_CMD) & PORT_CMD_CR) == 0).then_some(()))
+        });
         let cmd = self.read_reg(PORT_CMD);
         self.write_reg(PORT_CMD, cmd | PORT_CMD_FRE);
         let cmd = self.read_reg(PORT_CMD);
@@ -178,14 +176,10 @@ impl AhciPortState {
     }
 
     fn wait_idle(&self) -> Result<(), BlockError> {
-        for _ in 0..500_000 {
+        super::poll_until(1_000_000, 500_000, || {
             let tfd = self.read_reg(PORT_TFD);
-            if (tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) == 0 {
-                return Ok(());
-            }
-            core::hint::spin_loop();
-        }
-        Err(BlockError::Timeout)
+            Ok(((tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) == 0).then_some(()))
+        })
     }
 
     fn exec_command(
@@ -219,12 +213,12 @@ impl AhciPortState {
             hdr_ptr.write_volatile(hdr);
 
             if byte_len > 0 {
-                (*tbl_ptr).prdt[0] = HbaPrdtEntry {
+                (*tbl_ptr).prdt.as_mut_ptr().write_volatile(HbaPrdtEntry {
                     dba: self.dma_buf_phys as u32,
                     dbau: (self.dma_buf_phys >> 32) as u32,
                     reserved: 0,
                     dbc: (byte_len as u32 - 1) | (1 << 31),
-                };
+                });
             }
 
             let fis_ptr = (*tbl_ptr).cfis.as_mut_ptr() as *mut FisRegH2D;
@@ -249,10 +243,13 @@ impl AhciPortState {
             });
         }
 
+        // Order descriptor and bounce-buffer writes before ringing PxCI.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
         // Issue command in slot 0
         self.write_reg(PORT_CI, 1);
 
-        for _ in 0..2_000_000 {
+        super::poll_until(5_000_000, 2_000_000, || {
             let ci = self.read_reg(PORT_CI);
             let is = self.read_reg(PORT_IS);
             if (is & PORT_IS_TFES) != 0 {
@@ -263,12 +260,11 @@ impl AhciPortState {
                 if (tfd & 0x01) != 0 {
                     return Err(BlockError::DeviceFault);
                 }
-                return Ok(());
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                return Ok(Some(()));
             }
-            core::hint::spin_loop();
-        }
-
-        Err(BlockError::Timeout)
+            Ok(None)
+        })
     }
 }
 
@@ -546,13 +542,10 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
             if (cap2 & HBA_CAP2_BOH) != 0 {
                 let bohc = ((abar_virt + HBA_BOHC) as *const u32).read_volatile();
                 ((abar_virt + HBA_BOHC) as *mut u32).write_volatile(bohc | HBA_BOHC_OOS);
-                for _ in 0..100_000 {
-                    if (((abar_virt + HBA_BOHC) as *const u32).read_volatile() & HBA_BOHC_BOS) == 0
-                    {
-                        break;
-                    }
-                    core::hint::spin_loop();
-                }
+                let _ = super::poll_until(500_000, 100_000, || {
+                    let cur = ((abar_virt + HBA_BOHC) as *const u32).read_volatile();
+                    Ok(((cur & HBA_BOHC_BOS) == 0).then_some(()))
+                });
             }
 
             // Enable AHCI mode in Global Host Control (GHC.AE)

@@ -89,6 +89,9 @@ pub struct UdpSocket {
     nonblock: AtomicBool,
     state: SpinLock<State>,
     me: Weak<UdpSocket>,
+    /// Bumped by `notify` when a datagram or error arrives.
+    events: core::sync::atomic::AtomicU64,
+    wait: crate::sched::WaitQueue,
 }
 
 struct Binding {
@@ -137,6 +140,8 @@ impl UdpSocket {
                 priority: 0,
             }),
             me: me.clone(),
+            events: core::sync::atomic::AtomicU64::new(0),
+            wait: crate::sched::WaitQueue::new(),
         })
     }
 
@@ -289,6 +294,13 @@ impl UdpSocket {
         Ok(payload.len())
     }
 
+    /// Wake blocked receivers and poll/epoll waiters of this socket only.
+    fn notify(&self) {
+        self.events.fetch_add(1, Ordering::AcqRel);
+        self.wait.wake_all();
+        crate::ipc::wake_object(self as *const Self);
+    }
+
     pub fn receive_msg(&self, max: usize, flags: u64) -> Result<InetReceived, VfsError> {
         const MSG_PEEK: u64 = 2;
         const MSG_DONTWAIT: u64 = 0x40;
@@ -297,6 +309,7 @@ impl UdpSocket {
         let deadline =
             (timeout_us != 0).then(|| crate::time::uptime_micros().saturating_add(timeout_us));
         loop {
+            let seen = self.events.load(Ordering::Acquire);
             {
                 let mut state = self.state.lock();
                 if let Some(error) = state.error.take() {
@@ -343,7 +356,12 @@ impl UdpSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            // Timeouts and signals are re-checked by the loop.
+            let _ = self.wait.wait_event(
+                || self.events.load(Ordering::Acquire) != seen,
+                true,
+                deadline,
+            );
         }
     }
 
@@ -531,7 +549,7 @@ impl UdpSocket {
         state.rmem += charge;
         state.queue.push_back(datagram);
         drop(state);
-        crate::ipc::wake_pollers();
+        self.notify();
     }
 }
 
@@ -775,7 +793,7 @@ pub fn error(event: &icmp::IcmpError<'_>) {
         state.error = Some(errno);
     }
     drop(state);
-    crate::ipc::wake_pollers();
+    socket.notify();
 }
 
 fn ipv4_header(bytes: &[u8]) -> Option<super::ipv4::header::Ipv4Header> {

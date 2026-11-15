@@ -33,9 +33,24 @@ pub fn page_root() -> u64 {
     cr3 & ADDRESS_MASK
 }
 
+/// Root each CPU last loaded into CR3 (Linux `mm_cpumask`, made exact: no
+/// PCIDs are used, so loading any other root flushes a space's entries).
+/// Published before the CR3 write, so a shootdown that misses a CPU here is
+/// ordered before that CPU's table walk of the updated tables.
+static LOADED_ROOT: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
 pub fn set_page_root(root: u64) {
     // SAFETY: caller supplies an initialized and mapped PML4 frame.
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) }
+}
+
+/// `set_page_root` for task context, recording the root for targeted
+/// shootdowns. Every load of a user root goes through here; boot-time loads
+/// of the kernel root (before per-CPU state exists) use `set_page_root`.
+pub fn set_page_root_tracked(root: u64) {
+    LOADED_ROOT[crate::smp::current_cpu()].store(root, Ordering::SeqCst);
+    set_page_root(root);
 }
 
 pub fn pte_present(entry: u64) -> bool {
@@ -119,7 +134,33 @@ fn flush_local(vaddr: u64, pages: usize) {
     }
 }
 
+/// Invalidate a range on every CPU (kernel mappings are global).
 pub fn tlb_shootdown(virtual_address: u64, pages: usize) {
+    shootdown(virtual_address, pages, None);
+}
+
+/// Invalidate user translations of the address space whose root is `root`:
+/// only CPUs that currently have it loaded can cache them.
+pub fn tlb_shootdown_root(root: u64, virtual_address: u64, pages: usize) {
+    shootdown(virtual_address, pages, Some(root));
+}
+
+fn shootdown(virtual_address: u64, pages: usize, root: Option<u64>) {
+    // Order the caller's page-table writes before reading LOADED_ROOT.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let current = crate::smp::current_cpu();
+    let targets = |cpu: usize| {
+        cpu != current
+            && crate::smp::online(cpu)
+            && root.is_none_or(|root| LOADED_ROOT[cpu].load(Ordering::SeqCst) == root)
+    };
+    let local = root.is_none_or(|root| page_root() == root);
+    if !(0..crate::boot::cpu_count()).any(targets) {
+        if local {
+            flush_local(virtual_address, pages);
+        }
+        return;
+    }
     // Acquire TLB_LOCK before masking local interrupts so CPUs spinning on
     // TLB_LOCK keep interrupts enabled and still service peer TLB IPIs.
     let _guard = TLB_LOCK.lock();
@@ -127,26 +168,36 @@ pub fn tlb_shootdown(virtual_address: u64, pages: usize) {
     PENDING_PAGES.store(pages, Ordering::Release);
     ACK_COUNT.store(0, Ordering::Release);
 
-    let _online = crate::smp::online_count();
-    let current = crate::smp::current_cpu();
     let mut sent = 0;
-
-    for cpu in 0..crate::boot::cpu_count() {
-        if cpu != current && crate::smp::online(cpu) {
-            if let Some(hw_id) = crate::boot::cpu_hardware_id(cpu) {
-                if super::apic::send_fixed_ipi(hw_id as u32, TLB_IPI_VECTOR).is_ok() {
-                    sent += 1;
-                }
-            }
+    let mut missing = 0u64;
+    for cpu in (0..crate::boot::cpu_count()).filter(|&cpu| targets(cpu)) {
+        if let Some(hw_id) = crate::boot::cpu_hardware_id(cpu)
+            && super::apic::send_fixed_ipi(hw_id as u32, TLB_IPI_VECTOR).is_ok()
+        {
+            sent += 1;
+            missing |= 1 << (cpu % 64);
         }
     }
 
-    flush_local(virtual_address, pages);
+    if local {
+        flush_local(virtual_address, pages);
+    }
 
     if sent > 0 {
         let start = crate::time::uptime_micros();
         while ACK_COUNT.load(Ordering::Acquire) < sent {
+            // A target spinning with interrupts masked on a lock this CPU's
+            // caller holds can never acknowledge; give up rather than
+            // deadlock, but say so, since its TLB may now be stale.
             if crate::time::uptime_micros().saturating_sub(start) > 50_000 {
+                crate::kwarn!(
+                    "TLB shootdown {:#x}+{} pages: {}/{} CPUs acknowledged (targets {:#x})",
+                    virtual_address,
+                    pages,
+                    ACK_COUNT.load(Ordering::Acquire),
+                    sent,
+                    missing
+                );
                 break;
             }
             core::hint::spin_loop();

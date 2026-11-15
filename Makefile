@@ -43,7 +43,7 @@ QEMU := qemu-system-aarch64
 FIRMWARE := /usr/share/AAVMF/AAVMF_CODE.fd
 MACHINE := virt
 QEMU_CPU := -cpu max
-DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB)
+DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB) -nic none
 DTB_LINE = dtb_path: boot():/boot/limine/dtb.dtb
 else ifeq ($(ARCH),riscv64)
 TARGET := riscv64imac-unknown-none-elf
@@ -51,7 +51,7 @@ EFI := BOOTRISCV64.EFI
 QEMU := qemu-system-riscv64
 FIRMWARE := /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd
 MACHINE := virt
-DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB)
+DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB) -nic none
 DTB_LINE = dtb_path: boot():/boot/limine/dtb.dtb
 else
 $(error Unsupported ARCH=$(ARCH))
@@ -110,7 +110,9 @@ MODULE_LIST := $(strip \
   $(if $(filter y,$(CONFIG_MODULE_HELLO)),hello) \
   $(if $(filter y,$(CONFIG_MODULE_HELLO_RUST)),hello-rust) \
   $(if $(and $(filter y,$(CONFIG_MODULE_SB16)),$(filter x86_64,$(ARCH))),sb16) \
-  $(if $(filter y,$(CONFIG_MODULE_HDA)),hda))
+  $(if $(filter y,$(CONFIG_MODULE_HDA)),hda) \
+  $(if $(filter y,$(CONFIG_MODULE_USB)),usb) \
+  $(if $(filter y,$(CONFIG_MODULE_SIMPLEFB)),simplefb))
 
 OUT := build/$(ARCH)/$(PROFILE)
 MODULE_OUT := build/modules/$(ARCH)
@@ -134,10 +136,12 @@ endif
 AUDIO_REQUIRES := $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULE_SB16)),$(filter sb16 both,$(QEMU_SOUND))),--require 'SB16_MODULE_OK' --require 'SB16_PCM_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULE_HDA)),$(filter hda both,$(QEMU_SOUND))),--require 'HDA_MODULE_OK' --require 'HDA_PCM_OK',)
 WITH_ROOTFS ?= 0
 ROOTFS_SELFTEST ?= 0
-ROOTFS_IMG := build/rootfs/fat32.img
+ROOTFS_IMG ?= build/rootfs/fat32.img
+# Set ROOTFS_BUILD=0 to package an image produced elsewhere (e.g. tools/bench.py).
+ROOTFS_BUILD ?= 1
 ROOTFS_MODULE := $(if $(filter 1,$(WITH_ROOTFS)),module_path: boot():/rootfs.img,)
 
-.PHONY: desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
+.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
 all: release-try
 
 defconfig:
@@ -200,7 +204,7 @@ rootfs-image: modules
 busybox:
 	tools/build_busybox.sh
 
-iso: kernel limine $(if $(filter 1,$(WITH_ROOTFS)),rootfs-image)
+iso: kernel limine $(if $(and $(filter 1,$(WITH_ROOTFS)),$(filter 1,$(ROOTFS_BUILD))),rootfs-image)
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/EFI/BOOT $(ISO_ROOT)/boot/limine
 	cp $(KERNEL) $(ISO_ROOT)/kernel.elf
@@ -289,13 +293,17 @@ test-drm-abi:
 	mkdir -p build
 	gcc tools/drm_abi_probe.c -o build/drm-abi-probe
 	build/drm-abi-probe > build/drm-abi-probe.out
-	@grep -F -f build/drm-abi-probe.out src/gpu/abi.rs > /dev/null || (echo "DRM ABI mismatch" && exit 1)
+	python3 tools/check_drm_abi.py build/drm-abi-probe.out
+
+# Boot a release kernel with spbench as PID 1 and print BENCH results.
+bench:
+	python3 tools/bench.py --arch $(ARCH) --cpus $(CPUS)
 
 test-host: test-sched-model test-subsystem-model test-drm-abi
 
 test-single: iso
 	python3 tools/check_no_simd.py $(ARCH) $(KERNEL)
-	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULES)),$(filter y,$(CONFIG_MODULE_HELLO))),--require 'HELLO_MODULE_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_NIC),--nic '$(QEMU_NIC)',) $(if $(QEMU_SOUND),--sound '$(QEMU_SOUND)',) $(AUDIO_REQUIRES) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
+	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULES)),$(filter y,$(CONFIG_MODULE_HELLO))),--require 'HELLO_MODULE_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_NIC),--nic '$(QEMU_NIC)',) $(if $(QEMU_SOUND),--sound '$(QEMU_SOUND)',) $(AUDIO_REQUIRES) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULE_USB))),--usb,) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
 
 test-modules: iso
 	@if [ "$(CONFIG_MODULES)" != "y" ] || [ "$(CONFIG_MODULE_HELLO)" != "y" ]; then \

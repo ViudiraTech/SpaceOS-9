@@ -174,9 +174,9 @@ impl UserAddressSpace {
         }
         if let Some(address) = first_owned {
             if owned_count == 1 {
-                arch::tlb_shootdown(address, 1);
+                arch::tlb_shootdown_root(self.root_phys, address, 1);
             } else {
-                arch::tlb_shootdown(0, 0);
+                arch::tlb_shootdown_root(self.root_phys, 0, 0);
             }
         }
         Ok(child)
@@ -371,7 +371,7 @@ impl UserAddressSpace {
             unsafe { leaf.write_volatile(0) };
         }
         if !pages.is_empty() {
-            arch::tlb_shootdown(address, (length / PAGE_SIZE) as usize);
+            arch::tlb_shootdown_root(self.root_phys, address, (length / PAGE_SIZE) as usize);
         }
         for page in pages {
             if let Some(mapping) = self.mapped_frames.remove(&page) {
@@ -486,7 +486,7 @@ impl UserAddressSpace {
             unsafe { leaf.write_volatile(0) };
         }
         if !pages.is_empty() {
-            arch::tlb_shootdown(old, (moved_len / PAGE_SIZE) as usize);
+            arch::tlb_shootdown_root(self.root_phys, old, (moved_len / PAGE_SIZE) as usize);
         }
         for page in pages {
             let mapping = self.mapped_frames.remove(&page).unwrap();
@@ -660,9 +660,15 @@ impl UserAddressSpace {
     }
 
     fn activate_root(root: u64) {
+        // Linux switch_mm: switching between threads of one process (or back
+        // to the process after a kernel thread that kept its root) must not
+        // reload the root, which flushes every non-global TLB entry. Changes
+        // to a live space are flushed by tlb_shootdown, never by this reload.
         #[cfg(target_arch = "x86_64")]
         {
-            arch::set_page_root(root);
+            if arch::page_root() != root {
+                arch::set_page_root_tracked(root);
+            }
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -690,7 +696,9 @@ impl UserAddressSpace {
         }
         #[cfg(target_arch = "riscv64")]
         {
-            arch::set_page_root(root);
+            if arch::page_root() != root {
+                arch::set_page_root(root);
+            }
         }
     }
 
@@ -699,7 +707,9 @@ impl UserAddressSpace {
         if let Some(_kernel_root) = vmm::root() {
             #[cfg(target_arch = "x86_64")]
             {
-                arch::set_page_root(_kernel_root);
+                if arch::page_root() != _kernel_root {
+                    arch::set_page_root_tracked(_kernel_root);
+                }
             }
             #[cfg(target_arch = "aarch64")]
             {
@@ -718,7 +728,9 @@ impl UserAddressSpace {
             }
             #[cfg(target_arch = "riscv64")]
             {
-                arch::set_page_root(_kernel_root);
+                if arch::page_root() != _kernel_root {
+                    arch::set_page_root(_kernel_root);
+                }
             }
         }
     }
@@ -1031,7 +1043,7 @@ impl UserAddressSpace {
             }
         }
         if !keys.is_empty() {
-            arch::tlb_shootdown(address, (length / PAGE_SIZE) as usize);
+            arch::tlb_shootdown_root(self.root_phys, address, (length / PAGE_SIZE) as usize);
         }
         for page in keys {
             if let Some(m) = self.mapped_frames.remove(&page) {
@@ -1123,7 +1135,7 @@ impl UserAddressSpace {
             let leaf = self.leaf(page, false).map_err(|_| VfsError::Fault)?;
             unsafe { leaf.write_volatile(value) };
         }
-        arch::tlb_shootdown(address, (length / PAGE_SIZE) as usize);
+        arch::tlb_shootdown_root(self.root_phys, address, (length / PAGE_SIZE) as usize);
         Ok(())
     }
 

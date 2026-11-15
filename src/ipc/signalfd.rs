@@ -76,7 +76,10 @@ impl Inode for SignalFd {
         if buf.len() < SIGNALFD_SIGINFO_SIZE {
             return Err(VfsError::InvalidArgument);
         }
+        let signals = sched::current().ok_or(VfsError::InvalidArgument)?.signals();
         loop {
+            // Read before dequeuing: a signal queued after this ends the wait.
+            let seen = signals.signal_events();
             let mut written = 0usize;
             while written + SIGNALFD_SIGINFO_SIZE <= buf.len() {
                 let mask = self.mask();
@@ -93,10 +96,9 @@ impl Inode for SignalFd {
             if self.nonblock.load(Ordering::Acquire) {
                 return Err(VfsError::WouldBlock);
             }
-            if signal::pending_for_current() {
+            if signals.wait_signal_event(seen) == sched::WaitResult::Interrupted {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
         }
     }
 

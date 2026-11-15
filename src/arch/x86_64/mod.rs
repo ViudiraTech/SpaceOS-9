@@ -31,7 +31,8 @@ pub use paging::setup_memory_protection;
 #[allow(unused_imports)]
 pub use paging::{
     flush_page, flush_table, page_root, paging_geometry, pte_is_table, pte_kernel, pte_leaf,
-    pte_phys, pte_present, pte_table, set_page_root, sync_instruction_cache, tlb_shootdown,
+    pte_phys, pte_present, pte_table, set_page_root, set_page_root_tracked, sync_instruction_cache,
+    tlb_shootdown, tlb_shootdown_root,
 };
 pub use scheduler::set_kernel_stack;
 pub use serial::{serial_enable_irq, serial_init, serial_try_read, serial_write};

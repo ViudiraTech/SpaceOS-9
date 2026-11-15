@@ -11,8 +11,9 @@
 //! Futex keys are `(address-space root, virtual address)`, which matches
 //! Linux's private futexes and all CLONE_VM threads.  A global queue lock is
 //! held across the value re-check and enqueue, and wake also takes it, so a
-//! wake racing with the wait cannot be lost.  Waiters sleep in short slices
-//! because the scheduler has no direct wait-channel wake yet.
+//! wake racing with the wait cannot be lost.  A waiter calls `prepare_wait`
+//! before it is published, so a wake that lands before it parks leaves a
+//! token and its `park` returns at once; later wakes unpark it directly.
 
 use crate::{sched, sync::SpinLock, user::uaccess, vfs::abi};
 use alloc::{sync::Arc, vec::Vec};
@@ -40,6 +41,15 @@ struct Waiter {
     key: Key,
     bitset: u32,
     woken: Arc<AtomicBool>,
+    task: sched::TaskRef,
+}
+
+/// Wake tasks that were taken off the waiter list. Runs after the futex
+/// lock is released because `wake_task` takes scheduler locks.
+fn wake_tasks(tasks: Vec<sched::TaskRef>) {
+    for task in tasks {
+        sched::wake_task(&task);
+    }
 }
 
 static WAITERS: SpinLock<Vec<Waiter>> = SpinLock::new(Vec::new());
@@ -112,6 +122,7 @@ fn wait(
     };
     let woken = Arc::new(AtomicBool::new(false));
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    sched::prepare_wait(&current);
     {
         let mut waiters = WAITERS.lock();
         let value = match uaccess::read_value::<u32>(address) {
@@ -126,27 +137,32 @@ fn wait(
             key,
             bitset,
             woken: woken.clone(),
+            task: current.clone(),
         });
     }
-    let _ = current;
     loop {
         if woken.load(Ordering::Acquire) {
             return 0;
         }
+        // On EINTR/ETIMEDOUT, a wake that raced the removal still counts as
+        // success so that the waker's wakeup is not lost.
         if crate::signal::pending_for_current() {
             remove(id);
-            return -abi::EINTR;
+            return if woken.load(Ordering::Acquire) {
+                0
+            } else {
+                -abi::EINTR
+            };
         }
-        let now = crate::time::uptime_micros();
-        if let Some(deadline) = deadline {
-            if now >= deadline {
-                remove(id);
-                return -abi::ETIMEDOUT;
-            }
-            sched::sleep_micros((deadline - now).min(1000));
-        } else {
-            sched::sleep_micros(1000);
+        if deadline.is_some_and(|deadline| crate::time::uptime_micros() >= deadline) {
+            remove(id);
+            return if woken.load(Ordering::Acquire) {
+                0
+            } else {
+                -abi::ETIMEDOUT
+            };
         }
+        sched::park(deadline);
     }
 }
 
@@ -155,18 +171,22 @@ pub fn wake_key(key: Key, bitset: u32, count: u32) -> u32 {
     if count == 0 || bitset == 0 {
         return 0;
     }
-    let mut waiters = WAITERS.lock();
-    let mut index = 0;
-    let mut woken = 0;
-    while index < waiters.len() && woken < count {
-        if waiters[index].key == key && waiters[index].bitset & bitset != 0 {
-            let waiter = waiters.remove(index);
-            waiter.woken.store(true, Ordering::Release);
-            woken += 1;
-        } else {
-            index += 1;
+    let mut tasks = Vec::new();
+    {
+        let mut waiters = WAITERS.lock();
+        let mut index = 0;
+        while index < waiters.len() && (tasks.len() as u32) < count {
+            if waiters[index].key == key && waiters[index].bitset & bitset != 0 {
+                let waiter = waiters.remove(index);
+                waiter.woken.store(true, Ordering::Release);
+                tasks.push(waiter.task);
+            } else {
+                index += 1;
+            }
         }
     }
+    let woken = tasks.len() as u32;
+    wake_tasks(tasks);
     woken
 }
 
@@ -220,17 +240,18 @@ fn requeue(
             return -abi::EAGAIN;
         }
     }
-    let mut woken = 0;
+    let mut tasks = Vec::new();
     let mut index = 0;
-    while index < waiters.len() && woken < count {
+    while index < waiters.len() && (tasks.len() as u32) < count {
         if waiters[index].key == key && waiters[index].bitset & bitset != 0 {
             let waiter = waiters.remove(index);
             waiter.woken.store(true, Ordering::Release);
-            woken += 1;
+            tasks.push(waiter.task);
         } else {
             index += 1;
         }
     }
+    let woken = tasks.len() as u32;
     let mut moved = 0;
     for waiter in waiters.iter_mut() {
         if moved >= requeue_count {
@@ -241,6 +262,8 @@ fn requeue(
             moved += 1;
         }
     }
+    drop(waiters);
+    wake_tasks(tasks);
     (woken + moved) as i64
 }
 

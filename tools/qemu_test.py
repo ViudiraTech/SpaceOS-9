@@ -19,6 +19,26 @@ import tempfile
 import time
 
 
+def make_usb_stick(path):
+    """16 MiB disk: MBR with one FAT32 (LBA) partition at 1 MiB holding HELLO.TXT."""
+    size, start = 16 << 20, 2048
+    with open(path, "wb") as disk:
+        disk.truncate(size)
+        sectors = size // 512 - start
+        entry = bytes([0x00, 0, 0, 0, 0x0c, 0, 0, 0]) + start.to_bytes(4, "little") \
+            + sectors.to_bytes(4, "little")
+        disk.seek(446)
+        disk.write(entry)
+        disk.seek(510)
+        disk.write(b"\x55\xaa")
+    subprocess.run(["mkfs.vfat", "-F", "32", "--offset", str(start), "-n", "SPKUSB", path,
+                    str(sectors // 2)], check=True, stdout=subprocess.DEVNULL)
+    hello = path + ".txt"
+    with open(hello, "w") as file:
+        file.write("SPACEOS USB OK\n")
+    subprocess.run(["mcopy", "-i", f"{path}@@{start * 512}", hello, "::/HELLO.TXT"], check=True)
+
+
 def write_result(path, result):
     """Persist a machine-readable result; the Makefile matrix consumes it."""
     if not path:
@@ -38,15 +58,28 @@ def main():
     parser.add_argument("--accel", choices=["tcg", "kvm"])
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--gpu", choices=["2d", "virgl", "venus"])
+    parser.add_argument("--simplefb", action="store_true",
+                        help="no virtio-gpu: test simpledrm on the firmware framebuffer "
+                             "(ramfb on aarch64/riscv64)")
+    parser.add_argument("--gdb-wait", action="store_true",
+                        help="with --gdb: start paused (-S) so breakpoints can be set before boot")
+    parser.add_argument("--qemu-log", metavar="FILE",
+                        help="QEMU -d int,cpu_reset,guest_errors -D FILE (finds triple faults)")
     parser.add_argument("--cpu")
     parser.add_argument("--machine")
     parser.add_argument("--nic", help="QEMU -nic argument, e.g. user,model=e1000")
     parser.add_argument("--sound", choices=["sb16", "hda", "both"])
-    parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--usb", action="store_true",
+                        help="attach qemu-xhci with a keyboard, a mouse and a FAT32 USB stick")
+    parser.add_argument("--timeout", type=float,
+                        help="seconds (default: 300 x86_64, 600 aarch64, 900 riscv64 under TCG)")
     parser.add_argument("--online-cpus", type=int)
     parser.add_argument("--require", action="append", default=[])
     parser.add_argument("--result", help="Write a machine-readable JSON result")
     parser.add_argument("--verbose", action="store_true", help="Print full log on success")
+    parser.add_argument("--gdb", type=int, metavar="PORT",
+                        help="Expose the QEMU gdbstub on this TCP port (build with "
+                             "CONFIG_KASLR=n so kernel symbols match)")
     args = parser.parse_args()
     arch, iso, firmware, cpus, memory_mib = args.arch, args.iso, args.firmware, args.cpus, args.memory_mib
     binary = {
@@ -55,10 +88,19 @@ def main():
         "riscv64": "qemu-system-riscv64",
     }[arch]
     machine = args.machine or ("q35" if arch == "x86_64" else "virt")
+    if args.timeout is None:
+        args.timeout = {"x86_64": 300, "aarch64": 600, "riscv64": 900}[arch]
     command = [binary, "-machine", machine, "-m", memory_mib, "-smp", cpus,
                "-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot",
-               "-drive", f"if=pflash,format=raw,readonly=on,file={firmware}",
-               "-cdrom", iso]
+               "-drive", f"if=pflash,format=raw,readonly=on,file={firmware}"]
+    if arch == "riscv64":
+        # The RISC-V virt machine has no controller for -cdrom's default
+        # interface in some QEMU releases (8.x), so EDK2 finds no boot device.
+        # The ISO is an isohybrid GPT image, which EDK2 boots as a disk.
+        command += ["-drive", f"file={iso},if=none,id=bootiso,format=raw,readonly=on",
+                    "-device", "virtio-blk-pci,drive=bootiso"]
+    else:
+        command += ["-cdrom", iso]
     if args.gpu == "2d":
         command += ["-device", "virtio-gpu-pci"]
     elif args.gpu in ("virgl", "venus"):
@@ -68,13 +110,24 @@ def main():
             device += ",hostmem=256M,blob=true,venus=true"
             command += ["-object", f"memory-backend-memfd,id=mem,size={memory_mib}M,share=on", "-numa", "node,memdev=mem"]
         command += ["-device", device]
+    if args.simplefb:
+        if args.gpu:
+            parser.error("--simplefb needs the firmware framebuffer; drop --gpu")
+        if arch != "x86_64":
+            command += ["-device", "ramfb"]
+        args.require.append("DRM_SIMPLEFB_OK")
     cpu = args.cpu or ("max" if arch == "aarch64" else None)
     if cpu:
         command += ["-cpu", cpu]
     if args.accel:
         command += ["-accel", args.accel]
-    if args.nic:
-        command += ["-nic", args.nic]
+    if args.qemu_log:
+        command += ["-d", "int,cpu_reset,guest_errors", "-D", args.qemu_log]
+    if args.gdb:
+        command += ["-gdb", f"tcp:127.0.0.1:{args.gdb}"]
+        if args.gdb_wait:
+            command += ["-S"]
+    command += ["-nic", args.nic or "none"]
     if arch == "x86_64" and args.sound:
         command += ["-audiodev", "none,id=snd0"]
     if arch == "x86_64" and args.sound in ("hda", "both"):
@@ -83,6 +136,17 @@ def main():
         command += ["-device", "sb16,audiodev=snd0"]
 
     temp_dir = tempfile.TemporaryDirectory(prefix="spacekernel_disks_")
+    if args.usb:
+        stick = os.path.join(temp_dir.name, "usbstick.img")
+        make_usb_stick(stick)
+        command += ["-device", "qemu-xhci,id=xhci",
+                    "-device", "usb-kbd,bus=xhci.0",
+                    "-device", "usb-mouse,bus=xhci.0",
+                    "-drive", f"file={stick},if=none,id=usbstick,format=raw",
+                    "-device", "usb-storage,bus=xhci.0,drive=usbstick"]
+        for marker in ("USB_HID_OK keyboard", "USB_HID_OK mouse", "USB_MSC_OK",
+                       "USB_MSC_FS_OK"):
+            args.require.append(marker)
     nvme_img = os.path.join(temp_dir.name, "nvme.img")
     sata_img = os.path.join(temp_dir.name, "sata.img")
     for p in (nvme_img, sata_img):

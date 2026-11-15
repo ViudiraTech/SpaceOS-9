@@ -261,6 +261,12 @@ impl State {
 
 pub struct UnixSocket {
     state: SpinLock<State>,
+    /// Bumped by `notify` on every state change a blocked caller may await.
+    events: core::sync::atomic::AtomicU64,
+    /// Tasks blocked on this socket's state: readers and accepters on their
+    /// own socket, writers on their own socket for space their peer frees,
+    /// connecters on the listener for backlog space.
+    wait: crate::sched::WaitQueue,
     nonblock: AtomicBool,
     ino: u64,
     owner: Credentials,
@@ -293,6 +299,8 @@ impl UnixSocket {
                 rcvbuf: DEFAULT_BUFFER,
                 error: 0,
             }),
+            events: core::sync::atomic::AtomicU64::new(0),
+            wait: crate::sched::WaitQueue::new(),
             nonblock: AtomicBool::new(nonblock),
             ino: vfs::tree::ino(),
             owner: current_credentials(),
@@ -396,6 +404,24 @@ impl UnixSocket {
         self.state.lock().listening
     }
 
+    fn events(&self) -> u64 {
+        self.events.load(Ordering::Acquire)
+    }
+
+    /// Announce a state change: wake blocked callers and poll/epoll waiters.
+    /// Must be called without this socket's state lock held.
+    fn notify(&self) {
+        self.events.fetch_add(1, Ordering::AcqRel);
+        self.wait.wake_all();
+        crate::ipc::wake_object(self as *const Self);
+    }
+
+    /// Sleep until `notify` runs after `seen` was read, or a signal arrives.
+    /// Callers loop and re-check their state, including pending signals.
+    fn wait_change(&self, seen: u64) {
+        let _ = self.wait.wait_interruptible(|| self.events() != seen);
+    }
+
     pub fn accept(self: &Arc<Self>, nonblock: bool) -> Result<Arc<UnixSocket>, VfsError> {
         {
             let state = self.state.lock();
@@ -404,11 +430,12 @@ impl UnixSocket {
             }
         }
         loop {
-            {
-                let mut state = self.state.lock();
-                if let Some(peer) = state.pending.pop_front() {
-                    return Ok(peer);
-                }
+            let seen = self.events();
+            let accepted = self.state.lock().pending.pop_front();
+            if let Some(peer) = accepted {
+                // A connecter may be waiting for backlog space.
+                self.notify();
+                return Ok(peer);
             }
             if nonblock || self.nonblock.load(Ordering::Acquire) {
                 return Err(VfsError::WouldBlock);
@@ -416,7 +443,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            self.wait_change(seen);
         }
     }
 
@@ -482,6 +509,7 @@ impl UnixSocket {
         }
         let nonblock = self.nonblock.load(Ordering::Acquire);
         loop {
+            let seen = target.events();
             {
                 let mut listener = target.state.lock();
                 if !listener.listening {
@@ -490,6 +518,8 @@ impl UnixSocket {
                 if listener.pending.len() < listener.backlog {
                     listener.pending.push_back(server);
                     listener.read_generation = listener.read_generation.wrapping_add(1);
+                    drop(listener);
+                    target.notify();
                     return Ok(());
                 }
             }
@@ -499,7 +529,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            crate::ipc::block_briefly();
+            target.wait_change(seen);
         }
     }
 
@@ -568,9 +598,9 @@ impl UnixSocket {
                 return Err(VfsError::BrokenPipe);
             }
         }
-        let mut wait = crate::ipc::pollwait::PollWait::new();
         loop {
-            wait.arm_object(self as *const Self);
+            // Read before checking state: a change after this ends the wait.
+            let seen = self.events();
             let peer = {
                 let state = self.state.lock();
                 state.peer.as_ref().and_then(Weak::upgrade)
@@ -609,7 +639,7 @@ impl UnixSocket {
                         });
                     }
                     drop(target);
-                    crate::ipc::wake_object(Arc::as_ptr(&peer));
+                    peer.notify();
                     return Ok(count);
                 }
             }
@@ -619,7 +649,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            wait.sleep();
+            self.wait_change(seen);
         }
     }
 
@@ -636,9 +666,9 @@ impl UnixSocket {
             return Err(VfsError::MessageTooLong);
         }
         let cost = bytes.len() + 32;
-        let mut wait = crate::ipc::pollwait::PollWait::new();
         loop {
-            wait.arm_object(self as *const Self);
+            // Read before checking state: a change after this ends the wait.
+            let seen = self.events();
             {
                 let mut state = self.state.lock();
                 if state.read_shutdown || state.peer_gone {
@@ -657,7 +687,7 @@ impl UnixSocket {
                         });
                         state.read_generation = state.read_generation.wrapping_add(1);
                         drop(state);
-                        crate::ipc::wake_object(self as *const Self);
+                        self.notify();
                         return Ok(());
                     }
                 } else {
@@ -670,7 +700,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            wait.sleep();
+            self.wait_change(seen);
         }
     }
 
@@ -722,9 +752,9 @@ impl UnixSocket {
         if self.state.lock().peer.is_none() {
             return Err(VfsError::NotConnected);
         }
-        let mut wait = crate::ipc::pollwait::PollWait::new();
         loop {
-            wait.arm_object(self as *const Self);
+            // Read before checking state: a change after this ends the wait.
+            let seen = self.events();
             {
                 let mut state = self.state.lock();
                 if state.read_shutdown {
@@ -768,7 +798,7 @@ impl UnixSocket {
                             let peer = state.peer.as_ref().and_then(Weak::upgrade);
                             drop(state);
                             if let Some(peer) = peer {
-                                crate::ipc::wake_object(Arc::as_ptr(&peer));
+                                peer.notify();
                             }
                         }
                     }
@@ -792,7 +822,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            wait.sleep();
+            self.wait_change(seen);
         }
     }
 
@@ -800,9 +830,9 @@ impl UnixSocket {
         if self.kind() == SocketKind::Seqpacket && self.state.lock().peer.is_none() {
             return Err(VfsError::NotConnected);
         }
-        let mut wait = crate::ipc::pollwait::PollWait::new();
         loop {
-            wait.arm_object(self as *const Self);
+            // Read before checking state: a change after this ends the wait.
+            let seen = self.events();
             {
                 let mut state = self.state.lock();
                 if state.read_shutdown {
@@ -830,7 +860,7 @@ impl UnixSocket {
                     let packet = state.packets.pop_front().unwrap();
                     state.packet_bytes = state.packet_bytes.saturating_sub(packet.data.len() + 32);
                     drop(state);
-                    crate::ipc::wake_object(self as *const Self);
+                    self.notify();
                     return Ok(Received {
                         bytes,
                         descriptors: packet.descriptors,
@@ -856,7 +886,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            wait.sleep();
+            self.wait_change(seen);
         }
     }
 
@@ -876,14 +906,18 @@ impl UnixSocket {
         }
         let peer = state.peer.as_ref().and_then(Weak::upgrade);
         drop(state);
+        self.notify();
         if let Some(peer) = peer {
-            let mut peer_state = peer.state.lock();
-            if how == 0 || how == 2 {
-                peer_state.peer_read_closed = true;
+            {
+                let mut peer_state = peer.state.lock();
+                if how == 0 || how == 2 {
+                    peer_state.peer_read_closed = true;
+                }
+                if how == 1 || how == 2 {
+                    peer_state.peer_write_closed = true;
+                }
             }
-            if how == 1 || how == 2 {
-                peer_state.peer_write_closed = true;
-            }
+            peer.notify();
         }
         Ok(())
     }
@@ -1078,10 +1112,14 @@ impl Drop for UnixSocket {
         let bound = self.state.lock().bound.clone();
         let peer = self.state.lock().peer.clone();
         if let Some(peer) = peer.and_then(|weak| weak.upgrade()) {
-            let mut state = peer.state.lock();
-            state.peer_gone = true;
-            state.peer_write_closed = true;
-            state.peer_read_closed = true;
+            {
+                let mut state = peer.state.lock();
+                state.peer_gone = true;
+                state.peer_write_closed = true;
+                state.peer_read_closed = true;
+            }
+            // The peer's blocked reader sees EOF, its writer EPIPE.
+            peer.notify();
         }
         // Runs on the task exit path too, where no close syscall announces it.
         crate::ipc::poll_kick();

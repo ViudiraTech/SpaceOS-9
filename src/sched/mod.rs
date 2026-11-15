@@ -8,7 +8,7 @@
  *
  */
 
-//! Lock order: ascending CPU runqueues -> wait/timer queue -> task metadata.
+//! Lock order: ascending CPU runqueues -> park/timer tree -> task metadata.
 //! Wakers detach under the wait/timer lock, release it, then lock the owning
 //! runqueue. A switch transfers that runqueue lock to the incoming stack. Thus
 //! no CPU can migrate, wake or free the outgoing task before its registers and
@@ -47,11 +47,20 @@ pub const fn cpu_mask_bytes() -> usize {
     smp::MAX_CPUS / 8
 }
 pub(crate) use task::{UserTaskSpec, has_children, take_zombie, zombies};
-pub use wait::WaitQueue;
+pub use wait::{Completion, WaitQueue, WaitQueueHead, WaitResult};
 
 type Entity = Box<Node<TaskRef>>;
 static SCHEDULER: AtomicPtr<Scheduler> = AtomicPtr::new(core::ptr::null_mut());
 static TIMERS: SpinLock<RBTree<TaskRef>> = SpinLock::new(RBTree::new());
+/// Tasks blocked in `park`, keyed `(deadline or i128::MAX, tid)`. A task's
+/// `park_key` names its node here, so `wake_task` can find it directly.
+static PARKED: SpinLock<RBTree<TaskRef>> = SpinLock::new(RBTree::new());
+/// Linux `current`: the task each CPU runs, published under that CPU's
+/// runqueue lock whenever `CpuQueue::current` changes. The runqueue node keeps
+/// the task alive while it is published, and only the owning CPU reads its
+/// slot, with interrupts masked so no switch can intervene.
+static CURRENT: [AtomicPtr<task::TaskLock>; smp::MAX_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; smp::MAX_CPUS];
 static USER_NS: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
 static SYSTEM_NS: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
 static IDLE_NS: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
@@ -308,6 +317,7 @@ pub(crate) fn activate_cpu(cpu: usize) {
     assert!(rq.current.is_none());
     let idle = rq.idle.take().unwrap();
     idle.value.lock().state = TaskState::Running;
+    CURRENT[cpu].store(idle.value.as_raw().cast_mut(), Ordering::Release);
     rq.current = Some(idle);
     rq.clock_us = time::uptime_micros();
     rq.publish();
@@ -355,7 +365,7 @@ pub fn spawn_with_fds(
     let sched = try_scheduler().ok_or("scheduler not initialized")?;
     let cpu = loadbalance::select_cpu(sched, affinity, smp::current_cpu())
         .ok_or("no online CPU in affinity")?;
-    let task = Task::create_with_fds(Some(Box::new(entry)), cpu, affinity, fd_table)?;
+    let task = Task::create_with_fds(Some(task::Entry::new(entry)), cpu, affinity, fd_table)?;
     let tid = {
         let mut guard = task.lock();
         guard.nice = nice.clamp(-20, 19);
@@ -377,7 +387,7 @@ pub(crate) fn spawn_user(
     let sched = try_scheduler().ok_or("scheduler not initialized")?;
     let cpu = loadbalance::select_cpu(sched, affinity, smp::current_cpu())
         .ok_or("no online CPU in affinity")?;
-    let task = Task::create_user(Box::new(entry), cpu, affinity, spec)?;
+    let task = Task::create_user(task::Entry::new(entry), cpu, affinity, spec)?;
     {
         let mut guard = task.lock();
         guard.nice = nice.clamp(-20, 19);
@@ -453,14 +463,14 @@ pub fn exit_group(status: i32) -> ! {
 /// Obtain an ownership handle for this task with a consistent CPU-local lookup.
 /// TaskRef::stats returns a snapshot without exposing context/FPU ownership.
 pub fn current() -> Option<TaskRef> {
-    let sched = try_scheduler()?;
+    try_scheduler()?;
     let flags = arch::irq_save();
-    let task = sched.cpus[smp::current_cpu()]
-        .queue
-        .lock()
-        .current
-        .as_ref()
-        .map(|node| node.value.clone());
+    let raw = CURRENT[smp::current_cpu()].load(Ordering::Acquire);
+    let task = (!raw.is_null()).then(|| {
+        // SAFETY: with interrupts masked this CPU cannot switch away, so the
+        // runqueue's reference to its current task outlives this clone.
+        unsafe { TaskRef::clone_from_raw(raw) }
+    });
     arch::irq_restore(flags);
     task
 }
@@ -559,6 +569,8 @@ pub fn exit(exit_code: i32) -> ! {
             let space = task.address_space.take();
             (closed_fds, space)
         };
+        // A vfork parent may continue once this task stops using its memory.
+        current_task.complete_vfork();
         drop(closed_fds);
         if space.is_some() {
             crate::user::UserAddressSpace::deactivate();
@@ -571,14 +583,66 @@ pub fn exit(exit_code: i32) -> ! {
     panic!("dead task resumed")
 }
 
-enum Disposition<'a> {
+enum Disposition {
     Runnable,
     Sleep(u64),
-    Wait(Guard<'a, wait::Queue>),
+    /// Block until `wake_task` or the optional deadline, unless a wakeup has
+    /// already been posted to this task since its last `prepare_wait`.
+    Park(Option<u64>),
     Exit(i32),
 }
 
-fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, voluntary: bool) {
+/// Start a wait: discard wakeups addressed to an earlier wait. Call before
+/// publishing the task on a wait list and checking the wait condition, so any
+/// wakeup after this point is either seen by `park` or ends it.
+pub fn prepare_wait(task: &TaskRef) {
+    task.lock().wake_token = false;
+}
+
+/// Block the current task until `wake_task` targets it or `deadline` (uptime
+/// microseconds) passes. Returns at once when a wakeup was posted after
+/// `prepare_wait`. Spurious returns are allowed; callers re-check their
+/// condition in a loop. Must not be called with a spinlock held.
+pub fn park(deadline: Option<u64>) {
+    if deadline.is_some_and(|deadline| deadline <= time::uptime_micros()) {
+        return;
+    }
+    let flags = arch::irq_save();
+    let cpu = smp::current_cpu();
+    let rq = scheduler().cpus[cpu].queue.lock();
+    dispatch(rq, Disposition::Park(deadline), true);
+    arch::irq_restore(flags);
+}
+
+/// Linux `try_to_wake_up`: make a parked task runnable, or post the wakeup so
+/// its next `park` returns immediately. Safe from IRQ context but not while
+/// holding a runqueue or park-tree lock. Returns whether a task was unparked.
+pub fn wake_task(task: &TaskRef) -> bool {
+    let entity = {
+        let mut parked = PARKED.lock();
+        let mut guard = task.lock();
+        match guard.park_key.take() {
+            Some(key) => {
+                let tid = guard.tid;
+                drop(guard);
+                parked.remove((key, tid))
+            }
+            None => {
+                guard.wake_token = true;
+                None
+            }
+        }
+    };
+    match entity {
+        Some(entity) => {
+            wake_entity(entity);
+            true
+        }
+        None => false,
+    }
+}
+
+fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition, voluntary: bool) {
     let cpu = rq.cpu;
     rq.account();
     let mut previous = rq.current.take().expect("CPU not activated");
@@ -613,18 +677,34 @@ fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, volu
             previous.key.0 = i128::from(wake);
             TIMERS.lock().insert(previous);
         }
-        Disposition::Wait(mut queue) => {
-            assert_ne!(previous.weight, 0, "idle cannot wait");
-            rq.subtract_node_pelt(&previous);
-            rq.fair.save_lag(&mut previous, None);
-            previous.value.lock().state = TaskState::Blocked;
-            previous.key.0 = i128::from(queue.sequence);
-            queue.sequence = queue
-                .sequence
-                .checked_add(1)
-                .expect("wait sequence overflow");
-            queue.tree.insert(previous);
-            drop(queue);
+        Disposition::Park(deadline) => {
+            assert_ne!(previous.weight, 0, "idle cannot park");
+            // The park tree lock orders this against wake_task: a wakeup
+            // either left a token before this point or finds the node after.
+            let mut parked = PARKED.lock();
+            let posted = {
+                let mut task = previous.value.lock();
+                if task.wake_token {
+                    task.wake_token = false;
+                    task.state = TaskState::Ready;
+                    true
+                } else {
+                    let key = deadline.map_or(i128::MAX, i128::from);
+                    task.park_key = Some(key);
+                    task.state = TaskState::Blocked;
+                    false
+                }
+            };
+            if posted {
+                drop(parked);
+                previous.key.0 = previous.deadline;
+                rq.fair.ready.insert(previous);
+            } else {
+                rq.subtract_node_pelt(&previous);
+                rq.fair.save_lag(&mut previous, None);
+                previous.key.0 = deadline.map_or(i128::MAX, i128::from);
+                parked.insert(previous);
+            }
         }
         Disposition::Exit(code) => {
             assert_ne!(previous.weight, 0, "idle cannot exit");
@@ -666,6 +746,7 @@ fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, volu
         next_context = task.context.get().cast_const();
         next_fpu = task.fpu_state.get().cast_const();
     }
+    CURRENT[cpu].store(next.value.as_raw().cast_mut(), Ordering::Release);
     rq.current = Some(next);
     rq.publish();
     scheduler().cpus[cpu]
@@ -722,6 +803,7 @@ pub(crate) fn finish_switch() {
             let closed_fds = (!task.files_shared).then(|| task.fd_table.lock().take_all());
             (space, closed_fds)
         };
+        retired.value.complete_vfork();
         // Drop outside `retired.value.lock()` so close/drop paths (e.g. PTY/GPU)
         // never re-enter the task list or lock this task while its lock is held.
         drop(closed_fds);
@@ -758,6 +840,14 @@ pub(crate) fn finish_switch() {
                     (crate::signal::CLD_KILLED, stats.exit_code & 0x7f)
                 };
                 crate::signal::notify_child_exit(stats.ppid, stats.tgid, code, status);
+            }
+        }
+        if stats.user {
+            // An exec in this thread group waits for the other threads to go.
+            if let Some(leader) = retired.value.signals().exec_leader()
+                && let Some(task) = find_by_ltid(leader)
+            {
+                wake_task(&task);
             }
         }
         drop(retired); // Never free the stack while it is still executing.
@@ -868,6 +958,27 @@ pub fn tick() {
         };
         wake_entity(entity);
     }
+    for _ in 0..64 {
+        let entity = {
+            let mut parked = PARKED.lock();
+            if parked
+                .first()
+                .is_none_or(|node| node.key.0 > i128::from(now))
+            {
+                None
+            } else {
+                let entity = parked.pop_first();
+                if let Some(entity) = &entity {
+                    entity.value.lock().park_key = None;
+                }
+                entity
+            }
+        };
+        let Some(entity) = entity else {
+            break;
+        };
+        wake_entity(entity);
+    }
     if cpu == 0 {
         crate::ipc::pollwait::timer_tick(now);
     }
@@ -911,7 +1022,7 @@ fn spawn_placed(
     nice: i32,
     affinity: CpuMask,
 ) -> Result<u64, &'static str> {
-    let task = Task::create(Some(Box::new(entry)), cpu, affinity)?;
+    let task = Task::create(Some(task::Entry::new(entry)), cpu, affinity)?;
     let tid = {
         let mut guard = task.lock();
         guard.nice = nice.clamp(-20, 19);
@@ -943,6 +1054,9 @@ pub fn task_snapshots() -> Vec<TaskStats> {
         });
     }
     TIMERS.lock().for_each(|node| {
+        list.push(node.value.stats());
+    });
+    PARKED.lock().for_each(|node| {
         list.push(node.value.stats());
     });
     list
