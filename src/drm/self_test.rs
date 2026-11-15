@@ -261,6 +261,7 @@ fn exercise(
     let screen = Scanout { base: fb.address().cast_const().cast(), pitch: fb.pitch as usize };
 
     // Identification and capabilities.
+    crate::kinfo!("simpledrm self-test: identification");
     let version = client.ioctl(nr::VERSION, |b| {
         put64(b, 16, 32);
         put64(b, 24, SCRATCH);
@@ -272,6 +273,7 @@ fn exercise(
     assert_eq!(client.cap(6), 1, "DRM_CAP_TIMESTAMP_MONOTONIC");
 
     // Resources: one connector -> encoder -> CRTC with the firmware mode.
+    crate::kinfo!("simpledrm self-test: resources");
     let res = client.ioctl(nr::MODE_GETRESOURCES, |b| {
         put64(b, 8, SCRATCH);
         put64(b, 16, SCRATCH + 0x10);
@@ -294,6 +296,7 @@ fn exercise(
     assert!(width >= 320 && height >= 80);
 
     // Legacy modeset with an XRGB8888 dumb buffer.
+    crate::kinfo!("simpledrm self-test: dumb+setcrtc");
     let (handle, pitch) = client.dumb(width, height, 32, XRGB_MAP);
     client.fill(XRGB_MAP, pitch, (0, 0, width, height), 4, pattern);
     let xrgb = client.addfb2(width, height, super::fourcc::XRGB8888, handle, pitch);
@@ -318,6 +321,7 @@ fn exercise(
     }
 
     // DIRTYFB: only the clip is presented.
+    crate::kinfo!("simpledrm self-test: dirtyfb");
     client.fill(XRGB_MAP, pitch, (8, 8, 40, 24), 4, |_, _| 0x00ff_0000);
     client.fill(XRGB_MAP, pitch, (200, 8, 232, 24), 4, |_, _| 0x0000_00ff);
     client.poke(SCRATCH + 0x300, &[8, 0, 8, 0, 40, 0, 24, 0]);
@@ -332,6 +336,7 @@ fn exercise(
     }
 
     // Format conversion: RGB565 is emulated on an XRGB8888 scanout.
+    crate::kinfo!("simpledrm self-test: rgb565");
     let mut converted = "native";
     if xrgb_native {
         let (handle565, pitch565) = client.dumb(width, height, 16, RGB565_MAP);
@@ -351,6 +356,7 @@ fn exercise(
     }
 
     // PAGE_FLIP with an event (second XRGB buffer).
+    crate::kinfo!("simpledrm self-test: page-flip");
     let (handle2, pitch2) = client.dumb(width, height, 32, XRGB_MAP + 0x0800_0000);
     client.fill(XRGB_MAP + 0x0800_0000, pitch2, (0, 0, width, height), 4, |x, y| pattern(y, x));
     let flip_fb = client.addfb2(width, height, super::fourcc::XRGB8888, handle2, pitch2);
@@ -368,6 +374,7 @@ fn exercise(
     }
 
     // Atomic: plane lookup by property name, TEST_ONLY, damage clips.
+    crate::kinfo!("simpledrm self-test: atomic");
     client.ioctl(nr::SET_CLIENT_CAP, |b| {
         put64(b, 0, 3);
         put64(b, 8, 1);
@@ -417,6 +424,7 @@ fn exercise(
     }
 
     // Simulated vblank advances at the mode's refresh rate.
+    crate::kinfo!("simpledrm self-test: vblank");
     let first = at32(&client.ioctl(nr::WAIT_VBLANK, |b| put32(b, 0, 1)), 4);
     let second = at32(
         &client.ioctl(nr::WAIT_VBLANK, |b| {
@@ -428,6 +436,11 @@ fn exercise(
     assert!(second >= first + 2, "vblank counter {first} -> {second}");
 
     // Last close hands the screen back to the console.
+    crate::kinfo!("simpledrm self-test: lastclose");
+    // The scratch space must outlive its use as the active page table: leave
+    // it (restore the task's space, switch CR3) before the last reference
+    // goes away, or its freed root would still be loaded.
+    let scratch = client.space.clone();
     drop(client);
     assert!(!crate::tty::vt::scanout_claimed(), "lastclose did not release the console");
 
@@ -437,6 +450,7 @@ fn exercise(
     } else {
         UserAddressSpace::deactivate();
     }
+    drop(scratch);
     format!(
         "{}x{} bpp={} pitch={} convert={} damage=ok flip=ok vblank=ok",
         width, height, fb.bpp, fb.pitch, converted

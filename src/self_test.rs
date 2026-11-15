@@ -13,6 +13,9 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::verbose::log as verbose_log;
 
 pub fn run_early() {
+    if crate::boot::selftest_filter().is_some() {
+        return;
+    }
     crate::net::self_test::run();
     run();
     crate::user::self_test::run();
@@ -37,6 +40,18 @@ pub fn spawn_late() {
     crate::sched::spawn_on(
         crate::boot::bsp_cpu_index(),
         || {
+            if let Some(suite) = crate::boot::selftest_filter() {
+                // Single-suite mode: only the named area runs.
+                match suite {
+                    "drm" => {
+                        let status = crate::drm::self_test::run();
+                        crate::kinfo!("SELFTEST_OK suite=drm drm={}", status);
+                        crate::kinfo!("BOOT_OK");
+                    }
+                    other => panic!("unknown selftest suite '{other}'"),
+                }
+                return;
+            }
             crate::sched::sched_test::run();
             crate::user::run_self_test().expect("user self-test failed");
             #[cfg(target_arch = "x86_64")]

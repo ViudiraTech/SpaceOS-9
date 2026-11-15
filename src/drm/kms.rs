@@ -413,7 +413,9 @@ impl State {
 
 // ---- property values --------------------------------------------------------
 
-fn object_props(device: &Device, pipe: usize, kind: u32, atomic: bool) -> Vec<Prop> {
+/// Properties an object exposes; `state` is the caller's view of the device
+/// (the kms lock is not reentrant, so this never locks).
+fn object_props(state: &State, pipe: usize, kind: u32, atomic: bool) -> Vec<Prop> {
     let props: &[Prop] = match kind {
         KIND_CONNECTOR => &[Prop::Dpms, Prop::Edid, Prop::NonDesktop, Prop::ConnectorCrtc],
         KIND_CRTC => &[Prop::Active, Prop::ModeId],
@@ -439,7 +441,7 @@ fn object_props(device: &Device, pipe: usize, kind: u32, atomic: bool) -> Vec<Pr
         .iter()
         .copied()
         .filter(|p| atomic || p.flags() & PROP_ATOMIC == 0)
-        .filter(|p| *p != Prop::Edid || device.kms.lock().edid_blob[pipe] != 0)
+        .filter(|p| *p != Prop::Edid || state.edid_blob[pipe] != 0)
         .collect()
 }
 
@@ -492,7 +494,7 @@ pub(crate) struct Change {
 fn apply(device: &Device, state: &State, config: &mut Config, change: &Change) -> Result<(), VfsError> {
     let (pipe, kind) = decode_object(device, change.object).ok_or(VfsError::NotFound)?;
     let prop = Prop::from_id(change.prop).ok_or(VfsError::NotFound)?;
-    if !object_props(device, pipe, kind, true).contains(&prop) {
+    if !object_props(state, pipe, kind, true).contains(&prop) {
         return Err(VfsError::InvalidArgument);
     }
     if prop.flags() & PROP_IMMUTABLE != 0 {
@@ -914,12 +916,12 @@ pub(crate) fn get_connector(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsError>
         crate::user::uaccess::write(arg.u64(8), &bytes)?;
     }
     arg.set_u32(32, info.modes.len() as u32);
-    let props = object_props(c.device, pipe, KIND_CONNECTOR, c.atomic);
-    let (ids, values) = {
+    let (ids, values): (Vec<u32>, Vec<u64>) = {
         let state = c.device.kms.lock();
-        let ids: Vec<u32> = props.iter().map(|p| *p as u32).collect();
-        let values: Vec<u64> = props.iter().map(|p| prop_value(&state, pipe, KIND_CONNECTOR, *p)).collect();
-        (ids, values)
+        object_props(&state, pipe, KIND_CONNECTOR, c.atomic)
+            .iter()
+            .map(|p| (*p as u32, prop_value(&state, pipe, KIND_CONNECTOR, *p)))
+            .unzip()
     };
     ioctl::copy_out_u32(arg.u64(16), arg.u32(36), &ids)?;
     ioctl::copy_out_u64(arg.u64(24), arg.u32(36), &values)?;
@@ -1021,10 +1023,12 @@ pub(crate) fn obj_get_properties(c: &Caller, arg: &mut Ioctl) -> Result<(), VfsE
     if arg.u32(24) != 0 && arg.u32(24) != expected {
         return Err(VfsError::NotFound);
     }
-    let props = object_props(c.device, pipe, kind, c.atomic);
     let (ids, values): (Vec<u32>, Vec<u64>) = {
         let state = c.device.kms.lock();
-        props.iter().map(|p| (*p as u32, prop_value(&state, pipe, kind, *p))).unzip()
+        object_props(&state, pipe, kind, c.atomic)
+            .iter()
+            .map(|p| (*p as u32, prop_value(&state, pipe, kind, *p)))
+            .unzip()
     };
     ioctl::copy_out_u32(arg.u64(0), arg.u32(16), &ids)?;
     ioctl::copy_out_u64(arg.u64(8), arg.u32(16), &values)?;

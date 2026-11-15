@@ -61,6 +61,10 @@ def main():
     parser.add_argument("--simplefb", action="store_true",
                         help="no virtio-gpu: test simpledrm on the firmware framebuffer "
                              "(ramfb on aarch64/riscv64)")
+    parser.add_argument("--gdb-wait", action="store_true",
+                        help="with --gdb: start paused (-S) so breakpoints can be set before boot")
+    parser.add_argument("--qemu-log", metavar="FILE",
+                        help="QEMU -d int,cpu_reset,guest_errors -D FILE (finds triple faults)")
     parser.add_argument("--cpu")
     parser.add_argument("--machine")
     parser.add_argument("--nic", help="QEMU -nic argument, e.g. user,model=e1000")
@@ -117,8 +121,12 @@ def main():
         command += ["-cpu", cpu]
     if args.accel:
         command += ["-accel", args.accel]
+    if args.qemu_log:
+        command += ["-d", "int,cpu_reset,guest_errors", "-D", args.qemu_log]
     if args.gdb:
         command += ["-gdb", f"tcp:127.0.0.1:{args.gdb}"]
+        if args.gdb_wait:
+            command += ["-S"]
     if args.nic:
         command += ["-nic", args.nic]
     if arch == "x86_64" and args.sound:
