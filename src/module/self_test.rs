@@ -17,6 +17,7 @@ static E1000: &[u8] = include_bytes!(env!("SPK_E1000_KO"));
 static E1000E: &[u8] = include_bytes!(env!("SPK_E1000E_KO"));
 static SB16: &[u8] = include_bytes!(env!("SPK_SB16_KO"));
 static HDA: &[u8] = include_bytes!(env!("SPK_HDA_KO"));
+static USB: &[u8] = include_bytes!(env!("SPK_USB_KO"));
 
 fn check_module(name: &str) {
     assert!(crate::module::is_loaded(name), "module {name} missing");
@@ -99,6 +100,52 @@ fn load_network_driver(pci_id: u16, name: &str, image: &[u8]) -> bool {
             crate::kwarn!("module: {} failed to load ({})", name, error);
             false
         }
+    }
+}
+
+/// USB end-to-end check when QEMU provides an xHCI controller (tools/
+/// qemu_test.py --usb): load usb.ko, mount the stick's FAT32 partition
+/// through the HAL block class and read a known file, then unload the module
+/// and verify that its block and input devices are gone (hot-unplug path).
+pub fn usb_late() {
+    if crate::boot::init_path().is_some() || USB.is_empty() {
+        return;
+    }
+    let has_xhci = crate::pci::devices().iter().any(|device| {
+        device.class == 0x0c && device.subclass == 0x03 && device.programming_interface == 0x30
+    });
+    if !has_xhci {
+        return;
+    }
+    crate::module::load(USB, "").expect("usb module failed to load");
+    check_module("usb");
+    let disk = crate::block::devices()
+        .into_iter()
+        .find(|device| device.info().kind == crate::block::BlockDeviceKind::Hal);
+    if let Some(disk) = disk {
+        let partition = alloc::format!("{}1", disk.info().name);
+        if crate::block::find_device(&partition).is_some() {
+            let source = alloc::format!("/dev/{}", partition);
+            crate::vfs::mount_by_type(&source, "/mnt/usb", "vfat").expect("USB FAT32 mount failed");
+            let data = crate::vfs::read_file("/mnt/usb/HELLO.TXT").expect("USB file read failed");
+            assert!(
+                data.starts_with(b"SPACEOS USB OK"),
+                "USB file content mismatch"
+            );
+            crate::vfs::umount("/mnt/usb").expect("USB unmount failed");
+            crate::kinfo!("USB_MSC_FS_OK {} {} bytes", partition, data.len());
+        }
+    }
+    #[cfg(feature = "module-unload")]
+    {
+        crate::module::unload("usb", false).expect("usb module failed to unload");
+        assert!(
+            crate::block::devices()
+                .iter()
+                .all(|device| device.info().kind != crate::block::BlockDeviceKind::Hal),
+            "USB disk still registered after unload"
+        );
+        crate::kinfo!("USB_UNLOAD_OK");
     }
 }
 

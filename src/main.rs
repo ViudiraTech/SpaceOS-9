@@ -24,6 +24,8 @@ pub mod cpuid;
 pub mod device;
 pub mod fpu;
 pub mod gpu;
+#[cfg(feature = "modules")]
+pub mod hal;
 mod hardware;
 pub mod input;
 pub mod ipc;

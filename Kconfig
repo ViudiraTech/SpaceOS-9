@@ -294,6 +294,20 @@ config MODULE_HDA
 
 endmenu
 
+menu "USB drivers"
+
+config MODULE_USB
+	bool "USB stack (xHCI, HID boot keyboard/mouse, mass storage)"
+	depends on PCI
+	default y
+	help
+	  Build usb.ko: an xHCI host controller driver with device
+	  enumeration, HID boot-protocol keyboards and mice (evdev) and
+	  Bulk-Only mass storage (block devices with partition scan). It
+	  uses only the module HAL; see docs/HAL.md.
+
+endmenu
+
 menu "Sample modules"
 
 config MODULE_HELLO

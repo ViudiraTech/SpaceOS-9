@@ -19,6 +19,26 @@ import tempfile
 import time
 
 
+def make_usb_stick(path):
+    """16 MiB disk: MBR with one FAT32 (LBA) partition at 1 MiB holding HELLO.TXT."""
+    size, start = 16 << 20, 2048
+    with open(path, "wb") as disk:
+        disk.truncate(size)
+        sectors = size // 512 - start
+        entry = bytes([0x00, 0, 0, 0, 0x0c, 0, 0, 0]) + start.to_bytes(4, "little") \
+            + sectors.to_bytes(4, "little")
+        disk.seek(446)
+        disk.write(entry)
+        disk.seek(510)
+        disk.write(b"\x55\xaa")
+    subprocess.run(["mkfs.vfat", "-F", "32", "--offset", str(start), "-n", "SPKUSB", path,
+                    str(sectors // 2)], check=True, stdout=subprocess.DEVNULL)
+    hello = path + ".txt"
+    with open(hello, "w") as file:
+        file.write("SPACEOS USB OK\n")
+    subprocess.run(["mcopy", "-i", f"{path}@@{start * 512}", hello, "::/HELLO.TXT"], check=True)
+
+
 def write_result(path, result):
     """Persist a machine-readable result; the Makefile matrix consumes it."""
     if not path:
@@ -42,6 +62,8 @@ def main():
     parser.add_argument("--machine")
     parser.add_argument("--nic", help="QEMU -nic argument, e.g. user,model=e1000")
     parser.add_argument("--sound", choices=["sb16", "hda", "both"])
+    parser.add_argument("--usb", action="store_true",
+                        help="attach qemu-xhci with a keyboard, a mouse and a FAT32 USB stick")
     parser.add_argument("--timeout", type=float,
                         help="seconds (default: 300 x86_64, 600 aarch64, 900 riscv64 under TCG)")
     parser.add_argument("--online-cpus", type=int)
@@ -98,6 +120,17 @@ def main():
         command += ["-device", "sb16,audiodev=snd0"]
 
     temp_dir = tempfile.TemporaryDirectory(prefix="spacekernel_disks_")
+    if args.usb:
+        stick = os.path.join(temp_dir.name, "usbstick.img")
+        make_usb_stick(stick)
+        command += ["-device", "qemu-xhci,id=xhci",
+                    "-device", "usb-kbd,bus=xhci.0",
+                    "-device", "usb-mouse,bus=xhci.0",
+                    "-drive", f"file={stick},if=none,id=usbstick,format=raw",
+                    "-device", "usb-storage,bus=xhci.0,drive=usbstick"]
+        for marker in ("USB_HID_OK keyboard", "USB_HID_OK mouse", "USB_MSC_OK",
+                       "USB_MSC_FS_OK"):
+            args.require.append(marker)
     nvme_img = os.path.join(temp_dir.name, "nvme.img")
     sata_img = os.path.join(temp_dir.name, "sata.img")
     for p in (nvme_img, sata_img):

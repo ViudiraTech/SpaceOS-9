@@ -260,6 +260,49 @@ pub static EXPORTS: &[Export] = &[
     export!("spk_writeb", crate::module::hw::spk_writeb),
     export!("spk_writel", crate::module::hw::spk_writel),
     export!("spk_writew", crate::module::hw::spk_writew),
+    // Hardware abstraction layer v1 (src/hal): sync, input and block classes.
+    export!("spk_blkdev_name", crate::hal::block::spk_blkdev_name),
+    export!(
+        "spk_blkdev_register",
+        crate::hal::block::spk_blkdev_register
+    ),
+    export!(
+        "spk_blkdev_unregister",
+        crate::hal::block::spk_blkdev_unregister
+    ),
+    export!("spk_complete", crate::hal::sync::spk_complete),
+    export!(
+        "spk_completion_alloc",
+        crate::hal::sync::spk_completion_alloc
+    ),
+    export!("spk_completion_free", crate::hal::sync::spk_completion_free),
+    export!(
+        "spk_completion_reinit",
+        crate::hal::sync::spk_completion_reinit
+    ),
+    export!("spk_hal_version", crate::hal::spk_hal_version),
+    export!("spk_input_alloc", crate::hal::input::spk_input_alloc),
+    export!("spk_input_event", crate::hal::input::spk_input_event),
+    export!("spk_input_free", crate::hal::input::spk_input_free),
+    export!("spk_input_register", crate::hal::input::spk_input_register),
+    export!("spk_input_set_abs", crate::hal::input::spk_input_set_abs),
+    export!(
+        "spk_input_set_capability",
+        crate::hal::input::spk_input_set_capability
+    ),
+    export!("spk_input_sync", crate::hal::input::spk_input_sync),
+    export!(
+        "spk_input_unregister",
+        crate::hal::input::spk_input_unregister
+    ),
+    export!("spk_mutex_alloc", crate::hal::sync::spk_mutex_alloc),
+    export!("spk_mutex_free", crate::hal::sync::spk_mutex_free),
+    export!("spk_mutex_lock", crate::hal::sync::spk_mutex_lock),
+    export!("spk_mutex_unlock", crate::hal::sync::spk_mutex_unlock),
+    export!(
+        "spk_wait_for_completion_timeout",
+        crate::hal::sync::spk_wait_for_completion_timeout
+    ),
 ];
 
 pub fn lookup(name: &str) -> Option<u64> {

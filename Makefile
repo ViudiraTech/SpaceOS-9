@@ -110,7 +110,8 @@ MODULE_LIST := $(strip \
   $(if $(filter y,$(CONFIG_MODULE_HELLO)),hello) \
   $(if $(filter y,$(CONFIG_MODULE_HELLO_RUST)),hello-rust) \
   $(if $(and $(filter y,$(CONFIG_MODULE_SB16)),$(filter x86_64,$(ARCH))),sb16) \
-  $(if $(filter y,$(CONFIG_MODULE_HDA)),hda))
+  $(if $(filter y,$(CONFIG_MODULE_HDA)),hda) \
+  $(if $(filter y,$(CONFIG_MODULE_USB)),usb))
 
 OUT := build/$(ARCH)/$(PROFILE)
 MODULE_OUT := build/modules/$(ARCH)
@@ -301,7 +302,7 @@ test-host: test-sched-model test-subsystem-model test-drm-abi
 
 test-single: iso
 	python3 tools/check_no_simd.py $(ARCH) $(KERNEL)
-	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULES)),$(filter y,$(CONFIG_MODULE_HELLO))),--require 'HELLO_MODULE_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_NIC),--nic '$(QEMU_NIC)',) $(if $(QEMU_SOUND),--sound '$(QEMU_SOUND)',) $(AUDIO_REQUIRES) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
+	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'SELFTEST_OK' --require 'BOOT_OK',) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULES)),$(filter y,$(CONFIG_MODULE_HELLO))),--require 'HELLO_MODULE_OK',) $(if $(filter x86_64,$(ARCH)),--gpu venus,) --online-cpus $(CPUS) $(if $(QEMU_NIC),--nic '$(QEMU_NIC)',) $(if $(QEMU_SOUND),--sound '$(QEMU_SOUND)',) $(AUDIO_REQUIRES) $(if $(and $(filter y,$(CONFIG_BOOT_SELF_TEST)),$(filter y,$(CONFIG_MODULE_USB))),--usb,) $(if $(QEMU_RESULT),--result '$(QEMU_RESULT)',)
 
 test-modules: iso
 	@if [ "$(CONFIG_MODULES)" != "y" ] || [ "$(CONFIG_MODULE_HELLO)" != "y" ]; then \

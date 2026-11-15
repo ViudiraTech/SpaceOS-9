@@ -46,6 +46,8 @@ pub fn spawn_late() {
                 .expect("process/signal self-test failed");
             #[cfg(feature = "modules")]
             crate::module::self_test::network_late();
+            #[cfg(feature = "modules")]
+            crate::module::self_test::usb_late();
             crate::vfs::pseudo_test::processes();
             crate::vfs::dcache::self_test();
             crate::user::self_test::syscalls();

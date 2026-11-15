@@ -479,7 +479,7 @@ unsafe impl Send for DriverEntry {}
 
 static DRIVERS: SpinLock<Vec<DriverEntry>> = SpinLock::new(Vec::new());
 
-fn c_string<'a>(pointer: *const c_char) -> &'a [u8] {
+pub(crate) fn c_string<'a>(pointer: *const c_char) -> &'a [u8] {
     if pointer.is_null() {
         return b"(null)";
     }
