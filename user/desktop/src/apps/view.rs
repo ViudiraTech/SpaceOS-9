@@ -455,9 +455,12 @@ fn draw_viewer(
         26,
     );
     let ctrl_rad = theme.radius_control();
+    let is_vortex = theme.is_vortexglass();
     if is_win98 {
         canvas.fill(meta_r, theme.panel);
         ui::raised_bevel(canvas, theme, meta_r);
+    } else if is_vortex {
+        ui::draw_aero_floating_pill(canvas, theme, meta_r, ctrl_rad, true);
     } else {
         canvas.rounded_rect(meta_r, ctrl_rad, 0x18181b, 0.88);
         canvas.rounded_border(meta_r, ctrl_rad, 0x3f3f46, 0.70, 1);
@@ -477,6 +480,8 @@ fn draw_viewer(
     if is_win98 {
         canvas.fill(tb_r, theme.panel);
         ui::raised_bevel(canvas, theme, tb_r);
+    } else if is_vortex {
+        ui::draw_aero_floating_pill(canvas, theme, tb_r, ctrl_rad + 2, true);
     } else {
         canvas.rounded_rect(tb_r, ctrl_rad + 2, 0x18181b, 0.92);
         canvas.rounded_border(tb_r, ctrl_rad + 2, 0x3f3f46, 0.85, 1);
@@ -504,6 +509,28 @@ fn draw_viewer(
                 theme.accent
             } else {
                 theme.text
+            }
+        } else if is_vortex {
+            if hovered {
+                ui::draw_aero_surface(
+                    canvas,
+                    theme,
+                    br.inset(2),
+                    ctrl_rad,
+                    i == 6,
+                    true,
+                    1.0,
+                    false,
+                );
+                if i == 6 || !theme.is_dark() {
+                    if i == 6 { 0xffffff } else { theme.text }
+                } else {
+                    0xf1f7ff
+                }
+            } else if i == 6 {
+                crate::draw::mix(theme.accent, 0xffffff, 0.35)
+            } else {
+                0xe6effa
             }
         } else {
             if hovered {

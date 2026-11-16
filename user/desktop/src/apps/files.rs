@@ -578,7 +578,19 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         }
 
         if app.needs_redraw {
-            draw_browser(&mut app.canvas, &mut app.text, &app.theme, &mut state);
+            app.set_glass_toolbar_height(if app.theme.is_vortexglass() {
+                TOOLBAR_H
+            } else {
+                0
+            });
+            let glass_toolbar = app.is_composited_glass();
+            draw_browser(
+                &mut app.canvas,
+                &mut app.text,
+                &app.theme,
+                &mut state,
+                glass_toolbar,
+            );
             app.draw_chrome();
             app.present()?;
         }
@@ -591,30 +603,37 @@ fn draw_browser(
     text: &mut TextRenderer,
     theme: &Theme,
     state: &mut BrowserState,
+    glass_toolbar: bool,
 ) {
     let w = canvas.width as i32;
     let h = canvas.height as i32;
     let content = content_rect(theme, w, h);
     let is_win98 = theme.is_win98();
+    let is_vortex = theme.is_vortexglass();
     let ctrl_r = theme.radius_control();
     canvas.clear(theme.window);
 
-    // Top toolbar
-    canvas.fill(Rect::new(content.x, content.y, content.w, TOOLBAR_H), theme.panel);
-    if is_win98 {
-        canvas.fill(
-            Rect::new(content.x, content.y + TOOLBAR_H - 2, content.w, 1),
-            theme.bevel_shadow,
-        );
-        canvas.fill(
-            Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
-            theme.bevel_hi,
-        );
+    // Top toolbar (extended DWM Aero glass band under titlebar in VortexGlass)
+    let toolbar_r = Rect::new(content.x, content.y, content.w, TOOLBAR_H);
+    if is_vortex {
+        ui::draw_aero_extended_toolbar(canvas, theme, toolbar_r, glass_toolbar, true);
     } else {
-        canvas.fill(
-            Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
-            theme.window_border,
-        );
+        canvas.fill(toolbar_r, theme.panel);
+        if is_win98 {
+            canvas.fill(
+                Rect::new(content.x, content.y + TOOLBAR_H - 2, content.w, 1),
+                theme.bevel_shadow,
+            );
+            canvas.fill(
+                Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
+                theme.bevel_hi,
+            );
+        } else {
+            canvas.fill(
+                Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
+                theme.window_border,
+            );
+        }
     }
 
     let can_back = !state.history.is_empty();
@@ -673,6 +692,13 @@ fn draw_browser(
     if is_win98 {
         canvas.fill(path_box, theme.input_bg);
         ui::sunken_bevel(canvas, theme, path_box);
+    } else if is_vortex {
+        canvas.rounded_rect(path_box, ctrl_r, theme.input_bg, 0.94);
+        canvas.rounded_border(path_box, ctrl_r, theme.window_border, 0.90, 1);
+        canvas.fill(
+            Rect::new(path_box.x + 2, path_box.y + 1, (path_box.w - 4).max(0), 1),
+            crate::draw::mix(theme.input_bg, 0xffffff, if theme.is_dark() { 0.14 } else { 0.85 }),
+        );
     } else {
         canvas.rounded_rect(path_box, ctrl_r, theme.input_bg, 1.0);
         canvas.rounded_border(path_box, ctrl_r, theme.panel_border, 1.0, 1);
@@ -722,7 +748,7 @@ fn draw_browser(
     for (i, place) in state.places.iter().enumerate() {
         let r = place_rect(content, i);
         let active = state.current == place.path;
-        let fg = if is_win98 {
+        let fg = if is_win98 || is_vortex {
             ui::list_item_bg(canvas, theme, r, active, state.hover == HoverTarget::Place(i))
         } else {
             if active {
@@ -748,7 +774,17 @@ fn draw_browser(
     // Table header
     let table_x = content.x + SIDEBAR_W;
     let table_w = (content.w - SIDEBAR_W).max(1);
-    canvas.fill(Rect::new(table_x, body_top, table_w, HEADER_H), theme.panel);
+    let header_r = Rect::new(table_x, body_top, table_w, HEADER_H);
+    if is_vortex {
+        let (h_top, h_bot) = if theme.is_dark() {
+            (0x212c3c, 0x161f2c)
+        } else {
+            (0xfafcff, 0xe8eff8)
+        };
+        canvas.fill_gradient_v(header_r, h_top, h_bot, 1.0, 1.0);
+    } else {
+        canvas.fill(header_r, theme.panel);
+    }
     canvas.fill(
         Rect::new(table_x, body_top + HEADER_H - 1, table_w, 1),
         theme.window_border,
@@ -833,7 +869,7 @@ fn draw_browser(
                 let is_sel = state.selected == Some(slot);
                 let is_hov = state.hover == HoverTarget::Row(slot);
                 let row_rect = Rect::new(table_x + 4, ry + 1, rows_clip.w - 6, ROW_H - 2);
-                let row_fg = if is_win98 {
+                let row_fg = if is_win98 || is_vortex {
                     ui::list_item_bg(c, theme, row_rect, is_sel, is_hov)
                 } else {
                     if is_sel {
@@ -846,6 +882,8 @@ fn draw_browser(
                 };
                 let sub_fg = if is_win98 && is_sel {
                     theme.selection_text
+                } else if is_vortex && is_sel {
+                    crate::draw::mix(row_fg, theme.text_muted, 0.32)
                 } else {
                     theme.text_muted
                 };
@@ -895,10 +933,17 @@ fn draw_browser(
 
     // Bottom status bar
     let status_y = content.bottom() - STATUS_H;
-    canvas.fill(
-        Rect::new(content.x, status_y, content.w, STATUS_H),
-        theme.panel,
-    );
+    let status_r = Rect::new(content.x, status_y, content.w, STATUS_H);
+    if is_vortex {
+        let (s_top, s_bot) = if theme.is_dark() {
+            (0x1f2b3c, 0x151e2b)
+        } else {
+            (0xf3f7fc, 0xe1ebf6)
+        };
+        canvas.fill_gradient_v(status_r, s_top, s_bot, 1.0, 1.0);
+    } else {
+        canvas.fill(status_r, theme.panel);
+    }
     canvas.fill(
         Rect::new(content.x, status_y, content.w, 1),
         theme.window_border,

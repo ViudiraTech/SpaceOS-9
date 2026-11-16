@@ -1125,6 +1125,7 @@ pub struct SettingsState {
     sound_card: String,
     last_clock_preview: String,
     thumbnails: [Option<Sprite>; 4],
+    thumbnails_loaded: bool,
     sys_info: SystemInfo,
     log_state: LogViewerState,
     net_state: NetPageState,
@@ -1137,8 +1138,10 @@ impl SettingsState {
     pub fn new(host: &impl SettingsHost, initial_page: Option<&str>) -> Self {
         apply_local_timezone(&host.config().timezone);
         let cfg = host.config();
+        let page = parse_initial_page(initial_page);
+        let thumbnails_loaded = page == Page::DesktopPanel;
         Self {
-            page: parse_initial_page(initial_page),
+            page,
             scroll: ui::SmoothScroll::new("settings_scroll"),
             vol_slider_rect: None,
             dragging_volume: false,
@@ -1148,7 +1151,12 @@ impl SettingsState {
             screen_size: host.root_resolution(),
             sound_card: crate::sound::detected_card_name(),
             last_clock_preview: String::new(),
-            thumbnails: load_wallpaper_thumbnails(),
+            thumbnails: if thumbnails_loaded {
+                load_wallpaper_thumbnails()
+            } else {
+                [None, None, None, None]
+            },
+            thumbnails_loaded,
             sys_info: SystemInfo::gather(),
             log_state: LogViewerState::load(),
             net_state: NetPageState::new(cfg),
@@ -2391,6 +2399,10 @@ impl SettingsState {
 
         let hover = self.hover;
         let page = self.page;
+        if page == Page::DesktopPanel && !self.thumbnails_loaded {
+            self.thumbnails = load_wallpaper_thumbnails();
+            self.thumbnails_loaded = true;
+        }
         let dragging_volume = self.dragging_volume;
         let thumbnails = &self.thumbnails;
         let screen_size = self.screen_size;
@@ -2459,21 +2471,28 @@ impl SettingsState {
             match page {
                 Page::Appearance => {
                     y = draw_section_heading(canvas, text, theme, content_x, y, "系统主题方案");
-                    let c_theme = Rect::new(content_x, y, card_w, 134);
+                    let n_presets = THEME_PRESETS.len() as i32;
+                    let cols = if card_w >= 620 { 3 } else { 2 };
+                    let rows = (n_presets + cols - 1) / cols;
+                    let preset_gap = 12;
+                    let card_item_h = if cols == 3 { 126 } else { 86 };
+                    let c_theme_h = 14 + rows * card_item_h + (rows - 1).max(0) * 10 + 30;
+                    let c_theme = Rect::new(content_x, y, card_w, c_theme_h);
                     ui::card(canvas, theme, c_theme);
                     let active_preset = THEME_PRESETS
                         .iter()
                         .copied()
                         .find(|p| p.id() == cfg.theme_id)
                         .unwrap_or_else(|| ThemePreset::from_style(cfg.theme_style));
-                    let preset_gap = 14;
-                    let preset_w = (card_w - 32 - preset_gap) / 2;
+                    let preset_w = (card_w - 32 - preset_gap * (cols - 1)) / cols;
                     for (idx, preset) in THEME_PRESETS.iter().enumerate() {
+                        let col_i = idx as i32 % cols;
+                        let row_i = idx as i32 / cols;
                         let card_r = Rect::new(
-                            content_x + 16 + idx as i32 * (preset_w + preset_gap),
-                            y + 14,
+                            content_x + 16 + col_i * (preset_w + preset_gap),
+                            y + 14 + row_i * (card_item_h + 10),
                             preset_w,
-                            82,
+                            card_item_h,
                         );
                         let selected = *preset == active_preset;
                         let target = HitTarget::ThemePreset(idx);
@@ -2517,8 +2536,51 @@ impl SettingsState {
                         }
 
                         // Mini desktop + window preview.
-                        let mini = Rect::new(card_r.x + 12, card_r.y + 13, 82, 56);
+                        let stacked = cols == 3;
+                        let mini = if stacked {
+                            Rect::new(card_r.x + (card_r.w - 110) / 2, card_r.y + 10, 110, 56)
+                        } else {
+                            Rect::new(card_r.x + 12, card_r.y + 15, 82, 56)
+                        };
                         match preset {
+                            ThemePreset::VortexGlass => {
+                                canvas.vertical_gradient(mini, 0x103b66, 0x2f88ca);
+                                canvas.line(
+                                    mini.x + 8,
+                                    mini.y + 4,
+                                    mini.right() - 24,
+                                    mini.bottom() - 10,
+                                    0xbbe4ff,
+                                    0.26,
+                                );
+                                let win_m = Rect::new(mini.x + 11, mini.y + 7, mini.w - 22, 34);
+                                canvas.rounded_drop_shadow(win_m, 4, 4, 1, 0.45);
+                                canvas.rounded_rect(win_m, 4, 0x8cc6f2, 0.88);
+                                canvas.rounded_border(win_m, 4, 0xffffff, 0.65, 1);
+                                canvas.fill(
+                                    Rect::new(win_m.x + 3, win_m.y + 9, win_m.w - 6, win_m.h - 12),
+                                    0xf4f8fc,
+                                );
+                                canvas.fill(
+                                    Rect::new(win_m.right() - 12, win_m.y + 2, 9, 4),
+                                    0xd94336,
+                                );
+                                canvas.fill_gradient_v(
+                                    Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
+                                    0x2d6699,
+                                    0x183d62,
+                                    0.92,
+                                    0.92,
+                                );
+                                canvas.circle(
+                                    (mini.x + 8) as f32,
+                                    (mini.bottom() - 5) as f32,
+                                    4.0,
+                                    0x5ecfff,
+                                    1.0,
+                                );
+                                canvas.rounded_border(mini, 4, 0xffffff, 0.55, 1);
+                            }
                             ThemePreset::Spui4 => {
                                 canvas.rounded_rect(mini, 4, 0x0f172a, 1.0);
                                 let win_m = Rect::new(mini.x + 10, mini.y + 8, mini.w - 20, 32);
@@ -2555,37 +2617,72 @@ impl SettingsState {
                             }
                         }
 
-                        let tx = mini.right() + 12;
-                        text.draw(
-                            canvas,
-                            preset.name(),
-                            tx as f32,
-                            (card_r.y + 28) as f32,
-                            13.5,
-                            if selected { theme.accent } else { theme.text },
-                            Face::Bold,
-                        );
-                        let sub_max = (card_r.right() - tx - 10).max(40) as f32;
-                        let sub_shown = text.truncate(preset.subtitle(), sub_max, 11.0, Face::Ui);
-                        text.draw(
-                            canvas,
-                            &sub_shown,
-                            tx as f32,
-                            (card_r.y + 47) as f32,
-                            11.0,
-                            theme.text_dim,
-                            Face::Ui,
-                        );
-                        if selected {
+                        if stacked {
+                            let tx = card_r.x + 10;
                             text.draw(
                                 canvas,
-                                "● 当前启用",
+                                preset.name(),
                                 tx as f32,
-                                (card_r.y + 66) as f32,
-                                10.5,
-                                theme.accent,
+                                (mini.bottom() + 18) as f32,
+                                13.0,
+                                if selected { theme.accent } else { theme.text },
                                 Face::Bold,
                             );
+                            let sub_max = (card_r.w - 20).max(40) as f32;
+                            let sub_shown = text.truncate(preset.subtitle(), sub_max, 10.5, Face::Ui);
+                            text.draw(
+                                canvas,
+                                &sub_shown,
+                                tx as f32,
+                                (mini.bottom() + 36) as f32,
+                                10.5,
+                                theme.text_dim,
+                                Face::Ui,
+                            );
+                            if selected {
+                                text.draw(
+                                    canvas,
+                                    "● 当前启用",
+                                    (card_r.right() - 74) as f32,
+                                    (mini.bottom() + 18) as f32,
+                                    10.5,
+                                    theme.accent,
+                                    Face::Bold,
+                                );
+                            }
+                        } else {
+                            let tx = mini.right() + 12;
+                            text.draw(
+                                canvas,
+                                preset.name(),
+                                tx as f32,
+                                (card_r.y + 28) as f32,
+                                13.5,
+                                if selected { theme.accent } else { theme.text },
+                                Face::Bold,
+                            );
+                            let sub_max = (card_r.right() - tx - 10).max(40) as f32;
+                            let sub_shown = text.truncate(preset.subtitle(), sub_max, 11.0, Face::Ui);
+                            text.draw(
+                                canvas,
+                                &sub_shown,
+                                tx as f32,
+                                (card_r.y + 47) as f32,
+                                11.0,
+                                theme.text_dim,
+                                Face::Ui,
+                            );
+                            if selected {
+                                text.draw(
+                                    canvas,
+                                    "● 当前启用",
+                                    tx as f32,
+                                    (card_r.y + 66) as f32,
+                                    10.5,
+                                    theme.accent,
+                                    Face::Bold,
+                                );
+                            }
                         }
                         push_clipped_hit(hits, viewport, card_r, target);
                     }
@@ -2593,7 +2690,7 @@ impl SettingsState {
                         canvas,
                         "切换主题将立即更新桌面、任务栏、开始菜单、全部应用、登录及关机界面；深浅/强调色仍可微调",
                         (content_x + 16) as f32,
-                        (y + 116) as f32,
+                        (y + c_theme_h - 14) as f32,
                         11.0,
                         theme.text_muted,
                         Face::Ui,
@@ -2664,15 +2761,30 @@ impl SettingsState {
                         }
                         let mini = Rect::new(card_r.x + 12, card_r.y + 11, 56, 44);
                         let mini_r = if is_win98 { 0 } else { 4 };
-                        canvas.rounded_rect(mini, mini_r, bg_col, 1.0);
-                        canvas.fill(
-                            Rect::new(mini.x + 1, mini.y + 1, mini.w - 2, 10),
-                            chrome_col,
-                        );
-                        canvas.rounded_border(mini, mini_r, theme.panel_border, 1.0, 1);
-                        canvas.fill(Rect::new(mini.x + 7, mini.y + 18, 22, 4), cfg.accent);
-                        canvas.fill(Rect::new(mini.x + 7, mini.y + 27, 36, 3), fg_col);
-                        canvas.fill(Rect::new(mini.x + 7, mini.y + 34, 28, 3), chrome_col);
+                        if theme.is_vortexglass() {
+                            canvas.rounded_rect(mini, mini_r, bg_col, 1.0);
+                            canvas.fill_gradient_v(
+                                Rect::new(mini.x + 1, mini.y + 1, mini.w - 2, 11),
+                                crate::draw::mix(chrome_col, theme.accent, 0.35),
+                                chrome_col,
+                                1.0,
+                                1.0,
+                            );
+                            canvas.rounded_border(mini, mini_r, theme.aero_hover_border(), 0.72, 1);
+                            canvas.fill(Rect::new(mini.x + 7, mini.y + 18, 22, 4), cfg.accent);
+                            canvas.fill(Rect::new(mini.x + 7, mini.y + 27, 36, 3), fg_col);
+                            canvas.fill(Rect::new(mini.x + 7, mini.y + 34, 28, 3), chrome_col);
+                        } else {
+                            canvas.rounded_rect(mini, mini_r, bg_col, 1.0);
+                            canvas.fill(
+                                Rect::new(mini.x + 1, mini.y + 1, mini.w - 2, 10),
+                                chrome_col,
+                            );
+                            canvas.rounded_border(mini, mini_r, theme.panel_border, 1.0, 1);
+                            canvas.fill(Rect::new(mini.x + 7, mini.y + 18, 22, 4), cfg.accent);
+                            canvas.fill(Rect::new(mini.x + 7, mini.y + 27, 36, 3), fg_col);
+                            canvas.fill(Rect::new(mini.x + 7, mini.y + 34, 28, 3), chrome_col);
+                        }
                         text.draw(
                             canvas,
                             label,

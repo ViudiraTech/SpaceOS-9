@@ -22,5 +22,7 @@ pub mod text;
 pub mod theme;
 #[path = "../../desktop/src/ui.rs"]
 pub mod ui;
+#[path = "../../desktop/src/vortex.rs"]
+pub mod vortex;
 #[path = "../../desktop/src/x11.rs"]
 pub mod x11;

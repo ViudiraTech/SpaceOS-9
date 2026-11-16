@@ -36,10 +36,10 @@ pub const DEFAULT_START_TILES: &str = "status-clock:wide,status-net:wide,status-
 pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {
     match channel {
         "appearance" => vec![
-            ("/theme/id", Value::String("spui-4".to_string())),
-            ("/theme/style", Value::String("spui".to_string())),
-            ("/theme/mode", Value::String("dark".to_string())),
-            ("/theme/accent", Value::String("#3b82f6".to_string())),
+            ("/theme/id", Value::String("vortexglass".to_string())),
+            ("/theme/style", Value::String("vortexglass".to_string())),
+            ("/theme/mode", Value::String("light".to_string())),
+            ("/theme/accent", Value::String("#5898d8".to_string())),
             ("/font/scale", Value::Int(100)),
         ],
         "desktop" => vec![
@@ -50,16 +50,16 @@ pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {
             ("/backdrop/style", Value::String("cover".to_string())),
             (
                 "/backdrop/solid-color",
-                Value::String("#1e293b".to_string()),
+                Value::String("#14385c".to_string()),
             ),
             ("/icons/visible", Value::Bool(true)),
             ("/icons/size", Value::Int(40)),
         ],
         "panel" => vec![
             ("/position", Value::String("bottom".to_string())),
-            ("/size", Value::Int(46)),
+            ("/size", Value::Int(44)),
             ("/show-pinned", Value::Bool(true)),
-            ("/start-fullscreen", Value::Bool(true)),
+            ("/start-fullscreen", Value::Bool(false)),
             (
                 "/start-tiles",
                 Value::String(DEFAULT_START_TILES.to_string()),

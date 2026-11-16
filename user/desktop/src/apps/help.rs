@@ -334,7 +334,7 @@ fn draw_help(
         let ry = content.y + 36 + i as i32 * 38;
         let r = Rect::new(content.x + 10, ry, SIDEBAR_W - 20, 32);
         let active = topic == *t;
-        let fg = if is_win98 {
+        let fg = if is_win98 || theme.is_vortexglass() {
             ui::list_item_bg(canvas, theme, r, active, hover == Some(i))
         } else {
             if active {
@@ -457,6 +457,23 @@ fn draw_help(
                 if is_win98 {
                     c.fill(card_r, theme.input_bg);
                     ui::sunken_bevel(c, theme, card_r);
+                } else if theme.is_vortexglass() {
+                    let (top, bot) = if theme.is_dark() {
+                        (0x182334, 0x111926)
+                    } else {
+                        (0xf3f8fe, 0xe8f0fa)
+                    };
+                    ui::draw_win7_glossy_box(
+                        c,
+                        card_r,
+                        ctrl_r,
+                        top,
+                        top,
+                        bot,
+                        bot,
+                        theme.panel_border,
+                        if theme.is_dark() { 0.16 } else { 0.85 },
+                    );
                 } else {
                     c.rounded_rect(card_r, ctrl_r, theme.input_bg, 1.0);
                     c.rounded_border(card_r, ctrl_r, theme.panel_border, 1.0, 1);

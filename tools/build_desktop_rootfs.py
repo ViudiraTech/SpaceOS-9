@@ -606,14 +606,14 @@ def configure() -> None:
         "appearance": (
             '# uxconf channel: appearance\n'
             '/font/scale = int:100\n'
-            '/theme/accent = string:"#3b82f6"\n'
-            '/theme/id = string:"spui-4"\n'
-            '/theme/mode = string:"dark"\n'
-            '/theme/style = string:"spui"\n'
+            '/theme/accent = string:"#5898d8"\n'
+            '/theme/id = string:"vortexglass"\n'
+            '/theme/mode = string:"light"\n'
+            '/theme/style = string:"vortexglass"\n'
         ),
         "desktop": (
             '# uxconf channel: desktop\n'
-            '/backdrop/solid-color = string:"#1e293b"\n'
+            '/backdrop/solid-color = string:"#14385c"\n'
             '/backdrop/style = string:"cover"\n'
             '/backdrop/wallpaper = string:"alpine-peaks.jpg"\n'
             '/icons/size = int:40\n'
@@ -623,7 +623,8 @@ def configure() -> None:
             '# uxconf channel: panel\n'
             '/position = string:"bottom"\n'
             '/show-pinned = bool:true\n'
-            '/size = int:46\n'
+            '/size = int:44\n'
+            '/start-fullscreen = bool:false\n'
         ),
         "wm": (
             '# uxconf channel: wm\n'

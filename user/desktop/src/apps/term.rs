@@ -1574,6 +1574,13 @@ fn draw_terminal(
     canvas.fill(body, default_bg);
     if theme.is_win98() {
         ui::sunken_bevel(canvas, theme, body);
+    } else if theme.is_vortexglass() {
+        canvas.fill_alpha(
+            Rect::new(body.x, body.y, body.w, 1),
+            crate::draw::mix(default_bg, 0xffffff, 0.24),
+            if window_active { 0.55 } else { 0.28 },
+        );
+        canvas.border_1px(body, theme.panel_border);
     }
 
     let origin_x = body.x + PAD_X;

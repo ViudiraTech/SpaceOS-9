@@ -371,6 +371,7 @@ fn draw_calc(
     pressed: Option<(usize, usize)>,
 ) {
     let is_win98 = theme.is_win98();
+    let is_vortex = theme.is_vortexglass();
     let ctrl_r = theme.radius_control();
     canvas.clear(theme.window);
 
@@ -379,6 +380,15 @@ fn draw_calc(
     if is_win98 {
         canvas.fill(display_r, theme.input_bg);
         ui::sunken_bevel(canvas, theme, display_r);
+    } else if is_vortex {
+        let (lcd_top, lcd_bot, lcd_brd, lcd_rim) = if theme.is_dark() {
+            (0x131e2c, 0x1e2e42, 0x3b4d66, 0.20)
+        } else {
+            (0xe5effb, 0xffffff, 0x8e9fbb, 0.90)
+        };
+        ui::draw_win7_glossy_box(
+            canvas, display_r, 4, lcd_top, lcd_top, lcd_bot, lcd_bot, lcd_brd, lcd_rim,
+        );
     } else {
         canvas.rounded_rect(display_r, 6, theme.window_alt, 1.0);
         canvas.rounded_border(display_r, 6, theme.window_border, 1.0, 1);
@@ -472,6 +482,22 @@ fn draw_calc(
                 } else {
                     ui::raised_bevel(canvas, theme, btn_r);
                 }
+            } else if is_vortex {
+                let hover_t = ui::animate_bool(
+                    (row as u64) << 16 | (col as u64),
+                    is_hover,
+                    ui::MOTION_HOVER,
+                );
+                ui::draw_aero_surface(
+                    canvas,
+                    theme,
+                    btn_r,
+                    ctrl_r,
+                    is_accent,
+                    is_func,
+                    hover_t,
+                    is_pressed,
+                );
             } else {
                 // Press tactile micro-inset
                 if is_pressed {

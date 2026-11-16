@@ -8,6 +8,12 @@ extern "C" {
 
 typedef struct SpacePage SpacePage;
 
+enum SpaceThemeStyle {
+    SPACE_THEME_SPUI4 = 0,
+    SPACE_THEME_WIN98 = 1,
+    SPACE_THEME_VORTEXGLASS = 2,
+};
+
 enum SpaceBorderStyle {
     SPACE_BORDER_NONE = 0,
     SPACE_BORDER_SOLID = 1,
@@ -109,9 +115,9 @@ typedef struct SpaceHostCallbacks {
 } SpaceHostCallbacks;
 
 SpacePage* space_page_create(const SpaceHostCallbacks* cb, int viewport_w, int viewport_h,
-                             int dark_mode, int is_win98);
+                             int dark_mode, int theme_style);
 void space_page_destroy(SpacePage* page);
-void space_page_set_theme(SpacePage* page, int dark_mode, int is_win98);
+void space_page_set_theme(SpacePage* page, int dark_mode, int theme_style);
 void space_page_load_html(SpacePage* page, const char* html, int html_len, const char* url);
 void space_page_resize(SpacePage* page, int viewport_w, int viewport_h);
 int space_page_relayout(SpacePage* page, int force);

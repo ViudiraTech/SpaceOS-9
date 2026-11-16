@@ -102,6 +102,15 @@ fn draw_notify(
     let th = theme.titlebar_height();
     let content = Rect::new(bw, th, (w - bw * 2).max(1), (h - th - bw).max(1));
     canvas.clear(theme.window);
+    if theme.is_vortexglass() {
+        let top = crate::draw::mix(theme.window, theme.accent, 0.10);
+        canvas.fill_gradient_v(content, top, theme.window, 1.0, 1.0);
+        canvas.fill_alpha(
+            Rect::new(content.x, content.y, content.w, 1),
+            0xffffff,
+            if theme.is_dark() { 0.14 } else { 0.65 },
+        );
+    }
 
     icons::draw(canvas, Icon::Notify, content.x + 16, content.y + 16, 32, None);
     let max_w = (content.w - 72) as f32;

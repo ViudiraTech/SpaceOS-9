@@ -78,6 +78,10 @@ impl Rect {
             self.h - amount * 2,
         )
     }
+
+    pub fn expand(&self, amount: i32) -> Rect {
+        self.inset(-amount)
+    }
 }
 
 #[inline(always)]
@@ -126,6 +130,102 @@ pub const fn blend_premul(dst: u32, premul_argb: u32) -> u32 {
     let g = if g_raw > 255 { 255 } else { g_raw };
     let b = if b_raw > 255 { 255 } else { b_raw };
     (r << 16) | (g << 8) | b
+}
+
+/// Premultiply straight `0xRRGGBB` + `alpha` into `0xAARRGGBB`.
+#[inline(always)]
+pub const fn premultiply_u8(rgb_color: u32, alpha: u8) -> u32 {
+    if alpha == 0 {
+        return 0;
+    }
+    if alpha == 255 {
+        return 0xff00_0000 | (rgb_color & 0x00ff_ffff);
+    }
+    let a = (alpha as u32) + ((alpha as u32) >> 7);
+    let rb = (((rgb_color & 0x00ff_00ff) * a) >> 8) & 0x00ff_00ff;
+    let g = (((rgb_color & 0x0000_ff00) * a) >> 8) & 0x0000_ff00;
+    ((alpha as u32) << 24) | rb | g
+}
+
+/// Porter-Duff `SRC_OVER` blending straight `src_rgb` (`alpha`) over premultiplied `dst_argb`.
+#[inline(always)]
+pub const fn src_over_u8(dst_argb: u32, src_rgb: u32, alpha: u8) -> u32 {
+    if alpha == 0 {
+        return dst_argb;
+    }
+    if alpha == 255 {
+        return 0xff00_0000 | (src_rgb & 0x00ff_ffff);
+    }
+    let da = (dst_argb >> 24) & 0xff;
+    if da == 255 {
+        return 0xff00_0000 | blend_u8(dst_argb, src_rgb, alpha);
+    }
+    let sa = alpha as u32;
+    let sf = sa + (sa >> 7);
+    let inv = 256 - sf;
+    let srb = (((src_rgb & 0x00ff_00ff) * sf) >> 8) & 0x00ff_00ff;
+    let sg = (((src_rgb & 0x0000_ff00) * sf) >> 8) & 0x0000_ff00;
+    if da == 0 {
+        return (sa << 24) | srb | sg;
+    }
+    let drb = (((dst_argb & 0x00ff_00ff) * inv) >> 8) & 0x00ff_00ff;
+    let dg = (((dst_argb & 0x0000_ff00) * inv) >> 8) & 0x0000_ff00;
+    let out_a_raw = sa + ((da * inv) >> 8);
+    let out_a = if out_a_raw > 255 { 255 } else { out_a_raw };
+    let r_raw = ((srb >> 16) & 0xff) + ((drb >> 16) & 0xff);
+    let g_raw = ((sg >> 8) & 0xff) + ((dg >> 8) & 0xff);
+    let b_raw = (srb & 0xff) + (drb & 0xff);
+    let r = if r_raw > 255 { 255 } else { r_raw };
+    let g = if g_raw > 255 { 255 } else { g_raw };
+    let b = if b_raw > 255 { 255 } else { b_raw };
+    (out_a << 24) | (r << 16) | (g << 8) | b
+}
+
+/// Porter-Duff `SRC_OVER` blending premultiplied `premul_src` over premultiplied `dst_argb`.
+#[inline(always)]
+pub const fn src_over_premul(dst_argb: u32, premul_src: u32) -> u32 {
+    let sa = (premul_src >> 24) & 0xff;
+    if sa == 0 {
+        return dst_argb;
+    }
+    if sa == 255 {
+        return premul_src;
+    }
+    let da = (dst_argb >> 24) & 0xff;
+    if da == 255 {
+        return 0xff00_0000 | blend_premul(dst_argb, premul_src);
+    }
+    if da == 0 {
+        return premul_src;
+    }
+    let sf = sa + (sa >> 7);
+    let inv = 256 - sf;
+    let out_a_raw = sa + ((da * inv) >> 8);
+    let out_a = if out_a_raw > 255 { 255 } else { out_a_raw };
+    let drb = (((dst_argb & 0x00ff_00ff) * inv) >> 8) & 0x00ff_00ff;
+    let dg = (((dst_argb & 0x0000_ff00) * inv) >> 8) & 0x0000_ff00;
+    let r_raw = ((drb >> 16) & 0xff) + ((premul_src >> 16) & 0xff);
+    let g_raw = ((dg >> 8) & 0xff) + ((premul_src >> 8) & 0xff);
+    let b_raw = (drb & 0xff) + (premul_src & 0xff);
+    let r = if r_raw > 255 { 255 } else { r_raw };
+    let g = if g_raw > 255 { 255 } else { g_raw };
+    let b = if b_raw > 255 { 255 } else { b_raw };
+    (out_a << 24) | (r << 16) | (g << 8) | b
+}
+
+/// Scale a premultiplied `0xAARRGGBB` pixel by opacity `scale_u8` (`0..=255`).
+#[inline(always)]
+pub const fn scale_premul(premul_argb: u32, scale_u8: u8) -> u32 {
+    if scale_u8 == 255 {
+        return premul_argb;
+    }
+    if scale_u8 == 0 || (premul_argb >> 24) == 0 {
+        return 0;
+    }
+    let f = (scale_u8 as u32) + ((scale_u8 as u32) >> 7);
+    let ag = (((premul_argb >> 8) & 0x00ff_00ff) * f) & 0xff00_ff00;
+    let rb = (((premul_argb & 0x00ff_00ff) * f) >> 8) & 0x00ff_00ff;
+    ag | rb
 }
 
 #[inline]
@@ -427,6 +527,7 @@ pub struct Canvas {
     pub buffer: PixelBuffer,
     clip: Rect,
     dirty: Rect,
+    pub argb: bool,
 }
 
 impl Canvas {
@@ -438,6 +539,7 @@ impl Canvas {
             buffer: PixelBuffer::Heap(vec![background; width * height]),
             clip: full,
             dirty: full,
+            argb: false,
         }
     }
 
@@ -452,6 +554,42 @@ impl Canvas {
             buffer,
             clip: full,
             dirty: full,
+            argb: false,
+        }
+    }
+
+    pub fn set_argb(&mut self, enabled: bool) {
+        self.argb = enabled;
+    }
+
+    pub const fn is_argb(&self) -> bool {
+        self.argb
+    }
+
+    #[inline(always)]
+    const fn opaque_color(&self, color: u32) -> u32 {
+        if self.argb {
+            0xff00_0000 | (color & 0x00ff_ffff)
+        } else {
+            color & 0x00ff_ffff
+        }
+    }
+
+    #[inline(always)]
+    const fn mix_pixel(&self, dst: u32, color: u32, alpha: u8) -> u32 {
+        if self.argb {
+            src_over_u8(dst, color, alpha)
+        } else {
+            blend_u8(dst, color, alpha)
+        }
+    }
+
+    #[inline(always)]
+    const fn mix_premul(&self, dst: u32, premul_src: u32) -> u32 {
+        if self.argb {
+            src_over_premul(dst, premul_src)
+        } else {
+            blend_premul(dst, premul_src)
         }
     }
 
@@ -481,8 +619,39 @@ impl Canvas {
     }
 
     #[inline(always)]
-    fn clip_rect(&self, rect: Rect) -> Rect {
+    pub const fn clip(&self) -> Rect {
+        self.clip
+    }
+
+    #[inline(always)]
+    pub fn clip_rect(&self, rect: Rect) -> Rect {
         rect.intersect(self.clip)
+    }
+
+    /// Fast row-wise copy from an opaque `0xRRGGBB` source slice over `rect` clipped to `self.clip`.
+    pub fn copy_rect_from(&mut self, src: &[u32], src_w: usize, rect: Rect) {
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() || src_w == 0 {
+            return;
+        }
+        let max_src_rows = src.len() / src_w;
+        let max_y = clip.bottom().min(max_src_rows as i32);
+        let max_x = clip.right().min(src_w as i32);
+        if max_y <= clip.y || max_x <= clip.x {
+            return;
+        }
+        let valid = Rect::new(clip.x, clip.y, max_x - clip.x, max_y - clip.y);
+        self.mark_dirty(valid);
+        let dw = self.width;
+        let dst = self.buffer.as_mut_slice();
+        let cnt = valid.w as usize;
+        let sx = valid.x as usize;
+        for py in valid.y..valid.bottom() {
+            let y = py as usize;
+            let s_off = y * src_w + sx;
+            let d_off = y * dw + sx;
+            dst[d_off..d_off + cnt].copy_from_slice(&src[s_off..s_off + cnt]);
+        }
     }
 
     #[inline(always)]
@@ -504,14 +673,112 @@ impl Canvas {
     }
 
     pub fn clear(&mut self, color: u32) {
-        self.pixels_mut().fill(color & 0x00ff_ffff);
+        let px = self.opaque_color(color);
+        self.pixels_mut().fill(px);
         self.mark_all_dirty();
     }
 
+    /// Clear `rect` to full transparent `0x0000_0000` (for ARGB glass regions)
+    /// when `self.argb` is enabled, otherwise fills with `fallback`.
+    pub fn clear_transparent(&mut self, rect: Rect, fallback: u32) {
+        if !self.argb {
+            self.fill(rect, fallback);
+            return;
+        }
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let width = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        for y in clip.y..clip.bottom() {
+            let start = y as usize * width + clip.x as usize;
+            pixels[start..start + clip.w as usize].fill(0);
+        }
+    }
+
+    /// Ensure every pixel inside `rect` carries `alpha = 0xFF` on 32-bit ARGB canvases.
+    pub fn enforce_opaque_rect(&mut self, rect: Rect) {
+        let clip = rect.intersect(self.bounds());
+        if clip.is_empty() {
+            return;
+        }
+        let width = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        for y in clip.y..clip.bottom() {
+            let start = y as usize * width + clip.x as usize;
+            for px in &mut pixels[start..start + clip.w as usize] {
+                *px |= 0xff00_0000;
+            }
+        }
+    }
+
+    /// Anti-alias outer `radius x radius` window corners in the ARGB alpha channel.
+    pub fn mask_rounded_corners(&mut self, radius: i32) {
+        self.mask_rounded_corners_rect(radius, self.bounds());
+    }
+
+    /// Anti-alias outer `radius x radius` window corners inside `area` so partial
+    /// damage updates do not re-darken untouched corner pixels.
+    pub fn mask_rounded_corners_rect(&mut self, radius: i32, area: Rect) {
+        if radius <= 0 || self.width < 2 || self.height < 2 {
+            return;
+        }
+        let area = area.intersect(self.bounds());
+        if area.is_empty() {
+            return;
+        }
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let r = radius.min(w / 2).min(h / 2);
+        if r <= 0 {
+            return;
+        }
+        let rf = r as f32;
+        let stride = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        let corners = [
+            (0, 0, rf, rf),
+            (w - r, 0, (w - r) as f32, rf),
+            (0, h - r, rf, (h - r) as f32),
+            (w - r, h - r, (w - r) as f32, (h - r) as f32),
+        ];
+        for (bx, by, cx, cy) in corners {
+            let corner_clip = Rect::new(bx, by, r, r).intersect(area);
+            if corner_clip.is_empty() {
+                continue;
+            }
+            for y in corner_clip.y..corner_clip.bottom() {
+                let dy = y as f32 + 0.5 - cy;
+                let row = y as usize * stride;
+                for x in corner_clip.x..corner_clip.right() {
+                    let dx = x as f32 + 0.5 - cx;
+                    let cov = Self::corner_coverage(dx, dy, rf);
+                    if cov < 1.0 {
+                        let slot = &mut pixels[row + x as usize];
+                        if cov <= 0.0 {
+                            *slot = 0;
+                        } else {
+                            *slot = scale_premul(*slot, f32_to_u8(cov));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn copy_background(&mut self, bg: &[u32]) {
+        let argb = self.argb;
         let dst = self.pixels_mut();
         if bg.len() == dst.len() {
-            dst.copy_from_slice(bg);
+            if argb {
+                for (d, &s) in dst.iter_mut().zip(bg.iter()) {
+                    *d = 0xff00_0000 | (s & 0x00ff_ffff);
+                }
+            } else {
+                dst.copy_from_slice(bg);
+            }
             self.mark_all_dirty();
         }
     }
@@ -522,8 +789,13 @@ impl Canvas {
             return;
         }
         let idx = y as usize * self.width + x as usize;
+        let argb = self.argb;
         let pixels = self.buffer.as_mut_slice();
-        pixels[idx] = blend_u8(pixels[idx], color, alpha);
+        pixels[idx] = if argb {
+            src_over_u8(pixels[idx], color, alpha)
+        } else {
+            blend_u8(pixels[idx], color, alpha)
+        };
     }
 
     #[inline]
@@ -545,13 +817,25 @@ impl Canvas {
             return;
         }
         self.mark_dirty(clip);
+        let argb = self.argb;
         let width = self.width;
         let pixels = self.buffer.as_mut_slice();
-        let color = color & 0x00ff_ffff;
+        let opaque = if argb {
+            0xff00_0000 | (color & 0x00ff_ffff)
+        } else {
+            color & 0x00ff_ffff
+        };
         if alpha == 255 {
             for y in clip.y..clip.bottom() {
                 let start = y as usize * width + clip.x as usize;
-                pixels[start..start + clip.w as usize].fill(color);
+                pixels[start..start + clip.w as usize].fill(opaque);
+            }
+        } else if argb {
+            for y in clip.y..clip.bottom() {
+                let start = y as usize * width + clip.x as usize;
+                for slot in &mut pixels[start..start + clip.w as usize] {
+                    *slot = src_over_u8(*slot, color, alpha);
+                }
             }
         } else {
             for y in clip.y..clip.bottom() {
@@ -584,12 +868,14 @@ impl Canvas {
             return;
         }
         self.mark_dirty(clip);
+        let argb = self.argb;
         let span = rect.h.max(1) as u32;
         let width = self.width;
         let pixels = self.buffer.as_mut_slice();
         for y in clip.y..clip.bottom() {
             let t = (((y - rect.y).max(0) as u32 * 255) / span).min(255) as u8;
-            let color = blend_u8(top, bottom, t);
+            let raw = blend_u8(top, bottom, t);
+            let color = if argb { 0xff00_0000 | raw } else { raw };
             let start = y as usize * width + clip.x as usize;
             pixels[start..start + clip.w as usize].fill(color);
         }
@@ -605,6 +891,7 @@ impl Canvas {
             return;
         }
         self.mark_dirty(clip);
+        let argb = self.argb;
         let span = (rect.w - 1).max(1) as u32;
         let width = self.width;
         let pixels = self.buffer.as_mut_slice();
@@ -612,7 +899,8 @@ impl Canvas {
         for dx in 0..clip.w {
             let x = clip.x + dx;
             let t = (((x - rect.x).max(0) as u32 * 255) / span).min(255) as u8;
-            pixels[first_start + dx as usize] = blend_u8(left, right, t);
+            let raw = blend_u8(left, right, t);
+            pixels[first_start + dx as usize] = if argb { 0xff00_0000 | raw } else { raw };
         }
         let row_len = clip.w as usize;
         for y in (clip.y + 1)..clip.bottom() {
@@ -664,7 +952,7 @@ impl Canvas {
             return;
         }
         self.mark_dirty(clip);
-        let color = color & 0x00ff_ffff;
+        let color = self.opaque_color(color);
         let width = self.width;
         let pixels = self.buffer.as_mut_slice();
         let top_y = rect.y;
@@ -703,8 +991,8 @@ impl Canvas {
             return;
         }
         self.mark_dirty(clip);
-        let c0 = even_color & 0x00ff_ffff;
-        let c1 = odd_color & 0x00ff_ffff;
+        let c0 = self.opaque_color(even_color);
+        let c1 = self.opaque_color(odd_color);
         let width = self.width;
         let pixels = self.buffer.as_mut_slice();
         for y in clip.y..clip.bottom() {
@@ -797,6 +1085,49 @@ impl Canvas {
         }
     }
 
+    fn fill_rounded_row(
+        &mut self,
+        rect: Rect,
+        clip: Rect,
+        r: i32,
+        y: i32,
+        row_color: u32,
+        a_u8: u8,
+    ) {
+        let in_top = y < rect.y + r;
+        let in_bot = y >= rect.bottom() - r;
+        if !in_top && !in_bot {
+            self.fill_u8(Rect::new(clip.x, y, clip.w, 1), row_color, a_u8);
+            return;
+        }
+        let rf = r as f32;
+        let mid_l = (rect.x + r).max(clip.x);
+        let mid_r = (rect.right() - r).min(clip.right());
+        if mid_r > mid_l {
+            self.fill_u8(Rect::new(mid_l, y, mid_r - mid_l, 1), row_color, a_u8);
+        }
+        let cy = if in_top {
+            rect.y as f32 + rf
+        } else {
+            (rect.bottom() - r) as f32
+        };
+        let dy = y as f32 + 0.5 - cy;
+        for x in clip.x..mid_l.min(clip.right()) {
+            let dx = x as f32 + 0.5 - (rect.x as f32 + rf);
+            let cov = Self::corner_coverage(dx, dy, rf);
+            if cov > 0.0 {
+                self.blend_pixel_u8(x, y, row_color, ((a_u8 as f32) * cov + 0.5) as u8);
+            }
+        }
+        for x in mid_r.max(clip.x)..clip.right() {
+            let dx = x as f32 + 0.5 - (rect.right() - r) as f32;
+            let cov = Self::corner_coverage(dx, dy, rf);
+            if cov > 0.0 {
+                self.blend_pixel_u8(x, y, row_color, ((a_u8 as f32) * cov + 0.5) as u8);
+            }
+        }
+    }
+
     pub fn rounded_gradient(&mut self, rect: Rect, radius: i32, top: u32, bottom: u32, alpha: f32) {
         if top == bottom {
             self.rounded_rect(rect, radius, top, alpha);
@@ -817,41 +1148,56 @@ impl Canvas {
         }
         self.mark_dirty(clip);
         let span = rect.h.max(1) as u32;
-        let rf = r as f32;
         for y in clip.y..clip.bottom() {
             let t = (((y - rect.y).max(0) as u32 * 255) / span).min(255) as u8;
             let row_color = blend_u8(top, bottom, t);
-            let in_top = y < rect.y + r;
-            let in_bot = y >= rect.bottom() - r;
-            if !in_top && !in_bot {
-                self.fill_u8(Rect::new(clip.x, y, clip.w, 1), row_color, a_u8);
-                continue;
-            }
-            let mid_l = (rect.x + r).max(clip.x);
-            let mid_r = (rect.right() - r).min(clip.right());
-            if mid_r > mid_l {
-                self.fill_u8(Rect::new(mid_l, y, mid_r - mid_l, 1), row_color, a_u8);
-            }
-            let cy = if in_top {
-                rect.y as f32 + rf
+            self.fill_rounded_row(rect, clip, r, y, row_color, a_u8);
+        }
+    }
+
+    /// Fill an anti-aliased rounded rectangle with Windows 7 4-stop vertical gloss (`top_hi->top_lo` | `bot_hi->bot_lo`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rounded_glossy_4stop(
+        &mut self,
+        rect: Rect,
+        radius: i32,
+        top_hi: u32,
+        top_lo: u32,
+        bot_hi: u32,
+        bot_lo: u32,
+        alpha: f32,
+    ) {
+        let a_u8 = f32_to_u8(alpha);
+        if a_u8 == 0 || rect.is_empty() {
+            return;
+        }
+        let r = radius.max(0).min(rect.w / 2).min(rect.h / 2);
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let top_h = (rect.h / 2).max(1);
+        let bot_h = (rect.h - top_h).max(1);
+        for y in clip.y..clip.bottom() {
+            let rel = y - rect.y;
+            let row_color = if rel < top_h {
+                let t = if top_h <= 1 {
+                    0
+                } else {
+                    (((rel.max(0) as u32) * 255) / (top_h - 1) as u32).min(255) as u8
+                };
+                blend_u8(top_hi, top_lo, t)
             } else {
-                (rect.bottom() - r) as f32
+                let brel = rel - top_h;
+                let t = if bot_h <= 1 {
+                    0
+                } else {
+                    (((brel.max(0) as u32) * 255) / (bot_h - 1) as u32).min(255) as u8
+                };
+                blend_u8(bot_hi, bot_lo, t)
             };
-            let dy = y as f32 + 0.5 - cy;
-            for x in clip.x..mid_l.min(clip.right()) {
-                let dx = x as f32 + 0.5 - (rect.x as f32 + rf);
-                let cov = Self::corner_coverage(dx, dy, rf);
-                if cov > 0.0 {
-                    self.blend_pixel_u8(x, y, row_color, ((a_u8 as f32) * cov + 0.5) as u8);
-                }
-            }
-            for x in mid_r.max(clip.x)..clip.right() {
-                let dx = x as f32 + 0.5 - (rect.right() - r) as f32;
-                let cov = Self::corner_coverage(dx, dy, rf);
-                if cov > 0.0 {
-                    self.blend_pixel_u8(x, y, row_color, ((a_u8 as f32) * cov + 0.5) as u8);
-                }
-            }
+            self.fill_rounded_row(rect, clip, r, y, row_color, a_u8);
         }
     }
 
@@ -1044,15 +1390,34 @@ impl Canvas {
         color: u32,
         coverage: &[u8],
     ) {
+        self.blend_coverage_alpha(x, y, w, h, color, coverage, 255);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn blend_coverage_alpha(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: usize,
+        h: usize,
+        color: u32,
+        coverage: &[u8],
+        opacity: u8,
+    ) {
+        if opacity == 0 {
+            return;
+        }
         let target = Rect::new(x, y, w as i32, h as i32);
         let clip = self.clip_rect(target);
         if clip.is_empty() {
             return;
         }
         self.mark_dirty(clip);
+        let argb = self.argb;
         let stride = self.width;
         let pixels = self.buffer.as_mut_slice();
         let color = color & 0x00ff_ffff;
+        let op = opacity as u16;
         for py in clip.y..clip.bottom() {
             let gy = (py - y) as usize;
             let cov_row = &coverage[gy * w..gy * w + w];
@@ -1061,10 +1426,21 @@ impl Canvas {
             let col_len = clip.w as usize;
             let dst_x = clip.x as usize;
             for i in 0..col_len {
-                let alpha = cov_row[col_start + i];
-                if alpha != 0 {
-                    let slot = &mut dst_row[dst_x + i];
-                    *slot = blend_u8(*slot, color, alpha);
+                let raw = cov_row[col_start + i];
+                if raw != 0 {
+                    let alpha = if op == 255 {
+                        raw
+                    } else {
+                        ((raw as u16 * op + 127) / 255) as u8
+                    };
+                    if alpha != 0 {
+                        let slot = &mut dst_row[dst_x + i];
+                        *slot = if argb {
+                            src_over_u8(*slot, color, alpha)
+                        } else {
+                            blend_u8(*slot, color, alpha)
+                        };
+                    }
                 }
             }
         }
@@ -1072,27 +1448,191 @@ impl Canvas {
 
     /// Blit a premultiplied `0xAARRGGBB` sprite at `(x, y)` respecting `clip`.
     pub fn blit_sprite(&mut self, x: i32, y: i32, sprite: &Sprite) {
-        let target = Rect::new(x, y, sprite.width as i32, sprite.height as i32);
+        self.blit_sprite_opacity(x, y, sprite, 255);
+    }
+
+    /// Blit a premultiplied `0xAARRGGBB` sprite with global opacity `opacity` (`0..=255`).
+    pub fn blit_sprite_opacity(&mut self, x: i32, y: i32, sprite: &Sprite, opacity: u8) {
+        self.blit_sprite_subrect(
+            x,
+            y,
+            sprite,
+            Rect::new(0, 0, sprite.width as i32, sprite.height as i32),
+            opacity,
+        );
+    }
+
+    /// Blit a 1:1 sub-rectangle `src_rect` of a premultiplied sprite at `(dx, dy)` respecting `clip`.
+    pub fn blit_sprite_subrect(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        sprite: &Sprite,
+        src_rect: Rect,
+        opacity: u8,
+    ) {
+        if opacity == 0 || sprite.width == 0 || sprite.height == 0 {
+            return;
+        }
+        let sb = Rect::new(0, 0, sprite.width as i32, sprite.height as i32);
+        let srect = src_rect.intersect(sb);
+        if srect.is_empty() {
+            return;
+        }
+        let target = Rect::new(dx, dy, srect.w, srect.h);
         let clip = self.clip_rect(target);
         if clip.is_empty() {
             return;
         }
         self.mark_dirty(clip);
+        let argb = self.argb;
         let sw = sprite.width as usize;
+        let dw = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        let ox = srect.x + (clip.x - dx);
+        let oy = srect.y - dy;
+        let cnt = clip.w as usize;
+        let dx_start = clip.x as usize;
+        let sx_start = ox as usize;
+        for py in clip.y..clip.bottom() {
+            let sy = (oy + py) as usize;
+            let src_row = &sprite.pixels[sy * sw + sx_start..sy * sw + sx_start + cnt];
+            let dst_row = &mut pixels[py as usize * dw + dx_start..py as usize * dw + dx_start + cnt];
+            for (slot, &raw) in dst_row.iter_mut().zip(src_row.iter()) {
+                let mut spx = raw;
+                if (spx >> 24) != 0 {
+                    if opacity < 255 {
+                        spx = scale_premul(spx, opacity);
+                    }
+                    *slot = if argb {
+                        src_over_premul(*slot, spx)
+                    } else {
+                        blend_premul(*slot, spx)
+                    };
+                }
+            }
+        }
+    }
+
+    /// Cross-fade two same-size premultiplied sprites `s0 -> s1` by `t` (`0.0..=1.0`).
+    pub fn blit_sprite_crossfade(&mut self, x: i32, y: i32, s0: &Sprite, s1: &Sprite, t: f32) {
+        let t = t.clamp(0.0, 1.0);
+        if t <= 0.001 {
+            self.blit_sprite(x, y, s0);
+            return;
+        }
+        if t >= 0.999 {
+            self.blit_sprite(x, y, s1);
+            return;
+        }
+        if s0.width != s1.width || s0.height != s1.height {
+            self.blit_sprite_opacity(x, y, s0, f32_to_u8(1.0 - t));
+            self.blit_sprite_opacity(x, y, s1, f32_to_u8(t));
+            return;
+        }
+        let target = Rect::new(x, y, s0.width as i32, s0.height as i32);
+        let clip = self.clip_rect(target);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let argb = self.argb;
+        let w2 = (t * 256.0 + 0.5) as u32;
+        let w1 = 256 - w2;
+        let sw = s0.width as usize;
         let dw = self.width;
         let pixels = self.buffer.as_mut_slice();
         for py in clip.y..clip.bottom() {
             let sy = (py - y) as usize;
-            let src_row = &sprite.pixels[sy * sw..sy * sw + sw];
+            let row0 = &s0.pixels[sy * sw..sy * sw + sw];
+            let row1 = &s1.pixels[sy * sw..sy * sw + sw];
             let dst_row = &mut pixels[py as usize * dw..py as usize * dw + dw];
             let sx_start = (clip.x - x) as usize;
             let dx_start = clip.x as usize;
             for i in 0..clip.w as usize {
-                let spx = src_row[sx_start + i];
+                let p0 = row0[sx_start + i];
+                let p1 = row1[sx_start + i];
+                if ((p0 | p1) >> 24) == 0 {
+                    continue;
+                }
+                let ag = ((((p0 >> 8) & 0x00ff_00ff) * w1 + ((p1 >> 8) & 0x00ff_00ff) * w2))
+                    & 0xff00_ff00;
+                let rb = (((p0 & 0x00ff_00ff) * w1 + (p1 & 0x00ff_00ff) * w2) >> 8) & 0x00ff_00ff;
+                let spx = ag | rb;
                 if (spx >> 24) != 0 {
                     let slot = &mut dst_row[dx_start + i];
-                    *slot = blend_premul(*slot, spx);
+                    *slot = if argb {
+                        src_over_premul(*slot, spx)
+                    } else {
+                        blend_premul(*slot, spx)
+                    };
                 }
+            }
+        }
+    }
+
+    /// Stretch-blit a premultiplied sprite into `dst_rect` with nearest/linear Y and optional accent tint.
+    pub fn blit_sprite_stretched_tint(
+        &mut self,
+        dst_rect: Rect,
+        sprite: &Sprite,
+        tint: Option<(u32, f32)>,
+        opacity: u8,
+    ) {
+        if opacity == 0 || sprite.width == 0 || sprite.height == 0 || dst_rect.is_empty() {
+            return;
+        }
+        let clip = self.clip_rect(dst_rect);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let argb = self.argb;
+        let sw = sprite.width as i32;
+        let sh = sprite.height as i32;
+        let dw = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        let (tr, tg, tb, tf) = match tint {
+            Some((c, f)) => (
+                ((c >> 16) & 0xff) as i32,
+                ((c >> 8) & 0xff) as i32,
+                (c & 0xff) as i32,
+                (f.clamp(0.0, 1.0) * 256.0 + 0.5) as i32,
+            ),
+            None => (0, 0, 0, 0),
+        };
+        for py in clip.y..clip.bottom() {
+            let sy = (((py - dst_rect.y) * sh) / dst_rect.h.max(1)).clamp(0, sh - 1) as usize;
+            let src_row = &sprite.pixels[sy * sw as usize..(sy + 1) * sw as usize];
+            let dst_row = &mut pixels[py as usize * dw..py as usize * dw + dw];
+            for px in clip.x..clip.right() {
+                let sx = (((px - dst_rect.x) * sw) / dst_rect.w.max(1)).clamp(0, sw - 1) as usize;
+                let mut spx = src_row[sx];
+                let sa = (spx >> 24) & 0xff;
+                if sa == 0 {
+                    continue;
+                }
+                if tf > 0 {
+                    let sr = ((spx >> 16) & 0xff) as i32;
+                    let sg = ((spx >> 8) & 0xff) as i32;
+                    let sb = (spx & 0xff) as i32;
+                    let tint_r = (tr * sa as i32) / 255;
+                    let tint_g = (tg * sa as i32) / 255;
+                    let tint_b = (tb * sa as i32) / 255;
+                    let nr = (sr + (((tint_r - sr) * tf) >> 8)).clamp(0, sa as i32) as u32;
+                    let ng = (sg + (((tint_g - sg) * tf) >> 8)).clamp(0, sa as i32) as u32;
+                    let nb = (sb + (((tint_b - sb) * tf) >> 8)).clamp(0, sa as i32) as u32;
+                    spx = (sa << 24) | (nr << 16) | (ng << 8) | nb;
+                }
+                if opacity < 255 {
+                    spx = scale_premul(spx, opacity);
+                }
+                let slot = &mut dst_row[px as usize];
+                *slot = if argb {
+                    src_over_premul(*slot, spx)
+                } else {
+                    blend_premul(*slot, spx)
+                };
             }
         }
     }
@@ -1111,6 +1651,7 @@ impl Canvas {
             return;
         }
         self.mark_dirty(clip);
+        let argb = self.argb;
         let stride = self.width;
         let pixels = self.buffer.as_mut_slice();
         let inv_h = 1.0 / (rect.h as f32).max(1.0);
@@ -1124,7 +1665,11 @@ impl Canvas {
             let row = &mut pixels[py as usize * stride..py as usize * stride + stride];
             for px in clip.x..clip.right() {
                 let slot = &mut row[px as usize];
-                *slot = blend_u8(*slot, row_color, alpha);
+                *slot = if argb {
+                    src_over_u8(*slot, row_color, alpha)
+                } else {
+                    blend_u8(*slot, row_color, alpha)
+                };
             }
         }
     }
@@ -1159,6 +1704,7 @@ impl Canvas {
 
         // Draw vertical area fill under the curve if requested
         if let Some(fill) = fill_color {
+            let argb = self.argb;
             let stride = self.width;
             let pixels = self.buffer.as_mut_slice();
             for i in 0..n - 1 {
@@ -1179,7 +1725,11 @@ impl Canvas {
                         let rel_y = (y - top_y) as f32 / (rect.h as f32).max(1.0);
                         let alpha = ((1.0 - rel_y * 0.75).clamp(0.05, 0.40) * 255.0) as u8;
                         let slot = &mut pixels[y as usize * stride + x as usize];
-                        *slot = blend_u8(*slot, fill, alpha);
+                        *slot = if argb {
+                            src_over_u8(*slot, fill, alpha)
+                        } else {
+                            blend_u8(*slot, fill, alpha)
+                        };
                     }
                 }
             }
@@ -1197,6 +1747,464 @@ impl Canvas {
                 1.0,
             );
         }
+    }
+
+    /// Windows 7 Aero split-gloss vertical gradient (upper highlight half + sharp
+    /// reflection transition + lower saturated half) clipped cleanly to `radius`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_gloss_vgradient(
+        &mut self,
+        rect: Rect,
+        radius: i32,
+        top_start: u32,
+        top_end: u32,
+        bot_start: u32,
+        bot_end: u32,
+        split_ratio: f32,
+        alpha: f32,
+    ) {
+        let a_u8 = f32_to_u8(alpha);
+        if a_u8 == 0 || rect.is_empty() {
+            return;
+        }
+        let r = radius.max(0).min(rect.w / 2).min(rect.h / 2);
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let split_y = rect.y + ((rect.h as f32) * split_ratio.clamp(0.1, 0.9)).round() as i32;
+        let top_h = (split_y - rect.y).max(1) as f32;
+        let bot_h = (rect.bottom() - split_y).max(1) as f32;
+        let rf = r as f32;
+        for py in clip.y..clip.bottom() {
+            let row_color = if py < split_y {
+                let t = ((py - rect.y) as f32 / top_h).clamp(0.0, 1.0);
+                mix(top_start, top_end, t)
+            } else {
+                let t = ((py - split_y) as f32 / bot_h).clamp(0.0, 1.0);
+                mix(bot_start, bot_end, t)
+            };
+            if r == 0 || (py >= rect.y + r && py < rect.bottom() - r) {
+                self.fill_u8(Rect::new(clip.x, py, clip.w, 1), row_color, a_u8);
+                continue;
+            }
+            let mid_l = (rect.x + r).max(clip.x);
+            let mid_r = (rect.right() - r).min(clip.right());
+            if mid_r > mid_l {
+                self.fill_u8(Rect::new(mid_l, py, mid_r - mid_l, 1), row_color, a_u8);
+            }
+            let cy = if py < rect.y + r {
+                rect.y as f32 + rf
+            } else {
+                (rect.bottom() - r) as f32
+            };
+            let dy = py as f32 + 0.5 - cy;
+            for x in clip.x..mid_l.min(clip.right()) {
+                let dx = x as f32 + 0.5 - (rect.x as f32 + rf);
+                let cov = Self::corner_coverage(dx, dy, rf);
+                if cov > 0.0 {
+                    self.blend_pixel_u8(x, py, row_color, ((a_u8 as f32) * cov + 0.5) as u8);
+                }
+            }
+            for x in mid_r.max(clip.x)..clip.right() {
+                let dx = x as f32 + 0.5 - (rect.right() - r) as f32;
+                let cov = Self::corner_coverage(dx, dy, rf);
+                if cov > 0.0 {
+                    self.blend_pixel_u8(x, py, row_color, ((a_u8 as f32) * cov + 0.5) as u8);
+                }
+            }
+        }
+    }
+
+    /// Paint a smooth circular radial glow centered at `(cx, cy)` inside current `clip`.
+    pub fn radial_glow(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        color: u32,
+        max_alpha: f32,
+    ) {
+        if radius <= 1.0 || max_alpha <= 0.002 {
+            return;
+        }
+        let bounds = Rect::new(
+            (cx - radius).floor() as i32,
+            (cy - radius).floor() as i32,
+            (radius * 2.0 + 2.0).ceil() as i32,
+            (radius * 2.0 + 2.0).ceil() as i32,
+        );
+        let clip = self.clip_rect(bounds);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let argb = self.argb;
+        let color = color & 0x00ff_ffff;
+        let inv_r = 1.0 / radius;
+        let stride = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        for py in clip.y..clip.bottom() {
+            let dy = (py as f32 + 0.5 - cy) * inv_r;
+            let dy2 = dy * dy;
+            if dy2 >= 1.0 {
+                continue;
+            }
+            let row = &mut pixels[py as usize * stride..py as usize * stride + stride];
+            for px in clip.x..clip.right() {
+                let dx = (px as f32 + 0.5 - cx) * inv_r;
+                let d2 = dx * dx + dy2;
+                if d2 < 1.0 {
+                    let falloff = 1.0 - d2;
+                    let a = (falloff * falloff * max_alpha * 255.0 + 0.5) as u8;
+                    if a > 0 {
+                        let slot = &mut row[px as usize];
+                        *slot = if argb {
+                            src_over_u8(*slot, color, a)
+                        } else {
+                            blend_u8(*slot, color, a)
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Diagonal glossy specular shimmer band sweeping across `rect` at normalized `phase` (`0.0..=1.0`).
+    pub fn diagonal_shimmer(
+        &mut self,
+        rect: Rect,
+        phase: f32,
+        band_w: f32,
+        color: u32,
+        max_alpha: f32,
+    ) {
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() || band_w <= 1.0 || max_alpha <= 0.002 {
+            return;
+        }
+        self.mark_dirty(clip);
+        let argb = self.argb;
+        let skew = (rect.h as f32) * 0.45;
+        let sweep_span = rect.w as f32 + band_w * 2.0 + skew;
+        let center_base = rect.x as f32 - band_w + phase.clamp(0.0, 1.0) * sweep_span;
+        let inv_half = 2.0 / band_w;
+        let color = color & 0x00ff_ffff;
+        let stride = self.width;
+        let pixels = self.buffer.as_mut_slice();
+        for py in clip.y..clip.bottom() {
+            let row_center = center_base - ((py - rect.y) as f32) * 0.45;
+            let x_lo = ((row_center - band_w * 0.5).floor() as i32).max(clip.x);
+            let x_hi = ((row_center + band_w * 0.5).ceil() as i32).min(clip.right());
+            if x_lo >= x_hi {
+                continue;
+            }
+            let row = &mut pixels[py as usize * stride..py as usize * stride + stride];
+            for px in x_lo..x_hi {
+                let d = ((px as f32 + 0.5 - row_center) * inv_half).abs();
+                if d < 1.0 {
+                    let s = 1.0 - d;
+                    let intensity = s * s * (3.0 - 2.0 * s);
+                    let a = (intensity * max_alpha * 255.0 + 0.5) as u8;
+                    if a > 0 {
+                        let slot = &mut row[px as usize];
+                        *slot = if argb {
+                            src_over_u8(*slot, color, a)
+                        } else {
+                            blend_u8(*slot, color, a)
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Paint a soft rounded drop shadow halo around `rect` (used for popups, cards, and windows).
+    pub fn rounded_drop_shadow(
+        &mut self,
+        rect: Rect,
+        radius: i32,
+        spread: i32,
+        y_offset: i32,
+        max_alpha: f32,
+    ) {
+        if spread <= 0 || max_alpha <= 0.002 || rect.is_empty() {
+            return;
+        }
+        let s = spread.min(24);
+        let step = if s > 8 { 2 } else { 1 };
+        let mut ring = s;
+        while ring > 0 {
+            let t = ring as f32 / s as f32;
+            let ring_alpha = max_alpha * (1.0 - t) * (1.0 - t) * 0.45;
+            let expand = Rect::new(
+                rect.x - ring,
+                rect.y - ring + y_offset,
+                rect.w + ring * 2,
+                rect.h + ring * 2,
+            );
+            self.rounded_border(expand, radius + ring, 0x0000_0000, ring_alpha, step);
+            ring -= step;
+        }
+    }
+
+    /// Blur `rect` on this `Canvas` in place using `blur_rect_fast`.
+    pub fn blur_rect(&mut self, rect: Rect, radius: i32, scratch: &mut BlurScratch) {
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() || radius <= 0 {
+            return;
+        }
+        self.mark_dirty(clip);
+        let w = self.width;
+        let h = self.height;
+        let argb = self.argb;
+        blur_rect_fast(self.pixels_mut(), w, h, clip, radius, scratch);
+        if argb {
+            self.enforce_opaque_rect(clip);
+        }
+    }
+}
+
+/// Reusable scratch allocations for zero-alloc per-frame backdrop blur.
+#[derive(Default)]
+pub struct BlurScratch {
+    down_a: Vec<u32>,
+    down_b: Vec<u32>,
+    down_c: Vec<u32>,
+}
+
+/// One-dimensional $O(1)$ per-pixel sliding box pass over a packed `0xRRGGBB` buffer
+/// (separable H+V passes approximate Gaussian blur at fixed-point arithmetic speed).
+fn box_blur_h(src: &[u32], dst: &mut [u32], w: usize, h: usize, radius: usize) {
+    if w == 0 || h == 0 || radius == 0 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let r = radius.min(32);
+    let win = (r * 2 + 1) as u32;
+    let inv = ((1u32 << 16) + win / 2) / win;
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        let out = &mut dst[y * w..(y + 1) * w];
+        let mut sr = 0u32;
+        let mut sg = 0u32;
+        let mut sb = 0u32;
+        let first = row[0];
+        sr += ((first >> 16) & 0xff) * (r as u32 + 1);
+        sg += ((first >> 8) & 0xff) * (r as u32 + 1);
+        sb += (first & 0xff) * (r as u32 + 1);
+        for i in 1..=r {
+            let p = row[i.min(w - 1)];
+            sr += (p >> 16) & 0xff;
+            sg += (p >> 8) & 0xff;
+            sb += p & 0xff;
+        }
+        for x in 0..w {
+            let cr = ((sr * inv) >> 16).min(255);
+            let cg = ((sg * inv) >> 16).min(255);
+            let cb = ((sb * inv) >> 16).min(255);
+            out[x] = (cr << 16) | (cg << 8) | cb;
+            let p_in = row[(x + r + 1).min(w - 1)];
+            let p_out = row[x.saturating_sub(r)];
+            sr = sr + ((p_in >> 16) & 0xff) - ((p_out >> 16) & 0xff);
+            sg = sg + ((p_in >> 8) & 0xff) - ((p_out >> 8) & 0xff);
+            sb = sb + (p_in & 0xff) - (p_out & 0xff);
+        }
+    }
+}
+
+fn box_blur_v(src: &[u32], dst: &mut [u32], w: usize, h: usize, radius: usize) {
+    if w == 0 || h == 0 || radius == 0 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let r = radius.min(32);
+    let win = (r * 2 + 1) as u32;
+    let inv = ((1u32 << 16) + win / 2) / win;
+    for x in 0..w {
+        let first = src[x];
+        let mut sr = ((first >> 16) & 0xff) * (r as u32 + 1);
+        let mut sg = ((first >> 8) & 0xff) * (r as u32 + 1);
+        let mut sb = (first & 0xff) * (r as u32 + 1);
+        for i in 1..=r {
+            let p = src[i.min(h - 1) * w + x];
+            sr += (p >> 16) & 0xff;
+            sg += (p >> 8) & 0xff;
+            sb += p & 0xff;
+        }
+        for y in 0..h {
+            let cr = ((sr * inv) >> 16).min(255);
+            let cg = ((sg * inv) >> 16).min(255);
+            let cb = ((sb * inv) >> 16).min(255);
+            dst[y * w + x] = (cr << 16) | (cg << 8) | cb;
+            let y_in = (y + r + 1).min(h - 1);
+            let y_out = y.saturating_sub(r);
+            let p_in = src[y_in * w + x];
+            let p_out = src[y_out * w + x];
+            sr = sr + ((p_in >> 16) & 0xff) - ((p_out >> 16) & 0xff);
+            sg = sg + ((p_in >> 8) & 0xff) - ((p_out >> 8) & 0xff);
+            sb = sb + (p_in & 0xff) - (p_out & 0xff);
+        }
+    }
+}
+
+fn downsample_2x_region(
+    src: &[u32],
+    stride: usize,
+    rx: usize,
+    ry: usize,
+    rw: usize,
+    rh: usize,
+    dst: &mut Vec<u32>,
+) -> (usize, usize) {
+    let dw = (rw + 1) / 2;
+    let dh = (rh + 1) / 2;
+    dst.resize(dw * dh, 0);
+    for dy in 0..dh {
+        let sy0 = ry + (dy * 2).min(rh - 1);
+        let sy1 = ry + (dy * 2 + 1).min(rh - 1);
+        let r0 = &src[sy0 * stride..];
+        let r1 = &src[sy1 * stride..];
+        let out_row = &mut dst[dy * dw..(dy + 1) * dw];
+        for dx in 0..dw {
+            let sx0 = rx + (dx * 2).min(rw - 1);
+            let sx1 = rx + (dx * 2 + 1).min(rw - 1);
+            let p00 = r0[sx0];
+            let p10 = r0[sx1];
+            let p01 = r1[sx0];
+            let p11 = r1[sx1];
+            let rb = (((p00 & 0x00ff_00ff)
+                + (p10 & 0x00ff_00ff)
+                + (p01 & 0x00ff_00ff)
+                + (p11 & 0x00ff_00ff)
+                + 0x0002_0002)
+                >> 2)
+                & 0x00ff_00ff;
+            let g = (((p00 & 0x0000_ff00)
+                + (p10 & 0x0000_ff00)
+                + (p01 & 0x0000_ff00)
+                + (p11 & 0x0000_ff00)
+                + 0x0000_0200)
+                >> 2)
+                & 0x0000_ff00;
+            out_row[dx] = rb | g;
+        }
+    }
+    (dw, dh)
+}
+
+fn upsample_bilinear_to_region(
+    src: &[u32],
+    sw: usize,
+    sh: usize,
+    dst: &mut [u32],
+    stride: usize,
+    rx: usize,
+    ry: usize,
+    rw: usize,
+    rh: usize,
+) {
+    if sw == 0 || sh == 0 || rw == 0 || rh == 0 {
+        return;
+    }
+    for y in 0..rh {
+        let fy_fp = ((y * sh * 256 + 128) / rh)
+            .saturating_sub(128)
+            .min((sh - 1) * 256);
+        let sy0 = fy_fp >> 8;
+        let sy1 = (sy0 + 1).min(sh - 1);
+        let fy = (fy_fp & 0xff) as u32;
+        let inv_fy = 256 - fy;
+        let row0 = &src[sy0 * sw..];
+        let row1 = &src[sy1 * sw..];
+        let dst_row = &mut dst[(ry + y) * stride + rx..];
+        for x in 0..rw {
+            let fx_fp = ((x * sw * 256 + 128) / rw)
+                .saturating_sub(128)
+                .min((sw - 1) * 256);
+            let sx0 = fx_fp >> 8;
+            let sx1 = (sx0 + 1).min(sw - 1);
+            let fx = (fx_fp & 0xff) as u32;
+            let inv_fx = 256 - fx;
+
+            let p00 = row0[sx0];
+            let p10 = row0[sx1];
+            let p01 = row1[sx0];
+            let p11 = row1[sx1];
+
+            let top_rb = (((p00 & 0x00ff_00ff) * inv_fx + (p10 & 0x00ff_00ff) * fx) >> 8)
+                & 0x00ff_00ff;
+            let bot_rb = (((p01 & 0x00ff_00ff) * inv_fx + (p11 & 0x00ff_00ff) * fx) >> 8)
+                & 0x00ff_00ff;
+            let out_rb = ((top_rb * inv_fy + bot_rb * fy) >> 8) & 0x00ff_00ff;
+
+            let top_g = (((p00 & 0x0000_ff00) * inv_fx + (p10 & 0x0000_ff00) * fx) >> 8)
+                & 0x0000_ff00;
+            let bot_g = (((p01 & 0x0000_ff00) * inv_fx + (p11 & 0x0000_ff00) * fx) >> 8)
+                & 0x0000_ff00;
+            let out_g = ((top_g * inv_fy + bot_g * fy) >> 8) & 0x0000_ff00;
+
+            dst_row[x] = out_rb | out_g;
+        }
+    }
+}
+
+/// Fast CPU backdrop frosted-glass blur over `rect` in `buf`.
+///
+/// Uses 2x/4x box downsampling + dual-pass separable $O(1)$ sliding box blur +
+/// bilinear upsample for radii >= 4, delivering smooth Dual-Kawase quality at
+/// high frame rates without per-pixel integer division.
+pub fn blur_rect_fast(
+    buf: &mut [u32],
+    width: usize,
+    height: usize,
+    rect: Rect,
+    radius: i32,
+    scratch: &mut BlurScratch,
+) {
+    let clipped = rect.intersect(Rect::new(0, 0, width as i32, height as i32));
+    if clipped.is_empty() || radius <= 0 {
+        return;
+    }
+    let rx = clipped.x as usize;
+    let ry = clipped.y as usize;
+    let rw = clipped.w as usize;
+    let rh = clipped.h as usize;
+
+    if radius >= 4 && rw >= 8 && rh >= 8 {
+        let (w1, h1) = downsample_2x_region(buf, width, rx, ry, rw, rh, &mut scratch.down_a);
+        if radius >= 10 && w1 >= 8 && h1 >= 8 {
+            let (w2, h2) = downsample_2x_region(&scratch.down_a, w1, 0, 0, w1, h1, &mut scratch.down_b);
+            let r_scaled = ((radius + 2) / 4).max(1) as usize;
+            scratch.down_c.resize(w2 * h2, 0);
+            box_blur_h(&scratch.down_b, &mut scratch.down_c, w2, h2, r_scaled);
+            box_blur_v(&scratch.down_c, &mut scratch.down_b, w2, h2, r_scaled);
+            box_blur_h(&scratch.down_b, &mut scratch.down_c, w2, h2, r_scaled.max(1));
+            box_blur_v(&scratch.down_c, &mut scratch.down_b, w2, h2, r_scaled.max(1));
+            upsample_bilinear_to_region(&scratch.down_b, w2, h2, buf, width, rx, ry, rw, rh);
+        } else {
+            let r_scaled = ((radius + 1) / 2).max(1) as usize;
+            scratch.down_b.resize(w1 * h1, 0);
+            box_blur_h(&scratch.down_a, &mut scratch.down_b, w1, h1, r_scaled);
+            box_blur_v(&scratch.down_b, &mut scratch.down_a, w1, h1, r_scaled);
+            upsample_bilinear_to_region(&scratch.down_a, w1, h1, buf, width, rx, ry, rw, rh);
+        }
+        return;
+    }
+
+    let r = (radius as usize).min(16);
+    scratch.down_a.resize(rw * rh, 0);
+    scratch.down_b.resize(rw * rh, 0);
+    for y in 0..rh {
+        let src_start = (ry + y) * width + rx;
+        scratch.down_a[y * rw..(y + 1) * rw].copy_from_slice(&buf[src_start..src_start + rw]);
+    }
+    box_blur_h(&scratch.down_a, &mut scratch.down_b, rw, rh, r);
+    box_blur_v(&scratch.down_b, &mut scratch.down_a, rw, rh, r);
+    for y in 0..rh {
+        let dst_start = (ry + y) * width + rx;
+        buf[dst_start..dst_start + rw].copy_from_slice(&scratch.down_a[y * rw..(y + 1) * rw]);
     }
 }
 
@@ -1259,5 +2267,36 @@ mod tests {
         assert_eq!(px[14 * 40 + 2], 0x000080);
         assert_eq!(px[14 * 40 + 17], 0x1084d0);
         assert_eq!(px[17 * 40 + 2], 0x000080);
+    }
+
+    #[test]
+    fn argb_glass_clear_and_enforce_opaque_work() {
+        let mut c = Canvas::new(20, 20, 0xff22_3344);
+        c.set_argb(true);
+        c.clear(0x112233);
+        assert_eq!(c.pixels()[0], 0xff11_2233);
+        c.clear_transparent(Rect::new(0, 0, 20, 6), 0);
+        assert_eq!(c.pixels()[0], 0);
+        assert_eq!(c.pixels()[6 * 20], 0xff11_2233);
+
+        // Semi-transparent white fog over transparent region accumulates alpha cleanly.
+        c.fill_alpha(Rect::new(2, 1, 4, 2), 0xffffff, 0.5);
+        assert!((c.pixels()[20 + 2] >> 24) > 100);
+
+        // Enforce opaque over content body strips zeroed alphas from third-party blits.
+        c.pixels_mut()[10 * 20 + 5] = 0x00aa_bbcc;
+        c.enforce_opaque_rect(Rect::new(0, 6, 20, 14));
+        assert_eq!(c.pixels()[10 * 20 + 5], 0xffaa_bbcc);
+    }
+
+    #[test]
+    fn downsampled_blur_smooths_edges() {
+        let mut canvas = Canvas::new(64, 64, 0x000000);
+        canvas.fill(Rect::new(16, 16, 32, 32), 0xffffff);
+        let mut scratch = BlurScratch::default();
+        canvas.blur_rect(Rect::new(0, 0, 64, 64), 10, &mut scratch);
+        let edge = canvas.pixels()[16 * 64 + 14];
+        let edge_r = (edge >> 16) & 0xff;
+        assert!(edge_r > 0 && edge_r < 255, "expected blurred edge, got {edge_r}");
     }
 }

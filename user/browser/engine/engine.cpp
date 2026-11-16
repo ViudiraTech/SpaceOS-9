@@ -72,6 +72,38 @@ button {
 }
 )CSS";
 
+static const char* kVortexLightUaOverride = R"CSS(
+html, body {
+    color: #0f172a;
+    background-color: #f6f9fe;
+}
+a {
+    color: #0066cc;
+}
+button {
+    border-radius: 4px;
+    border: 1px solid #7f97b2;
+    background-color: #ebf1f8;
+    color: #0f172a;
+}
+)CSS";
+
+static const char* kVortexDarkUaOverride = R"CSS(
+html, body {
+    color: #e6eef8;
+    background-color: #101824;
+}
+a {
+    color: #6cb8ff;
+}
+button {
+    border-radius: 4px;
+    border: 1px solid #485b73;
+    background-color: #243142;
+    color: #f1f6fc;
+}
+)CSS";
+
 bool contains_ci(const std::string& hay, const std::string& needle) {
     if (needle.empty()) return false;
     std::string h = to_lower_ascii(hay);
@@ -229,11 +261,13 @@ litehtml::uint_ptr create_host_font(const SpaceHostCallbacks& cb, const char* fa
 
 } // namespace space
 
-SpacePage::SpacePage(const SpaceHostCallbacks* host_cb, int vw, int vh, bool dark, bool win98)
+SpacePage::SpacePage(const SpaceHostCallbacks* host_cb, int vw, int vh, bool dark, int theme_style)
     : viewport_w(std::max(64, vw)),
       viewport_h(std::max(64, vh)),
       dark_mode(dark),
-      is_win98(win98) {
+      is_win98(theme_style == SPACE_THEME_WIN98),
+      is_vortex(theme_style == SPACE_THEME_VORTEXGLASS),
+      theme_style(theme_style) {
     if (host_cb) cb = *host_cb;
     container = std::make_shared<space::SpaceContainer>(this);
     dom = std::make_unique<space::DomBridge>(this);
@@ -380,18 +414,20 @@ void SpacePage::dispatch_click_or_submit(const std::shared_ptr<litehtml::element
 extern "C" {
 
 SpacePage* space_page_create(const SpaceHostCallbacks* cb, int viewport_w, int viewport_h,
-                             int dark_mode, int is_win98) {
-    return new SpacePage(cb, viewport_w, viewport_h, dark_mode != 0, is_win98 != 0);
+                             int dark_mode, int theme_style) {
+    return new SpacePage(cb, viewport_w, viewport_h, dark_mode != 0, theme_style);
 }
 
 void space_page_destroy(SpacePage* page) {
     delete page;
 }
 
-void space_page_set_theme(SpacePage* page, int dark_mode, int is_win98) {
+void space_page_set_theme(SpacePage* page, int dark_mode, int theme_style) {
     if (!page) return;
     page->dark_mode = (dark_mode != 0);
-    page->is_win98 = (is_win98 != 0);
+    page->theme_style = theme_style;
+    page->is_win98 = (theme_style == SPACE_THEME_WIN98);
+    page->is_vortex = (theme_style == SPACE_THEME_VORTEXGLASS);
     page->mark_dirty(true, true);
 }
 
@@ -412,8 +448,9 @@ void space_page_load_html(SpacePage* page, const char* html, int html_len, const
 
     std::string master = std::string(litehtml::master_css) + "\n" + space::kExtraUaCss;
     std::string user_css;
-    if (page->dark_mode && !page->is_win98) user_css = space::kDarkUaOverride;
-    else if (page->is_win98) user_css = space::kWin98UaOverride;
+    if (page->is_win98) user_css = space::kWin98UaOverride;
+    else if (page->is_vortex) user_css = page->dark_mode ? space::kVortexDarkUaOverride : space::kVortexLightUaOverride;
+    else if (page->dark_mode) user_css = space::kDarkUaOverride;
 
     page->doc = litehtml::document::createFromString(
         html_str.c_str(), page->container.get(), master.c_str(), user_css.c_str());

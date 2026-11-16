@@ -90,6 +90,27 @@ void draw_win98_bevel(const SpaceHostCallbacks& cb, int x, int y, int w, int h, 
     cb.draw_borders(cb.user_data, &b2);
 }
 
+void draw_aero_gloss_box(const SpaceHostCallbacks& cb, int x, int y, int w, int h, int rad,
+                         uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
+                         uint32_t border, uint32_t inner_rim) {
+    if (w <= 0 || h <= 0) return;
+    int radii[8] = {rad, rad, rad, rad, rad, rad, rad, rad};
+    if (cb.draw_linear_gradient) {
+        uint32_t colors[4] = {c0, c1, c2, c3};
+        float stops[4] = {0.0f, 0.48f, 0.50f, 1.0f};
+        cb.draw_linear_gradient(cb.user_data, x, y, w, h,
+                                static_cast<float>(x), static_cast<float>(y),
+                                static_cast<float>(x), static_cast<float>(y + h),
+                                colors, stops, 4, rad > 0 ? radii : nullptr);
+    } else if (cb.fill_rect) {
+        cb.fill_rect(cb.user_data, x, y, w, h, c2, rad > 0 ? radii : nullptr);
+    }
+    if (w > 2 && h > 2) {
+        draw_box_border_uniform(cb, x + 1, y + 1, w - 2, h - 2, inner_rim, 1, std::max(0, rad - 1));
+    }
+    draw_box_border_uniform(cb, x, y, w, h, border, 1, rad);
+}
+
 bool is_focused_el(const SpacePage* page, const litehtml::element* self) {
     if (!page || !page->page_focused) return false;
     auto f = page->focused_el.lock();
@@ -285,7 +306,8 @@ void el_space_input::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml:
     const bool active = is_active_el(page_, this);
     const bool dark = page_->dark_mode;
     const bool win98 = page_->is_win98;
-    const int rad = win98 ? 0 : 5;
+    const bool vortex = page_->is_vortex;
+    const int rad = win98 ? 0 : (vortex ? 4 : 5);
     int radii[8] = {rad, rad, rad, rad, rad, rad, rad, rad};
     std::string t = input_type();
 
@@ -299,12 +321,28 @@ void el_space_input::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml:
         int by = py + (ph - box_sz) / 2;
         int r3[8] = {win98 ? 0 : 3, win98 ? 0 : 3, win98 ? 0 : 3, win98 ? 0 : 3,
                      win98 ? 0 : 3, win98 ? 0 : 3, win98 ? 0 : 3, win98 ? 0 : 3};
-        if (cb.fill_rect) cb.fill_rect(cb.user_data, bx, by, box_sz, box_sz, bg, win98 ? nullptr : r3);
-        if (win98) {
-            draw_win98_bevel(cb, bx, by, box_sz, box_sz, true);
+        if (vortex) {
+            if (checked_) {
+                draw_aero_gloss_box(cb, bx, by, box_sz, box_sz, 3,
+                                    0xff9ad3fbu, 0xff4fa4eau, 0xff1e75c9u, 0xff3690deu,
+                                    0xff2c628bu, 0x80ffffffu);
+            } else {
+                draw_aero_gloss_box(cb, bx, by, box_sz, box_sz, 3,
+                                    dark ? 0xff283446u : 0xffffffffu,
+                                    dark ? 0xff202b3bu : 0xfff2f6fbu,
+                                    dark ? 0xff18212fu : 0xffe4ecf5u,
+                                    dark ? 0xff1e2938u : 0xffeef4fbu,
+                                    focused ? (dark ? 0xff52a6ebu : 0xff3c7fb1u) : (dark ? 0xff566b87u : 0xff708299u),
+                                    dark ? 0x30ffffffu : 0xd8ffffffu);
+            }
         } else {
-            uint32_t bcol = focused ? 0xff3b82f6u : (checked_ ? 0xff2563ebu : (dark ? 0xff4b5563u : 0xff94a3b8u));
-            draw_box_border_uniform(cb, bx, by, box_sz, box_sz, bcol, 1, 3);
+            if (cb.fill_rect) cb.fill_rect(cb.user_data, bx, by, box_sz, box_sz, bg, win98 ? nullptr : r3);
+            if (win98) {
+                draw_win98_bevel(cb, bx, by, box_sz, box_sz, true);
+            } else {
+                uint32_t bcol = focused ? 0xff3b82f6u : (checked_ ? 0xff2563ebu : (dark ? 0xff4b5563u : 0xff94a3b8u));
+                draw_box_border_uniform(cb, bx, by, box_sz, box_sz, bcol, 1, 3);
+            }
         }
         if (checked_ && cb.fill_rect) {
             uint32_t tick_col = win98 ? 0xff000000u : 0xffffffffu;
@@ -320,17 +358,19 @@ void el_space_input::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml:
         int by = py + (ph - d) / 2;
         int hr = d / 2;
         int rrad[8] = {hr, hr, hr, hr, hr, hr, hr, hr};
-        uint32_t bg = win98 ? 0xffffffffu : (dark ? 0xff242834u : 0xffffffffu);
+        uint32_t bg = win98 ? 0xffffffffu : (vortex ? (dark ? 0xff1e2838u : 0xfff8fbffu) : (dark ? 0xff242834u : 0xffffffffu));
         if (cb.fill_rect) cb.fill_rect(cb.user_data, bx, by, d, d, bg, rrad);
-        uint32_t bcol = focused ? 0xff3b82f6u : (checked_ ? 0xff2563ebu : (dark ? 0xff6b7280u : 0xff64748bu));
-        draw_box_border_uniform(cb, bx, by, d, d, bcol, win98 ? 1 : 2, hr);
+        uint32_t bcol = vortex
+            ? (focused ? 0xff3c7fb1u : (checked_ ? 0xff2a7ac4u : (dark ? 0xff5a6f8cu : 0xff6e849eu)))
+            : (focused ? 0xff3b82f6u : (checked_ ? 0xff2563ebu : (dark ? 0xff6b7280u : 0xff64748bu)));
+        draw_box_border_uniform(cb, bx, by, d, d, bcol, win98 ? 1 : (vortex ? 1 : 2), hr);
         if (checked_ && cb.fill_rect) {
             int pad = std::max(4, d / 3);
             int inner = std::max(4, d - 2 * pad);
             int ir = inner / 2;
             int irad[8] = {ir, ir, ir, ir, ir, ir, ir, ir};
             cb.fill_rect(cb.user_data, bx + (d - inner) / 2, by + (d - inner) / 2, inner, inner,
-                         win98 ? 0xff000000u : 0xff2563ebu, irad);
+                         win98 ? 0xff000000u : (vortex ? 0xff2582d6u : 0xff2563ebu), irad);
         }
         return;
     }
@@ -345,30 +385,60 @@ void el_space_input::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml:
         int track_r[8] = {2, 2, 2, 2, 2, 2, 2, 2};
         if (cb.fill_rect) {
             cb.fill_rect(cb.user_data, px + 4, track_y, pw - 8, 4,
-                         dark ? 0xff374151u : 0xffcbd5e1u, win98 ? nullptr : track_r);
+                         vortex ? (dark ? 0xff1d2838u : 0xffd2dfeeu) : (dark ? 0xff374151u : 0xffcbd5e1u),
+                         win98 ? nullptr : track_r);
             cb.fill_rect(cb.user_data, px + 4, track_y, static_cast<int>((pw - 8) * ratio), 4,
-                         win98 ? 0xff000080u : 0xff2563ebu, win98 ? nullptr : track_r);
+                         win98 ? 0xff000080u : (vortex ? 0xff2c8ce0u : 0xff2563ebu), win98 ? nullptr : track_r);
             int kw = 12, kh = 16;
             int kx = px + 4 + static_cast<int>((pw - 16) * ratio) - kw / 2 + 4;
             int ky = py + (ph - kh) / 2;
             int kr[8] = {6, 6, 6, 6, 6, 6, 6, 6};
-            cb.fill_rect(cb.user_data, kx, ky, kw, kh, win98 ? 0xffc0c0c0u : 0xffffffffu, win98 ? nullptr : kr);
-            if (win98) draw_win98_bevel(cb, kx, ky, kw, kh, false);
-            else draw_box_border_uniform(cb, kx, ky, kw, kh, 0xff2563ebu, 1, 6);
+            if (vortex) {
+                draw_aero_gloss_box(cb, kx, ky, kw, kh, 4,
+                                    dark ? 0xff3a4d66u : 0xffffffffu,
+                                    dark ? 0xff2b3c52u : 0xffeef5fcu,
+                                    dark ? 0xff1d2b3eu : 0xffcfe0f3u,
+                                    dark ? 0xff25354au : 0xffe1ecfau,
+                                    focused ? 0xff3c7fb1u : (dark ? 0xff5a7494u : 0xff6e849eu),
+                                    dark ? 0x40ffffffu : 0xd8ffffffu);
+            } else {
+                cb.fill_rect(cb.user_data, kx, ky, kw, kh, win98 ? 0xffc0c0c0u : 0xffffffffu, win98 ? nullptr : kr);
+                if (win98) draw_win98_bevel(cb, kx, ky, kw, kh, false);
+                else draw_box_border_uniform(cb, kx, ky, kw, kh, 0xff2563ebu, 1, 6);
+            }
         }
         return;
     }
 
     if (is_button_like()) {
         uint32_t bg = web_color_to_argb(css().get_bg().m_color);
-        if ((bg >> 24) == 0) {
-            bg = win98 ? 0xffc0c0c0u : (active ? 0xff1d4ed8u : (dark ? 0xff374151u : 0xffe2e8f0u));
-        }
-        if (cb.fill_rect) cb.fill_rect(cb.user_data, px, py, pw, ph, bg, win98 ? nullptr : radii);
-        if (win98) {
-            draw_win98_bevel(cb, px, py, pw, ph, active);
-        } else if (!css().get_borders().is_visible()) {
-            draw_box_border_uniform(cb, px, py, pw, ph, focused ? 0xff3b82f6u : (dark ? 0xff4b5563u : 0xff94a3b8u), 1, rad);
+        if (vortex && (bg >> 24) == 0) {
+            if (active) {
+                draw_aero_gloss_box(cb, px, py, pw, ph, rad,
+                                    dark ? 0xff1d3d61u : 0xffe5f4fcu,
+                                    dark ? 0xff183554u : 0xffc4e5f6u,
+                                    dark ? 0xff112842u : 0xff98d1efu,
+                                    dark ? 0xff163150u : 0xffaddcf6u,
+                                    0xff2c628bu, dark ? 0x35ffffffu : 0xd0ffffffu);
+            } else if (dark) {
+                draw_aero_gloss_box(cb, px, py, pw, ph, rad,
+                                    0xff324156u, 0xff263346u, 0xff1a2433u, 0xff222e40u,
+                                    focused ? 0xff4da6e8u : 0xff4a5d75u, 0x30ffffffu);
+            } else {
+                draw_aero_gloss_box(cb, px, py, pw, ph, rad,
+                                    0xfffefeffu, 0xffeff3f8u, 0xffdbe3eeu, 0xffeaedf5u,
+                                    focused ? 0xff3c7fb1u : 0xff707070u, 0xd8ffffffu);
+            }
+        } else {
+            if ((bg >> 24) == 0) {
+                bg = win98 ? 0xffc0c0c0u : (active ? 0xff1d4ed8u : (dark ? 0xff374151u : 0xffe2e8f0u));
+            }
+            if (cb.fill_rect) cb.fill_rect(cb.user_data, px, py, pw, ph, bg, win98 ? nullptr : radii);
+            if (win98) {
+                draw_win98_bevel(cb, px, py, pw, ph, active);
+            } else if (!css().get_borders().is_visible()) {
+                draw_box_border_uniform(cb, px, py, pw, ph, focused ? 0xff3b82f6u : (dark ? 0xff4b5563u : 0xff94a3b8u), 1, rad);
+            }
         }
         std::string label = display_text();
         uint32_t fg = web_color_to_argb(css().get_color());
@@ -376,8 +446,8 @@ void el_space_input::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml:
             fg = win98 ? 0xff000000u : (dark ? 0xfff8fafcu : 0xff0f172au);
         }
         int tw = cb.text_width ? cb.text_width(cb.user_data, label.c_str(), fh) : static_cast<int>(label.size() * 8);
-        int tx = px + std::max(4, (pw - tw) / 2) + (win98 && active ? 1 : 0);
-        int ty = py + std::max(2, (ph - fh_px) / 2) + (win98 && active ? 1 : 0);
+        int tx = px + std::max(4, (pw - tw) / 2) + ((win98 || vortex) && active ? 1 : 0);
+        int ty = py + std::max(2, (ph - fh_px) / 2) + ((win98 || vortex) && active ? 1 : 0);
         if (cb.draw_text && !label.empty()) {
             cb.draw_text(cb.user_data, label.c_str(), fh, fg, tx, ty, pw - 8, ph - 4, 0);
         }
@@ -387,11 +457,19 @@ void el_space_input::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml:
     // Text-like inputs
     uint32_t bg = web_color_to_argb(css().get_bg().m_color);
     if ((bg >> 24) == 0) {
-        bg = win98 ? 0xffffffffu : (dark ? 0xff1e2430u : 0xffffffffu);
+        bg = win98 ? 0xffffffffu : (vortex ? (dark ? 0xff16202eu : 0xffffffffu) : (dark ? 0xff1e2430u : 0xffffffffu));
     }
     if (cb.fill_rect) cb.fill_rect(cb.user_data, px, py, pw, ph, bg, win98 ? nullptr : radii);
     if (win98) {
         draw_win98_bevel(cb, px, py, pw, ph, true);
+    } else if (vortex) {
+        uint32_t bcol = focused ? (dark ? 0xff52a6ebu : 0xff3d7badu) : (dark ? 0xff465a73u : 0xffabadb3u);
+        if (!css().get_borders().is_visible() || focused) {
+            draw_box_border_uniform(cb, px, py, pw, ph, bcol, focused ? 2 : 1, rad);
+        }
+        if (cb.fill_rect && pw > 4) {
+            cb.fill_rect(cb.user_data, px + 2, py + 1, pw - 4, 1, dark ? 0x20000000u : 0x18000000u, nullptr);
+        }
     } else {
         uint32_t bcol = focused ? 0xff3b82f6u : (dark ? 0xff475569u : 0xffcbd5e1u);
         if (!css().get_borders().is_visible() || focused) {
@@ -675,14 +753,35 @@ void el_space_textarea::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, liteht
     const bool focused = is_focused_el(page_, this);
     const bool dark = page_->dark_mode;
     const bool win98 = page_->is_win98;
-    const int rad = win98 ? 0 : 6;
+    const bool vortex = page_->is_vortex;
+    const int rad = win98 ? 0 : (vortex ? 5 : 6);
     int radii[8] = {rad, rad, rad, rad, rad, rad, rad, rad};
 
     uint32_t bg = web_color_to_argb(css().get_bg().m_color);
-    if ((bg >> 24) == 0) bg = win98 ? 0xffffffffu : (dark ? 0xff1e2430u : 0xffffffffu);
+    const bool author_bg = (bg >> 24) != 0;
+    if (!author_bg) {
+        if (win98) bg = 0xffffffffu;
+        else if (vortex) bg = dark ? 0xff16202eu : 0xffffffffu;
+        else bg = dark ? 0xff1e2430u : 0xffffffffu;
+    }
     if (cb.fill_rect) cb.fill_rect(cb.user_data, px, py, pw, ph, bg, win98 ? nullptr : radii);
-    if (win98) draw_win98_bevel(cb, px, py, pw, ph, true);
-    else if (!css().get_borders().is_visible() || focused) {
+    if (win98) {
+        draw_win98_bevel(cb, px, py, pw, ph, true);
+    } else if (vortex && (!css().get_borders().is_visible() || focused)) {
+        if (!author_bg && cb.fill_rect && pw > 4 && ph > 4) {
+            int srad[8] = {std::max(0, rad - 1), std::max(0, rad - 1), 0, 0, 0, 0, 0, 0};
+            cb.fill_rect(cb.user_data, px + 1, py + 1, pw - 2, 2,
+                         dark ? 0x33000000u : 0x226888aau, srad);
+        }
+        uint32_t brd = focused ? 0xff3b94e6u : (dark ? 0xff49627eu : 0xff8ea6c2u);
+        draw_box_border_uniform(cb, px, py, pw, ph, brd, focused ? 2 : 1, rad);
+        if (pw > 4 && ph > 4) {
+            draw_box_border_uniform(cb, px + 1, py + 1, pw - 2, ph - 2,
+                                    focused ? (dark ? 0x555cb8ffu : 0x5570bfffu)
+                                            : (dark ? 0x2279a6d2u : 0x66ffffffu),
+                                    1, std::max(0, rad - 1));
+        }
+    } else if (!css().get_borders().is_visible() || focused) {
         draw_box_border_uniform(cb, px, py, pw, ph, focused ? 0xff3b82f6u : (dark ? 0xff475569u : 0xffcbd5e1u),
                                 focused ? 2 : 1, rad);
     }
@@ -818,8 +917,7 @@ void el_space_button::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml
                            const litehtml::position* clip,
                            const std::shared_ptr<litehtml::render_item>& ri) {
     html_tag::draw(hdc, x, y, clip, ri);
-    if (!page_ || !page_->is_win98) return;
-    // Overlay subtle Win98 pressed/raised bevel if author did not define custom border
+    if (!page_ || (!page_->is_win98 && !page_->is_vortex)) return;
     if (!css().get_borders().is_visible()) {
         litehtml::position pos = ri->pos();
         pos.x += x - ri->padding_left() - ri->border_left();
@@ -828,7 +926,21 @@ void el_space_button::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml
         int py = static_cast<int>(std::round(pos.y.value()));
         int pw = static_cast<int>(std::round(ri->content_width().value()));
         int ph = static_cast<int>(std::round(ri->content_height().value()));
-        draw_win98_bevel(page_->cb, px, py, pw, ph, is_active_el(page_, this));
+        if (page_->is_win98) {
+            draw_win98_bevel(page_->cb, px, py, pw, ph, is_active_el(page_, this));
+        } else {
+            const bool active = is_active_el(page_, this);
+            const bool focused = is_focused_el(page_, this);
+            const bool dark = page_->dark_mode;
+            // Semi-transparent Win7 glass sheen preserves html_tag text drawn above.
+            uint32_t c0 = active ? 0x1e6088b0u : (dark ? 0x2690bce8u : 0x44ffffffu);
+            uint32_t c1 = active ? 0x1278a4ccu : (dark ? 0x105882b0u : 0x1cffffffu);
+            uint32_t c2 = active ? 0x18386088u : (dark ? 0x1c000000u : 0x146a88a8u);
+            uint32_t c3 = active ? 0x1688b8e0u : (dark ? 0x185686b8u : 0x28ffffffu);
+            uint32_t brd = focused ? 0xff3b94e6u : (dark ? 0xff5a7594u : 0xff8ea6c2u);
+            uint32_t rim = dark ? 0x55a8d4ffu : 0x99ffffffu;
+            draw_aero_gloss_box(page_->cb, px, py, pw, ph, 5, c0, c1, c2, c3, brd, rim);
+        }
     }
 }
 
@@ -973,19 +1085,51 @@ void el_space_select::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml
     const bool focused = is_focused_el(page_, this);
     const bool dark = page_->dark_mode;
     const bool win98 = page_->is_win98;
-    const int rad = win98 ? 0 : 5;
+    const bool vortex = page_->is_vortex;
+    const int rad = win98 ? 0 : (vortex ? 5 : 5);
     int radii[8] = {rad, rad, rad, rad, rad, rad, rad, rad};
 
     uint32_t bg = web_color_to_argb(css().get_bg().m_color);
-    if ((bg >> 24) == 0) bg = win98 ? 0xffffffffu : (dark ? 0xff1e2430u : 0xffffffffu);
-    if (cb.fill_rect) cb.fill_rect(cb.user_data, px, py, pw, ph, bg, win98 ? nullptr : radii);
+    const bool author_bg = (bg >> 24) != 0;
+    if (!author_bg) {
+        if (win98) bg = 0xffffffffu;
+        else if (vortex) bg = dark ? 0xff162334u : 0xffeef6ffu;
+        else bg = dark ? 0xff1e2430u : 0xffffffffu;
+    }
 
     if (win98) {
+        if (cb.fill_rect) cb.fill_rect(cb.user_data, px, py, pw, ph, bg, nullptr);
         draw_win98_bevel(cb, px, py, pw, ph, true);
         int bw = std::min(18, pw - 4);
         if (cb.fill_rect) cb.fill_rect(cb.user_data, px + pw - bw - 2, py + 2, bw, ph - 4, 0xffc0c0c0u, nullptr);
         draw_win98_bevel(cb, px + pw - bw - 2, py + 2, bw, ph - 4, false);
+    } else if (vortex) {
+        uint32_t brd = focused ? 0xff3b94e6u : (dark ? 0xff526e8eu : 0xff8ea6c2u);
+        uint32_t rim = dark ? 0x449ac5f0u : 0x99ffffffu;
+        if (!author_bg) {
+            uint32_t c0 = dark ? 0xff2a3c52u : 0xffffffffu;
+            uint32_t c1 = dark ? 0xff1f2e42u : 0xfff0f6fdu;
+            uint32_t c2 = dark ? 0xff162334u : 0xffe0ecf9u;
+            uint32_t c3 = dark ? 0xff21334au : 0xffeef6ffu;
+            draw_aero_gloss_box(cb, px, py, pw, ph, rad, c0, c1, c2, c3, brd, rim);
+        } else {
+            if (cb.fill_rect) cb.fill_rect(cb.user_data, px, py, pw, ph, bg, radii);
+            draw_box_border_uniform(cb, px, py, pw, ph, brd, focused ? 2 : 1, rad);
+        }
+        int bw = std::min(20, pw - 6);
+        if (bw > 6 && ph > 6 && cb.fill_rect) {
+            int btn_x = px + pw - bw - 2;
+            cb.fill_rect(cb.user_data, btn_x - 1, py + 3, 1, ph - 6,
+                         dark ? 0x557094b8u : 0x557fa0c4u, nullptr);
+            int br[8] = {0, std::max(0, rad - 1), std::max(0, rad - 1), 0, 0, 0, 0, 0};
+            cb.fill_rect(cb.user_data, btn_x, py + 2, bw, (ph - 4) / 2,
+                         dark ? 0x2690bce8u : 0x66ffffffu, br);
+        }
+        if (focused) {
+            draw_box_border_uniform(cb, px, py, pw, ph, 0xff3b94e6u, 2, rad);
+        }
     } else {
+        if (cb.fill_rect) cb.fill_rect(cb.user_data, px, py, pw, ph, bg, radii);
         draw_box_border_uniform(cb, px, py, pw, ph, focused ? 0xff3b82f6u : (dark ? 0xff475569u : 0xffcbd5e1u),
                                 focused ? 2 : 1, rad);
     }

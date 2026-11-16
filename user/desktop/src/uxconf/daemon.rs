@@ -536,7 +536,7 @@ mod tests {
         // Built-in defaults are readable immediately.
         assert_eq!(
             client.get("appearance", "/theme/mode").unwrap(),
-            Value::String("dark".to_string())
+            Value::String("light".to_string())
         );
         assert!(client
             .list_channels()
@@ -550,7 +550,7 @@ mod tests {
 
         // Valid mutations persist to disk and push live notifications to matching subscribers.
         client
-            .set("appearance", "/theme/mode", Value::String("light".into()))
+            .set("appearance", "/theme/mode", Value::String("dark".into()))
             .unwrap();
         client.set("panel", "/size", Value::Int(54)).unwrap();
 
@@ -560,7 +560,7 @@ mod tests {
         let (changed, all_events) = watch_all.poll_into(&mut cfg);
         assert!(changed);
         assert_eq!(all_events.len(), 2);
-        assert_eq!(cfg.mode, ThemeMode::Light);
+        assert_eq!(cfg.mode, ThemeMode::Dark);
         assert_eq!(cfg.panel_size, 54);
 
         let panel_events = watch_panel.drain_events();
@@ -575,12 +575,12 @@ mod tests {
         // Resetting the channel restores schema default and broadcasts the reverted value.
         let reset_count = client.reset("panel", "/", true).unwrap();
         assert_eq!(reset_count, 1);
-        assert_eq!(client.get("panel", "/size").unwrap(), Value::Int(46));
+        assert_eq!(client.get("panel", "/size").unwrap(), Value::Int(44));
 
         thread::sleep(Duration::from_millis(50));
         let (reverted, _) = watch_all.poll_into(&mut cfg);
         assert!(reverted);
-        assert_eq!(cfg.panel_size, 46);
+        assert_eq!(cfg.panel_size, 44);
 
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();

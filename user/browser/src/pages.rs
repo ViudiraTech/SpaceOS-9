@@ -21,6 +21,17 @@ fn escape_html(s: &str) -> String {
 }
 
 pub fn serve_builtin(url: &str, storage: Option<&BrowserStorage>, dark_mode: bool, is_win98: bool) -> BuiltinPage {
+    serve_builtin_styled(url, storage, dark_mode, if is_win98 { 1 } else { 0 })
+}
+
+pub fn serve_builtin_styled(
+    url: &str,
+    storage: Option<&BrowserStorage>,
+    dark_mode: bool,
+    theme_style: i32,
+) -> BuiltinPage {
+    let is_win98 = theme_style == 1;
+    let is_vortex = theme_style == 2;
     if url.starts_with("about:blank") || url.is_empty() {
         return BuiltinPage {
             status: 200,
@@ -41,12 +52,12 @@ pub fn serve_builtin(url: &str, storage: Option<&BrowserStorage>, dark_mode: boo
         "space://js-lab" => BuiltinPage {
             status: 200,
             content_type: "text/html; charset=utf-8",
-            body: js_lab_html(dark_mode, is_win98),
+            body: js_lab_html(dark_mode, is_win98, is_vortex),
         },
         "space://about" => BuiltinPage {
             status: 200,
             content_type: "text/html; charset=utf-8",
-            body: about_html(dark_mode, is_win98),
+            body: about_html(dark_mode, is_win98, is_vortex),
         },
         _ => {
             // If space://search?q=... arrived from home form, render quick offline/search router page
@@ -56,25 +67,43 @@ pub fn serve_builtin(url: &str, storage: Option<&BrowserStorage>, dark_mode: boo
                 return BuiltinPage {
                     status: 200,
                     content_type: "text/html; charset=utf-8",
-                    body: search_router_html(&decoded, dark_mode, is_win98),
+                    body: search_router_html(&decoded, dark_mode, is_win98, is_vortex),
                 };
             }
             BuiltinPage {
                 status: 200,
                 content_type: "text/html; charset=utf-8",
-                body: home_html(storage, dark_mode, is_win98),
+                body: home_html(storage, dark_mode, is_win98, is_vortex),
             }
         }
     }
 }
 
-fn base_css(dark_mode: bool, is_win98: bool) -> &'static str {
+fn base_css(dark_mode: bool, is_win98: bool, is_vortex: bool) -> &'static str {
     if is_win98 {
         return r#"
         body { font-family: sans-serif; margin: 20px; background: #c0c0c0; color: #000; }
         .card { background: #fff; border: 2px solid #808080; padding: 14px; margin-bottom: 14px; }
         .btn { background: #c0c0c0; border: 2px solid #000; padding: 6px 12px; color: #000; text-decoration: none; display: inline-block; }
         .pill { background: #dfdfdf; border: 1px solid #808080; padding: 4px 10px; display: inline-block; margin-right: 6px; }
+        "#;
+    }
+    if is_vortex {
+        if dark_mode {
+            return r#"
+            body { font-family: sans-serif; margin: 0; padding: 28px 36px; background: linear-gradient(180deg, #0d1726 0%, #142238 100%); color: #e8f1fc; }
+            .card { background: #19263a; border: 1px solid #486387; border-top-color: #7094c2; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+            .muted { color: #9db6d4; }
+            .pill { background: #213754; color: #8ed0ff; border: 1px solid #4873a6; border-radius: 999px; padding: 4px 11px; font-size: 12px; display: inline-block; margin-right: 6px; }
+            .link-card { display: block; background: #202f46; border: 1px solid #3f5879; border-radius: 6px; padding: 12px 14px; color: #e8f1fc; text-decoration: none; margin-bottom: 8px; }
+            "#;
+        }
+        return r#"
+        body { font-family: sans-serif; margin: 0; padding: 28px 36px; background: linear-gradient(180deg, #dfeaf8 0%, #f4f8fe 100%); color: #0f172a; }
+        .card { background: #fbfdff; border: 1px solid #8fb1d9; border-top-color: #ffffff; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+        .muted { color: #4f647d; }
+        .pill { background: #e6f2ff; color: #0b57a4; border: 1px solid #96c2ed; border-radius: 999px; padding: 4px 11px; font-size: 12px; display: inline-block; margin-right: 6px; }
+        .link-card { display: block; background: #f2f7fd; border: 1px solid #b8cfe8; border-radius: 6px; padding: 12px 14px; color: #0f172a; text-decoration: none; margin-bottom: 8px; }
         "#;
     }
     if dark_mode {
@@ -95,7 +124,7 @@ fn base_css(dark_mode: bool, is_win98: bool) -> &'static str {
     "#
 }
 
-fn home_html(storage: Option<&BrowserStorage>, dark_mode: bool, is_win98: bool) -> String {
+fn home_html(storage: Option<&BrowserStorage>, dark_mode: bool, is_win98: bool, is_vortex: bool) -> String {
     let mut bmarks_html = String::new();
     if let Some(st) = storage {
         for b in st.bookmarks.iter().take(12) {
@@ -179,12 +208,12 @@ if (st) st.textContent = 'QuickJS-NG 就绪 · UA: SpaceBrowser/1.0';
 </script>
 </body>
 </html>"#,
-        css = base_css(dark_mode, is_win98),
+        css = base_css(dark_mode, is_win98, is_vortex),
         bookmarks = bmarks_html
     )
 }
 
-fn search_router_html(query: &str, dark_mode: bool, is_win98: bool) -> String {
+fn search_router_html(query: &str, dark_mode: bool, is_win98: bool, is_vortex: bool) -> String {
     let trimmed = query.trim();
     if trimmed.contains("://") || trimmed.starts_with('/') {
         let escaped = escape_html(trimmed);
@@ -194,7 +223,7 @@ fn search_router_html(query: &str, dark_mode: bool, is_win98: bool) -> String {
     }
     let q_esc = escape_html(trimmed);
     let url_q = url_encode_simple(trimmed);
-    let css = base_css(dark_mode, is_win98);
+    let css = base_css(dark_mode, is_win98, is_vortex);
     format!(
         r#"<!doctype html>
 <html>
@@ -231,8 +260,8 @@ fn url_encode_simple(s: &str) -> String {
     out
 }
 
-fn js_lab_html(dark_mode: bool, is_win98: bool) -> String {
-    let base = base_css(dark_mode, is_win98);
+fn js_lab_html(dark_mode: bool, is_win98: bool, is_vortex: bool) -> String {
+    let base = base_css(dark_mode, is_win98, is_vortex);
     let extra = if is_win98 {
         r#"
   .box { background: #fff; border: 2px solid #808080; padding: 14px; margin-bottom: 14px; }
@@ -240,6 +269,22 @@ fn js_lab_html(dark_mode: bool, is_win98: bool) -> String {
   .highlighted { background: #ffff00; border-color: #000; font-weight: bold; }
   canvas { border: 2px solid #808080; background: #fff; }
   #form-out { margin-top: 8px; font-size: 13px; color: #000080; }
+"#
+    } else if is_vortex && dark_mode {
+        r#"
+  .box { background: linear-gradient(180deg, #1b2839 0%, #121c2a 100%); border: 1px solid #48688c; border-radius: 8px; padding: 14px; margin-bottom: 14px; color: #eef5fd; }
+  .badge { background: linear-gradient(180deg, #2b4d78 0%, #1c3556 100%); color: #d8ebff; padding: 3px 9px; border-radius: 4px; font-size: 12px; border: 1px solid #5994d6; }
+  .highlighted { background: #854d0e; color: #fef08a; border-color: #facc15; font-weight: bold; }
+  canvas { border: 1px solid #48688c; border-radius: 6px; background: #0f1722; }
+  #form-out { margin-top: 8px; font-size: 13px; color: #7dd3fc; }
+"#
+    } else if is_vortex {
+        r#"
+  .box { background: linear-gradient(180deg, #ffffff 0%, #eff6fd 100%); border: 1px solid #9ab4cf; border-radius: 8px; padding: 14px; margin-bottom: 14px; color: #0e1a28; }
+  .badge { background: linear-gradient(180deg, #f3f9ff 0%, #d4e8fc 100%); color: #0c4d8a; padding: 3px 9px; border-radius: 4px; font-size: 12px; border: 1px solid #7fb3e6; }
+  .highlighted { background: #fef08a; color: #854d0e; border-color: #eab308; font-weight: bold; }
+  canvas { border: 1px solid #8ea7c4; border-radius: 6px; background: #fff; }
+  #form-out { margin-top: 8px; font-size: 13px; color: #0c5aa6; }
 "#
     } else if dark_mode {
         r#"
@@ -407,10 +452,14 @@ document.getElementById('btn-store').addEventListener('click', function(){{
     )
 }
 
-fn about_html(dark_mode: bool, is_win98: bool) -> String {
-    let css = base_css(dark_mode, is_win98);
+fn about_html(dark_mode: bool, is_win98: bool, is_vortex: bool) -> String {
+    let css = base_css(dark_mode, is_win98, is_vortex);
     let box_extra = if is_win98 {
         ".box { background: #fff; border: 2px solid #808080; padding: 16px; }"
+    } else if is_vortex && dark_mode {
+        ".box { background: linear-gradient(180deg, #1b2839 0%, #121c2a 100%); border: 1px solid #48688c; border-radius: 8px; padding: 16px; color: #eef5fd; }"
+    } else if is_vortex {
+        ".box { background: linear-gradient(180deg, #ffffff 0%, #eff6fd 100%); border: 1px solid #9ab4cf; border-radius: 8px; padding: 16px; color: #0e1a28; }"
     } else if dark_mode {
         ".box { background: #1c202b; border: 1px solid #2d3343; border-radius: 8px; padding: 16px; color: #f1f5f9; }"
     } else {

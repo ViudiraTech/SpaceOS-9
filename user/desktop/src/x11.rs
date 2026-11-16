@@ -18,14 +18,17 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use x11rb::connection::Connection;
+use x11rb::protocol::composite::{self, ConnectionExt as CompositeExt};
+use x11rb::protocol::damage::{self, ConnectionExt as DamageExt};
 use x11rb::protocol::render::{ConnectionExt as RenderExt, PictType, Pictformat};
 use x11rb::protocol::shape::{self, ConnectionExt as ShapeExt};
 use x11rb::protocol::shm::ConnectionExt as ShmExt;
+use x11rb::protocol::xfixes::ConnectionExt as XFixesExt;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, AutoRepeatMode, Blanking, ChangeKeyboardControlAux, ChangeWindowAttributesAux,
-    ClientMessageEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux, CreateWindowAux, Cursor,
-    EventMask, Exposures, Gcontext, GrabMode, ImageFormat, InputFocus, ModMask, PropMode,
-    Rectangle, StackMode, Window, WindowClass,
+    ClientMessageEvent, Colormap, ColormapAlloc, ConfigureWindowAux, ConnectionExt, CreateGCAux,
+    CreateWindowAux, Cursor, EventMask, Exposures, Gcontext, GrabMode, ImageFormat, InputFocus,
+    ModMask, PropMode, Rectangle, StackMode, Visualid, Window, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -106,6 +109,28 @@ pub struct Atoms {
     pub wm_class: Atom,
     pub spui_window_cmd: Atom,
     pub spui_icon: Atom,
+    pub spui_glass_extents: Atom,
+    pub spui_compositor: Atom,
+}
+
+/// Reusable MIT-SHM readback buffer for incremental `XDamage` window captures.
+pub struct ShmReadBuf {
+    pub seg: u32,
+    ptr: *mut u32,
+    pub cap_pixels: usize,
+}
+
+// SAFETY: `ptr` points to an exclusive SysV SHM mapping owned by this `ShmReadBuf`.
+unsafe impl Send for ShmReadBuf {}
+
+impl Drop for ShmReadBuf {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                libc::shmdt(self.ptr as *const libc::c_void);
+            }
+        }
+    }
 }
 
 pub struct X {
@@ -116,9 +141,15 @@ pub struct X {
     pub height: u16,
     pub depth: u8,
     pub gc: Gcontext,
+    pub argb_visual: Option<Visualid>,
+    pub argb_colormap: Colormap,
+    pub argb_gc: Gcontext,
     pub atoms: Atoms,
     pub has_shm: bool,
     pub has_shape: bool,
+    pub has_composite: bool,
+    pub has_damage: bool,
+    pub has_xfixes: bool,
     cursors: [Cursor; 8],
     min_keycode: u8,
     keysyms_per: u8,
@@ -165,6 +196,22 @@ impl X {
             .ok()
             .and_then(|c| c.reply().ok())
             .is_some();
+        let has_composite = conn
+            .composite_query_version(0, 4)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some();
+        let has_damage = conn
+            .damage_query_version(1, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some();
+        let has_xfixes = conn
+            .xfixes_query_version(5, 0)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some();
+        let (argb_visual, argb_colormap, argb_gc) = init_argb_visual(&conn, screen, &screen_info);
         let cursors = load_cursors(&conn, root);
 
         Ok(Self {
@@ -175,9 +222,15 @@ impl X {
             height,
             depth,
             gc,
+            argb_visual,
+            argb_colormap,
+            argb_gc,
             atoms,
             has_shm,
             has_shape,
+            has_composite,
+            has_damage,
+            has_xfixes,
             cursors,
             min_keycode,
             keysyms_per: mapping.keysyms_per_keycode,
@@ -327,6 +380,67 @@ impl X {
         Ok(())
     }
 
+    /// Create an InputOutput window preferring a 32-bit ARGB TrueColor visual when
+    /// available so compositor glass/corner transparency works seamlessly, returning
+    /// `(window_id, is_argb32)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_argb_window(
+        &self,
+        id: Window,
+        parent: Window,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        override_redirect: bool,
+        mask: EventMask,
+        fallback_bg: u32,
+    ) -> Result<(Window, bool)> {
+        if let Some(visual) = self.argb_visual {
+            let cid = self.cursors[CursorKind::Default.index()];
+            let mut aux = CreateWindowAux::new()
+                .background_pixel(0)
+                .border_pixel(0)
+                .colormap(self.argb_colormap)
+                .event_mask(mask)
+                .override_redirect(u32::from(override_redirect));
+            if cid != 0 {
+                aux = aux.cursor(cid);
+            }
+            if self
+                .conn
+                .create_window(
+                    32,
+                    id,
+                    parent,
+                    x,
+                    y,
+                    width,
+                    height,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    visual,
+                    &aux,
+                )
+                .is_ok()
+            {
+                return Ok((id, true));
+            }
+        }
+        self.create_window(
+            id,
+            parent,
+            x,
+            y,
+            width,
+            height,
+            override_redirect,
+            mask,
+            fallback_bg,
+        )?;
+        Ok((id, false))
+    }
+
     pub fn create_window(
         &self,
         id: Window,
@@ -415,11 +529,22 @@ impl X {
         Ok(())
     }
 
-    /// Create an off-screen pixmap matching `window`'s size and depth.
+    /// Create an off-screen pixmap matching `window`'s size and root depth.
     pub fn create_backing(&self, window: Window, width: u16, height: u16) -> Result<u32> {
+        self.create_backing_depth(window, self.depth, width, height)
+    }
+
+    /// Create an off-screen pixmap with an explicit bit `depth`.
+    pub fn create_backing_depth(
+        &self,
+        window: Window,
+        depth: u8,
+        width: u16,
+        height: u16,
+    ) -> Result<u32> {
         let pixmap = self.conn.generate_id()?;
         self.conn
-            .create_pixmap(self.depth, pixmap, window, width.max(1), height.max(1))?;
+            .create_pixmap(depth, pixmap, window, width.max(1), height.max(1))?;
         Ok(pixmap)
     }
 
@@ -494,6 +619,29 @@ impl X {
         let _ = self.flush();
     }
 
+    /// Acquire an async keyboard grab scoped to `window` (used by Alt+Tab and Flip 3D).
+    pub fn grab_keyboard(&self, window: Window) -> bool {
+        let Ok(cookie) = self.conn.grab_keyboard(
+            false,
+            window,
+            x11rb::CURRENT_TIME,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        ) else {
+            return false;
+        };
+        let _ = self.flush();
+        cookie
+            .reply()
+            .is_ok_and(|r| r.status == x11rb::protocol::xproto::GrabStatus::SUCCESS)
+    }
+
+    /// Release any active keyboard grab held by this X11 connection.
+    pub fn ungrab_keyboard(&self) {
+        let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+        let _ = self.flush();
+    }
+
     pub fn set_active_window(&self, window: Window) -> Result<()> {
         self.conn.change_property(
             PropMode::REPLACE,
@@ -541,6 +689,294 @@ impl X {
             name.as_bytes(),
         )?;
         Ok(())
+    }
+
+    /// Publish DWM extended-glass margins `[top, bottom, left, right, corner_r]` in
+    /// `_SPUI_GLASS_EXTENTS` so the compositor blurs behind transparent client chrome.
+    pub fn set_glass_extents(
+        &self,
+        window: Window,
+        top: i32,
+        bottom: i32,
+        left: i32,
+        right: i32,
+        corner_r: i32,
+    ) -> Result<()> {
+        let vals = [top, bottom, left, right, corner_r];
+        let mut bytes = [0u8; 20];
+        for (i, v) in vals.into_iter().enumerate() {
+            bytes[i * 4..(i + 1) * 4].copy_from_slice(&(v as u32).to_ne_bytes());
+        }
+        self.conn.change_property(
+            PropMode::REPLACE,
+            window,
+            self.atoms.spui_glass_extents,
+            AtomEnum::CARDINAL,
+            32,
+            5,
+            &bytes,
+        )?;
+        Ok(())
+    }
+
+    /// Read `_SPUI_GLASS_EXTENTS` (`[top, bottom, left, right, corner_r]`) if set.
+    pub fn get_glass_extents(&self, window: Window) -> Option<[i32; 5]> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.spui_glass_extents,
+                AtomEnum::CARDINAL,
+                0,
+                5,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.value.len() < 20 {
+            return None;
+        }
+        let mut out = [0i32; 5];
+        for (i, dst) in out.iter_mut().enumerate() {
+            let chunk: [u8; 4] = reply.value[i * 4..(i + 1) * 4].try_into().ok()?;
+            *dst = u32::from_ne_bytes(chunk) as i32;
+        }
+        Some(out)
+    }
+
+    /// Enable manual subwindow redirection and obtain the pass-through Composite Overlay Window.
+    pub fn enable_compositor(&self) -> Result<Option<Window>> {
+        if !self.has_composite || !self.has_damage || !self.has_xfixes {
+            return Ok(None);
+        }
+        self.conn
+            .composite_redirect_subwindows(self.root, composite::Redirect::MANUAL)?
+            .check()?;
+        let overlay = self
+            .conn
+            .composite_get_overlay_window(self.root)?
+            .reply()?
+            .overlay_win;
+        let reg = self.conn.generate_id()?;
+        self.conn.xfixes_create_region(reg, &[])?;
+        self.conn
+            .xfixes_set_window_shape_region(overlay, shape::SK::INPUT, 0, 0, reg)?;
+        self.conn.xfixes_destroy_region(reg)?;
+        self.set_compositor_active(true);
+        self.conn.flush()?;
+        Ok(Some(overlay))
+    }
+
+    /// Release Composite Overlay Window on compositor shutdown.
+    pub fn disable_compositor(&self, overlay: Option<Window>) {
+        if overlay.is_some() && self.has_composite {
+            self.set_compositor_active(false);
+            let _ = self.conn.composite_release_overlay_window(self.root);
+            let _ = self
+                .conn
+                .composite_unredirect_subwindows(self.root, composite::Redirect::MANUAL);
+            let _ = self.flush();
+        }
+    }
+
+    /// Advertise compositor availability on the root window (`_SPUI_COMPOSITOR`).
+    pub fn set_compositor_active(&self, active: bool) {
+        if active {
+            let val = 1u32.to_ne_bytes();
+            let _ = self.conn.change_property(
+                PropMode::REPLACE,
+                self.root,
+                self.atoms.spui_compositor,
+                AtomEnum::CARDINAL,
+                32,
+                1,
+                &val,
+            );
+        } else {
+            let _ = self
+                .conn
+                .delete_property(self.root, self.atoms.spui_compositor);
+        }
+    }
+
+    /// Query whether `spui shell`'s software compositor currently owns redirection.
+    pub fn is_compositor_active(&self) -> bool {
+        self.conn
+            .get_property(
+                false,
+                self.root,
+                self.atoms.spui_compositor,
+                AtomEnum::CARDINAL,
+                0,
+                1,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.value.len() >= 4 && u32::from_ne_bytes([r.value[0], r.value[1], r.value[2], r.value[3]]) != 0)
+    }
+
+    pub fn name_window_pixmap(&self, window: Window) -> Result<u32> {
+        let pixmap = self.conn.generate_id()?;
+        self.conn
+            .composite_name_window_pixmap(window, pixmap)?
+            .check()?;
+        Ok(pixmap)
+    }
+
+    pub fn create_damage(&self, window: Window) -> Result<u32> {
+        let dmg = self.conn.generate_id()?;
+        self.conn
+            .damage_create(dmg, window, damage::ReportLevel::BOUNDING_BOX)?
+            .check()?;
+        Ok(dmg)
+    }
+
+    pub fn destroy_damage(&self, dmg: u32) {
+        if dmg != 0 && self.has_damage {
+            let _ = self.conn.damage_destroy(dmg);
+        }
+    }
+
+    pub fn damage_subtract(&self, dmg: u32) {
+        if dmg != 0 && self.has_damage {
+            let _ = self.conn.damage_subtract(dmg, 0u32, 0u32);
+        }
+    }
+
+    pub fn create_shm_read_buffer(&self, width: usize, height: usize) -> Option<ShmReadBuf> {
+        if !self.has_shm || width == 0 || height == 0 {
+            return None;
+        }
+        let cap_pixels = width * height;
+        let byte_len = cap_pixels * 4;
+        unsafe {
+            let shmid = libc::shmget(libc::IPC_PRIVATE, byte_len, libc::IPC_CREAT | 0o600);
+            if shmid < 0 {
+                return None;
+            }
+            let raw = libc::shmat(shmid, std::ptr::null(), 0);
+            if raw == (-1isize as *mut libc::c_void) || raw.is_null() {
+                let _ = libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut());
+                return None;
+            }
+            let attached = self
+                .conn
+                .generate_id()
+                .ok()
+                .and_then(|seg| {
+                    let ok = self
+                        .conn
+                        .shm_attach(seg, shmid as u32, false)
+                        .ok()
+                        .and_then(|c| c.check().ok())
+                        .is_some();
+                    ok.then_some(seg)
+                });
+            let _ = libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut());
+            if let Some(seg) = attached {
+                return Some(ShmReadBuf {
+                    seg,
+                    ptr: raw as *mut u32,
+                    cap_pixels,
+                });
+            }
+            libc::shmdt(raw);
+        }
+        None
+    }
+
+    pub fn release_shm_read_buffer(&self, buf: &ShmReadBuf) {
+        let _ = self.conn.shm_detach(buf.seg);
+    }
+
+    /// Read a sub-rectangle from an off-screen `pixmap` into `dst` (normalized to
+    /// premultiplied `0xAARRGGBB`, forcing `alpha = 0xFF` for depth-24 sources).
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_pixmap_rect(
+        &self,
+        pixmap: u32,
+        shm: Option<&ShmReadBuf>,
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+        depth: u8,
+        dst: &mut [u32],
+        dst_stride: usize,
+    ) -> bool {
+        if pixmap == 0 || w == 0 || h == 0 {
+            return false;
+        }
+        let wu = w as usize;
+        let hu = h as usize;
+        let xu = x.max(0) as usize;
+        let yu = y.max(0) as usize;
+        if yu + hu > dst.len() / dst_stride.max(1) || xu + wu > dst_stride {
+            return false;
+        }
+        if let Some(s) = shm {
+            if wu * hu <= s.cap_pixels {
+                if let Ok(cookie) = self.conn.shm_get_image(
+                    pixmap,
+                    x,
+                    y,
+                    w,
+                    h,
+                    !0u32,
+                    ImageFormat::Z_PIXMAP.into(),
+                    s.seg,
+                    0,
+                ) {
+                    if cookie.reply().is_ok() {
+                        let src = unsafe { std::slice::from_raw_parts(s.ptr, wu * hu) };
+                        for row in 0..hu {
+                            let d_row = &mut dst[(yu + row) * dst_stride + xu..(yu + row) * dst_stride + xu + wu];
+                            let s_row = &src[row * wu..(row + 1) * wu];
+                            if depth == 32 {
+                                d_row.copy_from_slice(s_row);
+                            } else {
+                                for (d, &p) in d_row.iter_mut().zip(s_row.iter()) {
+                                    *d = 0xff00_0000 | (p & 0x00ff_ffff);
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        let Ok(cookie) =
+            self.conn
+                .get_image(ImageFormat::Z_PIXMAP, pixmap, x, y, w, h, !0u32)
+        else {
+            return false;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return false;
+        };
+        if reply.data.len() < wu * hu * 4 {
+            return false;
+        }
+        for row in 0..hu {
+            let d_row = &mut dst[(yu + row) * dst_stride + xu..(yu + row) * dst_stride + xu + wu];
+            let s_off = row * wu * 4;
+            for col in 0..wu {
+                let p_off = s_off + col * 4;
+                let px = u32::from_ne_bytes([
+                    reply.data[p_off],
+                    reply.data[p_off + 1],
+                    reply.data[p_off + 2],
+                    reply.data[p_off + 3],
+                ]);
+                d_row[col] = if depth == 32 {
+                    px
+                } else {
+                    0xff00_0000 | (px & 0x00ff_ffff)
+                };
+            }
+        }
+        true
     }
 
     pub fn set_class(&self, window: Window, instance: &str, class: &str) -> Result<()> {
@@ -614,8 +1050,25 @@ impl X {
 
     /// Send a window-management command (`cmd`: 1 = minimize, 2 = toggle maximize) to the root WM.
     pub fn send_window_cmd(&self, window: Window, cmd: u32) -> Result<()> {
-        let event =
-            ClientMessageEvent::new(32, window, self.atoms.spui_window_cmd, [cmd, 0, 0, 0, 0]);
+        self.send_window_cmd_data(window, cmd, 0, 0, 0, 0)
+    }
+
+    /// Send a window-management command with payload arguments to the root WM.
+    pub fn send_window_cmd_data(
+        &self,
+        window: Window,
+        cmd: u32,
+        d1: u32,
+        d2: u32,
+        d3: u32,
+        d4: u32,
+    ) -> Result<()> {
+        let event = ClientMessageEvent::new(
+            32,
+            window,
+            self.atoms.spui_window_cmd,
+            [cmd, d1, d2, d3, d4],
+        );
         self.conn.send_event(
             false,
             self.root,
@@ -797,14 +1250,29 @@ impl X {
     }
 
     pub fn put_canvas(&self, window: Window, canvas: &Canvas, area: Rect) -> Result<()> {
+        self.put_canvas_depth(window, canvas, area, self.depth)
+    }
+
+    pub fn put_canvas_depth(
+        &self,
+        window: Window,
+        canvas: &Canvas,
+        area: Rect,
+        depth: u8,
+    ) -> Result<()> {
         let area = area.intersect(Rect::new(0, 0, canvas.width as i32, canvas.height as i32));
         if area.is_empty() {
             return Ok(());
         }
+        let gc = if depth == 32 && self.argb_gc != 0 {
+            self.argb_gc
+        } else {
+            self.gc
+        };
         if let Some(seg) = canvas.shm_seg() {
             self.conn.shm_put_image(
                 window,
-                self.gc,
+                gc,
                 canvas.width as u16,
                 canvas.height as u16,
                 area.x as u16,
@@ -813,7 +1281,7 @@ impl X {
                 area.h as u16,
                 area.x as i16,
                 area.y as i16,
-                self.depth,
+                depth,
                 ImageFormat::Z_PIXMAP.into(),
                 false,
                 seg,
@@ -842,13 +1310,13 @@ impl X {
                 self.conn.put_image(
                     ImageFormat::Z_PIXMAP,
                     window,
-                    self.gc,
+                    gc,
                     area.w as u16,
                     height as u16,
                     0,
                     y as i16,
                     0,
-                    self.depth,
+                    depth,
                     bytes,
                 )?;
                 y += height;
@@ -873,13 +1341,13 @@ impl X {
             self.conn.put_image(
                 ImageFormat::Z_PIXMAP,
                 window,
-                self.gc,
+                gc,
                 area.w as u16,
                 height as u16,
                 area.x as i16,
                 y as i16,
                 0,
-                self.depth,
+                depth,
                 &bytes,
             )?;
             y += height;
@@ -1013,8 +1481,79 @@ impl Atoms {
             wm_class: get("WM_CLASS")?,
             spui_window_cmd: get("_SPUI_WINDOW_CMD")?,
             spui_icon: get("_SPUI_ICON")?,
+            spui_glass_extents: get("_SPUI_GLASS_EXTENTS")?,
+            spui_compositor: get("_SPUI_COMPOSITOR")?,
         })
     }
+}
+
+fn init_argb_visual(
+    conn: &RustConnection,
+    screen: usize,
+    screen_info: &x11rb::protocol::xproto::Screen,
+) -> (Option<Visualid>, Colormap, Gcontext) {
+    let mut found_visual = None;
+    if let Ok(cookie) = conn.render_query_pict_formats() {
+        if let Ok(formats) = cookie.reply() {
+            let argb_fmt = formats.formats.iter().find(|info| {
+                info.type_ == PictType::DIRECT
+                    && info.depth == 32
+                    && info.direct.alpha_mask == 0xff
+                    && info.direct.red_mask == 0xff
+                    && info.direct.green_mask == 0xff
+                    && info.direct.blue_mask == 0xff
+                    && info.direct.alpha_shift == 24
+            });
+            if let (Some(fmt), Some(scr)) = (argb_fmt, formats.screens.get(screen)) {
+                'outer: for d in &scr.depths {
+                    if d.depth == 32 {
+                        for v in &d.visuals {
+                            if v.format == fmt.id {
+                                found_visual = Some(v.visual);
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if found_visual.is_none() {
+        found_visual = screen_info
+            .allowed_depths
+            .iter()
+            .find(|d| d.depth == 32)
+            .and_then(|d| d.visuals.first())
+            .map(|v| v.visual_id);
+    }
+    let Some(visual) = found_visual else {
+        return (None, 0, 0);
+    };
+    let Ok(cmap) = conn.generate_id() else {
+        return (None, 0, 0);
+    };
+    if conn
+        .create_colormap(ColormapAlloc::NONE, cmap, screen_info.root, visual)
+        .is_err()
+    {
+        return (None, 0, 0);
+    }
+    let Ok(tmp) = conn.generate_id() else {
+        return (None, 0, 0);
+    };
+    if conn.create_pixmap(32, tmp, screen_info.root, 1, 1).is_err() {
+        return (None, 0, 0);
+    }
+    let Ok(gc) = conn.generate_id() else {
+        let _ = conn.free_pixmap(tmp);
+        return (None, 0, 0);
+    };
+    if conn.create_gc(gc, tmp, &Default::default()).is_err() {
+        let _ = conn.free_pixmap(tmp);
+        return (None, 0, 0);
+    }
+    let _ = conn.free_pixmap(tmp);
+    (Some(visual), cmap, gc)
 }
 
 struct XcursorImage {

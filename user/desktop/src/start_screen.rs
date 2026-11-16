@@ -17,7 +17,7 @@ use crate::apps::settings::{
     search_settings, Page as SettingsPage, SettingsHost, SettingsRenderStyle, SettingsState,
 };
 use crate::ddm::wire::PowerAction;
-use crate::draw::{mix, Canvas, Rect};
+use crate::draw::{mix, BlurScratch, Canvas, Rect};
 use crate::icons::{self, Icon};
 use crate::netmgr::NetStatus;
 use crate::shell::{now_local, session_identity, AppCategory, APPS};
@@ -1172,6 +1172,11 @@ impl StartScreenState {
             canvas.fill(Rect::new(0, 0, w, hdr.height - 2), theme.panel);
             canvas.fill(Rect::new(0, hdr.height - 2, w, 1), theme.bevel_shadow);
             canvas.fill(Rect::new(0, hdr.height - 1, w, 1), theme.bevel_hi);
+        } else if theme.is_vortexglass() {
+            let hdr_r = Rect::new(0, 0, w, hdr.height - 2);
+            crate::vortex::draw_glass_chrome_overlay(canvas, hdr_r, 0, theme, true, 0, 0, None);
+            canvas.fill_alpha(Rect::new(0, hdr.height - 2, w, 1), theme.panel_border, 0.72);
+            canvas.fill_alpha(Rect::new(0, hdr.height - 1, w, 1), 0xffffff, 0.35);
         } else {
             let hdr_bg = if theme.mode == ThemeMode::Dark {
                 0x0a1019
@@ -1217,6 +1222,8 @@ impl StartScreenState {
                 canvas,
                 if is_win98 {
                     "SPACEOS 9 · 经典模式"
+                } else if theme.is_vortexglass() {
+                    "SPACEOS 9 · VORTEXGLASS 4.0"
                 } else {
                     "SPACEOS 9 · SPUI"
                 },
@@ -3059,6 +3066,55 @@ fn draw_xj380_card(
         );
         return;
     }
+    let ctrl_r = theme.radius_control();
+    if theme.is_vortexglass() {
+        canvas.rounded_drop_shadow(rect, ctrl_r, if hovered { 8 } else { 4 }, 2, if hovered { 0.34 } else { 0.20 });
+        let base = if theme.is_dark() {
+            mix(0x162436, accent, if hovered { 0.26 } else { 0.14 })
+        } else {
+            mix(0xf7fbff, accent, if hovered { 0.18 } else { 0.08 })
+        };
+        canvas.rounded_rect(rect, ctrl_r, base, alpha.min(0.92));
+        let top_h = (rect.h / 2).max(4);
+        canvas.with_clip(rect.inset(1), |c| {
+            c.fill_gradient_v(
+                Rect::new(rect.x + 1, rect.y + 1, (rect.w - 2).max(1), top_h),
+                0xffffff,
+                0xffffff,
+                if hovered { 0.42 } else { 0.28 },
+                0.04,
+            );
+            crate::vortex::blit_aero_sheen(
+                c,
+                rect.inset(1),
+                rect.x,
+                rect.y,
+                None,
+                if hovered { 0.38 } else { 0.20 },
+            );
+        });
+        canvas.rounded_border(
+            rect,
+            ctrl_r,
+            if hovered { theme.aero_hover_border() } else { theme.panel_border },
+            if hovered { 0.96 } else { 0.72 },
+            1,
+        );
+        if rect.w > 4 && rect.h > 4 {
+            canvas.rounded_border(
+                rect.inset(1),
+                (ctrl_r - 1).max(1),
+                0xffffff,
+                if hovered { 0.62 } else { 0.38 },
+                1,
+            );
+        }
+        canvas.fill(
+            Rect::new(rect.x + 3, rect.y + 1, (rect.w - 6).max(1), 2),
+            accent,
+        );
+        return;
+    }
     let base = if theme.mode == ThemeMode::Dark {
         mix(theme.panel, accent, if hovered { 0.22 } else { 0.12 })
     } else {
@@ -3189,6 +3245,37 @@ pub fn build_start_backdrop(
                 .collect();
         }
         return vec![config.solid_color; len];
+    }
+    if config.theme_style == uxconf::ThemeStyle::VortexGlass {
+        let wi = usize::from(w.max(1));
+        let hi = usize::from(h.max(1));
+        let mut c = Canvas::new(wi, hi, config.solid_color);
+        let bounds = c.bounds();
+        if wallpaper_scaled.len() == len {
+            c.copy_background(wallpaper_scaled);
+        } else {
+            crate::vortex::draw_aero_aurora(
+                &mut c,
+                bounds,
+                Theme::from_config(config).accent,
+                config.mode == ThemeMode::Dark,
+                0.0,
+            );
+        }
+        let mut scratch = BlurScratch::default();
+        c.blur_rect(bounds, crate::vortex::AERO_BLUR_RADIUS, &mut scratch);
+        let scrim = if config.mode == ThemeMode::Dark {
+            0x091320
+        } else {
+            0xdcebf8
+        };
+        c.fill_alpha(
+            bounds,
+            scrim,
+            if config.mode == ThemeMode::Dark { 0.56 } else { 0.62 },
+        );
+        crate::vortex::blit_aero_sheen(&mut c, bounds, 0, 0, None, 0.35);
+        return c.pixels()[..len].to_vec();
     }
     let scrim = if config.mode == ThemeMode::Dark {
         0x080d16

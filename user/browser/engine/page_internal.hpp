@@ -31,6 +31,8 @@ struct SpacePage {
     int scroll_y = 0;
     bool dark_mode = false;
     bool is_win98 = false;
+    bool is_vortex = false;
+    int theme_style = SPACE_THEME_SPUI4;
     bool restyle_needed = false;
     bool relayout_needed = false;
     bool repaint_needed = false;
@@ -50,7 +52,7 @@ struct SpacePage {
 
     uint64_t ui_font = 0;
 
-    SpacePage(const SpaceHostCallbacks* host_cb, int vw, int vh, bool dark, bool win98);
+    SpacePage(const SpaceHostCallbacks* host_cb, int vw, int vh, bool dark, int theme_style);
     ~SpacePage();
 
     void mark_dirty(bool relayout, bool repaint);

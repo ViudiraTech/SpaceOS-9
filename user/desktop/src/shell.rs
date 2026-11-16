@@ -13,14 +13,26 @@
 //! menu, top- or bottom-docked panel, XShape-clipped Start Menu (with live
 //! search) and notification toasts, synchronized live with `uxconfd`.
 
+use crate::compositor::{
+    attach_window_pixmap, blit_scaled_window, blit_window_pixels, capture_dirty_windows,
+    composite_shell_layer, compute_thumb_popup, detach_window_resources, draw_aero_peek_sheet,
+    draw_alt_tab_hud, draw_flip3d_scene, draw_thumb_preview, lerp_rect, paint_shell_glass_region,
+    scaled_rect_around_center, window_damage_bounds, AltTabState, AnimKind, ClosingGhost,
+    CompWindow, Compositor, Flip3dState, SnapZone, SwitcherEntry, WindowAnim,
+};
 use crate::ddm::wire::PowerAction;
-use crate::draw::{Canvas, Rect, Sprite};
+use crate::draw::{mix, Canvas, Rect, Sprite};
 use crate::icons::{self, Icon};
 use crate::start_screen::{ShellConfigHost, StartAction, StartScreenState};
 use crate::text::{Face, TextRenderer};
-use crate::theme::Theme;
+use crate::theme::{Theme, VORTEX_TITLEBAR_HEIGHT};
 use crate::ui;
+use crate::vortex::{
+    draw_space_start_orb, draw_vortex_frame_chrome, draw_vortexglass_fog, smootherstep,
+    AERO_BLUR_RADIUS,
+};
 use crate::x11::{CursorKind, Key, Result, X};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -29,7 +41,7 @@ use uxconf::client::{UxConfClient, UxConfWatch};
 use uxconf::{BackdropStyle, DesktopConfig, FocusMode, PanelPosition, WindowPlacement};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux,
-    ConnectionExt, EventMask, ModMask, NotifyDetail, NotifyMode, PropMode, Window,
+    ConnectionExt, EventMask, ModMask, NotifyDetail, NotifyMode, PropMode, StackMode, Window,
 };
 use x11rb::protocol::Event;
 
@@ -39,6 +51,8 @@ extern "C" {
 
 const MENU_WIDTH: i32 = 380;
 const MENU_HEIGHT: i32 = 530;
+const VORTEX_MENU_WIDTH: i32 = 448;
+const VORTEX_MENU_HEIGHT: i32 = 536;
 const CTX_WIDTH: i32 = 192;
 const CTX_HEIGHT: i32 = 148;
 const TOAST_WIDTH: i32 = 324;
@@ -46,6 +60,58 @@ const TOAST_HEIGHT: i32 = 74;
 const VOL_POPUP_WIDTH: i32 = 286;
 const VOL_POPUP_HEIGHT: i32 = 138;
 const VOLUME_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
+
+struct StartPlace {
+    label: &'static str,
+    icon: Icon,
+    mode: &'static str,
+    arg: Option<&'static str>,
+}
+
+const VORTEX_PLACES: [StartPlace; 7] = [
+    StartPlace {
+        label: "我的文档",
+        icon: Icon::Files,
+        mode: "files",
+        arg: None,
+    },
+    StartPlace {
+        label: "图片相册",
+        icon: Icon::ImageViewer,
+        mode: "view",
+        arg: None,
+    },
+    StartPlace {
+        label: "音乐播放",
+        icon: Icon::Music,
+        mode: "music",
+        arg: None,
+    },
+    StartPlace {
+        label: "计算机",
+        icon: Icon::Files,
+        mode: "files",
+        arg: Some("/"),
+    },
+    StartPlace {
+        label: "控制面板",
+        icon: Icon::Settings,
+        mode: "settings",
+        arg: None,
+    },
+    StartPlace {
+        label: "帮助和支持",
+        icon: Icon::Help,
+        mode: "help",
+        arg: None,
+    },
+    StartPlace {
+        label: "终端控制台",
+        icon: Icon::Terminal,
+        mode: "term",
+        arg: None,
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppCategory {
@@ -174,11 +240,13 @@ enum Hit {
     Network,
     Volume,
     Bell,
+    ShowDesktop,
     VolMute,
     VolSlider,
     VolSfx,
     VolSettings,
     MenuRow(usize),
+    MenuPlace(usize),
     Logout,
     Reboot,
     PowerOff,
@@ -211,6 +279,9 @@ pub struct Shell {
     ux_client: Option<UxConfClient>,
     watch: Option<UxConfWatch>,
     theme: Theme,
+    comp: Compositor,
+    comps: HashMap<Window, CompWindow>,
+    z_stack: Vec<Window>,
     wallpaper_raw: Option<Sprite>,
     wallpaper_scaled: Vec<u32>,
     wallpaper_file: String,
@@ -222,6 +293,7 @@ pub struct Shell {
     selected_desktop_icon: Option<usize>,
     taskbar: Window,
     taskbar_canvas: Canvas,
+    thumb_window: Window,
     menu: Window,
     menu_canvas: Canvas,
     menu_open: bool,
@@ -231,17 +303,20 @@ pub struct Shell {
     ctx_menu: Window,
     ctx_canvas: Canvas,
     ctx_open: bool,
+    ctx_pos: (i16, i16),
     vol_popup: Window,
     vol_canvas: Canvas,
     vol_open: bool,
     vol_dragging: bool,
     vol_persist: VolumePersistState,
     pointer_grab: Option<Window>,
+    kbd_grabbed: bool,
     toast_window: Window,
     toast_canvas: Canvas,
     toast: Option<Toast>,
     windows: Vec<Managed>,
     active: Option<Window>,
+    all_minimized_backup: Vec<Window>,
     hover: Hit,
     clock_tick: (i32, i32, i32),
     net_fd: Option<i32>,
@@ -254,7 +329,15 @@ pub struct Shell {
 impl Drop for Shell {
     fn drop(&mut self) {
         self.release_popup_grab();
+        if self.kbd_grabbed {
+            self.x.ungrab_keyboard();
+            self.kbd_grabbed = false;
+        }
         self.x.ungrab_pointer();
+        for (_, mut cw) in self.comps.drain() {
+            detach_window_resources(&self.x, &mut cw);
+        }
+        self.comp.shutdown(&self.x);
         self.flush_volume_persist();
     }
 }
@@ -490,6 +573,27 @@ fn menu_row_rect(index: usize) -> Rect {
     Rect::new(12, 58 + index as i32 * 52, MENU_WIDTH - 24, 48)
 }
 
+fn vortex_menu_row_rect(index: usize) -> Rect {
+    Rect::new(14, 16 + index as i32 * 54, 244, 50)
+}
+
+fn vortex_menu_search_rect() -> Rect {
+    Rect::new(16, VORTEX_MENU_HEIGHT - 54, 240, 34)
+}
+
+fn vortex_menu_place_rect(index: usize) -> Rect {
+    Rect::new(274, 82 + index as i32 * 38, VORTEX_MENU_WIDTH - 288, 34)
+}
+
+fn vortex_menu_footer_rects() -> (Rect, Rect, Rect, Rect, Rect) {
+    let power_off = Rect::new(274, VORTEX_MENU_HEIGHT - 48, 76, 30);
+    let reboot = Rect::new(354, VORTEX_MENU_HEIGHT - 48, 42, 30);
+    let logout = Rect::new(398, VORTEX_MENU_HEIGHT - 48, 42, 30);
+    let confirm_cancel = Rect::new(274, VORTEX_MENU_HEIGHT - 48, 78, 30);
+    let confirm_ok = Rect::new(358, VORTEX_MENU_HEIGHT - 48, 82, 30);
+    (logout, reboot, power_off, confirm_cancel, confirm_ok)
+}
+
 fn compact_footer_rects() -> (Rect, Rect, Rect, Rect, Rect) {
     let logout = Rect::new(MENU_WIDTH - 222, MENU_HEIGHT - 42, 66, 30);
     let reboot = Rect::new(MENU_WIDTH - 150, MENU_HEIGHT - 42, 66, 30);
@@ -577,12 +681,29 @@ struct TaskbarLayout {
     volume: Rect,
     bell: Rect,
     clock_sep_x: i32,
+    show_desktop: Rect,
 }
 
 impl TaskbarLayout {
+    #[allow(dead_code)]
     fn compute(screen_w: i32, panel_h: i32, tray_w: i32, show_pinned: bool) -> Self {
-        let start_bh = (panel_h - 10).clamp(26, 42);
-        let start = Rect::new(6, (panel_h - start_bh) / 2, 86, start_bh);
+        Self::compute_styled(screen_w, panel_h, tray_w, show_pinned, false)
+    }
+
+    fn compute_styled(
+        screen_w: i32,
+        panel_h: i32,
+        tray_w: i32,
+        show_pinned: bool,
+        is_vortex: bool,
+    ) -> Self {
+        let start = if is_vortex {
+            let orb = (panel_h - 4).clamp(32, 46);
+            Rect::new(6, (panel_h - orb) / 2, orb.max(42), orb)
+        } else {
+            let start_bh = (panel_h - 10).clamp(26, 42);
+            Rect::new(6, (panel_h - start_bh) / 2, 86, start_bh)
+        };
         let start_sep_x = start.right() + 6;
         let pinned_start_x = start_sep_x + 6;
         let pinned_sep_x = pinned_start_x + (PINNED_MODES.len() as i32) * 36 + 2;
@@ -593,10 +714,16 @@ impl TaskbarLayout {
         };
         let tray_bh = (panel_h - 12).clamp(24, 38);
         let tray_y = (panel_h - tray_bh) / 2;
-        let clock_sep_x = screen_w - tray_w;
+        let peek_w = if is_vortex { 16 } else { 0 };
+        let clock_sep_x = screen_w - tray_w - peek_w;
         let bell = Rect::new(clock_sep_x - 40, tray_y, 32, tray_bh);
         let volume = Rect::new(bell.x - 36, tray_y, 32, tray_bh);
         let net = Rect::new(volume.x - 36, tray_y, 32, tray_bh);
+        let show_desktop = if is_vortex {
+            Rect::new(screen_w - 14, 0, 14, panel_h)
+        } else {
+            Rect::new(screen_w, 0, 0, 0)
+        };
         Self {
             start,
             start_sep_x,
@@ -606,6 +733,7 @@ impl TaskbarLayout {
             volume,
             bell,
             clock_sep_x,
+            show_desktop,
         }
     }
 
@@ -683,8 +811,10 @@ impl Shell {
             true,
             EventMask::EXPOSURE
                 | EventMask::BUTTON_PRESS
+                | EventMask::BUTTON_RELEASE
                 | EventMask::POINTER_MOTION
-                | EventMask::KEY_PRESS,
+                | EventMask::KEY_PRESS
+                | EventMask::KEY_RELEASE,
             theme.bg_top,
         )?;
         x.set_wm_type(desktop, x.atoms.net_wm_type_desktop)?;
@@ -717,20 +847,37 @@ impl Shell {
         x.set_wm_type(taskbar, x.atoms.net_wm_type_dock)?;
         x.map(taskbar)?;
 
+        let thumb_window = x.generate_id()?;
+        x.create_window(
+            thumb_window,
+            x.root,
+            0,
+            0,
+            1,
+            1,
+            true,
+            EventMask::ENTER_WINDOW
+                | EventMask::LEAVE_WINDOW
+                | EventMask::POINTER_MOTION
+                | EventMask::BUTTON_PRESS,
+            theme.panel,
+        )?;
+        x.set_wm_type(thumb_window, x.atoms.net_wm_type_dialog)?;
+
+        let (base_mw, base_mh) = if theme.is_vortexglass() {
+            (VORTEX_MENU_WIDTH, VORTEX_MENU_HEIGHT)
+        } else {
+            (MENU_WIDTH, MENU_HEIGHT)
+        };
         let popup_menu_y = if config.panel_position == PanelPosition::Top {
             panel_h + 6
         } else {
-            (taskbar_y - MENU_HEIGHT - 6).max(8)
+            (taskbar_y - base_mh - 6).max(8)
         };
         let (menu_x, menu_y, menu_w, menu_h) = if config.panel_start_fullscreen {
             (0i16, 0i16, x.width, x.height)
         } else {
-            (
-                6i16,
-                popup_menu_y as i16,
-                MENU_WIDTH as u16,
-                MENU_HEIGHT as u16,
-            )
+            (6i16, popup_menu_y as i16, base_mw as u16, base_mh as u16)
         };
         let menu = x.generate_id()?;
         x.create_window(
@@ -747,6 +894,7 @@ impl Shell {
                 | EventMask::POINTER_MOTION
                 | EventMask::LEAVE_WINDOW
                 | EventMask::KEY_PRESS
+                | EventMask::KEY_RELEASE
                 | EventMask::FOCUS_CHANGE
                 | EventMask::STRUCTURE_NOTIFY,
             theme.panel,
@@ -755,16 +903,20 @@ impl Shell {
         if !config.panel_start_fullscreen {
             x.set_rounded_shape(
                 menu,
-                MENU_WIDTH as u16,
-                MENU_HEIGHT as u16,
+                base_mw as u16,
+                base_mh as u16,
                 theme.radius_popup(),
             )?;
         }
 
-        // Bind global Start Screen shortcuts (Super_L, Super_R, Ctrl+Escape).
+        // Bind global Start Screen, Alt+Tab, and Win+Tab Flip 3D shortcuts.
         x.grab_global_key(0xffeb, ModMask::from(0u16));
         x.grab_global_key(0xffec, ModMask::from(0u16));
         x.grab_global_key(0xff1b, ModMask::CONTROL);
+        x.grab_global_key(0xff09, ModMask::M1);
+        x.grab_global_key(0xff09, ModMask::M1 | ModMask::SHIFT);
+        x.grab_global_key(0xff09, ModMask::M4);
+        x.grab_global_key(0xff09, ModMask::M4 | ModMask::SHIFT);
 
         let ctx_menu = x.generate_id()?;
         x.create_window(
@@ -859,6 +1011,11 @@ impl Shell {
         let net_fd = crate::netmgr::open_event_socket();
         let net_status = crate::netmgr::query_status();
         let vol_persist = VolumePersistState::new(SoundSnapshot::from_config(&config));
+        let comp = Compositor::new(&x, &theme);
+        eprintln!(
+            "spui: compositor active={} (composite={} damage={} xfixes={})",
+            comp.active, x.has_composite, x.has_damage, x.has_xfixes
+        );
 
         let mut shell = Self {
             x,
@@ -867,6 +1024,9 @@ impl Shell {
             ux_client,
             watch,
             theme,
+            comp,
+            comps: HashMap::new(),
+            z_stack: Vec::new(),
             wallpaper_raw: None,
             wallpaper_scaled: Vec::new(),
             wallpaper_file: String::new(),
@@ -876,6 +1036,7 @@ impl Shell {
             selected_desktop_icon: None,
             taskbar,
             taskbar_canvas,
+            thumb_window,
             menu,
             menu_canvas,
             menu_open: false,
@@ -885,17 +1046,20 @@ impl Shell {
             ctx_menu,
             ctx_canvas,
             ctx_open: false,
+            ctx_pos: (0, 0),
             vol_popup,
             vol_canvas,
             vol_open: false,
             vol_dragging: false,
             vol_persist,
             pointer_grab: None,
+            kbd_grabbed: false,
             toast_window,
             toast_canvas,
             toast: None,
             windows: Vec::new(),
             active: None,
+            all_minimized_backup: Vec::new(),
             hover: Hit::None,
             clock_tick: (-1, -1, -1),
             net_fd,
@@ -904,6 +1068,7 @@ impl Shell {
             last_launch: None,
             running: true,
         };
+        shell.sync_argb_canvases();
         shell.claim_wm()?;
         shell.apply_x11_settings(None);
         crate::sound::apply_mixer_volume(
@@ -916,12 +1081,33 @@ impl Shell {
         shell.update_clock();
         shell.draw_taskbar();
         shell.present_taskbar()?;
+        shell.composite_frame()?;
         crate::sound::play(&shell.config, crate::sound::SystemSound::Startup);
         eprintln!(
             "spui: desktop ready at {} ms",
             startup.elapsed().as_millis()
         );
         shell.event_loop()
+    }
+
+    fn menu_dims(&self) -> (i32, i32) {
+        if self.config.panel_start_fullscreen {
+            (i32::from(self.x.width), i32::from(self.x.height))
+        } else if self.theme.is_vortexglass() {
+            (VORTEX_MENU_WIDTH, VORTEX_MENU_HEIGHT)
+        } else {
+            (MENU_WIDTH, MENU_HEIGHT)
+        }
+    }
+
+    fn sync_argb_canvases(&mut self) {
+        let argb = self.comp.active && self.theme.is_vortexglass();
+        self.taskbar_canvas.set_argb(argb);
+        self.menu_canvas
+            .set_argb(argb && !self.config.panel_start_fullscreen);
+        self.ctx_canvas.set_argb(argb);
+        self.vol_canvas.set_argb(argb);
+        self.toast_canvas.set_argb(argb);
     }
 
     fn panel_height(&self) -> i32 {
@@ -937,10 +1123,11 @@ impl Shell {
     }
 
     fn menu_y(&self) -> i32 {
+        let (_, mh) = self.menu_dims();
         if self.config.panel_position == PanelPosition::Top {
             self.panel_height() + 6
         } else {
-            (self.taskbar_y() - MENU_HEIGHT - 6).max(8)
+            (self.taskbar_y() - mh - 6).max(8)
         }
     }
 
@@ -948,13 +1135,8 @@ impl Shell {
         let (mx, my, mw, mh, rounded) = if self.config.panel_start_fullscreen {
             (0i16, 0i16, self.x.width, self.x.height, false)
         } else {
-            (
-                6i16,
-                self.menu_y() as i16,
-                MENU_WIDTH as u16,
-                MENU_HEIGHT as u16,
-                true,
-            )
+            let (vw, vh) = self.menu_dims();
+            (6i16, self.menu_y() as i16, vw as u16, vh as u16, true)
         };
         self.x.move_resize(self.menu, mx, my, mw, mh)?;
         if rounded {
@@ -970,6 +1152,7 @@ impl Shell {
                 .create_canvas(mw as usize, mh as usize, self.theme.panel);
             self.start_screen.invalidate_backdrop();
         }
+        self.sync_argb_canvases();
         Ok(())
     }
 
@@ -1074,12 +1257,17 @@ impl Shell {
     }
 
     fn taskbar_layout(&self) -> TaskbarLayout {
-        TaskbarLayout::compute(
+        TaskbarLayout::compute_styled(
             i32::from(self.x.width),
             self.panel_height(),
             self.tray_width(),
             self.config.panel_show_pinned,
+            self.theme.is_vortexglass(),
         )
+    }
+
+    fn show_desktop_rect(&self) -> Rect {
+        self.taskbar_layout().show_desktop
     }
 
     fn start_button_rect(&self) -> Rect {
@@ -1217,9 +1405,11 @@ impl Shell {
         }
 
         if desktop_redraw_needed {
+            self.sync_argb_canvases();
             self.draw_desktop();
             self.present_desktop()?;
         }
+        self.sync_argb_canvases();
         self.draw_taskbar();
         self.present_taskbar()?;
         if self.menu_open {
@@ -1252,6 +1442,8 @@ impl Shell {
             self.draw_vol_popup();
             self.present_vol_popup()?;
         }
+        self.comp.mark_full_dirty();
+        self.composite_frame()?;
         if self.toast.is_some() {
             self.draw_toast();
             self.present_toast()?;
@@ -1396,6 +1588,7 @@ impl Shell {
     }
 
     fn event_loop(&mut self) -> Result<()> {
+        let mut comp_animating = false;
         while self.running {
             self.poll_uxconf()?;
 
@@ -1412,7 +1605,7 @@ impl Shell {
             while let Some(event) = self.x.poll()? {
                 raw.push(event);
             }
-            let was_animating = ui::has_active_animations();
+            let was_animating = ui::has_active_animations() || comp_animating;
             if raw.is_empty() {
                 let ux_fd = self.watch.as_ref().map(UxConfWatch::as_raw_fd);
                 let mut timeout = if was_animating {
@@ -1426,6 +1619,9 @@ impl Shell {
                     if let Some(persist_ms) = self.vol_persist.timeout_ms_until(Instant::now()) {
                         timeout = timeout.min(persist_ms);
                     }
+                }
+                if self.comp.thumb_hover_start.is_some() || self.comp.thumb_leave_at.is_some() {
+                    timeout = timeout.min(25);
                 }
                 let (_, ux_ready, net_ready) = self.x.wait_fds(ux_fd, self.net_fd, timeout);
                 if ux_ready {
@@ -1447,16 +1643,55 @@ impl Shell {
                 net_dirty |= self.refresh_net_status();
             }
 
-            // Coalesce burst MotionNotify events on the same shell window.
+            // Coalesce burst MotionNotify & ConfigureNotify events cleanly while preserving event ordering.
             let mut events: Vec<Event> = Vec::with_capacity(raw.len());
             for ev in raw {
-                if let (Some(Event::MotionNotify(prev)), Event::MotionNotify(curr)) =
-                    (events.last(), &ev)
-                {
-                    if prev.event == curr.event {
-                        *events.last_mut().unwrap() = ev;
-                        continue;
+                match &ev {
+                    Event::MotionNotify(curr) => {
+                        if let Some(slot) = events
+                            .iter_mut()
+                            .rev()
+                            .take_while(|p| {
+                                matches!(
+                                    p,
+                                    Event::MotionNotify(_)
+                                        | Event::ConfigureNotify(_)
+                                        | Event::DamageNotify(_)
+                                )
+                            })
+                            .find_map(|p| match p {
+                                Event::MotionNotify(prev) if prev.event == curr.event => Some(p),
+                                _ => None,
+                            })
+                        {
+                            *slot = ev;
+                            continue;
+                        }
                     }
+                    Event::ConfigureNotify(curr) => {
+                        if let Some(slot) = events
+                            .iter_mut()
+                            .rev()
+                            .take_while(|p| {
+                                matches!(
+                                    p,
+                                    Event::MotionNotify(_)
+                                        | Event::ConfigureNotify(_)
+                                        | Event::DamageNotify(_)
+                                )
+                            })
+                            .find_map(|p| match p {
+                                Event::ConfigureNotify(prev) if prev.window == curr.window => {
+                                    Some(p)
+                                }
+                                _ => None,
+                            })
+                        {
+                            *slot = ev;
+                            continue;
+                        }
+                    }
+                    _ => {}
                 }
                 events.push(ev);
             }
@@ -1465,39 +1700,98 @@ impl Shell {
                 self.handle(event)?;
             }
 
+            let now = Instant::now();
+            // Trigger taskbar live thumbnail card after 90ms dwell over a window button.
+            if self.comp.active && self.comp.thumb.is_none() {
+                if let Some((idx, ts)) = self.comp.thumb_hover_start {
+                    if now.duration_since(ts).as_millis() >= 90
+                        && !self.menu_open
+                        && !self.vol_open
+                        && !self.ctx_open
+                    {
+                        self.open_thumb(idx)?;
+                    }
+                }
+            }
+            if self.comp.active {
+                let should_close_thumb = self.comp.thumb.as_ref().is_some_and(|t| {
+                    !t.pointer_inside
+                        && self
+                            .comp
+                            .thumb_leave_at
+                            .is_some_and(|ts| now.duration_since(ts).as_millis() >= 240)
+                });
+                if should_close_thumb {
+                    self.close_thumb()?;
+                }
+            }
+
             let start_net = if net_event {
                 self.start_screen.on_net_event()
             } else {
                 false
             };
-            let anim_active = was_animating || ui::has_active_animations();
-            if self.update_clock() || anim_active || net_dirty {
+            let ui_anim = ui::has_active_animations();
+            if self.update_clock() || ui_anim || net_dirty {
                 self.draw_taskbar();
                 self.present_taskbar()?;
             }
-            if self.vol_open && anim_active {
+            if self.vol_open && ui_anim {
                 self.draw_vol_popup();
                 self.present_vol_popup()?;
             }
             if self.menu_open {
                 if self.config.panel_start_fullscreen {
                     let start_tick = self.start_screen.tick(&self.config);
-                    if start_tick || start_net || anim_active || net_dirty {
+                    if start_tick || start_net || ui_anim || net_dirty {
                         self.draw_menu();
                         self.present_menu()?;
                     }
-                } else if anim_active {
+                } else if ui_anim {
                     self.draw_menu();
                     self.present_menu()?;
                 }
             }
             if let Some(toast) = &self.toast {
-                if Instant::now() >= toast.deadline {
+                if now >= toast.deadline {
                     self.hide_toast()?;
                 }
             }
-            if !self.vol_dragging && self.vol_persist.is_due(Instant::now()) {
+            if !self.vol_dragging && self.vol_persist.is_due(now) {
                 self.flush_volume_persist();
+            }
+
+            if self.comp.active {
+                let pre_anim_dirty = self.active_anim_dirty_bounds();
+                let mut win_anims: Vec<Option<WindowAnim>> = self
+                    .z_stack
+                    .iter()
+                    .map(|w| self.comps.get(w).and_then(|c| c.anim))
+                    .collect();
+                let start_orb_hov = self.hover == Hit::Start;
+                let tick_out = self.comp.tick(
+                    now,
+                    self.menu_open,
+                    self.ctx_open,
+                    self.vol_open,
+                    self.toast.is_some(),
+                    start_orb_hov,
+                    &mut win_anims,
+                );
+                comp_animating = tick_out.animating;
+                for (&w, anim) in self.z_stack.iter().zip(win_anims.into_iter()) {
+                    if let Some(cw) = self.comps.get_mut(&w) {
+                        cw.anim = anim;
+                    }
+                }
+                if tick_out.orb_changed {
+                    self.draw_taskbar();
+                    let _ = self.present_taskbar();
+                }
+                self.mark_tick_dirty(tick_out, pre_anim_dirty);
+                self.composite_frame()?;
+            } else {
+                comp_animating = false;
             }
             self.x.flush()?;
         }
@@ -1536,6 +1830,8 @@ impl Shell {
         self.taskbar_canvas = self
             .x
             .create_canvas(new_w as usize, ph as usize, self.theme.panel);
+        self.comp.resize(&self.x, new_w, new_h, self.theme.bg_top);
+        self.sync_argb_canvases();
 
         self.reload_wallpaper(false);
         {
@@ -1566,13 +1862,88 @@ impl Shell {
         if self.menu_open {
             self.x.raise(self.menu)?;
         }
+        self.composite_frame()?;
         Ok(())
     }
 
     fn handle(&mut self, event: Event) -> Result<()> {
         match event {
-            Event::ConfigureNotify(e) if e.window == self.x.root => {
-                self.handle_screen_resize(e.width, e.height)?;
+            Event::ConfigureNotify(e) => {
+                if e.window == self.x.root {
+                    self.handle_screen_resize(e.width, e.height)?;
+                } else {
+                    let scr_w = i32::from(self.x.width);
+                    let work_h = i32::from(self.x.height) - self.panel_height();
+                    let is_vortex = self.theme.is_vortexglass();
+                    let mut dirty_move = None;
+                    if let Some(managed) = self.windows.iter_mut().find(|w| w.window == e.window) {
+                        let old_rect = Rect::new(
+                            i32::from(managed.x),
+                            i32::from(managed.y),
+                            i32::from(managed.width),
+                            i32::from(managed.height),
+                        );
+                        let size_changed = managed.width != e.width || managed.height != e.height;
+                        managed.x = e.x;
+                        managed.y = e.y;
+                        managed.width = e.width;
+                        managed.height = e.height;
+                        let new_rect = Rect::new(
+                            i32::from(e.x),
+                            i32::from(e.y),
+                            i32::from(e.width),
+                            i32::from(e.height),
+                        );
+                        if let Some(cw) = self.comps.get_mut(&e.window) {
+                            if size_changed
+                                || cw.pw != usize::from(e.width)
+                                || cw.ph != usize::from(e.height)
+                            {
+                                let depth = cw.depth;
+                                attach_window_pixmap(&self.x, cw, e.width, e.height, depth);
+                            }
+                        }
+                        if self.comp.active {
+                            let old_max = old_rect.w >= scr_w - 2 && old_rect.h >= work_h - 2;
+                            let new_max = new_rect.w >= scr_w - 2 && new_rect.h >= work_h - 2;
+                            dirty_move = Some(
+                                window_damage_bounds(old_rect, is_vortex, old_max)
+                                    .union(window_damage_bounds(new_rect, is_vortex, new_max)),
+                            );
+                        }
+                    }
+                    if let Some(d) = dirty_move {
+                        self.comp.mark_dirty(d);
+                    }
+                }
+            }
+            Event::DamageNotify(e) => {
+                if self.comp.active {
+                    let target = self
+                        .comps
+                        .values_mut()
+                        .find(|c| c.window == e.drawable || c.damage == e.damage);
+                    if let Some(cw) = target {
+                        let local = Rect::new(
+                            i32::from(e.area.x),
+                            i32::from(e.area.y),
+                            i32::from(e.area.width),
+                            i32::from(e.area.height),
+                        );
+                        cw.mark_damage(local);
+                        if let Some(m) = self.windows.iter().find(|w| w.window == cw.window) {
+                            let scr = Rect::new(
+                                i32::from(m.x) + local.x - 16,
+                                i32::from(m.y) + local.y - 16,
+                                local.w + 32,
+                                local.h + 32,
+                            );
+                            self.comp.mark_dirty(scr);
+                        } else {
+                            self.comp.mark_full_dirty();
+                        }
+                    }
+                }
             }
             Event::MapRequest(e) => self.manage(e.window)?,
             Event::ConfigureRequest(e) => {
@@ -1593,7 +1964,19 @@ impl Shell {
                 self.x.conn.configure_window(e.window, &aux)?;
                 let resized =
                     mask & (u16::from(ConfigWindow::WIDTH) | u16::from(ConfigWindow::HEIGHT)) != 0;
+                let scr_w = i32::from(self.x.width);
+                let work_h = i32::from(self.x.height) - self.panel_height();
+                let is_vortex = self.theme.is_vortexglass();
+                let mut dirty_req = None;
+                let mut is_managed = false;
                 if let Some(managed) = self.windows.iter_mut().find(|w| w.window == e.window) {
+                    is_managed = true;
+                    let old_rect = Rect::new(
+                        i32::from(managed.x),
+                        i32::from(managed.y),
+                        i32::from(managed.width),
+                        i32::from(managed.height),
+                    );
                     if mask & u16::from(ConfigWindow::X) != 0 {
                         managed.x = e.x;
                     }
@@ -1606,6 +1989,20 @@ impl Shell {
                     if mask & u16::from(ConfigWindow::HEIGHT) != 0 {
                         managed.height = e.height;
                     }
+                    let new_rect = Rect::new(
+                        i32::from(managed.x),
+                        i32::from(managed.y),
+                        i32::from(managed.width),
+                        i32::from(managed.height),
+                    );
+                    if self.comp.active && old_rect != new_rect {
+                        let old_max = old_rect.w >= scr_w - 2 && old_rect.h >= work_h - 2;
+                        let new_max = new_rect.w >= scr_w - 2 && new_rect.h >= work_h - 2;
+                        dirty_req = Some(
+                            window_damage_bounds(old_rect, is_vortex, old_max)
+                                .union(window_damage_bounds(new_rect, is_vortex, new_max)),
+                        );
+                    }
                     if resized {
                         let notify = ConfigureNotifyEvent {
                             response_type: 22,
@@ -1613,8 +2010,8 @@ impl Shell {
                             event: e.window,
                             window: e.window,
                             above_sibling: x11rb::NONE,
-                            x: e.x,
-                            y: e.y,
+                            x: managed.x,
+                            y: managed.y,
                             width: managed.width,
                             height: managed.height,
                             border_width: 0,
@@ -1628,8 +2025,34 @@ impl Shell {
                         );
                     }
                 }
+                if let Some(d) = dirty_req {
+                    self.comp.mark_dirty(d);
+                }
+                if is_managed
+                    && (mask & u16::from(ConfigWindow::STACK_MODE) != 0)
+                    && e.stack_mode == StackMode::ABOVE
+                {
+                    self.activate(e.window)?;
+                }
             }
             Event::EnterNotify(e) => {
+                if e.event == self.thumb_window {
+                    let thumb_dirty = if let Some(t) = self.comp.thumb.as_mut() {
+                        t.pointer_inside = true;
+                        t.close_hover = t.close_rect.contains(
+                            t.rect.x + i32::from(e.event_x),
+                            t.rect.y + i32::from(e.event_y),
+                        );
+                        Some(t.rect)
+                    } else {
+                        None
+                    };
+                    if let Some(r) = thumb_dirty {
+                        self.comp.thumb_leave_at = None;
+                        self.comp.mark_dirty(r);
+                    }
+                    return Ok(());
+                }
                 if self.config.wm_focus_mode == FocusMode::Sloppy
                     && !self.menu_open
                     && !self.ctx_open
@@ -1642,10 +2065,8 @@ impl Shell {
                 {
                     if self.config.wm_auto_raise {
                         self.x.raise(e.event)?;
-                        self.x.raise(self.taskbar)?;
-                        if self.toast.is_some() {
-                            let _ = self.x.raise(self.toast_window);
-                        }
+                        self.raise_z(e.event);
+                        self.raise_chrome_above_clients()?;
                     }
                     self.x.focus(e.event)?;
                     self.active = Some(e.event);
@@ -1707,7 +2128,9 @@ impl Shell {
             Event::PropertyNotify(e) => {
                 if e.window == self.x.root && e.atom == self.x.atoms.net_active_window {
                     let active = self.x.get_active_window();
-                    if active != self.active {
+                    let top_desync =
+                        active.is_some_and(|w| self.z_stack.last().copied() != Some(w));
+                    if active != self.active || top_desync {
                         self.active = active;
                         if active.is_some() && self.vol_open {
                             self.close_vol_popup()?;
@@ -1722,10 +2145,8 @@ impl Shell {
                         });
                         if let Some(window) = target {
                             self.x.raise(window)?;
-                            self.x.raise(self.taskbar)?;
-                            if self.toast.is_some() {
-                                let _ = self.x.raise(self.toast_window);
-                            }
+                            self.raise_z(window);
+                            self.raise_chrome_above_clients()?;
                             self.x.focus(window)?;
                             self.x.flush()?;
                         }
@@ -1735,6 +2156,13 @@ impl Shell {
                 } else if self.windows.iter().any(|w| w.window == e.window) {
                     let title = self.window_title(e.window);
                     let icon = self.window_icon(e.window, &title);
+                    if e.atom == self.x.atoms.spui_glass_extents {
+                        let ext = self.x.get_glass_extents(e.window);
+                        if let Some(cw) = self.comps.get_mut(&e.window) {
+                            cw.glass_extents = ext;
+                            self.comp.mark_full_dirty();
+                        }
+                    }
                     if let Some(managed) = self.windows.iter_mut().find(|w| w.window == e.window) {
                         if managed.title != title || managed.icon != icon {
                             managed.icon = icon;
@@ -1784,6 +2212,37 @@ impl Shell {
                     self.draw_menu();
                     self.present_menu()?;
                 }
+                if e.event == self.thumb_window {
+                    if matches!(e.mode, NotifyMode::GRAB | NotifyMode::UNGRAB) {
+                        return Ok(());
+                    }
+                    let mut thumb_rect = None;
+                    if let Some(t) = self.comp.thumb.as_mut() {
+                        t.pointer_inside = false;
+                        t.close_hover = false;
+                        thumb_rect = Some(t.rect);
+                    }
+                    if let Some(r) = thumb_rect {
+                        self.comp.mark_dirty(r);
+                    }
+                    let over_other_btn = self
+                        .taskbar_local_coords(e.root_x, e.root_y)
+                        .is_some_and(|(tx, ty)| match self.taskbar_hit(tx, ty) {
+                            Hit::Window(idx) => self
+                                .comp
+                                .thumb
+                                .as_ref()
+                                .is_some_and(|t| t.win_index != idx),
+                            Hit::None => false,
+                            _ => true,
+                        });
+                    if over_other_btn {
+                        self.close_thumb()?;
+                    } else if self.comp.thumb.is_some() {
+                        self.comp.thumb_leave_at = Some(Instant::now());
+                    }
+                    return Ok(());
+                }
                 let prev = self.hover;
                 if (e.event == self.taskbar
                     && matches!(
@@ -1794,11 +2253,13 @@ impl Shell {
                             | Hit::Network
                             | Hit::Volume
                             | Hit::Bell
+                            | Hit::ShowDesktop
                     ))
                     || (e.event == self.menu
                         && matches!(
                             prev,
                             Hit::MenuRow(_)
+                                | Hit::MenuPlace(_)
                                 | Hit::Logout
                                 | Hit::Reboot
                                 | Hit::PowerOff
@@ -1815,6 +2276,21 @@ impl Shell {
                 {
                     self.hover = Hit::None;
                     if e.event == self.taskbar {
+                        self.comp.taskbar_mouse_x = None;
+                        self.comp.thumb_hover_start = None;
+                        self.comp.show_desktop_peek = false;
+                        if !matches!(e.mode, NotifyMode::GRAB | NotifyMode::UNGRAB)
+                            && self.comp.thumb.is_some()
+                        {
+                            if self.thumb_bridge_contains(i32::from(e.root_x), i32::from(e.root_y))
+                            {
+                                if self.comp.thumb_leave_at.is_none() {
+                                    self.comp.thumb_leave_at = Some(Instant::now());
+                                }
+                            } else {
+                                self.close_thumb()?;
+                            }
+                        }
                         self.draw_taskbar();
                         self.present_taskbar()?;
                     } else if e.event == self.menu && self.menu_open {
@@ -1832,7 +2308,43 @@ impl Shell {
             Event::ButtonPress(e) => {
                 let (x, y) = (e.event_x as i32, e.event_y as i32);
                 ui::notify_pointer_button(x, y, e.detail, true);
-                if e.event == self.taskbar {
+                if self.comp.flip3d.is_some() || self.comp.alt_tab.is_some() {
+                    match e.detail {
+                        4 => {
+                            self.cycle_switcher(-1);
+                            return Ok(());
+                        }
+                        5 => {
+                            self.cycle_switcher(1);
+                            return Ok(());
+                        }
+                        1 => {
+                            self.commit_switcher()?;
+                            return Ok(());
+                        }
+                        3 => {
+                            self.cancel_switcher()?;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+                if e.event == self.thumb_window {
+                    if let Some(t) = &self.comp.thumb {
+                        let target = t.target_window;
+                        let on_close = t.close_rect.contains(t.rect.x + x, t.rect.y + y);
+                        self.close_thumb()?;
+                        if e.detail == 1 {
+                            if on_close {
+                                let _ = self.x.send_delete(target);
+                                let _ = self.x.flush();
+                            } else {
+                                self.activate(target)?;
+                            }
+                        }
+                    }
+                } else if e.event == self.taskbar {
+                    self.close_thumb()?;
                     if (e.detail == 4 || e.detail == 5) && self.vol_rect().contains(x, y) {
                         let step = if e.detail == 4 { 5 } else { -5 };
                         self.adjust_volume_step(step)?;
@@ -1906,7 +2418,10 @@ impl Shell {
                             };
                             self.handle_start_action(action, prev_cfg)?;
                         }
-                    } else if !popup_contains_point(MENU_WIDTH, MENU_HEIGHT, x, y) {
+                    } else if {
+                        let (mw, mh) = self.menu_dims();
+                        !popup_contains_point(mw, mh, x, y)
+                    } {
                         self.close_menu()?;
                         if e.detail == 1 {
                             if let Some((tx, ty)) = self.taskbar_local_coords(e.root_x, e.root_y) {
@@ -2007,11 +2522,67 @@ impl Shell {
                         }
                     }
                 } else if e.event == self.taskbar {
+                    self.comp.taskbar_mouse_x = Some(x);
                     let hit = self.taskbar_hit(x, y);
-                    if hit != self.hover {
-                        self.hover = hit;
+                    let need_redraw = hit != self.hover || matches!(hit, Hit::Window(_));
+                    self.hover = hit;
+                    if self.comp.active {
+                        self.comp.show_desktop_peek = hit == Hit::ShowDesktop;
+                        match hit {
+                            Hit::Window(idx) => {
+                                if let Some(m) = self.windows.get(idx) {
+                                    let win = m.window;
+                                    if self.comp.thumb.as_ref().is_some_and(|t| t.target_window == win)
+                                    {
+                                        self.comp.thumb_leave_at = None;
+                                    } else if self
+                                        .comp
+                                        .thumb
+                                        .as_ref()
+                                        .is_some_and(|t| t.target_window != win)
+                                    {
+                                        self.open_thumb(idx)?;
+                                    } else if self.comp.thumb.is_none()
+                                        && !self.comp.thumb_hover_start.is_some_and(|(i, _)| i == idx)
+                                    {
+                                        self.comp.thumb_hover_start = Some((idx, Instant::now()));
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.comp.thumb_hover_start = None;
+                                if self.comp.thumb.is_some() {
+                                    self.close_thumb()?;
+                                }
+                            }
+                        }
+                        if self.theme.is_vortexglass() && need_redraw {
+                            self.comp.mark_dirty(Rect::new(
+                                0,
+                                self.taskbar_y(),
+                                i32::from(self.x.width),
+                                self.panel_height(),
+                            ));
+                        }
+                    }
+                    if need_redraw {
                         self.draw_taskbar();
                         self.present_taskbar()?;
+                    }
+                } else if e.event == self.thumb_window {
+                    let mut thumb_dirty = None;
+                    if let Some(t) = self.comp.thumb.as_mut() {
+                        let was_in = t.pointer_inside;
+                        let was_close = t.close_hover;
+                        t.pointer_inside = true;
+                        t.close_hover = t.close_rect.contains(t.rect.x + x, t.rect.y + y);
+                        self.comp.thumb_leave_at = None;
+                        if !was_in || was_close != t.close_hover {
+                            thumb_dirty = Some(t.rect);
+                        }
+                    }
+                    if let Some(r) = thumb_dirty {
+                        self.comp.mark_dirty(r);
                     }
                 } else if e.event == self.vol_popup && self.vol_open {
                     if self.vol_dragging {
@@ -2076,7 +2647,25 @@ impl Shell {
                     state: e.state.into(),
                     sym: self.x.key_symbol(e.detail, e.state.into()),
                 };
-                if matches!(key.sym, 0xffeb | 0xffec) || (key.control() && key.is_escape()) {
+                let is_tab = matches!(key.sym, 0xff09 | 0xfe20);
+                let alt_held = (key.state & 0x0008) != 0;
+                let win_held = (key.state & 0x0040) != 0;
+                let dir = if key.shift() { -1 } else { 1 };
+                if is_tab && win_held && !self.windows.is_empty() {
+                    self.open_or_cycle_flip3d(dir)?;
+                } else if is_tab && alt_held && !self.windows.is_empty() {
+                    self.open_or_cycle_alt_tab(dir)?;
+                } else if self.comp.flip3d.is_some() || self.comp.alt_tab.is_some() {
+                    if is_tab || matches!(key.sym, 0xff53 | 0xff54) {
+                        self.cycle_switcher(dir);
+                    } else if matches!(key.sym, 0xff51 | 0xff52) {
+                        self.cycle_switcher(-1);
+                    } else if key.is_enter() {
+                        self.commit_switcher()?;
+                    } else if key.is_escape() {
+                        self.cancel_switcher()?;
+                    }
+                } else if matches!(key.sym, 0xffeb | 0xffec) || (key.control() && key.is_escape()) {
                     self.toggle_menu()?;
                 } else if self.ctx_open && key.is_escape() {
                     self.close_ctx()?;
@@ -2128,14 +2717,39 @@ impl Shell {
                     }
                 }
             }
+            Event::KeyRelease(e) => {
+                let sym = self.x.key_symbol(e.detail, e.state.into());
+                if self.comp.alt_tab.is_some() && matches!(sym, 0xffe9 | 0xffea) {
+                    self.commit_switcher()?;
+                } else if self.comp.flip3d.is_some() && matches!(sym, 0xffeb | 0xffec) {
+                    self.commit_switcher()?;
+                }
+            }
             Event::ClientMessage(e) => {
                 if e.type_ == self.x.atoms.net_active_window {
                     let window = e.data.as_data32()[0];
                     self.activate(window)?;
                 } else if e.type_ == self.x.atoms.spui_window_cmd {
-                    let cmd = e.data.as_data32()[0];
-                    if cmd == 1 {
-                        self.minimize_window(e.window)?;
+                    let data = e.data.as_data32();
+                    match data[0] {
+                        1 => self.minimize_window(e.window)?,
+                        10 => {
+                            let sn = SnapZone::from_u32(data[1]);
+                            self.comp.snap_zone = sn;
+                            if sn != SnapZone::None {
+                                let ph = self.panel_height();
+                                let wt = if self.config.panel_position == PanelPosition::Top {
+                                    ph
+                                } else {
+                                    0
+                                };
+                                let wh = i32::from(self.x.height).saturating_sub(ph);
+                                self.comp.snap_rect =
+                                    sn.target_rect(i32::from(self.x.width), wt, wh);
+                            }
+                            self.comp.mark_full_dirty();
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2239,9 +2853,11 @@ impl Shell {
             geometry.width,
             geometry.height,
         )?;
+        let glass_extents = self.x.get_glass_extents(window);
         self.x.map(window)?;
         self.x.raise(window)?;
-        self.x.raise(self.taskbar)?;
+        self.raise_z(window);
+        self.raise_chrome_above_clients()?;
         self.x.focus(window)?;
         self.active = Some(window);
         self.windows.push(Managed {
@@ -2254,6 +2870,17 @@ impl Shell {
             width: geometry.width,
             height: geometry.height,
         });
+        if self.comp.active {
+            let mut cw = CompWindow::new(window, geometry.depth, glass_extents);
+            cw.anim = Some(WindowAnim {
+                kind: AnimKind::Open,
+                start: Instant::now(),
+                duration_ms: 200,
+            });
+            attach_window_pixmap(&self.x, &mut cw, geometry.width, geometry.height, geometry.depth);
+            self.comps.insert(window, cw);
+            self.comp.mark_full_dirty();
+        }
         self.publish_client_list()?;
         self.publish_active()?;
         self.draw_taskbar();
@@ -2262,22 +2889,64 @@ impl Shell {
     }
 
     fn minimize_window(&mut self, window: Window) -> Result<()> {
-        let Some(managed) = self.windows.iter_mut().find(|w| w.window == window) else {
+        let Some(win_idx) = self.windows.iter().position(|w| w.window == window) else {
             return Ok(());
         };
-        if managed.minimized {
+        if self.windows[win_idx].minimized {
             return Ok(());
-        };
-        managed.minimized = true;
+        }
+        let m_rect = Rect::new(
+            i32::from(self.windows[win_idx].x),
+            i32::from(self.windows[win_idx].y),
+            i32::from(self.windows[win_idx].width),
+            i32::from(self.windows[win_idx].height),
+        );
+        let btn_local = self.window_button_rect(win_idx);
+        let btn_screen = Rect::new(btn_local.x, self.taskbar_y() + btn_local.y, btn_local.w, btn_local.h);
+        if self.comp.active {
+            if let Some(cw) = self.comps.get_mut(&window) {
+                if cw.has_pixels && !cw.pixels.is_empty() {
+                    self.comp.ghosts.push(ClosingGhost {
+                        pixels: cw.pixels.clone(),
+                        pw: cw.pw,
+                        ph: cw.ph,
+                        from: m_rect,
+                        to_taskbar: Some(btn_screen),
+                        corner_r: cw.glass_extents.map_or(0, |e| e[4]),
+                        start: Instant::now(),
+                        duration_ms: 220,
+                    });
+                }
+                cw.anim = None;
+            }
+            self.comp.mark_full_dirty();
+        }
+        self.windows[win_idx].minimized = true;
         self.x.unmap(window)?;
         if self.active == Some(window) {
             self.active = self
-                .windows
+                .z_stack
                 .iter()
                 .rev()
-                .find(|w| !w.minimized)
-                .map(|w| w.window);
+                .copied()
+                .find(|&zw| {
+                    zw != window
+                        && self
+                            .windows
+                            .iter()
+                            .any(|w| w.window == zw && !w.minimized)
+                })
+                .or_else(|| {
+                    self.windows
+                        .iter()
+                        .rev()
+                        .find(|w| !w.minimized)
+                        .map(|w| w.window)
+                });
             if let Some(next) = self.active {
+                let _ = self.x.raise(next);
+                self.raise_z(next);
+                let _ = self.raise_chrome_above_clients();
                 let _ = self.x.focus(next);
             } else {
                 let _ = self.x.focus(self.x.root);
@@ -2290,19 +2959,60 @@ impl Shell {
     }
 
     fn remove_window(&mut self, window: Window) -> bool {
-        let before = self.windows.len();
-        self.windows.retain(|w| w.window != window);
-        if self.windows.len() == before {
+        let pos = self.windows.iter().position(|w| w.window == window);
+        let Some(idx) = pos else {
             return false;
+        };
+        let m = self.windows.remove(idx);
+        self.z_stack.retain(|&w| w != window);
+        self.all_minimized_backup.retain(|&w| w != window);
+        if self
+            .comp
+            .thumb
+            .as_ref()
+            .is_some_and(|t| t.target_window == window)
+        {
+            let _ = self.close_thumb();
+        }
+        if let Some(mut cw) = self.comps.remove(&window) {
+            if self.comp.active && !m.minimized && cw.has_pixels && !cw.pixels.is_empty() {
+                self.comp.ghosts.push(ClosingGhost {
+                    pixels: std::mem::take(&mut cw.pixels),
+                    pw: cw.pw,
+                    ph: cw.ph,
+                    from: Rect::new(
+                        i32::from(m.x),
+                        i32::from(m.y),
+                        i32::from(m.width),
+                        i32::from(m.height),
+                    ),
+                    to_taskbar: None,
+                    corner_r: cw.glass_extents.map_or(0, |e| e[4]),
+                    start: Instant::now(),
+                    duration_ms: 170,
+                });
+            }
+            detach_window_resources(&self.x, &mut cw);
+            self.comp.mark_full_dirty();
         }
         if self.active == Some(window) {
             self.active = self
-                .windows
+                .z_stack
                 .iter()
                 .rev()
-                .find(|w| !w.minimized)
-                .map(|w| w.window);
+                .copied()
+                .find(|&zw| self.windows.iter().any(|w| w.window == zw && !w.minimized))
+                .or_else(|| {
+                    self.windows
+                        .iter()
+                        .rev()
+                        .find(|w| !w.minimized)
+                        .map(|w| w.window)
+                });
             if let Some(next) = self.active {
+                let _ = self.x.raise(next);
+                self.raise_z(next);
+                let _ = self.raise_chrome_above_clients();
                 let _ = self.x.focus(next);
             }
             let _ = self.publish_active();
@@ -2342,21 +3052,268 @@ impl Shell {
         Ok(())
     }
 
-    fn activate(&mut self, window: Window) -> Result<()> {
-        self.close_vol_popup()?;
-        self.close_ctx()?;
-        let Some(managed) = self.windows.iter_mut().find(|w| w.window == window) else {
-            return Ok(());
-        };
-        if managed.minimized {
-            managed.minimized = false;
-            self.x.map(window)?;
-        }
-        self.x.raise(window)?;
+    fn raise_chrome_above_clients(&self) -> Result<()> {
         self.x.raise(self.taskbar)?;
+        if self.comp.thumb.is_some() {
+            let _ = self.x.raise(self.thumb_window);
+        }
+        if self.menu_open {
+            let _ = self.x.raise(self.menu);
+        }
+        if self.ctx_open {
+            let _ = self.x.raise(self.ctx_menu);
+        }
+        if self.vol_open {
+            let _ = self.x.raise(self.vol_popup);
+        }
         if self.toast.is_some() {
             let _ = self.x.raise(self.toast_window);
         }
+        Ok(())
+    }
+
+    fn raise_z(&mut self, window: Window) {
+        let prev_top = self.z_stack.last().copied();
+        self.z_stack.retain(|&w| w != window);
+        self.z_stack.push(window);
+        if self.comp.active {
+            let is_vortex = self.theme.is_vortexglass();
+            let mut dirty: Option<Rect> = None;
+            for target in [Some(window), prev_top].into_iter().flatten() {
+                if let Some((r, is_max)) = self
+                    .windows
+                    .iter()
+                    .find(|m| m.window == target)
+                    .map(|m| self.window_rect_for(m))
+                {
+                    let b = window_damage_bounds(r, is_vortex, is_max);
+                    dirty = Some(dirty.map_or(b, |p| p.union(b)));
+                }
+            }
+            if let Some(d) = dirty {
+                self.comp.mark_dirty(d);
+            } else {
+                self.comp.mark_full_dirty();
+            }
+        }
+    }
+
+    fn thumb_bridge_contains(&self, rx: i32, ry: i32) -> bool {
+        let Some(t) = self.comp.thumb.as_ref() else {
+            return false;
+        };
+        let tb_y = self.taskbar_y();
+        let panel_h = self.panel_height();
+        let top = t.rect.y.min(tb_y);
+        let bottom = t.rect.bottom().max(tb_y + panel_h);
+        let bridge = Rect::new(t.rect.x - 14, top - 6, t.rect.w + 28, bottom - top + 12);
+        bridge.contains(rx, ry)
+    }
+
+    fn open_thumb(&mut self, idx: usize) -> Result<()> {
+        let Some(m) = self.windows.get(idx) else {
+            return Ok(());
+        };
+        let win = m.window;
+        let btn = self.window_button_rect(idx);
+        let st = compute_thumb_popup(
+            btn,
+            i32::from(self.x.width),
+            self.taskbar_y(),
+            self.config.panel_position == PanelPosition::Top,
+            self.panel_height(),
+            idx,
+            win,
+        );
+        let prev_rect = self.comp.thumb.as_ref().map(|t| t.rect);
+        self.x.move_resize(
+            self.thumb_window,
+            st.rect.x as i16,
+            st.rect.y as i16,
+            st.rect.w as u16,
+            st.rect.h as u16,
+        )?;
+        self.x.map(self.thumb_window)?;
+        self.x.raise(self.thumb_window)?;
+        self.comp.thumb_leave_at = None;
+        let dirty = prev_rect.map_or(st.rect.expand(18), |p| p.union(st.rect).expand(18));
+        self.comp.thumb = Some(st);
+        self.comp.mark_dirty(dirty);
+        Ok(())
+    }
+
+    fn close_thumb(&mut self) -> Result<()> {
+        self.comp.thumb_hover_start = None;
+        self.comp.thumb_leave_at = None;
+        if let Some(prev) = self.comp.thumb.take() {
+            self.x.unmap(self.thumb_window)?;
+            self.comp.mark_dirty(prev.rect.expand(18));
+        }
+        Ok(())
+    }
+
+    fn acquire_switcher_grabs(&mut self) {
+        if !self.kbd_grabbed {
+            self.kbd_grabbed = self.x.grab_keyboard(self.desktop);
+        }
+        self.acquire_popup_grab(self.desktop);
+    }
+
+    fn release_switcher_grabs(&mut self) {
+        if self.kbd_grabbed {
+            self.x.ungrab_keyboard();
+            self.kbd_grabbed = false;
+        }
+        if self.pointer_grab == Some(self.desktop) {
+            self.release_popup_grab();
+        }
+    }
+
+    fn open_or_cycle_alt_tab(&mut self, dir: i32) -> Result<()> {
+        if self.windows.is_empty() {
+            return Ok(());
+        }
+        self.close_menu()?;
+        self.close_ctx()?;
+        self.close_vol_popup()?;
+        let _ = self.close_thumb();
+        self.comp.flip3d = None;
+        if self.comp.alt_tab.is_none() {
+            let start = self
+                .active
+                .and_then(|a| self.windows.iter().position(|w| w.window == a))
+                .map(|i| (i + 1) % self.windows.len())
+                .unwrap_or(0);
+            self.comp.alt_tab = Some(AltTabState {
+                selected: start,
+                opened: Instant::now(),
+            });
+            self.acquire_switcher_grabs();
+        } else {
+            self.cycle_switcher(dir);
+        }
+        self.comp.mark_full_dirty();
+        Ok(())
+    }
+
+    fn open_or_cycle_flip3d(&mut self, dir: i32) -> Result<()> {
+        if self.windows.is_empty() {
+            return Ok(());
+        }
+        self.close_menu()?;
+        self.close_ctx()?;
+        self.close_vol_popup()?;
+        let _ = self.close_thumb();
+        self.comp.alt_tab = None;
+        if self.comp.flip3d.is_none() {
+            let next = if self.windows.len() > 1 { 1 } else { 0 };
+            self.comp.flip3d = Some(Flip3dState {
+                selected: next,
+                scroll: 0.0,
+                target_scroll: next as f32,
+                opened: Instant::now(),
+            });
+            self.acquire_switcher_grabs();
+        } else {
+            self.cycle_switcher(dir);
+        }
+        self.comp.mark_full_dirty();
+        Ok(())
+    }
+
+    fn cycle_switcher(&mut self, dir: i32) {
+        let count = self.windows.len();
+        if count == 0 {
+            return;
+        }
+        if let Some(st) = self.comp.alt_tab.as_mut() {
+            st.selected = ((st.selected as i32 + dir).rem_euclid(count as i32)) as usize;
+        } else if let Some(st) = self.comp.flip3d.as_mut() {
+            st.target_scroll += dir as f32;
+            st.selected = ((st.target_scroll.round() as i32).rem_euclid(count as i32)) as usize;
+        }
+        self.comp.mark_full_dirty();
+    }
+
+    fn commit_switcher(&mut self) -> Result<()> {
+        let sel = if let Some(st) = self.comp.alt_tab.take() {
+            Some(st.selected)
+        } else {
+            self.comp.flip3d.take().map(|st| st.selected)
+        };
+        self.release_switcher_grabs();
+        self.comp.mark_full_dirty();
+        if let Some(idx) = sel {
+            if let Some(win) = self.windows.get(idx).map(|m| m.window) {
+                self.activate(win)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_switcher(&mut self) -> Result<()> {
+        self.comp.alt_tab = None;
+        self.comp.flip3d = None;
+        self.release_switcher_grabs();
+        self.comp.mark_full_dirty();
+        Ok(())
+    }
+
+    fn toggle_show_desktop(&mut self) -> Result<()> {
+        let any_visible = self.windows.iter().any(|w| !w.minimized);
+        if any_visible {
+            self.all_minimized_backup.clear();
+            let list: Vec<Window> = self
+                .windows
+                .iter()
+                .filter(|w| !w.minimized)
+                .map(|w| w.window)
+                .collect();
+            for win in list {
+                self.all_minimized_backup.push(win);
+                self.minimize_window(win)?;
+            }
+        } else if !self.all_minimized_backup.is_empty() {
+            let restore = std::mem::take(&mut self.all_minimized_backup);
+            for win in restore {
+                self.activate(win)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn activate(&mut self, window: Window) -> Result<()> {
+        self.close_vol_popup()?;
+        self.close_ctx()?;
+        let Some(win_idx) = self.windows.iter().position(|w| w.window == window) else {
+            return Ok(());
+        };
+        let was_min = self.windows[win_idx].minimized;
+        if was_min {
+            self.windows[win_idx].minimized = false;
+            self.x.map(window)?;
+            if self.comp.active {
+                let btn_local = self.window_button_rect(win_idx);
+                let btn_screen =
+                    Rect::new(btn_local.x, self.taskbar_y() + btn_local.y, btn_local.w, btn_local.h);
+                if let Some(cw) = self.comps.get_mut(&window) {
+                    let mw = self.windows[win_idx].width;
+                    let mh = self.windows[win_idx].height;
+                    let d = cw.depth;
+                    attach_window_pixmap(&self.x, cw, mw, mh, d);
+                    cw.anim = Some(WindowAnim {
+                        kind: AnimKind::Restore {
+                            taskbar_btn: btn_screen,
+                        },
+                        start: Instant::now(),
+                        duration_ms: 220,
+                    });
+                }
+            }
+        }
+        self.x.raise(window)?;
+        self.raise_z(window);
+        self.raise_chrome_above_clients()?;
         self.x.focus(window)?;
         self.active = Some(window);
         self.publish_active()?;
@@ -2419,6 +3376,9 @@ impl Shell {
         if self.bell_rect().contains(x, y) {
             return Hit::Bell;
         }
+        if self.theme.is_vortexglass() && self.show_desktop_rect().contains(x, y) {
+            return Hit::ShowDesktop;
+        }
         Hit::None
     }
 
@@ -2444,13 +3404,20 @@ impl Shell {
                 if let Some(managed) = self.windows.get(index) {
                     let window = managed.window;
                     let is_min = managed.minimized;
-                    if !is_min && self.active == Some(window) {
+                    if !is_min
+                        && self.active == Some(window)
+                        && self.z_stack.last().copied() == Some(window)
+                    {
                         self.minimize_window(window)?;
                     } else {
                         self.activate(window)?;
                     }
                 }
                 Ok(())
+            }
+            Hit::ShowDesktop => {
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                self.toggle_show_desktop()
             }
             Hit::Network => {
                 self.close_menu()?;
@@ -2647,6 +3614,7 @@ impl Shell {
         self.present_taskbar()?;
         let _ = self.x.focus(self.vol_popup);
         let _ = self.acquire_popup_grab(self.vol_popup);
+        self.comp.mark_full_dirty();
         Ok(())
     }
 
@@ -2668,6 +3636,7 @@ impl Shell {
             let _ = self.x.focus(target);
             self.draw_taskbar();
             self.present_taskbar()?;
+            self.comp.mark_full_dirty();
             let _ = self.x.flush();
             self.flush_volume_persist();
         }
@@ -2729,7 +3698,12 @@ impl Shell {
     }
 
     fn menu_hit(&self, x: i32, y: i32) -> Hit {
-        let (logout, reboot, power_off, confirm_cancel, confirm_ok) = compact_footer_rects();
+        let is_vortex = self.theme.is_vortexglass();
+        let (logout, reboot, power_off, confirm_cancel, confirm_ok) = if is_vortex {
+            vortex_menu_footer_rects()
+        } else {
+            compact_footer_rects()
+        };
         if self.menu_confirm_power.is_some() {
             if confirm_cancel.contains(x, y) {
                 return Hit::ConfirmPowerCancel;
@@ -2740,9 +3714,22 @@ impl Shell {
             return Hit::None;
         }
         let filtered = self.filtered_apps();
-        for (slot, &app_idx) in filtered.iter().enumerate() {
-            if menu_row_rect(slot).contains(x, y) {
-                return Hit::MenuRow(app_idx);
+        if is_vortex {
+            for (slot, &app_idx) in filtered.iter().take(8).enumerate() {
+                if vortex_menu_row_rect(slot).contains(x, y) {
+                    return Hit::MenuRow(app_idx);
+                }
+            }
+            for (i, _) in VORTEX_PLACES.iter().enumerate() {
+                if vortex_menu_place_rect(i).contains(x, y) {
+                    return Hit::MenuPlace(i);
+                }
+            }
+        } else {
+            for (slot, &app_idx) in filtered.iter().enumerate() {
+                if menu_row_rect(slot).contains(x, y) {
+                    return Hit::MenuRow(app_idx);
+                }
             }
         }
         if logout.contains(x, y) {
@@ -2764,6 +3751,17 @@ impl Shell {
                 crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 self.close_menu()?;
                 self.launch(mode);
+                Ok(())
+            }
+            Hit::MenuPlace(idx) => {
+                if let Some(p) = VORTEX_PLACES.get(idx) {
+                    crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                    self.close_menu()?;
+                    match p.arg {
+                        Some(a) => self.launch_arg(p.mode, a),
+                        None => self.launch(p.mode),
+                    }
+                }
                 Ok(())
             }
             Hit::Logout => {
@@ -2820,6 +3818,7 @@ impl Shell {
         let cx = root_x.clamp(4, max_x) as i16;
         let cy = root_y.clamp(min_y, max_y) as i16;
         self.ctx_open = true;
+        self.ctx_pos = (cx, cy);
         self.hover = Hit::None;
         self.x
             .move_resize(self.ctx_menu, cx, cy, CTX_WIDTH as u16, CTX_HEIGHT as u16)?;
@@ -2829,6 +3828,7 @@ impl Shell {
         self.present_ctx()?;
         let _ = self.x.focus(self.ctx_menu);
         let _ = self.acquire_popup_grab(self.ctx_menu);
+        self.comp.mark_full_dirty();
         Ok(())
     }
 
@@ -2839,6 +3839,7 @@ impl Shell {
             self.x.unmap(self.ctx_menu)?;
             let target = self.active.unwrap_or(self.x.root);
             let _ = self.x.focus(target);
+            self.comp.mark_full_dirty();
             self.x.flush()?;
         }
         Ok(())
@@ -2896,6 +3897,7 @@ impl Shell {
             if !self.config.panel_start_fullscreen {
                 let _ = self.acquire_popup_grab(self.menu);
             }
+            self.comp.mark_full_dirty();
             Ok(())
         }
     }
@@ -2913,6 +3915,7 @@ impl Shell {
             let _ = self.x.focus(target);
             self.draw_taskbar();
             self.present_taskbar()?;
+            self.comp.mark_full_dirty();
         }
         Ok(())
     }
@@ -2968,11 +3971,13 @@ impl Shell {
         let _ = self.x.map(self.toast_window);
         let _ = self.x.raise(self.toast_window);
         let _ = self.present_toast();
+        self.comp.mark_full_dirty();
     }
 
     fn hide_toast(&mut self) -> Result<()> {
         self.toast = None;
         self.x.unmap(self.toast_window)?;
+        self.comp.mark_full_dirty();
         self.x.flush()?;
         Ok(())
     }
@@ -3061,11 +4066,25 @@ impl Shell {
         }
     }
 
+    fn superbar_glow_tint(icon: Icon, fallback_accent: u32) -> u32 {
+        match icon {
+            Icon::Files | Icon::Browser => 0x56a8f5,
+            Icon::Terminal => 0x62c4e8,
+            Icon::Monitor | Icon::Minesweeper => 0x4fd18b,
+            Icon::Editor => 0xf2a74b,
+            Icon::Music => 0xe86b86,
+            Icon::Calculator => 0x7ab8e8,
+            Icon::ImageViewer => 0x9b7ee8,
+            _ => fallback_accent,
+        }
+    }
+
     fn draw_taskbar(&mut self) {
         let w = self.taskbar_canvas.width as i32;
         let h = self.panel_height();
         let show_pinned = self.config.panel_show_pinned;
-        let layout = TaskbarLayout::compute(w, h, self.tray_width(), show_pinned);
+        let is_vortex = self.theme.is_vortexglass();
+        let layout = TaskbarLayout::compute_styled(w, h, self.tray_width(), show_pinned, is_vortex);
         let start = layout.start;
         let pinned_rects: [Rect; PINNED_MODES.len()] =
             std::array::from_fn(|i| layout.pinned_rect(h, i));
@@ -3085,88 +4104,134 @@ impl Shell {
         };
 
         let canvas = &mut self.taskbar_canvas;
-        canvas.fill(Rect::new(0, 0, w, h), self.theme.panel);
-        if is_win98 {
-            if self.config.panel_position == PanelPosition::Top {
-                canvas.fill(Rect::new(0, h - 2, w, 1), self.theme.bevel_shadow);
-                canvas.fill(Rect::new(0, h - 1, w, 1), self.theme.bevel_dark);
+        if is_vortex {
+            if canvas.is_argb() {
+                canvas.clear_transparent(Rect::new(0, 0, w, h), self.theme.panel);
             } else {
-                canvas.fill(Rect::new(0, 0, w, 1), self.theme.bevel_light);
-                canvas.fill(Rect::new(0, 1, w, 1), self.theme.bevel_hi);
+                canvas.fill_gradient_v(
+                    Rect::new(0, 0, w, h),
+                    mix(self.theme.panel, self.theme.accent, 0.22),
+                    mix(self.theme.panel, 0x0b1624, 0.25),
+                    1.0,
+                    1.0,
+                );
             }
+            let rim_y = if self.config.panel_position == PanelPosition::Top {
+                h - 1
+            } else {
+                0
+            };
+            let hi_y = if self.config.panel_position == PanelPosition::Top {
+                h - 2
+            } else {
+                1
+            };
+            canvas.fill_alpha(Rect::new(0, rim_y, w, 1), 0x0a1420, 0.55);
+            canvas.fill_alpha(Rect::new(0, hi_y, w, 1), 0xffffff, 0.42);
         } else {
-            canvas.fill(Rect::new(0, border_y, w, 1), self.theme.panel_border);
+            canvas.fill(Rect::new(0, 0, w, h), self.theme.panel);
+            if is_win98 {
+                if self.config.panel_position == PanelPosition::Top {
+                    canvas.fill(Rect::new(0, h - 2, w, 1), self.theme.bevel_shadow);
+                    canvas.fill(Rect::new(0, h - 1, w, 1), self.theme.bevel_dark);
+                } else {
+                    canvas.fill(Rect::new(0, 0, w, 1), self.theme.bevel_light);
+                    canvas.fill(Rect::new(0, 1, w, 1), self.theme.bevel_hi);
+                }
+            } else {
+                canvas.fill(Rect::new(0, border_y, w, 1), self.theme.panel_border);
+            }
         }
 
-        // Start button using official SpaceOS9.png logo.
+        // Start button (SpaceOS Starlight Crystal Orb in VortexGlass; pill/bevel otherwise).
         let start_pressed = self.menu_open || ui::is_rect_pressed(start);
         let start_active = start_pressed || self.hover == Hit::Start;
         let start_t = ui::animate_bool(start, start_active, ui::MOTION_HOVER);
         let mut start_shift = 0;
-        if is_win98 {
-            canvas.fill(
-                start,
-                if start_pressed {
-                    crate::draw::mix(self.theme.panel, self.theme.bevel_shadow, 0.12)
-                } else if self.hover == Hit::Start {
-                    self.theme.panel_hover
-                } else {
-                    self.theme.panel
-                },
+        if is_vortex {
+            let radius = (start.w.min(start.h) as f32 * 0.48).max(12.0);
+            draw_space_start_orb(
+                canvas,
+                start.x as f32 + start.w as f32 * 0.5,
+                start.y as f32 + start.h as f32 * 0.5,
+                radius,
+                self.theme.accent,
+                start_t,
+                if start_pressed { 1.0 } else { 0.0 },
+                self.comp.start_orb_phase,
+                self.theme.is_dark(),
             );
-            if start_pressed {
-                ui::sunken_bevel(canvas, &self.theme, start);
-                if start.w >= 14 && start.h >= 12 {
-                    canvas.dotted_border_1px(start.inset(4), self.theme.text);
+        } else {
+            if is_win98 {
+                canvas.fill(
+                    start,
+                    if start_pressed {
+                        mix(self.theme.panel, self.theme.bevel_shadow, 0.12)
+                    } else if self.hover == Hit::Start {
+                        self.theme.panel_hover
+                    } else {
+                        self.theme.panel
+                    },
+                );
+                if start_pressed {
+                    ui::sunken_bevel(canvas, &self.theme, start);
+                    if start.w >= 14 && start.h >= 12 {
+                        canvas.dotted_border_1px(start.inset(4), self.theme.text);
+                    }
+                    start_shift = 1;
+                } else {
+                    ui::raised_bevel(canvas, &self.theme, start);
                 }
-                start_shift = 1;
-            } else {
-                ui::raised_bevel(canvas, &self.theme, start);
+            } else if start_t > 0.001 {
+                canvas.rounded_rect(
+                    start,
+                    ctrl_r,
+                    if start_pressed {
+                        self.theme.accent_soft
+                    } else {
+                        self.theme.panel_hover
+                    },
+                    start_t,
+                );
+                canvas.rounded_border(
+                    start,
+                    ctrl_r,
+                    if start_pressed {
+                        self.theme.accent
+                    } else {
+                        self.theme.panel_border
+                    },
+                    start_t,
+                    1,
+                );
             }
-        } else if start_t > 0.001 {
-            canvas.rounded_rect(
-                start,
-                ctrl_r,
-                if start_pressed {
-                    self.theme.accent_soft
-                } else {
-                    self.theme.panel_hover
-                },
-                start_t,
+            icons::draw(
+                canvas,
+                Icon::SpaceLogo,
+                start.x + 9 + start_shift,
+                start.y + (start.h - 22) / 2 + start_shift,
+                22,
+                None,
             );
-            canvas.rounded_border(
-                start,
-                ctrl_r,
-                if start_pressed {
-                    self.theme.accent
-                } else {
-                    self.theme.panel_border
-                },
-                start_t,
-                1,
+            self.text.draw(
+                canvas,
+                "开始",
+                (start.x + 38 + start_shift) as f32,
+                start.y as f32 + start.h as f32 * 0.5 + 4.8 + start_shift as f32,
+                13.0,
+                self.theme.text,
+                Face::Bold,
             );
         }
-        icons::draw(
-            canvas,
-            Icon::SpaceLogo,
-            start.x + 9 + start_shift,
-            start.y + (start.h - 22) / 2 + start_shift,
-            22,
-            None,
-        );
-        self.text.draw(
-            canvas,
-            "开始",
-            (start.x + 38 + start_shift) as f32,
-            start.y as f32 + start.h as f32 * 0.5 + 4.8 + start_shift as f32,
-            13.0,
-            self.theme.text,
-            Face::Bold,
-        );
 
         let sep_h = (h - 14).clamp(16, 26);
         let sep_y = (h - sep_h) / 2;
-        draw_etched_sep(canvas, &self.theme, layout.start_sep_x, sep_y, sep_h);
+        if is_vortex {
+            canvas.fill_alpha(Rect::new(layout.start_sep_x, sep_y, 1, sep_h), 0x0a1420, 0.30);
+            canvas.fill_alpha(Rect::new(layout.start_sep_x + 1, sep_y, 1, sep_h), 0xffffff, 0.38);
+        } else {
+            draw_etched_sep(canvas, &self.theme, layout.start_sep_x, sep_y, sep_h);
+        }
 
         // Quick-launch curated core apps (optional).
         if show_pinned {
@@ -3181,13 +4246,27 @@ impl Shell {
                     if pin_pressed {
                         canvas.fill(
                             rect,
-                            crate::draw::mix(self.theme.panel, self.theme.bevel_shadow, 0.14),
+                            mix(self.theme.panel, self.theme.bevel_shadow, 0.14),
                         );
                         canvas.bevel_1px(rect, self.theme.bevel_shadow, self.theme.bevel_light);
                     } else if self.hover == Hit::Pinned(i) {
                         canvas.fill(rect, self.theme.panel_hover);
                         canvas.bevel_1px(rect, self.theme.bevel_light, self.theme.bevel_shadow);
                     }
+                } else if is_vortex && (hov_t > 0.001 || pin_pressed) {
+                    let t = hov_t.max(f32::from(u8::from(pin_pressed)));
+                    let glow = Self::superbar_glow_tint(app.icon, self.theme.accent);
+                    canvas.rounded_rect(rect, ctrl_r, 0xffffff, 0.28 * t);
+                    canvas.with_clip(rect, |c| {
+                        c.radial_glow(
+                            (rect.x + rect.w / 2) as f32,
+                            (rect.bottom() - 2) as f32,
+                            rect.w as f32 * 0.9,
+                            glow,
+                            0.48 * t,
+                        );
+                    });
+                    canvas.rounded_border(rect, ctrl_r, 0xffffff, 0.45 * t, 1);
                 } else if hov_t > 0.001 || pin_pressed {
                     canvas.rounded_rect(
                         rect,
@@ -3205,7 +4284,12 @@ impl Shell {
                     None,
                 );
             }
-            draw_etched_sep(canvas, &self.theme, layout.pinned_sep_x, sep_y, sep_h);
+            if is_vortex {
+                canvas.fill_alpha(Rect::new(layout.pinned_sep_x, sep_y, 1, sep_h), 0x0a1420, 0.30);
+                canvas.fill_alpha(Rect::new(layout.pinned_sep_x + 1, sep_y, 1, sep_h), 0xffffff, 0.38);
+            } else {
+                draw_etched_sep(canvas, &self.theme, layout.pinned_sep_x, sep_y, sep_h);
+            }
         }
 
         // Running window buttons.
@@ -3224,7 +4308,7 @@ impl Shell {
                     } else {
                         canvas.fill(
                             rect,
-                            crate::draw::mix(self.theme.panel, self.theme.bevel_shadow, 0.14),
+                            mix(self.theme.panel, self.theme.bevel_shadow, 0.14),
                         );
                     }
                     ui::sunken_bevel(canvas, &self.theme, rect);
@@ -3240,11 +4324,62 @@ impl Shell {
                     );
                     ui::raised_bevel(canvas, &self.theme, rect);
                 }
+            } else if is_vortex {
+                let glow = Self::superbar_glow_tint(managed.icon, self.theme.accent);
+                let top_h = (rect.h / 2).max(4);
+                let base_a = if is_active {
+                    0.40
+                } else if !managed.minimized {
+                    0.18 + 0.18 * hov_t
+                } else {
+                    0.08 + 0.14 * hov_t
+                };
+                canvas.rounded_rect(
+                    rect,
+                    ctrl_r,
+                    if is_active { 0xffffff } else { glow },
+                    base_a,
+                );
+                canvas.fill_gradient_v(
+                    Rect::new(rect.x + 2, rect.y + 1, (rect.w - 4).max(1), top_h),
+                    0xffffff,
+                    0xffffff,
+                    if is_active { 0.36 } else { 0.18 + 0.14 * hov_t },
+                    0.04,
+                );
+                if hov_t > 0.01 {
+                    let mx = self
+                        .comp
+                        .taskbar_mouse_x
+                        .filter(|_| is_hover)
+                        .unwrap_or(rect.x + rect.w / 2)
+                        .clamp(rect.x, rect.right());
+                    canvas.with_clip(rect, |c| {
+                        c.radial_glow(
+                            mx as f32,
+                            (rect.bottom() - 2) as f32,
+                            (rect.h as f32 * 1.65).max(32.0),
+                            glow,
+                            0.60 * hov_t,
+                        );
+                    });
+                }
+                let rim_col = if is_active { 0xe8f5ff } else { 0xffffff };
+                let rim_a = if is_active { 0.80 } else { 0.32 + 0.36 * hov_t };
+                canvas.rounded_border(rect, ctrl_r, rim_col, rim_a, 1);
+                if is_active {
+                    canvas.rounded_rect(
+                        Rect::new(rect.x + 8, rect.bottom() - 3, (rect.w - 16).max(6), 2),
+                        1,
+                        mix(glow, 0xffffff, 0.35),
+                        0.95,
+                    );
+                }
             } else {
                 let bg = if is_active {
                     self.theme.panel_high
                 } else if hov_t > 0.001 {
-                    crate::draw::mix(self.theme.panel, self.theme.panel_hover, hov_t)
+                    mix(self.theme.panel, self.theme.panel_hover, hov_t)
                 } else {
                     self.theme.panel
                 };
@@ -3279,13 +4414,31 @@ impl Shell {
             );
             let max_w = (rect.w - 38).max(20) as f32;
             let label = self.text.truncate(&managed.title, max_w, 12.0, Face::Ui);
-            let fg = if is_active {
+            let fg = if is_vortex {
+                if self.theme.is_dark() {
+                    if managed.minimized { 0xbccad8 } else { 0xf5f9fd }
+                } else if is_active {
+                    0x0c1828
+                } else if managed.minimized {
+                    0x2a3b4e
+                } else {
+                    0x101c2b
+                }
+            } else if is_active {
                 self.theme.text
             } else if managed.minimized {
                 self.theme.text_muted
             } else {
                 self.theme.text_dim
             };
+            if is_vortex && !self.theme.is_dark() {
+                draw_vortexglass_fog(
+                    canvas,
+                    Rect::new(rect.x + 29, rect.y + 6, (rect.w - 34).max(16), rect.h - 12),
+                    0xffffff,
+                    if is_active { 0.58 } else { 0.42 },
+                );
+            }
             self.text.draw(
                 canvas,
                 &label,
@@ -3293,7 +4446,7 @@ impl Shell {
                 rect.y as f32 + rect.h as f32 * 0.5 + 4.5 + win_shift as f32,
                 12.0,
                 fg,
-                if is_win98 && is_active {
+                if (is_win98 || is_vortex) && is_active {
                     Face::Bold
                 } else {
                     Face::Ui
@@ -3317,7 +4470,12 @@ impl Shell {
                 canvas.bevel_1px(net, self.theme.bevel_hi, self.theme.bevel_shadow);
             }
         } else if net_hov > 0.001 {
-            canvas.rounded_rect(net, ctrl_r, self.theme.panel_hover, net_hov);
+            canvas.rounded_rect(
+                net,
+                ctrl_r,
+                if is_vortex { 0xffffff } else { self.theme.panel_hover },
+                if is_vortex { 0.30 * net_hov } else { net_hov },
+            );
         }
         let (net_icon, net_tint) = if net_connected {
             (Icon::NetworkWired, self.theme.text)
@@ -3351,10 +4509,16 @@ impl Shell {
                 ctrl_r,
                 if self.vol_open {
                     self.theme.accent_soft
+                } else if is_vortex {
+                    0xffffff
                 } else {
                     self.theme.panel_hover
                 },
-                vol_hov,
+                if is_vortex && !self.vol_open {
+                    0.30 * vol_hov
+                } else {
+                    vol_hov
+                },
             );
         }
         let vol_icon = Icon::for_volume(self.config.sound_master_volume, self.config.sound_muted);
@@ -3384,7 +4548,12 @@ impl Shell {
                 canvas.bevel_1px(bell, self.theme.bevel_hi, self.theme.bevel_shadow);
             }
         } else if bell_hov > 0.001 {
-            canvas.rounded_rect(bell, ctrl_r, self.theme.panel_hover, bell_hov);
+            canvas.rounded_rect(
+                bell,
+                ctrl_r,
+                if is_vortex { 0xffffff } else { self.theme.panel_hover },
+                if is_vortex { 0.30 * bell_hov } else { bell_hov },
+            );
         }
         icons::draw(
             canvas,
@@ -3403,10 +4572,15 @@ impl Shell {
             }),
         );
         if !is_win98 {
-            canvas.fill(
-                Rect::new(layout.clock_sep_x, sep_y, 1, sep_h),
-                self.theme.panel_border,
-            );
+            if is_vortex {
+                canvas.fill_alpha(Rect::new(layout.clock_sep_x, sep_y, 1, sep_h), 0x0a1420, 0.25);
+                canvas.fill_alpha(Rect::new(layout.clock_sep_x + 1, sep_y, 1, sep_h), 0xffffff, 0.36);
+            } else {
+                canvas.fill(
+                    Rect::new(layout.clock_sep_x, sep_y, 1, sep_h),
+                    self.theme.panel_border,
+                );
+            }
         }
 
         let (year, month, day, hour, minute, sec, weekday) = now_local();
@@ -3429,7 +4603,29 @@ impl Shell {
             }
         };
 
-        let right_x = (w - 14) as f32;
+        let right_x = if is_vortex {
+            (w - 22) as f32
+        } else {
+            (w - 14) as f32
+        };
+        if is_vortex && !self.theme.is_dark() {
+            draw_vortexglass_fog(
+                canvas,
+                Rect::new(layout.clock_sep_x + 4, 4, (w - 20 - layout.clock_sep_x).max(40), h - 8),
+                0xffffff,
+                0.50,
+            );
+        }
+        let clock_fg = if is_vortex {
+            if self.theme.is_dark() { 0xf4f8fc } else { 0x0d1826 }
+        } else {
+            self.theme.text
+        };
+        let date_fg = if is_vortex {
+            if self.theme.is_dark() { 0xc0d0e0 } else { 0x1e2c3e }
+        } else {
+            self.theme.text_muted
+        };
         if self.config.clock_show_date {
             let weeks = ["日", "一", "二", "三", "四", "五", "六"];
             let mid = h as f32 * 0.5;
@@ -3439,7 +4635,7 @@ impl Shell {
                 right_x,
                 mid - 2.0,
                 12.5,
-                self.theme.text,
+                clock_fg,
                 Face::Bold,
             );
             self.text.draw_right(
@@ -3451,7 +4647,7 @@ impl Shell {
                 right_x,
                 mid + 13.0,
                 10.0,
-                self.theme.text_muted,
+                date_fg,
                 Face::Ui,
             );
         } else {
@@ -3461,9 +4657,215 @@ impl Shell {
                 right_x,
                 h as f32 * 0.5 + 4.8,
                 13.0,
-                self.theme.text,
+                clock_fg,
                 Face::Bold,
             );
+        }
+
+        // Far-right Aero Show Desktop crystal sliver
+        if is_vortex && layout.show_desktop.w > 0 {
+            let sd = layout.show_desktop;
+            let sd_hov = ui::animate_bool(sd, self.hover == Hit::ShowDesktop, ui::MOTION_HOVER);
+            canvas.fill_alpha(sd, 0xffffff, 0.14 + 0.28 * sd_hov);
+            canvas.fill_alpha(Rect::new(sd.x, 1, 1, h - 2), 0x0a1420, 0.40);
+            canvas.fill_alpha(Rect::new(sd.x + 1, 1, 1, h - 2), 0xffffff, 0.45 + 0.30 * sd_hov);
+        }
+    }
+
+    fn draw_menu_vortex(&mut self) {
+        let filtered = self.filtered_apps();
+        let canvas = &mut self.menu_canvas;
+        let (w, h) = (VORTEX_MENU_WIDTH, VORTEX_MENU_HEIGHT);
+        let r = self.theme.radius_popup();
+        if canvas.is_argb() {
+            canvas.clear_transparent(Rect::new(0, 0, w, h), self.theme.panel);
+        } else {
+            canvas.clear(self.theme.panel);
+        }
+        let outer = Rect::new(0, 0, w, h);
+        let (frame_tint, frame_a) = self.theme.glass_tint(true);
+        canvas.rounded_rect(outer, r, frame_tint, (frame_a as f32 / 255.0).max(0.45));
+        canvas.rounded_border(outer, r, 0x0f1a28, 0.72, 1);
+        canvas.rounded_border(outer.inset(1), (r - 1).max(1), 0xffffff, 0.56, 1);
+
+        // Left pane: frosted crisp app list + recessed Win7 Search box.
+        let left_pane = Rect::new(10, 10, 252, h - 20);
+        let left_bg = if self.theme.is_dark() { 0x162230 } else { 0xfafdff };
+        canvas.rounded_rect(left_pane, 5, left_bg, 0.94);
+        canvas.rounded_border(
+            left_pane,
+            5,
+            if self.theme.is_dark() { 0x3a526c } else { 0x8aa2ba },
+            0.78,
+            1,
+        );
+
+        if filtered.is_empty() {
+            self.text.draw_centered(
+                canvas,
+                "未找到匹配的应用",
+                left_pane.x as f32 + left_pane.w as f32 * 0.5,
+                180.0,
+                12.5,
+                self.theme.text_muted,
+                Face::Ui,
+            );
+        } else {
+            for (slot, &app_idx) in filtered.iter().take(8).enumerate() {
+                let app = &APPS[app_idx];
+                let row = vortex_menu_row_rect(slot);
+                let hovered = self.hover == Hit::MenuRow(app_idx)
+                    || (slot == 0 && !self.menu_query.is_empty());
+                let fg = ui::list_item_bg(canvas, &self.theme, row, hovered, false);
+                icons::draw(canvas, app.icon, row.x + 8, row.y + 9, 32, None);
+                self.text.draw(
+                    canvas,
+                    app.name,
+                    (row.x + 48) as f32,
+                    (row.y + 22) as f32,
+                    12.5,
+                    fg,
+                    Face::Bold,
+                );
+                self.text.draw(
+                    canvas,
+                    app.subtitle,
+                    (row.x + 48) as f32,
+                    (row.y + 39) as f32,
+                    10.5,
+                    self.theme.text_muted,
+                    Face::Ui,
+                );
+            }
+        }
+
+        let search_r = vortex_menu_search_rect();
+        ui::text_input(
+            canvas,
+            &mut self.text,
+            &self.theme,
+            search_r,
+            &self.menu_query,
+            "搜索程序和文件...",
+            true,
+            Some(Icon::Search),
+        );
+
+        // Right smoky Aero column: user emblem + place links + split Win7 power bar.
+        let right_fg = if self.theme.is_dark() { 0xf4f8fc } else { 0x0d1a2a };
+        let avatar_box = Rect::new(280, 14, 48, 48);
+        canvas.rounded_rect(avatar_box, 6, 0xffffff, 0.35);
+        canvas.rounded_border(avatar_box, 6, 0x0a1624, 0.45, 1);
+        canvas.rounded_border(avatar_box.inset(1), 5, 0xffffff, 0.72, 1);
+        icons::draw(canvas, Icon::SpaceLogo, avatar_box.x + 8, avatar_box.y + 8, 32, None);
+
+        let identity = session_identity();
+        let shown_id = self.text.truncate(&identity, 96.0, 13.0, Face::Bold);
+        if !self.theme.is_dark() {
+            draw_vortexglass_fog(canvas, Rect::new(334, 20, 102, 34), 0xffffff, 0.65);
+        }
+        self.text.draw(canvas, &shown_id, 338.0, 38.0, 13.0, right_fg, Face::Bold);
+        self.text.draw(
+            canvas,
+            "SpaceOS 9",
+            338.0,
+            54.0,
+            10.5,
+            if self.theme.is_dark() { 0xb0c4d8 } else { 0x26384c },
+            Face::Ui,
+        );
+        canvas.fill_alpha(Rect::new(274, 72, w - 288, 1), 0xffffff, 0.35);
+
+        for (i, place) in VORTEX_PLACES.iter().enumerate() {
+            if i == 4 {
+                canvas.fill_alpha(Rect::new(274, 82 + 4 * 38 - 2, w - 288, 1), 0xffffff, 0.30);
+            }
+            let pr = vortex_menu_place_rect(i);
+            let hovered = self.hover == Hit::MenuPlace(i);
+            if hovered {
+                canvas.rounded_rect(pr, 4, 0xffffff, 0.34);
+                canvas.rounded_border(pr, 4, self.theme.aero_hover_border(), 0.72, 1);
+            }
+            if !self.theme.is_dark() {
+                draw_vortexglass_fog(canvas, pr, 0xffffff, if hovered { 0.72 } else { 0.48 });
+            }
+            icons::draw(canvas, place.icon, pr.x + 8, pr.y + 7, 20, None);
+            self.text.draw(
+                canvas,
+                place.label,
+                (pr.x + 34) as f32,
+                (pr.y + 22) as f32,
+                12.0,
+                right_fg,
+                if hovered { Face::Bold } else { Face::Ui },
+            );
+        }
+
+        let (logout, reboot, power_off, confirm_cancel, confirm_ok) = vortex_menu_footer_rects();
+        if let Some(action) = self.menu_confirm_power {
+            let (prompt, ok_label, ok_icon) = match action {
+                PowerAction::Reboot => ("确认重启？", "重启", Icon::Refresh),
+                PowerAction::PowerOff => ("确认关机？", "关机", Icon::Shutdown),
+            };
+            if !self.theme.is_dark() {
+                draw_vortexglass_fog(canvas, Rect::new(274, h - 78, 160, 22), 0xffffff, 0.75);
+            }
+            self.text
+                .draw(canvas, prompt, 276.0, (h - 60) as f32, 12.0, right_fg, Face::Bold);
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                confirm_cancel,
+                "取消",
+                None,
+                false,
+                self.hover == Hit::ConfirmPowerCancel,
+            );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                confirm_ok,
+                ok_label,
+                Some(ok_icon),
+                true,
+                self.hover == Hit::ConfirmPowerOk,
+            );
+        } else {
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                power_off,
+                "关机",
+                Some(Icon::Shutdown),
+                false,
+                self.hover == Hit::PowerOff,
+            );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                reboot,
+                "重启",
+                None,
+                false,
+                self.hover == Hit::Reboot,
+            );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                logout,
+                "注销",
+                None,
+                false,
+                self.hover == Hit::Logout,
+            );
+        }
+        if canvas.is_argb() {
+            canvas.mask_rounded_corners(r);
         }
     }
 
@@ -3479,6 +4881,10 @@ impl Shell {
                 &self.wallpaper_scaled,
                 self.windows.len(),
             );
+            return;
+        }
+        if self.theme.is_vortexglass() {
+            self.draw_menu_vortex();
             return;
         }
         let filtered = self.filtered_apps();
@@ -3635,13 +5041,9 @@ impl Shell {
 
     fn draw_ctx(&mut self) {
         let canvas = &mut self.ctx_canvas;
-        canvas.clear(self.theme.panel);
-        ui::popup_surface(
-            canvas,
-            &self.theme,
-            Rect::new(0, 0, CTX_WIDTH, CTX_HEIGHT),
-            self.theme.radius_popup(),
-        );
+        let full = Rect::new(0, 0, CTX_WIDTH, CTX_HEIGHT);
+        let r = self.theme.radius_popup();
+        draw_vortex_popup_shell(canvas, &self.theme, full, r, true);
 
         let items = [
             ("在此打开终端", Icon::Terminal),
@@ -3674,18 +5076,16 @@ impl Shell {
                 Face::Ui,
             );
         }
+        if canvas.is_argb() {
+            canvas.mask_rounded_corners(r);
+        }
     }
 
     fn draw_toast(&mut self) {
         let canvas = &mut self.toast_canvas;
         let (w, h) = (TOAST_WIDTH, TOAST_HEIGHT);
-        canvas.clear(self.theme.panel);
-        ui::popup_surface(
-            canvas,
-            &self.theme,
-            Rect::new(0, 0, w, h),
-            self.theme.radius_popup(),
-        );
+        let r = self.theme.radius_popup();
+        draw_vortex_popup_shell(canvas, &self.theme, Rect::new(0, 0, w, h), r, true);
         icons::draw(canvas, Icon::Notify, 14, (h - 28) / 2, 28, None);
         if let Some(toast) = &self.toast {
             self.text.draw(
@@ -3714,6 +5114,9 @@ impl Shell {
         let cy = 14;
         canvas.line(cx, cy, cx + 7, cy + 7, self.theme.text_muted, 1.0);
         canvas.line(cx + 7, cy, cx, cy + 7, self.theme.text_muted, 1.0);
+        if canvas.is_argb() {
+            canvas.mask_rounded_corners(r);
+        }
     }
 
     fn present_desktop(&mut self) -> Result<()> {
@@ -3726,6 +5129,11 @@ impl Shell {
         let area = area.intersect(self.desktop_canvas.bounds());
         if area.is_empty() {
             return Ok(());
+        }
+        if self.comp.active {
+            self.comp.invalidate_desktop_blur();
+            self.comp.mark_dirty(area);
+            return self.x.flush();
         }
         let full = self.desktop_bg == 0;
         if full {
@@ -3768,6 +5176,15 @@ impl Shell {
         } else {
             dirty
         };
+        if self.comp.active {
+            self.comp.mark_dirty(Rect::new(
+                area.x,
+                self.taskbar_y() + area.y,
+                area.w,
+                area.h,
+            ));
+            return Ok(());
+        }
         self.x
             .put_canvas(self.taskbar, &self.taskbar_canvas, area)?;
         self.x.flush()
@@ -3776,6 +5193,15 @@ impl Shell {
     fn present_menu(&mut self) -> Result<()> {
         let area = self.menu_canvas.bounds();
         self.menu_canvas.take_dirty();
+        if self.comp.active {
+            let r = if self.config.panel_start_fullscreen {
+                area
+            } else {
+                Rect::new(6, self.menu_y(), area.w, area.h).expand(16)
+            };
+            self.comp.mark_dirty(r);
+            return Ok(());
+        }
         self.x.put_canvas(self.menu, &self.menu_canvas, area)?;
         self.x.flush()
     }
@@ -3783,6 +5209,12 @@ impl Shell {
     fn present_ctx(&mut self) -> Result<()> {
         let area = self.ctx_canvas.bounds();
         self.ctx_canvas.take_dirty();
+        if self.comp.active {
+            let (cx, cy) = self.ctx_pos;
+            self.comp
+                .mark_dirty(Rect::new(i32::from(cx), i32::from(cy), area.w, area.h).expand(16));
+            return Ok(());
+        }
         self.x.put_canvas(self.ctx_menu, &self.ctx_canvas, area)?;
         self.x.flush()
     }
@@ -3790,6 +5222,12 @@ impl Shell {
     fn present_toast(&mut self) -> Result<()> {
         let area = self.toast_canvas.bounds();
         self.toast_canvas.take_dirty();
+        if self.comp.active {
+            let tx = i32::from(self.x.width) - TOAST_WIDTH - 12;
+            self.comp
+                .mark_dirty(Rect::new(tx, self.toast_y(), area.w, area.h).expand(28));
+            return Ok(());
+        }
         self.x
             .put_canvas(self.toast_window, &self.toast_canvas, area)?;
         self.x.flush()
@@ -3801,13 +5239,8 @@ impl Shell {
         let h = VOL_POPUP_HEIGHT;
         let is_win98 = self.theme.is_win98();
         let ctrl_r = self.theme.radius_control();
-        canvas.clear(self.theme.panel);
-        ui::popup_surface(
-            canvas,
-            &self.theme,
-            Rect::new(0, 0, w, h),
-            self.theme.radius_popup(),
-        );
+        let r = self.theme.radius_popup();
+        draw_vortex_popup_shell(canvas, &self.theme, Rect::new(0, 0, w, h), r, true);
 
         let muted = self.config.sound_muted;
         let vol = self.config.sound_master_volume.clamp(0, 100);
@@ -3932,13 +5365,884 @@ impl Shell {
             false,
             self.hover == Hit::VolSettings,
         );
+        if canvas.is_argb() {
+            canvas.mask_rounded_corners(self.theme.radius_popup());
+        }
     }
 
     fn present_vol_popup(&mut self) -> Result<()> {
         let area = self.vol_canvas.bounds();
         self.vol_canvas.take_dirty();
+        if self.comp.active {
+            let (vx, vy) = self.vol_popup_pos();
+            self.comp
+                .mark_dirty(Rect::new(i32::from(vx), i32::from(vy), area.w, area.h).expand(16));
+            return Ok(());
+        }
         self.x.put_canvas(self.vol_popup, &self.vol_canvas, area)?;
         self.x.flush()
+    }
+
+    fn active_anim_dirty_bounds(&self) -> Option<Rect> {
+        let is_vortex = self.theme.is_vortexglass();
+        let mut anim_dirty: Option<Rect> = None;
+        for &w in &self.z_stack {
+            if self.comps.get(&w).is_some_and(|cw| cw.anim.is_some()) {
+                if let Some((r, is_max)) = self
+                    .windows
+                    .iter()
+                    .find(|m| m.window == w)
+                    .map(|m| self.window_rect_for(m))
+                {
+                    let b = window_damage_bounds(r, is_vortex, is_max).expand(28);
+                    anim_dirty = Some(anim_dirty.map_or(b, |p| p.union(b)));
+                }
+            }
+        }
+        for g in &self.comp.ghosts {
+            let target = g.to_taskbar.unwrap_or(g.from);
+            let b = g.from.union(target).expand(28);
+            anim_dirty = Some(anim_dirty.map_or(b, |p| p.union(b)));
+        }
+        anim_dirty
+    }
+
+    fn mark_tick_dirty(
+        &mut self,
+        tick_out: crate::compositor::TickOutcome,
+        pre_anim_dirty: Option<Rect>,
+    ) {
+        if tick_out.peek_or_flip_changed {
+            self.comp.mark_full_dirty();
+            return;
+        }
+        if tick_out.snap_changed {
+            if let Some(sr) = self.comp.snap_rect {
+                self.comp.mark_dirty(sr.expand(16));
+            }
+        }
+        if tick_out.menu_changed {
+            if self.config.panel_start_fullscreen {
+                self.comp.mark_full_dirty();
+            } else {
+                self.comp.mark_dirty(
+                    Rect::new(
+                        6,
+                        self.menu_y(),
+                        self.menu_canvas.width as i32,
+                        self.menu_canvas.height as i32,
+                    )
+                    .expand(24),
+                );
+            }
+        }
+        if tick_out.ctx_changed {
+            let (cx, cy) = self.ctx_pos;
+            self.comp.mark_dirty(
+                Rect::new(i32::from(cx), i32::from(cy), CTX_WIDTH, CTX_HEIGHT).expand(20),
+            );
+        }
+        if tick_out.vol_changed {
+            let (vx, vy) = self.vol_popup_pos();
+            self.comp.mark_dirty(
+                Rect::new(i32::from(vx), i32::from(vy), VOL_POPUP_WIDTH, VOL_POPUP_HEIGHT)
+                    .expand(20),
+            );
+        }
+        if tick_out.toast_changed {
+            let tx = i32::from(self.x.width) - TOAST_WIDTH - 12;
+            self.comp.mark_dirty(
+                Rect::new(tx, self.toast_y(), TOAST_WIDTH + 32, TOAST_HEIGHT).expand(24),
+            );
+        }
+        if tick_out.win_anims_or_ghosts {
+            if let Some(b) = pre_anim_dirty {
+                self.comp.mark_dirty(b);
+            }
+            if let Some(b) = self.active_anim_dirty_bounds() {
+                self.comp.mark_dirty(b);
+            }
+        }
+    }
+
+    fn window_glass_top(&self, cw: &CompWindow, m_h: i32) -> i32 {
+        if !self.theme.is_vortexglass() || cw.depth != 32 {
+            0
+        } else {
+            cw.glass_extents
+                .map(|e| e[0])
+                .unwrap_or(VORTEX_TITLEBAR_HEIGHT)
+                .clamp(0, m_h)
+        }
+    }
+
+    fn window_rect_for(&self, m: &Managed) -> (Rect, bool) {
+        let scr_w = i32::from(self.x.width);
+        let work_h = i32::from(self.x.height) - self.panel_height();
+        let rect = Rect::new(
+            i32::from(m.x),
+            i32::from(m.y),
+            i32::from(m.width),
+            i32::from(m.height),
+        );
+        let is_max = rect.w >= scr_w - 2 && rect.h >= work_h - 2;
+        (rect, is_max)
+    }
+
+    fn find_occluding_window_idx(&self, region: Rect, max_idx_excl: usize) -> Option<usize> {
+        if region.is_empty() || self.comp.flip3d.is_some() || self.comp.peek_factor > 0.01 {
+            return None;
+        }
+        let end = max_idx_excl.min(self.z_stack.len());
+        for idx in (0..end).rev() {
+            let w = self.z_stack[idx];
+            let Some(m) = self.windows.iter().find(|m| m.window == w && !m.minimized) else {
+                continue;
+            };
+            let Some(cw) = self
+                .comps
+                .get(&w)
+                .filter(|c| c.has_pixels && c.anim.is_none())
+            else {
+                continue;
+            };
+            let glass_top = self.window_glass_top(cw, i32::from(m.height));
+            let opaque_rect = Rect::new(
+                i32::from(m.x),
+                i32::from(m.y) + glass_top,
+                i32::from(m.width),
+                (i32::from(m.height) - glass_top).max(0),
+            );
+            if !opaque_rect.is_empty()
+                && opaque_rect.x <= region.x
+                && opaque_rect.y <= region.y
+                && opaque_rect.right() >= region.right()
+                && opaque_rect.bottom() >= region.bottom()
+            {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn composite_frame(&mut self) -> Result<()> {
+        if !self.comp.active {
+            return Ok(());
+        }
+        let Some(overlay) = self.comp.overlay else {
+            return Ok(());
+        };
+        let is_vortex = self.theme.is_vortexglass();
+        let captured =
+            capture_dirty_windows(&self.x, self.comp.shm_read.as_ref(), self.comps.values_mut());
+        for (win, local_area, first_capture) in captured {
+            if let Some((rect, is_max)) = self
+                .windows
+                .iter()
+                .find(|m| m.window == win)
+                .map(|m| self.window_rect_for(m))
+            {
+                if first_capture {
+                    self.comp
+                        .mark_dirty(window_damage_bounds(rect, is_vortex, is_max));
+                } else {
+                    self.comp.mark_dirty(Rect::new(
+                        rect.x + local_area.x - 4,
+                        rect.y + local_area.y - 4,
+                        local_area.w + 8,
+                        local_area.h + 8,
+                    ));
+                }
+            }
+        }
+        if !self.comp.is_dirty() {
+            return Ok(());
+        }
+
+        let scr = Rect::new(0, 0, i32::from(self.x.width), i32::from(self.x.height));
+        if scr.is_empty() {
+            return Ok(());
+        }
+        let dirty_area = if self.comp.force_full {
+            scr
+        } else {
+            self.comp.dirty.unwrap_or(scr).intersect(scr)
+        };
+        if dirty_area.is_empty() {
+            self.comp.dirty = None;
+            return Ok(());
+        }
+
+        let Some(mut dst) = self.comp.canvas.take() else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        let upload_area = if self.try_fast_top_opaque_blit(&mut dst, dirty_area) {
+            dirty_area
+        } else {
+            if is_vortex || self.comp.flip3d.is_some() {
+                self.comp.ensure_desktop_blur(&self.desktop_canvas);
+            }
+            if self.comp.flip3d.is_some() {
+                dst.with_clip(dirty_area, |d| {
+                    d.copy_rect_from(
+                        self.desktop_canvas.pixels(),
+                        self.desktop_canvas.width,
+                        dirty_area,
+                    );
+                    let entries = build_switcher_entries(&self.windows, &self.comps);
+                    if let Some(ref flip) = self.comp.flip3d {
+                        draw_flip3d_scene(
+                            d,
+                            &self.comp.desktop_blur_cache,
+                            &mut self.text,
+                            &self.theme,
+                            &entries,
+                            flip,
+                            now,
+                        );
+                    }
+                });
+                self.composite_taskbar(&mut dst, dirty_area, now);
+            } else {
+                let start_idx = self.find_occluding_window_idx(dirty_area, self.z_stack.len());
+                if start_idx.is_none() {
+                    dst.with_clip(dirty_area, |d| {
+                        d.copy_rect_from(
+                            self.desktop_canvas.pixels(),
+                            self.desktop_canvas.width,
+                            dirty_area,
+                        );
+                    });
+                }
+                self.composite_windows_range(
+                    &mut dst,
+                    dirty_area,
+                    start_idx.unwrap_or(0),
+                    self.z_stack.len(),
+                    now,
+                    true,
+                );
+                dst.with_clip(dirty_area, |d| {
+                    self.composite_ghosts(d, now);
+                    self.composite_snap_preview(d);
+                });
+                self.composite_taskbar(&mut dst, dirty_area, now);
+                self.composite_popups(&mut dst, dirty_area);
+                if let Some(selected) = self.comp.alt_tab.as_ref().map(|a| a.selected) {
+                    let entries = build_switcher_entries(&self.windows, &self.comps);
+                    dst.with_clip(dirty_area, |d| {
+                        draw_alt_tab_hud(
+                            d,
+                            &mut self.text,
+                            &self.theme,
+                            &mut self.comp.blur_scratch,
+                            &entries,
+                            selected,
+                        );
+                    });
+                }
+            }
+            dirty_area
+        };
+
+        self.comp.dirty = None;
+        self.comp.force_full = false;
+        let put_res = self.x.put_canvas(overlay, &dst, upload_area);
+        self.comp.canvas = Some(dst);
+        put_res?;
+        self.x.flush()
+    }
+
+    fn try_fast_top_opaque_blit(&self, dst: &mut Canvas, dirty: Rect) -> bool {
+        if self.comp.flip3d.is_some()
+            || self.comp.alt_tab.is_some()
+            || self.comp.snap_alpha > 0.01
+            || !self.comp.ghosts.is_empty()
+            || self.comp.thumb.is_some()
+            || self.comp.peek_factor > 0.01
+            || self.menu_open
+            || self.ctx_open
+            || self.vol_open
+            || self.comp.menu_anim > 0.01
+            || self.comp.ctx_anim > 0.01
+            || self.comp.vol_anim > 0.01
+            || self.comp.toast_anim > 0.01
+        {
+            return false;
+        }
+        let Some(&top_w) = self.z_stack.last() else {
+            return false;
+        };
+        let Some(m) = self.windows.iter().find(|w| w.window == top_w && !w.minimized) else {
+            return false;
+        };
+        let Some(cw) = self
+            .comps
+            .get(&top_w)
+            .filter(|c| c.has_pixels && c.anim.is_none())
+        else {
+            return false;
+        };
+        let tb = Rect::new(
+            0,
+            self.taskbar_y(),
+            i32::from(self.x.width),
+            self.panel_height(),
+        );
+        if !dirty.intersect(tb).is_empty() {
+            return false;
+        }
+        let glass_top = self.window_glass_top(cw, i32::from(m.height));
+        let opaque_rect = Rect::new(
+            i32::from(m.x),
+            i32::from(m.y) + glass_top,
+            i32::from(m.width),
+            (i32::from(m.height) - glass_top).max(0),
+        );
+        if opaque_rect.is_empty()
+            || dirty.x < opaque_rect.x
+            || dirty.y < opaque_rect.y
+            || dirty.right() > opaque_rect.right()
+            || dirty.bottom() > opaque_rect.bottom()
+        {
+            return false;
+        }
+        dst.with_clip(dirty, |c| {
+            blit_window_pixels(
+                c,
+                &cw.pixels,
+                cw.pw,
+                cw.ph,
+                i32::from(m.x),
+                i32::from(m.y),
+                255,
+                0,
+                false,
+            );
+        });
+        true
+    }
+
+    fn frost_glass_strip(
+        &mut self,
+        dst: &mut Canvas,
+        target_idx: usize,
+        strip: Rect,
+        dirty_area: Rect,
+        now: Instant,
+    ) {
+        let clip = strip.intersect(dirty_area).intersect(dst.bounds());
+        if clip.is_empty() {
+            return;
+        }
+        let ex = clip.expand(AERO_BLUR_RADIUS).intersect(dst.bounds());
+        let is_vortex = self.theme.is_vortexglass();
+        let end = target_idx.min(self.z_stack.len());
+        let has_lower_overlap = (0..end).any(|i| {
+            let w = self.z_stack[i];
+            let Some(m) = self.windows.iter().find(|m| m.window == w && !m.minimized) else {
+                return false;
+            };
+            let Some(cw) = self.comps.get(&w).filter(|c| c.has_pixels) else {
+                return false;
+            };
+            let (rect, is_max) = self.window_rect_for(m);
+            let bounds = if cw.anim.is_some() {
+                rect.expand(24)
+            } else {
+                window_damage_bounds(rect, is_vortex, is_max)
+            };
+            !bounds.intersect(ex).is_empty()
+        });
+
+        if !has_lower_overlap {
+            dst.with_clip(clip, |d| {
+                d.copy_rect_from(
+                    &self.comp.desktop_blur_cache,
+                    self.desktop_canvas.width,
+                    clip,
+                );
+            });
+            return;
+        }
+
+        let Some(mut ft) = self.comp.frost_tmp.take() else {
+            return;
+        };
+        let sub_occ = self.find_occluding_window_idx(ex, end);
+        if sub_occ.is_none() {
+            ft.with_clip(ex, |f| {
+                f.copy_rect_from(self.desktop_canvas.pixels(), self.desktop_canvas.width, ex);
+            });
+        }
+        self.composite_windows_range(&mut ft, ex, sub_occ.unwrap_or(0), end, now, false);
+        ft.with_clip(ex, |f| {
+            f.blur_rect(ex, AERO_BLUR_RADIUS, &mut self.comp.blur_scratch);
+        });
+        dst.with_clip(clip, |d| {
+            d.copy_rect_from(ft.pixels(), ft.width, clip);
+        });
+        self.comp.frost_tmp = Some(ft);
+    }
+
+    fn composite_windows_range(
+        &mut self,
+        dst: &mut Canvas,
+        dirty_area: Rect,
+        start_idx: usize,
+        end_idx: usize,
+        now: Instant,
+        frost: bool,
+    ) {
+        let peek_factor = self.comp.peek_factor;
+        let peek_target = self
+            .comp
+            .thumb
+            .as_ref()
+            .filter(|t| t.pointer_inside)
+            .map(|t| t.target_window);
+        let is_vortex = self.theme.is_vortexglass();
+        let end = end_idx.min(self.z_stack.len());
+
+        for idx in start_idx..end {
+            let w = self.z_stack[idx];
+            let Some((base_rect, is_max)) = self
+                .windows
+                .iter()
+                .find(|m| m.window == w && !m.minimized)
+                .map(|m| self.window_rect_for(m))
+            else {
+                continue;
+            };
+            let (anim_kind, cw_pw, cw_ph, cw_depth, cw_glass_ext) = {
+                let Some(cw) = self.comps.get(&w).filter(|c| c.has_pixels) else {
+                    continue;
+                };
+                (cw.anim, cw.pw, cw.ph, cw.depth, cw.glass_extents)
+            };
+            let (draw_rect, opacity, is_anim) = match anim_kind {
+                Some(a) => {
+                    let t = smootherstep(a.progress(now));
+                    match a.kind {
+                        AnimKind::Open => {
+                            let scale = 0.90 + 0.10 * t;
+                            let dy = ((1.0 - t) * 14.0).round() as i32;
+                            let op = (t * 255.0).round().clamp(0.0, 255.0) as u8;
+                            (scaled_rect_around_center(base_rect, scale, dy), op, true)
+                        }
+                        AnimKind::Restore { taskbar_btn } => {
+                            let op = (70.0 + 185.0 * t).round().clamp(0.0, 255.0) as u8;
+                            (lerp_rect(taskbar_btn, base_rect, t), op, true)
+                        }
+                    }
+                }
+                None => (base_rect, 255, false),
+            };
+
+            let cull_bounds = if is_anim {
+                draw_rect.expand(16)
+            } else {
+                window_damage_bounds(draw_rect, is_vortex, is_max)
+            };
+            if cull_bounds.intersect(dirty_area).is_empty() {
+                continue;
+            }
+
+            let peeking_out = frost && peek_factor > 0.01 && peek_target != Some(w);
+            if peeking_out {
+                dst.with_clip(dirty_area, |d| {
+                    draw_aero_peek_sheet(d, draw_rect, self.theme.accent, peek_factor);
+                });
+                if peek_factor >= 0.96 {
+                    continue;
+                }
+            }
+            let eff_op = if peeking_out {
+                ((opacity as f32) * (1.0 - peek_factor))
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            } else {
+                opacity
+            };
+            if eff_op == 0 {
+                continue;
+            }
+
+            let active = self.active == Some(w);
+            let glass_top = if is_vortex && cw_depth == 32 {
+                cw_glass_ext
+                    .map(|e| e[0])
+                    .unwrap_or(VORTEX_TITLEBAR_HEIGHT)
+                    .clamp(1, draw_rect.h)
+            } else {
+                0
+            };
+
+            if is_vortex && !is_anim && cw_depth == 32 && eff_op == 255 {
+                let scr_w = i32::from(self.x.width);
+                let glass_x = if is_max { 0 } else { draw_rect.x - 4 };
+                let glass_w = if is_max { scr_w } else { draw_rect.w + 8 };
+                if frost {
+                    if glass_top > 1 {
+                        self.frost_glass_strip(
+                            dst,
+                            idx,
+                            Rect::new(glass_x, draw_rect.y + 1, glass_w, glass_top - 1),
+                            dirty_area,
+                            now,
+                        );
+                    }
+                    if !is_max {
+                        let client_y = draw_rect.y + glass_top;
+                        let client_h = (draw_rect.h - glass_top).max(0);
+                        if client_h > 0 {
+                            self.frost_glass_strip(
+                                dst,
+                                idx,
+                                Rect::new(draw_rect.x - 4, client_y, 3, client_h),
+                                dirty_area,
+                                now,
+                            );
+                            self.frost_glass_strip(
+                                dst,
+                                idx,
+                                Rect::new(draw_rect.right() + 1, client_y, 3, client_h),
+                                dirty_area,
+                                now,
+                            );
+                        }
+                        self.frost_glass_strip(
+                            dst,
+                            idx,
+                            Rect::new(glass_x, draw_rect.bottom(), glass_w, 4),
+                            dirty_area,
+                            now,
+                        );
+                    }
+                }
+                dst.with_clip(dirty_area, |d| {
+                    draw_vortex_frame_chrome(d, draw_rect, glass_top, &self.theme, active, is_max);
+                });
+            } else if !is_anim && !is_max && eff_op > 128 {
+                dst.with_clip(dirty_area, |d| {
+                    d.rounded_drop_shadow(
+                        draw_rect,
+                        self.theme.radius_window(),
+                        if active { 10 } else { 6 },
+                        2,
+                        if active { 0.28 } else { 0.15 },
+                    );
+                });
+            }
+
+            if let Some(cw) = self.comps.get(&w) {
+                dst.with_clip(dirty_area, |d| {
+                    if is_anim || draw_rect.w != cw_pw as i32 || draw_rect.h != cw_ph as i32 {
+                        blit_scaled_window(d, &cw.pixels, cw_pw, cw_ph, draw_rect, eff_op);
+                    } else {
+                        blit_window_pixels(
+                            d,
+                            &cw.pixels,
+                            cw_pw,
+                            cw_ph,
+                            draw_rect.x,
+                            draw_rect.y,
+                            eff_op,
+                            0,
+                            cw_depth == 32,
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    fn composite_ghosts(&self, dst: &mut Canvas, now: Instant) {
+        for ghost in &self.comp.ghosts {
+            let t = smootherstep(ghost.progress(now));
+            if let Some(tb) = ghost.to_taskbar {
+                let target = lerp_rect(ghost.from, tb, t);
+                let op = ((1.0 - t * 0.78) * 255.0).round().clamp(0.0, 255.0) as u8;
+                blit_scaled_window(dst, &ghost.pixels, ghost.pw, ghost.ph, target, op);
+            } else {
+                let scale = 1.0 - 0.10 * t;
+                let dy = (t * 12.0).round() as i32;
+                let target = scaled_rect_around_center(ghost.from, scale, dy);
+                let op = ((1.0 - t) * 255.0).round().clamp(0.0, 255.0) as u8;
+                blit_scaled_window(dst, &ghost.pixels, ghost.pw, ghost.ph, target, op);
+            }
+        }
+    }
+
+    fn composite_snap_preview(&self, dst: &mut Canvas) {
+        let a = self.comp.snap_alpha;
+        if a <= 0.01 {
+            return;
+        }
+        let Some(sr) = self.comp.snap_rect else {
+            return;
+        };
+        dst.rounded_rect(sr, 6, self.theme.accent, 0.22 * a);
+        dst.rounded_border(sr, 6, 0xffffff, 0.86 * a, 2);
+        if sr.w > 8 && sr.h > 8 {
+            dst.rounded_border(sr.inset(2), 4, self.theme.accent, 0.65 * a, 1);
+        }
+    }
+
+    fn composite_taskbar(&mut self, dst: &mut Canvas, dirty_area: Rect, now: Instant) {
+        let tb = Rect::new(
+            0,
+            self.taskbar_y(),
+            i32::from(self.x.width),
+            self.panel_height(),
+        );
+        if tb.intersect(dirty_area).is_empty() {
+            return;
+        }
+        if self.theme.is_vortexglass() {
+            if self.comp.flip3d.is_some() {
+                dst.with_clip(dirty_area, |d| {
+                    paint_shell_glass_region(
+                        d,
+                        tb,
+                        &self.theme,
+                        &mut self.comp.blur_scratch,
+                        130,
+                    );
+                });
+            } else {
+                self.frost_glass_strip(dst, self.z_stack.len(), tb, dirty_area, now);
+                dst.with_clip(dirty_area.intersect(tb), |d| {
+                    crate::compositor::finish_shell_glass_overlay(d, tb, &self.theme, 130);
+                });
+            }
+        }
+        dst.with_clip(dirty_area, |d| {
+            composite_shell_layer(
+                d,
+                &self.taskbar_canvas,
+                0,
+                tb.y,
+                255,
+                self.taskbar_canvas.is_argb(),
+            );
+        });
+    }
+
+    fn composite_popups(&mut self, dst: &mut Canvas, dirty_area: Rect) {
+        let panel_top = self.config.panel_position == PanelPosition::Top;
+        let is_vortex = self.theme.is_vortexglass();
+
+        if let Some(thumb) = self.comp.thumb.take() {
+            if !thumb.rect.expand(18).intersect(dirty_area).is_empty() {
+                if let Some(m) = self
+                    .windows
+                    .iter()
+                    .find(|w| w.window == thumb.target_window)
+                {
+                    let cw = self.comps.get(&m.window).filter(|c| c.has_pixels);
+                    dst.with_clip(dirty_area, |d| {
+                        draw_thumb_preview(
+                            d,
+                            &mut self.text,
+                            &self.theme,
+                            &mut self.comp.blur_scratch,
+                            &thumb,
+                            &m.title,
+                            m.icon,
+                            cw.map(|c| c.pixels.as_slice()),
+                            cw.map_or(0, |c| c.pw),
+                            cw.map_or(0, |c| c.ph),
+                        );
+                    });
+                }
+            }
+            self.comp.thumb = Some(thumb);
+        }
+
+        if self.comp.menu_anim > 0.01 {
+            let t = smootherstep(self.comp.menu_anim);
+            let fullscreen = self.config.panel_start_fullscreen;
+            let (mx, base_y) = if fullscreen {
+                (0, 0)
+            } else {
+                (6, self.menu_y())
+            };
+            let slide = if fullscreen {
+                0
+            } else {
+                ((1.0 - t) * if panel_top { -12.0 } else { 12.0 }).round() as i32
+            };
+            let mr = Rect::new(
+                mx,
+                base_y + slide,
+                self.menu_canvas.width as i32,
+                self.menu_canvas.height as i32,
+            );
+            if fullscreen || !mr.expand(18).intersect(dirty_area).is_empty() {
+                dst.with_clip(dirty_area, |d| {
+                    if is_vortex && !fullscreen {
+                        d.rounded_drop_shadow(mr, self.theme.radius_popup(), 12, 3, 0.36 * t);
+                        paint_shell_glass_region(
+                            d,
+                            mr,
+                            &self.theme,
+                            &mut self.comp.blur_scratch,
+                            110,
+                        );
+                    }
+                    composite_shell_layer(
+                        d,
+                        &self.menu_canvas,
+                        mr.x,
+                        mr.y,
+                        (t * 255.0).round().clamp(0.0, 255.0) as u8,
+                        self.menu_canvas.is_argb(),
+                    );
+                });
+            }
+        }
+
+        if self.comp.vol_anim > 0.01 {
+            let t = smootherstep(self.comp.vol_anim);
+            let (vx, vy) = self.vol_popup_pos();
+            let slide = ((1.0 - t) * if panel_top { -10.0 } else { 10.0 }).round() as i32;
+            let vr = Rect::new(
+                i32::from(vx),
+                i32::from(vy) + slide,
+                VOL_POPUP_WIDTH,
+                VOL_POPUP_HEIGHT,
+            );
+            if !vr.expand(16).intersect(dirty_area).is_empty() {
+                dst.with_clip(dirty_area, |d| {
+                    if is_vortex {
+                        d.rounded_drop_shadow(vr, self.theme.radius_popup(), 10, 3, 0.34 * t);
+                        paint_shell_glass_region(
+                            d,
+                            vr,
+                            &self.theme,
+                            &mut self.comp.blur_scratch,
+                            95,
+                        );
+                    }
+                    composite_shell_layer(
+                        d,
+                        &self.vol_canvas,
+                        vr.x,
+                        vr.y,
+                        (t * 255.0).round().clamp(0.0, 255.0) as u8,
+                        self.vol_canvas.is_argb(),
+                    );
+                });
+            }
+        }
+
+        if self.comp.ctx_anim > 0.01 {
+            let t = smootherstep(self.comp.ctx_anim);
+            let (cx, cy) = self.ctx_pos;
+            let slide = ((1.0 - t) * 6.0).round() as i32;
+            let cr = Rect::new(i32::from(cx), i32::from(cy) + slide, CTX_WIDTH, CTX_HEIGHT);
+            if !cr.expand(16).intersect(dirty_area).is_empty() {
+                dst.with_clip(dirty_area, |d| {
+                    if is_vortex {
+                        d.rounded_drop_shadow(cr, self.theme.radius_popup(), 10, 3, 0.34 * t);
+                        paint_shell_glass_region(
+                            d,
+                            cr,
+                            &self.theme,
+                            &mut self.comp.blur_scratch,
+                            85,
+                        );
+                    }
+                    composite_shell_layer(
+                        d,
+                        &self.ctx_canvas,
+                        cr.x,
+                        cr.y,
+                        (t * 255.0).round().clamp(0.0, 255.0) as u8,
+                        self.ctx_canvas.is_argb(),
+                    );
+                });
+            }
+        }
+
+        if self.comp.toast_anim > 0.01 {
+            let t = smootherstep(self.comp.toast_anim);
+            let slide_x = ((1.0 - t) * 28.0).round() as i32;
+            let tr = Rect::new(
+                i32::from(self.x.width) - TOAST_WIDTH - 12 + slide_x,
+                self.toast_y(),
+                TOAST_WIDTH,
+                TOAST_HEIGHT,
+            );
+            if !tr.expand(16).intersect(dirty_area).is_empty() {
+                dst.with_clip(dirty_area, |d| {
+                    if is_vortex {
+                        d.rounded_drop_shadow(tr, self.theme.radius_popup(), 10, 3, 0.34 * t);
+                        paint_shell_glass_region(
+                            d,
+                            tr,
+                            &self.theme,
+                            &mut self.comp.blur_scratch,
+                            95,
+                        );
+                    }
+                    composite_shell_layer(
+                        d,
+                        &self.toast_canvas,
+                        tr.x,
+                        tr.y,
+                        (t * 255.0).round().clamp(0.0, 255.0) as u8,
+                        self.toast_canvas.is_argb(),
+                    );
+                });
+            }
+        }
+    }
+
+}
+
+fn build_switcher_entries<'a>(
+    windows: &'a [Managed],
+    comps: &'a HashMap<Window, CompWindow>,
+) -> Vec<SwitcherEntry<'a>> {
+    windows
+        .iter()
+        .map(|m| {
+            let cw = comps.get(&m.window).filter(|c| c.has_pixels);
+            SwitcherEntry {
+                title: &m.title,
+                icon: m.icon,
+                pixels: cw.map(|c| c.pixels.as_slice()),
+                pw: cw.map_or(0, |c| c.pw),
+                ph: cw.map_or(0, |c| c.ph),
+                minimized: m.minimized,
+            }
+        })
+        .collect()
+}
+
+fn draw_vortex_popup_shell(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    full: Rect,
+    r: i32,
+    frosted_inset: bool,
+) {
+    if canvas.is_argb() {
+        canvas.clear_transparent(full, theme.panel);
+        let (tint, ta) = theme.glass_tint(true);
+        canvas.rounded_rect(full, r, tint, (ta as f32 / 255.0).max(0.48));
+        canvas.rounded_border(full, r, 0x0f1a28, 0.72, 1);
+        canvas.rounded_border(full.inset(1), (r - 1).max(1), 0xffffff, 0.56, 1);
+        if frosted_inset && full.w > 12 && full.h > 12 {
+            let inner_bg = if theme.is_dark() { 0x182434 } else { 0xf9fcff };
+            canvas.rounded_rect(full.inset(5), 4, inner_bg, 0.90);
+        }
+    } else {
+        canvas.clear(theme.panel);
+        ui::popup_surface(canvas, theme, full, r);
     }
 }
 
@@ -4169,5 +6473,45 @@ mod tests {
         assert_eq!(transition_popup_grab(None, 42, true), Some(42));
         assert_eq!(transition_popup_grab(Some(42), 99, true), Some(99));
         assert_eq!(transition_popup_grab(Some(42), 99, false), None);
+    }
+
+    #[test]
+    fn vortex_taskbar_and_menu_rects_have_no_overlaps() {
+        for screen_w in [800, 1024, 1280, 1920] {
+            for panel_h in [40, 44, 52] {
+                for show_pinned in [true, false] {
+                    let layout =
+                        TaskbarLayout::compute_styled(screen_w, panel_h, 108, show_pinned, true);
+                    assert!(layout.show_desktop.w >= 12);
+                    assert_eq!(layout.show_desktop.right(), screen_w);
+                    assert!(layout.clock_sep_x < layout.show_desktop.x);
+                    assert!(layout.start.right() < layout.start_sep_x);
+                    let last_win = layout.window_button_rect(panel_h, 4, 3);
+                    assert!(last_win.right() <= layout.net.x);
+                }
+            }
+        }
+
+        let search = vortex_menu_search_rect();
+        for idx in 0..8 {
+            let r = vortex_menu_row_rect(idx);
+            assert!(r.bottom() <= search.y);
+            assert!(r.right() < 274);
+            if idx > 0 {
+                assert!(vortex_menu_row_rect(idx - 1).bottom() <= r.y);
+            }
+        }
+        let (logout, reboot, power_off, confirm_cancel, confirm_ok) = vortex_menu_footer_rects();
+        for idx in 0..VORTEX_PLACES.len() {
+            let p = vortex_menu_place_rect(idx);
+            assert!(p.x >= 274);
+            assert!(p.right() < VORTEX_MENU_WIDTH);
+            assert!(p.bottom() < power_off.y);
+        }
+        assert!(power_off.right() < reboot.x);
+        assert!(reboot.right() < logout.x);
+        assert!(logout.right() <= VORTEX_MENU_WIDTH);
+        assert!(confirm_cancel.right() < confirm_ok.x);
+        assert!(confirm_ok.right() <= VORTEX_MENU_WIDTH);
     }
 }

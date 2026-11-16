@@ -625,6 +625,23 @@ fn draw_performance_tab(
     if theme.is_win98() {
         canvas.fill(spark_r, theme.input_bg);
         ui::sunken_bevel(canvas, theme, spark_r);
+    } else if theme.is_vortexglass() {
+        let (st, sb) = if theme.is_dark() {
+            (0x131d2b, 0x1d2c3f)
+        } else {
+            (0xf2f7fd, 0xffffff)
+        };
+        ui::draw_win7_glossy_box(
+            canvas,
+            spark_r,
+            4,
+            st,
+            st,
+            sb,
+            sb,
+            theme.window_border,
+            if theme.is_dark() { 0.18 } else { 0.85 },
+        );
     } else {
         canvas.rounded_rect(spark_r, 4, theme.window_alt, 1.0);
         canvas.rounded_border(spark_r, 4, theme.window_border, 1.0, 1);
@@ -722,6 +739,23 @@ fn draw_performance_tab(
     if theme.is_win98() {
         canvas.fill(m_spark_r, theme.input_bg);
         ui::sunken_bevel(canvas, theme, m_spark_r);
+    } else if theme.is_vortexglass() {
+        let (st, sb) = if theme.is_dark() {
+            (0x131d2b, 0x1d2c3f)
+        } else {
+            (0xf2f7fd, 0xffffff)
+        };
+        ui::draw_win7_glossy_box(
+            canvas,
+            m_spark_r,
+            4,
+            st,
+            st,
+            sb,
+            sb,
+            theme.window_border,
+            if theme.is_dark() { 0.18 } else { 0.85 },
+        );
     } else {
         canvas.rounded_rect(m_spark_r, 4, theme.window_alt, 1.0);
         canvas.rounded_border(m_spark_r, 4, theme.window_border, 1.0, 1);
@@ -895,12 +929,16 @@ fn draw_processes_tab(
             let is_sel = selected_pid == Some(proc.pid);
             let row_r = Rect::new(rows_clip.x + 2, ry, rows_clip.w - 4, PROC_ROW_H);
             let win98_sel = is_win98 && is_sel;
+            let vortex_sel = theme.is_vortexglass() && is_sel;
 
-            if is_win98 {
+            let name_fg = if is_win98 || theme.is_vortexglass() {
                 if is_sel {
-                    let _ = ui::list_item_bg(c, theme, row_r, true, false);
-                } else if idx % 2 == 1 {
-                    c.fill(row_r, theme.window_alt);
+                    ui::list_item_bg(c, theme, row_r, true, false)
+                } else {
+                    if idx % 2 == 1 {
+                        c.fill(row_r, theme.window_alt);
+                    }
+                    theme.text
                 }
             } else if is_sel {
                 c.rounded_rect(row_r, 4, theme.accent_soft, 1.0);
@@ -908,9 +946,13 @@ fn draw_processes_tab(
                     Rect::new(row_r.x, row_r.y + 4, 3, row_r.h - 8),
                     theme.accent,
                 );
-            } else if idx % 2 == 1 {
-                c.fill(row_r, theme.window_alt);
-            }
+                theme.accent
+            } else {
+                if idx % 2 == 1 {
+                    c.fill(row_r, theme.window_alt);
+                }
+                theme.text
+            };
 
             let baseline = ry as f32 + 20.0;
             let name_shown =
@@ -921,13 +963,7 @@ fn draw_processes_tab(
                 col_name as f32,
                 baseline,
                 12.0,
-                if win98_sel {
-                    theme.selection_text
-                } else if is_sel {
-                    theme.accent
-                } else {
-                    theme.text
-                },
+                if vortex_sel { name_fg } else if win98_sel { theme.selection_text } else if is_sel { theme.accent } else { theme.text },
                 if is_sel { Face::Bold } else { Face::Ui },
             );
 

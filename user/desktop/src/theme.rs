@@ -16,6 +16,7 @@ use crate::draw::mix;
 use uxconf::{DesktopConfig, ThemeMode, ThemeStyle};
 
 pub const TITLEBAR_HEIGHT: i32 = 34;
+pub const VORTEX_TITLEBAR_HEIGHT: i32 = 30;
 #[allow(dead_code)]
 pub const TASKBAR_HEIGHT: i32 = 46;
 #[allow(dead_code)]
@@ -67,6 +68,7 @@ pub struct Theme {
 impl Theme {
     pub fn from_config(config: &DesktopConfig) -> Self {
         let mut theme = match (config.theme_style, config.mode) {
+            (ThemeStyle::VortexGlass, mode) => Self::vortexglass_with_accent(config.accent, mode),
             (ThemeStyle::Win98, mode) => Self::win98_with_accent(config.accent, mode),
             (ThemeStyle::Spui, ThemeMode::Dark) => Self::dark_with_accent(config.accent),
             (ThemeStyle::Spui, ThemeMode::Light) => Self::light_with_accent(config.accent),
@@ -261,6 +263,96 @@ impl Theme {
         }
     }
 
+    /// Windows 7 Aero VortexGlass palette (authentic bright Aero controls in Light
+    /// mode or smoky crystal dark Aero in Dark mode, with accent glass tinting).
+    pub fn vortexglass_with_accent(accent: u32, mode: ThemeMode) -> Self {
+        if mode == ThemeMode::Dark {
+            let base_panel = 0x161d28;
+            let accent_soft = mix(base_panel, accent, 0.30);
+            return Self {
+                style: ThemeStyle::VortexGlass,
+                mode,
+                accent,
+                font_scale: 100,
+                accent_soft,
+                bg_top: 0x0b1726,
+                bg_bottom: 0x152b44,
+                panel: 0x161d28,
+                panel_high: 0x202a38,
+                panel_hover: mix(0x233042, accent, 0.28),
+                panel_border: 0x3b4d63,
+                text: 0xf1f5f9,
+                text_dim: 0xc8d4e3,
+                text_muted: 0x8a9bb0,
+                window: 0x1c222b,
+                window_high: 0x252d39,
+                window_alt: 0x171c24,
+                window_border: 0x3b4859,
+                window_border_active: mix(0x5da9e9, accent, 0.55),
+                titlebar: mix(0x101c2c, accent, 0.40),
+                titlebar_hi: mix(0x294262, accent, 0.50),
+                titlebar_inactive: 0x1e2632,
+                titlebar_inactive_hi: 0x2a3444,
+                titlebar_text: 0xf8fafc,
+                titlebar_inactive_text: 0xaab7c6,
+                input_bg: 0x131820,
+                scrollbar_track: 0x171c24,
+                scrollbar_thumb: 0x3b4b60,
+                bevel_light: 0x526378,
+                bevel_hi: 0x364354,
+                bevel_shadow: 0x11161d,
+                bevel_dark: 0x090c11,
+                selection_bg: mix(0x1e3a5f, accent, 0.45),
+                selection_text: 0xffffff,
+                danger: 0xef4444,
+                warning: 0xf59e0b,
+                success: 0x22c55e,
+            };
+        }
+
+        let base_panel = 0xeaf2fb;
+        let accent_soft = mix(base_panel, accent, 0.24);
+        Self {
+            style: ThemeStyle::VortexGlass,
+            mode: ThemeMode::Light,
+            accent,
+            font_scale: 100,
+            accent_soft,
+            bg_top: 0x18527a,
+            bg_bottom: 0x2b7cb3,
+            panel: 0xeaf2fb,
+            panel_high: 0xf8fbff,
+            panel_hover: 0xd9f0fc,
+            panel_border: 0x8ea8c6,
+            text: 0x0f172a,
+            text_dim: 0x334155,
+            text_muted: 0x64748b,
+            window: 0xf0f0f0,
+            window_high: 0xfbfcfd,
+            window_alt: 0xe6edf5,
+            window_border: 0x70849c,
+            window_border_active: mix(0x4b79a8, accent, 0.50),
+            titlebar: mix(0x2d5e8e, accent, 0.55),
+            titlebar_hi: mix(0x95c8f2, accent, 0.45),
+            titlebar_inactive: 0xcbd8e6,
+            titlebar_inactive_hi: 0xe2eaf2,
+            titlebar_text: 0x0b1220,
+            titlebar_inactive_text: 0x475569,
+            input_bg: 0xffffff,
+            scrollbar_track: 0xeeeeee,
+            scrollbar_thumb: 0xc2d5e8,
+            bevel_light: 0xffffff,
+            bevel_hi: 0xf4f4f4,
+            bevel_shadow: 0x9aa4b2,
+            bevel_dark: 0x707070,
+            selection_bg: 0xd9f0fc,
+            selection_text: 0x0f172a,
+            danger: 0xd93025,
+            warning: 0xd97706,
+            success: 0x18a934,
+        }
+    }
+
     pub const fn is_dark(&self) -> bool {
         matches!(self.mode, ThemeMode::Dark)
     }
@@ -269,9 +361,48 @@ impl Theme {
         matches!(self.style, ThemeStyle::Win98)
     }
 
+    pub const fn is_vortexglass(&self) -> bool {
+        matches!(self.style, ThemeStyle::VortexGlass)
+    }
+
+    /// Accent-tinted Aero glass colorization base & opacity for active/inactive chrome.
+    pub fn glass_tint(&self, active: bool) -> (u32, u8) {
+        if self.is_dark() {
+            if active {
+                (mix(0x101c2d, self.accent, 0.36), 132)
+            } else {
+                (0x18212e, 102)
+            }
+        } else if active {
+            (mix(0xd8ecff, self.accent, 0.35), 54)
+        } else {
+            (mix(0xe8eff8, self.accent, 0.16), 34)
+        }
+    }
+
+    /// Classic Windows 7 hover cyan-blue glow border color for controls.
+    pub fn aero_hover_border(&self) -> u32 {
+        if self.is_dark() {
+            mix(0x4da6e8, self.accent, 0.35)
+        } else {
+            0x3c7fb1
+        }
+    }
+
+    /// Classic Windows 7 pressed border color for controls.
+    pub fn aero_press_border(&self) -> u32 {
+        if self.is_dark() {
+            mix(0x3a84bd, self.accent, 0.45)
+        } else {
+            0x2c628b
+        }
+    }
+
     pub const fn titlebar_height(&self) -> i32 {
         if self.is_win98() {
             26
+        } else if self.is_vortexglass() {
+            VORTEX_TITLEBAR_HEIGHT
         } else {
             TITLEBAR_HEIGHT
         }
@@ -280,6 +411,8 @@ impl Theme {
     pub const fn window_border_width(&self) -> i32 {
         if self.is_win98() {
             3
+        } else if self.is_vortexglass() {
+            0
         } else {
             1
         }
@@ -288,6 +421,8 @@ impl Theme {
     pub fn panel_height(&self, config: &DesktopConfig) -> i32 {
         if self.is_win98() {
             (config.panel_size - 12).clamp(28, 44)
+        } else if self.is_vortexglass() {
+            config.panel_size.clamp(38, 56)
         } else {
             config.panel_size.clamp(34, 60)
         }
@@ -305,6 +440,8 @@ impl Theme {
     pub const fn radius_popup(&self) -> i32 {
         if self.is_win98() {
             0
+        } else if self.is_vortexglass() {
+            4
         } else {
             RADIUS_POPUP
         }
@@ -313,6 +450,8 @@ impl Theme {
     pub const fn radius_control(&self) -> i32 {
         if self.is_win98() {
             0
+        } else if self.is_vortexglass() {
+            3
         } else {
             RADIUS_CONTROL
         }
@@ -321,6 +460,8 @@ impl Theme {
     pub const fn radius_card(&self) -> i32 {
         if self.is_win98() {
             0
+        } else if self.is_vortexglass() {
+            4
         } else {
             6
         }
@@ -335,8 +476,18 @@ mod tests {
     #[test]
     fn theme_from_config_adapts_spui_and_win98() {
         let mut cfg = DesktopConfig::default();
+        let vg = Theme::from_config(&cfg);
+        assert!(vg.is_vortexglass());
+        assert!(!vg.is_win98());
+        assert_eq!(vg.titlebar_height(), VORTEX_TITLEBAR_HEIGHT);
+        assert_eq!(vg.window_border_width(), 0);
+        assert_eq!(vg.radius_control(), 3);
+        assert_eq!(vg.panel_height(&cfg), 44);
+
+        cfg.apply_theme_preset(ThemePreset::Spui4);
         let spui = Theme::from_config(&cfg);
         assert!(!spui.is_win98());
+        assert!(!spui.is_vortexglass());
         assert_eq!(spui.titlebar_height(), 34);
         assert_eq!(spui.radius_window(), RADIUS_WINDOW);
         assert_eq!(spui.panel_height(&cfg), 46);
@@ -356,6 +507,10 @@ mod tests {
 
     #[test]
     fn theme_preset_from_style_and_readonly_config_load() {
+        assert_eq!(
+            ThemePreset::from_style(ThemeStyle::VortexGlass),
+            ThemePreset::VortexGlass
+        );
         assert_eq!(ThemePreset::from_style(ThemeStyle::Spui), ThemePreset::Spui4);
         assert_eq!(ThemePreset::from_style(ThemeStyle::Win98), ThemePreset::Win98);
 

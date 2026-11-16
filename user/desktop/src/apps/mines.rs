@@ -30,6 +30,7 @@ use crate::icons::Icon;
 use crate::sound::{play as play_sound, SystemSound};
 use crate::text::{Face, TextRenderer};
 use crate::theme::Theme;
+use crate::ui;
 use crate::x11::{CursorKind, Result};
 use std::collections::{BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -2300,16 +2301,18 @@ fn draw_mines(
     smiley: SmileyFace,
     smiley_pressed: bool,
 ) {
-    // Classic Win98/XP outer client fill bounded cleanly inside window content rect
+    // Classic Win98/XP outer client fill, or Aero glass-toned surface in VortexGlass
+    let is_vortex = theme.is_vortexglass();
     canvas.fill(
         content_rect(theme, canvas.width as i32, canvas.height as i32),
-        XP_FACE,
+        if is_vortex { theme.window } else { XP_FACE },
     );
 
     // Menu & AI toolbar strips
     draw_toolbar_strip(
         canvas,
         text,
+        theme,
         board,
         layout,
         diff,
@@ -2319,19 +2322,50 @@ fn draw_mines(
         hover,
     );
     if let Some(cb) = layout.custom_bar {
-        draw_custom_bar(canvas, text, cb, &layout.custom_btns, custom_draft, hover);
+        draw_custom_bar(
+            canvas,
+            text,
+            theme,
+            cb,
+            &layout.custom_btns,
+            custom_draft,
+            hover,
+        );
     }
 
-    // Classic XP 3D #C0C0C0 chassis
-    draw_raised_bevel(canvas, layout.chassis, 3);
-    draw_sunken_bevel(canvas, layout.led_header, 2);
+    // Chassis / LED header
+    if is_vortex {
+        let (ht, hb) = if theme.is_dark() {
+            (0x212f42, 0x16202e)
+        } else {
+            (0xf2f7fd, 0xd8e5f4)
+        };
+        ui::draw_win7_glossy_box(
+            canvas,
+            layout.led_header,
+            5,
+            ht,
+            ht,
+            hb,
+            hb,
+            theme.window_border,
+            if theme.is_dark() { 0.22 } else { 0.85 },
+        );
+    } else {
+        draw_raised_bevel(canvas, layout.chassis, 3);
+        draw_sunken_bevel(canvas, layout.led_header, 2);
+    }
 
     draw_seven_seg(canvas, layout.mine_led, board.remaining_mines_display());
     draw_seven_seg(canvas, layout.timer_led, board.elapsed_seconds() as i32);
-    draw_smiley_button(canvas, layout.smiley, smiley, smiley_pressed);
+    draw_smiley_button(canvas, theme, layout.smiley, smiley, smiley_pressed);
 
     // Recessed board frame & cells
-    draw_sunken_bevel(canvas, layout.board_outer, 3);
+    if is_vortex {
+        canvas.rounded_border(layout.board_outer, 4, theme.window_border, 1.0, 2);
+    } else {
+        draw_sunken_bevel(canvas, layout.board_outer, 3);
+    }
     let (gx, gy) = layout.grid_origin;
     let cs = layout.cell_size;
     let rec_cell = ai.best_move.as_ref().map(|m| m.cell);
@@ -2344,6 +2378,7 @@ fn draw_mines(
             draw_cell(
                 canvas,
                 text,
+                theme,
                 board,
                 ai,
                 idx,
@@ -2356,8 +2391,15 @@ fn draw_mines(
         }
     }
 
-    // Recessed XP status bar at bottom
-    canvas.fill(layout.status_bar, XP_STATUS_BG);
+    // Recessed status bar at bottom
+    canvas.fill(
+        layout.status_bar,
+        if is_vortex {
+            theme.panel
+        } else {
+            XP_STATUS_BG
+        },
+    );
     canvas.fill(
         Rect::new(
             layout.status_bar.x,
@@ -2365,7 +2407,11 @@ fn draw_mines(
             layout.status_bar.w,
             1,
         ),
-        XP_SHADOW,
+        if is_vortex {
+            theme.window_border
+        } else {
+            XP_SHADOW
+        },
     );
     let status_text = if let Some(hc) = hover_cell {
         let (hx, hy) = board.coords(hc);
@@ -2401,7 +2447,7 @@ fn draw_mines(
         layout.status_bar.x as f32 + 8.0,
         layout.status_bar.y as f32 + 17.0,
         11.5,
-        XP_BLACK,
+        if is_vortex { theme.text } else { XP_BLACK },
         Face::Ui,
     );
 }
@@ -2410,6 +2456,7 @@ fn draw_mines(
 fn draw_toolbar_strip(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
+    theme: &Theme,
     board: &MinesBoard,
     layout: &MinesLayout,
     diff: Difficulty,
@@ -2418,20 +2465,31 @@ fn draw_toolbar_strip(
     show_custom: bool,
     hover: Option<UiHit>,
 ) {
-    canvas.fill(layout.menu_bar, XP_TOOLBAR_BG);
-    canvas.fill(layout.ai_bar, XP_TOOLBAR_BG);
+    let strip_bg = if theme.is_vortexglass() {
+        theme.panel
+    } else {
+        XP_TOOLBAR_BG
+    };
+    let strip_sep = if theme.is_vortexglass() {
+        theme.window_border
+    } else {
+        XP_SHADOW
+    };
+    canvas.fill(layout.menu_bar, strip_bg);
+    canvas.fill(layout.ai_bar, strip_bg);
     canvas.fill(
         Rect::new(0, layout.menu_bar.bottom() - 1, layout.menu_bar.w, 1),
-        XP_SHADOW,
+        strip_sep,
     );
     canvas.fill(
         Rect::new(0, layout.ai_bar.bottom() - 1, layout.ai_bar.w, 1),
-        XP_SHADOW,
+        strip_sep,
     );
 
     draw_xp_tab(
         canvas,
         text,
+        theme,
         layout.btn_beg,
         "初级",
         diff == Difficulty::Beginner,
@@ -2440,6 +2498,7 @@ fn draw_toolbar_strip(
     draw_xp_tab(
         canvas,
         text,
+        theme,
         layout.btn_int,
         "中级",
         diff == Difficulty::Intermediate,
@@ -2448,6 +2507,7 @@ fn draw_toolbar_strip(
     draw_xp_tab(
         canvas,
         text,
+        theme,
         layout.btn_exp,
         "高级",
         diff == Difficulty::Expert,
@@ -2456,6 +2516,7 @@ fn draw_toolbar_strip(
     draw_xp_tab(
         canvas,
         text,
+        theme,
         layout.btn_cust,
         "自定义",
         matches!(diff, Difficulty::Custom(..)) || show_custom,
@@ -2464,6 +2525,7 @@ fn draw_toolbar_strip(
     draw_xp_tab(
         canvas,
         text,
+        theme,
         layout.btn_zeroguess,
         if board.zero_guess_mode {
             "✓ 无猜模式"
@@ -2477,6 +2539,7 @@ fn draw_toolbar_strip(
     draw_xp_tab(
         canvas,
         text,
+        theme,
         layout.btn_heatmap,
         if show_heatmap {
             "概率热图: 开"
@@ -2489,6 +2552,7 @@ fn draw_toolbar_strip(
     draw_xp_tab(
         canvas,
         text,
+        theme,
         layout.btn_step,
         "AI 走一步(H)",
         false,
@@ -2497,6 +2561,7 @@ fn draw_toolbar_strip(
     draw_xp_tab(
         canvas,
         text,
+        theme,
         layout.btn_auto,
         if auto_play {
             "■ 停止托管"
@@ -2511,19 +2576,36 @@ fn draw_toolbar_strip(
 fn draw_custom_bar(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
+    theme: &Theme,
     bar: Rect,
     btns: &[Rect; 7],
     draft: (usize, usize, usize),
     hover: Option<UiHit>,
 ) {
-    canvas.fill(bar, XP_TOOLBAR_BG);
-    canvas.fill(Rect::new(bar.x, bar.bottom() - 1, bar.w, 1), XP_SHADOW);
+    let strip_bg = if theme.is_vortexglass() {
+        theme.panel
+    } else {
+        XP_TOOLBAR_BG
+    };
+    let strip_sep = if theme.is_vortexglass() {
+        theme.window_border
+    } else {
+        XP_SHADOW
+    };
+    let fg = if theme.is_vortexglass() {
+        theme.text
+    } else {
+        XP_BLACK
+    };
+    canvas.fill(bar, strip_bg);
+    canvas.fill(Rect::new(bar.x, bar.bottom() - 1, bar.w, 1), strip_sep);
     let y_base = bar.y as f32 + 21.0;
 
-    text.draw(canvas, "宽", (bar.x + 10) as f32, y_base, 11.5, XP_BLACK, Face::Ui);
+    text.draw(canvas, "宽", (bar.x + 10) as f32, y_base, 11.5, fg, Face::Ui);
     draw_xp_tab(
         canvas,
         text,
+        theme,
         btns[0],
         "-",
         false,
@@ -2535,12 +2617,13 @@ fn draw_custom_bar(
         (btns[0].right() + btns[1].x) as f32 * 0.5,
         y_base,
         11.5,
-        XP_BLACK,
+        fg,
         Face::Mono,
     );
     draw_xp_tab(
         canvas,
         text,
+        theme,
         btns[1],
         "+",
         false,
@@ -2553,12 +2636,13 @@ fn draw_custom_bar(
         (btns[1].right() + 8) as f32,
         y_base,
         11.5,
-        XP_BLACK,
+        fg,
         Face::Ui,
     );
     draw_xp_tab(
         canvas,
         text,
+        theme,
         btns[2],
         "-",
         false,
@@ -2570,12 +2654,13 @@ fn draw_custom_bar(
         (btns[2].right() + btns[3].x) as f32 * 0.5,
         y_base,
         11.5,
-        XP_BLACK,
+        fg,
         Face::Mono,
     );
     draw_xp_tab(
         canvas,
         text,
+        theme,
         btns[3],
         "+",
         false,
@@ -2588,12 +2673,13 @@ fn draw_custom_bar(
         (btns[3].right() + 8) as f32,
         y_base,
         11.5,
-        XP_BLACK,
+        fg,
         Face::Ui,
     );
     draw_xp_tab(
         canvas,
         text,
+        theme,
         btns[4],
         "-",
         false,
@@ -2605,12 +2691,13 @@ fn draw_custom_bar(
         (btns[4].right() + btns[5].x) as f32 * 0.5,
         y_base,
         11.5,
-        XP_BLACK,
+        fg,
         Face::Mono,
     );
     draw_xp_tab(
         canvas,
         text,
+        theme,
         btns[5],
         "+",
         false,
@@ -2620,6 +2707,7 @@ fn draw_custom_bar(
     draw_xp_tab(
         canvas,
         text,
+        theme,
         btns[6],
         "应用",
         true,
@@ -2630,11 +2718,35 @@ fn draw_custom_bar(
 fn draw_xp_tab(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
+    theme: &Theme,
     rect: Rect,
     label: &str,
     active: bool,
     hovered: bool,
 ) {
+    if theme.is_vortexglass() {
+        ui::draw_aero_surface(
+            canvas,
+            theme,
+            rect,
+            4,
+            active,
+            !active,
+            if hovered { 1.0 } else { 0.0 },
+            false,
+        );
+        let fg = if active { 0xffffff } else { theme.text };
+        text.draw_centered(
+            canvas,
+            label,
+            rect.x as f32 + rect.w as f32 * 0.5,
+            rect.y as f32 + rect.h as f32 * 0.5 + 4.0,
+            11.0,
+            fg,
+            if active { Face::Bold } else { Face::Ui },
+        );
+        return;
+    }
     if active {
         canvas.fill(rect, XP_TOOLBAR_ACTIVE);
         canvas.border_1px(rect, XP_DARK);
@@ -2689,9 +2801,11 @@ fn draw_sunken_bevel(canvas: &mut Canvas, rect: Rect, thickness: i32) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn draw_cell(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
+    theme: &Theme,
     board: &MinesBoard,
     ai: &AiSnapshot,
     idx: usize,
@@ -2703,25 +2817,37 @@ fn draw_cell(
 ) {
     let cs = r.w;
     let lost = board.status == GameStatus::Lost;
+    let is_vortex = theme.is_vortexglass();
+    let dark = theme.is_dark();
+    let revealed_face = if is_vortex {
+        if dark { 0x1a2636 } else { 0xeef4fb }
+    } else {
+        XP_FACE
+    };
+    let revealed_edge = if is_vortex {
+        if dark { 0x304258 } else { 0xc3d3e5 }
+    } else {
+        XP_SHADOW
+    };
 
     // On Loss: reveal unflagged mines and highlight wrongly flagged cells.
     if lost && board.mines[idx] && board.marks[idx] != MarkState::Flagged {
         let bg = if board.exploded_cell == Some(idx) {
             XP_RED
         } else {
-            XP_FACE
+            revealed_face
         };
         canvas.fill(r, bg);
-        canvas.fill(Rect::new(r.x, r.y, cs, 1), XP_SHADOW);
-        canvas.fill(Rect::new(r.x, r.y, 1, cs), XP_SHADOW);
+        canvas.fill(Rect::new(r.x, r.y, cs, 1), revealed_edge);
+        canvas.fill(Rect::new(r.x, r.y, 1, cs), revealed_edge);
         draw_mine_sprite(canvas, r);
         return;
     }
 
     if lost && !board.mines[idx] && board.marks[idx] == MarkState::Flagged {
-        canvas.fill(r, XP_FACE);
-        canvas.fill(Rect::new(r.x, r.y, cs, 1), XP_SHADOW);
-        canvas.fill(Rect::new(r.x, r.y, 1, cs), XP_SHADOW);
+        canvas.fill(r, revealed_face);
+        canvas.fill(Rect::new(r.x, r.y, cs, 1), revealed_edge);
+        canvas.fill(Rect::new(r.x, r.y, 1, cs), revealed_edge);
         draw_mine_sprite(canvas, r);
         // Red X over wrong flag
         canvas.line(r.x + 3, r.y + 3, r.right() - 4, r.bottom() - 4, XP_RED, 1.0);
@@ -2733,9 +2859,9 @@ fn draw_cell(
 
     match board.marks[idx] {
         MarkState::Revealed => {
-            canvas.fill(r, XP_FACE);
-            canvas.fill(Rect::new(r.x, r.y, cs, 1), XP_SHADOW);
-            canvas.fill(Rect::new(r.x, r.y, 1, cs), XP_SHADOW);
+            canvas.fill(r, revealed_face);
+            canvas.fill(Rect::new(r.x, r.y, cs, 1), revealed_edge);
+            canvas.fill(Rect::new(r.x, r.y, 1, cs), revealed_edge);
             if board.mines[idx] {
                 canvas.fill(r, XP_RED);
                 draw_mine_sprite(canvas, r);
@@ -2744,13 +2870,18 @@ fn draw_cell(
                 if n > 0 {
                     let s = n.to_string();
                     let px = (cs as f32 * 0.68).clamp(11.0, 20.0);
+                    let fg = if is_vortex && dark {
+                        crate::draw::mix(NUMBER_COLORS[n], 0xffffff, 0.35)
+                    } else {
+                        NUMBER_COLORS[n]
+                    };
                     text.draw_centered(
                         canvas,
                         &s,
                         r.x as f32 + cs as f32 * 0.5,
                         r.y as f32 + cs as f32 * 0.76,
                         px,
-                        NUMBER_COLORS[n],
+                        fg,
                         Face::Bold,
                     );
                 }
@@ -2758,9 +2889,36 @@ fn draw_cell(
         }
         MarkState::Hidden | MarkState::Question => {
             if is_pressed {
-                canvas.fill(r, XP_FACE);
-                canvas.fill(Rect::new(r.x, r.y, cs, 1), XP_SHADOW);
-                canvas.fill(Rect::new(r.x, r.y, 1, cs), XP_SHADOW);
+                canvas.fill(r, revealed_face);
+                canvas.fill(Rect::new(r.x, r.y, cs, 1), revealed_edge);
+                canvas.fill(Rect::new(r.x, r.y, 1, cs), revealed_edge);
+            } else if is_vortex {
+                ui::draw_aero_surface(
+                    canvas,
+                    theme,
+                    r,
+                    2,
+                    true,
+                    false,
+                    if is_hover { 1.0 } else { 0.0 },
+                    false,
+                );
+                if show_heatmap {
+                    if let Some(p) = ai.probs[idx] {
+                        let (tint, alpha) = if p < 1e-6 {
+                            (0x22c55e, 0.42)
+                        } else if p > 1.0 - 1e-6 {
+                            (0xef4444, 0.46)
+                        } else if p < 0.25 {
+                            (0x38bdf8, 0.26)
+                        } else if p < 0.50 {
+                            (0xf59e0b, 0.32)
+                        } else {
+                            (0xef4444, 0.36)
+                        };
+                        canvas.fill_alpha(r.inset(1), tint, alpha);
+                    }
+                }
             } else {
                 canvas.fill(r, XP_FACE);
                 if show_heatmap {
@@ -2796,7 +2954,7 @@ fn draw_cell(
                     r.x as f32 + cs as f32 * 0.5,
                     r.y as f32 + cs as f32 * 0.74,
                     px,
-                    XP_BLACK,
+                    if is_vortex { 0xffffff } else { XP_BLACK },
                     Face::Bold,
                 );
             } else if show_heatmap {
@@ -2829,11 +2987,15 @@ fn draw_cell(
             }
         }
         MarkState::Flagged => {
-            canvas.fill(r, XP_FACE);
+            if is_vortex {
+                ui::draw_aero_surface(canvas, theme, r, 2, true, false, 0.15, false);
+            } else {
+                canvas.fill(r, XP_FACE);
+                draw_raised_bevel(canvas, r, 2);
+            }
             if show_heatmap && is_best {
                 canvas.fill_alpha(r, 0xef4444, 0.25);
             }
-            draw_raised_bevel(canvas, r, 2);
             draw_flag_sprite(canvas, r);
         }
     }
@@ -2938,12 +3100,22 @@ fn draw_7seg_digit(canvas: &mut Canvas, x: i32, y: i32, w: i32, h: i32, digit: u
     }
 }
 
-fn draw_smiley_button(canvas: &mut Canvas, rect: Rect, face: SmileyFace, pressed: bool) {
-    canvas.fill(rect, XP_FACE);
-    if pressed {
-        draw_sunken_bevel(canvas, rect, 2);
+fn draw_smiley_button(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    face: SmileyFace,
+    pressed: bool,
+) {
+    if theme.is_vortexglass() {
+        ui::draw_aero_surface(canvas, theme, rect, 5, false, true, 0.25, pressed);
     } else {
-        draw_raised_bevel(canvas, rect, 2);
+        canvas.fill(rect, XP_FACE);
+        if pressed {
+            draw_sunken_bevel(canvas, rect, 2);
+        } else {
+            draw_raised_bevel(canvas, rect, 2);
+        }
     }
     let off = if pressed { 1 } else { 0 };
     let cx = rect.x as f32 + rect.w as f32 * 0.5 + off as f32;

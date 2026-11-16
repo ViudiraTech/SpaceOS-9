@@ -24,7 +24,7 @@ path = "src/main.rs"
 [dependencies]
 spui_ui = { path = "../spui_ui" }
 uxconf = { package = "spui", path = "../desktop" }
-x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "render", "shape", "randr"] }
+x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "render", "shape", "randr", "composite", "damage", "xfixes"] }
 png = "0.17"
 zune-jpeg = "0.4"
 resvg = { version = "0.45", default-features = false }

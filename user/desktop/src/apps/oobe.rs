@@ -690,6 +690,34 @@ impl Oobe {
                 Rect::new(sep_x + 1, tb.bottom() + 6, 1, layout.card.h - 36),
                 theme.bevel_light,
             );
+        } else if theme.is_vortexglass() {
+            self.screen
+                .canvas
+                .rounded_drop_shadow(layout.card, 14, 18, 2, 0.42);
+            self.screen
+                .canvas
+                .rounded_rect(layout.card, 12, theme.window, 0.95);
+            self.screen
+                .canvas
+                .rounded_rect(rail, 12, theme.window_alt, 0.95);
+            let rail_top = crate::draw::mix(theme.window_alt, theme.accent, 0.18);
+            self.screen.canvas.with_clip(rail.inset(1), |c| {
+                c.fill_gradient_v(rail.inset(1), rail_top, theme.window_alt, 0.95, 0.95);
+            });
+            self.screen.canvas.rounded_border(
+                layout.card.inset(1),
+                11,
+                0xffffff,
+                if theme.is_dark() { 0.22 } else { 0.78 },
+                1,
+            );
+            self.screen
+                .canvas
+                .rounded_border(layout.card, 12, theme.aero_hover_border(), 0.78, 1);
+            self.screen.canvas.fill(
+                Rect::new(rail.right() - 1, rail.y + 1, 1, rail.h - 2),
+                theme.window_border,
+            );
         } else {
             self.screen
                 .canvas

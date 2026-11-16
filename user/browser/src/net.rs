@@ -71,7 +71,7 @@ pub struct FetchPool {
     queues: Arc<(Mutex<FetchQueues>, Condvar)>,
     tab_gens: Arc<Mutex<HashMap<u64, u64>>>,
     storage: Arc<Mutex<BrowserStorage>>,
-    dark_mode: Arc<Mutex<(bool, bool)>>,
+    dark_mode: Arc<Mutex<(bool, i32)>>,
 }
 
 impl Drop for FetchPool {
@@ -97,7 +97,7 @@ impl FetchPool {
         let completed = Arc::new(Mutex::new(Vec::new()));
         let queues = Arc::new((Mutex::new(FetchQueues::default()), Condvar::new()));
         let tab_gens = Arc::new(Mutex::new(HashMap::<u64, u64>::new()));
-        let dark_mode = Arc::new(Mutex::new((false, false)));
+        let dark_mode = Arc::new(Mutex::new((false, 0i32)));
 
         // Dedicated navigation workers (never starved by slow images/XHR) + general workers.
         for worker_idx in 0..6 {
@@ -126,20 +126,20 @@ impl FetchPool {
                         guard = cv.wait(guard).unwrap();
                     }
                 };
-                let (dark, win98) = *dm.lock().unwrap();
+                let (dark, theme_style) = *dm.lock().unwrap();
                 let kind = if job.is_navigation {
                     FetchKind::Navigation
                 } else {
                     FetchKind::Subresource
                 };
-                let response = sync_fetch_with_kind(
+                let response = sync_fetch_with_kind_styled(
                     &job.method,
                     &job.url,
                     &job.headers,
                     &job.body,
                     Some(&st),
                     dark,
-                    win98,
+                    theme_style,
                     kind,
                 );
                 if !job.is_navigation && Self::is_req_stale(&gens, &job) {
@@ -207,8 +207,12 @@ impl FetchPool {
     }
 
     pub fn set_theme_flags(&self, dark_mode: bool, is_win98: bool) {
+        self.set_theme_style(dark_mode, if is_win98 { 1 } else { 0 });
+    }
+
+    pub fn set_theme_style(&self, dark_mode: bool, theme_style: i32) {
         if let Ok(mut g) = self.dark_mode.lock() {
-            *g = (dark_mode, is_win98);
+            *g = (dark_mode, theme_style);
         }
     }
 
@@ -418,14 +422,34 @@ pub fn sync_fetch(
     dark_mode: bool,
     is_win98: bool,
 ) -> FetchResponse {
-    sync_fetch_with_kind(
+    sync_fetch_styled(
         method,
         url_str,
         req_headers,
         req_body,
         storage,
         dark_mode,
-        is_win98,
+        if is_win98 { 1 } else { 0 },
+    )
+}
+
+pub fn sync_fetch_styled(
+    method: &str,
+    url_str: &str,
+    req_headers: &BTreeMap<String, String>,
+    req_body: &[u8],
+    storage: Option<&Arc<Mutex<BrowserStorage>>>,
+    dark_mode: bool,
+    theme_style: i32,
+) -> FetchResponse {
+    sync_fetch_with_kind_styled(
+        method,
+        url_str,
+        req_headers,
+        req_body,
+        storage,
+        dark_mode,
+        theme_style,
         FetchKind::Navigation,
     )
 }
@@ -440,9 +464,31 @@ pub fn sync_fetch_with_kind(
     is_win98: bool,
     kind: FetchKind,
 ) -> FetchResponse {
+    sync_fetch_with_kind_styled(
+        method,
+        url_str,
+        req_headers,
+        req_body,
+        storage,
+        dark_mode,
+        if is_win98 { 1 } else { 0 },
+        kind,
+    )
+}
+
+pub fn sync_fetch_with_kind_styled(
+    method: &str,
+    url_str: &str,
+    req_headers: &BTreeMap<String, String>,
+    req_body: &[u8],
+    storage: Option<&Arc<Mutex<BrowserStorage>>>,
+    dark_mode: bool,
+    theme_style: i32,
+    kind: FetchKind,
+) -> FetchResponse {
     if url_str.starts_with("about:") || url_str.starts_with("space://") || url_str.is_empty() {
         let guard = storage.and_then(|s| s.lock().ok());
-        let page = pages::serve_builtin(url_str, guard.as_deref(), dark_mode, is_win98);
+        let page = pages::serve_builtin_styled(url_str, guard.as_deref(), dark_mode, theme_style);
         let mut hdrs = BTreeMap::new();
         hdrs.insert(String::from("content-type"), page.content_type.to_string());
         return FetchResponse {
@@ -498,6 +544,15 @@ pub fn prefetch_subresources(
     dark_mode: bool,
     is_win98: bool,
 ) {
+    prefetch_subresources_styled(urls, storage, dark_mode, if is_win98 { 1 } else { 0 });
+}
+
+pub fn prefetch_subresources_styled(
+    urls: &[String],
+    storage: Option<&Arc<Mutex<BrowserStorage>>>,
+    dark_mode: bool,
+    theme_style: i32,
+) {
     let mut todo = Vec::new();
     let mut seen = HashSet::new();
     for raw in urls {
@@ -514,14 +569,14 @@ pub fn prefetch_subresources(
         return;
     }
     if todo.len() == 1 {
-        let _ = sync_fetch_with_kind(
+        let _ = sync_fetch_with_kind_styled(
             "GET",
             &todo[0],
             &BTreeMap::new(),
             &[],
             storage,
             dark_mode,
-            is_win98,
+            theme_style,
             FetchKind::Subresource,
         );
         return;
@@ -539,14 +594,14 @@ pub fn prefetch_subresources(
                 if i >= todo_ref.len() {
                     break;
                 }
-                let _ = sync_fetch_with_kind(
+                let _ = sync_fetch_with_kind_styled(
                     "GET",
                     &todo_ref[i],
                     hdrs_ref,
                     &[],
                     storage,
                     dark_mode,
-                    is_win98,
+                    theme_style,
                     FetchKind::Subresource,
                 );
             });

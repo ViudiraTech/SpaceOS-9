@@ -16,7 +16,8 @@
 use crate::draw::{mix, Canvas, Rect};
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
-use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT};
+use crate::theme::{Theme, RADIUS_CONTROL, TITLEBAR_HEIGHT, VORTEX_TITLEBAR_HEIGHT};
+use crate::vortex::{self, WinBtnKind};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -374,6 +375,47 @@ pub fn list_item_bg(
             }
             theme.text
         }
+    } else if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        if selected {
+            let (top_c, bot_c) = if dark {
+                (mix(0x22466e, theme.accent, 0.30), mix(0x16314f, theme.accent, 0.25))
+            } else {
+                (mix(0xe1f0fe, theme.accent, 0.14), mix(0xbddbfd, theme.accent, 0.20))
+            };
+            canvas.rounded_rect(rect, RADIUS_CONTROL, bot_c, 0.96);
+            canvas.with_clip(rect.inset(1), |c| {
+                c.fill_gradient_v(rect.inset(1), top_c, bot_c, 1.0, 1.0);
+            });
+            canvas.rounded_border(rect, RADIUS_CONTROL, theme.aero_hover_border(), 0.92, 1);
+            if rect.w > 4 && rect.h > 4 {
+                canvas.rounded_border(
+                    rect.inset(1),
+                    (RADIUS_CONTROL - 1).max(1),
+                    0xffffff,
+                    if dark { 0.24 } else { 0.65 },
+                    1,
+                );
+            }
+        } else if hovered {
+            let (top_c, bot_c) = if dark {
+                (0x243446, 0x1a2736)
+            } else {
+                (0xf3f8ff, 0xe0eeff)
+            };
+            canvas.rounded_rect(rect, RADIUS_CONTROL, bot_c, 0.92);
+            canvas.with_clip(rect.inset(1), |c| {
+                c.fill_gradient_v(rect.inset(1), top_c, bot_c, 1.0, 1.0);
+            });
+            canvas.rounded_border(
+                rect,
+                RADIUS_CONTROL,
+                if dark { theme.aero_hover_border() } else { 0x9fc2e6 },
+                0.78,
+                1,
+            );
+        }
+        if dark { 0xf2f7fd } else { 0x0c1828 }
     } else {
         if selected {
             canvas.rounded_rect(rect, RADIUS_CONTROL, theme.accent_soft, 1.0);
@@ -423,6 +465,23 @@ pub fn caption_button_rect_for(
     kind: CaptionHit,
     buttons_left: bool,
 ) -> Rect {
+    if theme.is_vortexglass() {
+        return if buttons_left {
+            match kind {
+                CaptionHit::Close => Rect::new(2, 0, 41, 18),
+                CaptionHit::Maximize => Rect::new(43, 0, 26, 18),
+                CaptionHit::Minimize => Rect::new(69, 0, 26, 18),
+                CaptionHit::None => Rect::default(),
+            }
+        } else {
+            match kind {
+                CaptionHit::Close => Rect::new(window_width - 43, 0, 41, 18),
+                CaptionHit::Maximize => Rect::new(window_width - 69, 0, 26, 18),
+                CaptionHit::Minimize => Rect::new(window_width - 95, 0, 26, 18),
+                CaptionHit::None => Rect::default(),
+            }
+        };
+    }
     if !theme.is_win98() {
         return caption_button_rect(window_width, kind, buttons_left);
     }
@@ -591,6 +650,96 @@ pub fn titlebar(
         return;
     }
 
+    if theme.is_vortexglass() {
+        let bar = Rect::new(0, 0, width, VORTEX_TITLEBAR_HEIGHT);
+        if canvas.is_argb() {
+            // Clear transparent so Shell compositor's Uinxed-Kernel frost + top.png +
+            // reflection.png sheen shines seamlessly behind icon, title, and buttons.
+            canvas.clear_transparent(bar, theme.titlebar);
+        } else {
+            vortex::draw_glass_chrome_overlay(canvas, bar, 0, theme, active, 0, 0, None);
+            canvas.fill_alpha(
+                Rect::new(0, VORTEX_TITLEBAR_HEIGHT - 1, width, 1),
+                if active {
+                    theme.window_border_active
+                } else {
+                    theme.window_border
+                },
+                0.78,
+            );
+        }
+
+        let (icon_x, title_x) = if buttons_left {
+            (104, 127.0)
+        } else {
+            (10, 32.0)
+        };
+        icons::draw(
+            canvas,
+            app_icon,
+            icon_x,
+            (VORTEX_TITLEBAR_HEIGHT - 16) / 2,
+            16,
+            None,
+        );
+
+        let max_title_w = (width - 108 - 38).max(40) as f32;
+        let shown = text.truncate(title, max_title_w, 12.5, Face::Ui);
+        if !theme.is_dark() {
+            let tw = (text.measure(&shown, 12.5, Face::Ui).ceil() as i32 + 16)
+                .clamp(24, max_title_w as i32 + 16);
+            vortex::draw_vortexglass_fog(
+                canvas,
+                Rect::new((title_x as i32 - 8).max(2), 3, tw, VORTEX_TITLEBAR_HEIGHT - 7),
+                0xffffff,
+                if active { 0.68 } else { 0.40 },
+            );
+            // Vista/Win7 Aero white outer title halo (`draw_vortexglass_title` in Uinxed-Kernel).
+            for (gx, gy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                text.draw_alpha(
+                    canvas,
+                    &shown,
+                    title_x + gx,
+                    20.0 + gy,
+                    12.5,
+                    0xffffff,
+                    if active { 0.78 } else { 0.45 },
+                    Face::Ui,
+                );
+            }
+        }
+        let title_color = if theme.is_dark() {
+            if active { 0xf4f8fc } else { 0xb8c8da }
+        } else if active {
+            0x000000
+        } else {
+            0x50555f
+        };
+        text.draw(canvas, &shown, title_x, 20.0, 12.5, title_color, Face::Ui);
+
+        for kind in [CaptionHit::Minimize, CaptionHit::Maximize, CaptionHit::Close] {
+            let btn = caption_button_rect_for(theme, width, kind, buttons_left);
+            let hov_t = animate_bool(btn, hover == kind, MOTION_HOVER);
+            let pressed = is_rect_pressed(btn);
+            let sprite_kind = match kind {
+                CaptionHit::Minimize => WinBtnKind::Minimize,
+                CaptionHit::Maximize if maximized => WinBtnKind::Restore,
+                CaptionHit::Maximize => WinBtnKind::Maximize,
+                CaptionHit::Close => WinBtnKind::Close,
+                CaptionHit::None => continue,
+            };
+            if !vortex::draw_aero_caption_sprite(canvas, btn, sprite_kind, active, hov_t, pressed) {
+                let col = if kind == CaptionHit::Close && (pressed || hov_t > 0.1) {
+                    theme.danger
+                } else {
+                    0xffffff
+                };
+                canvas.rounded_rect(btn, 3, col, if pressed { 0.65 } else { 0.25 + 0.35 * hov_t });
+            }
+        }
+        return;
+    }
+
     let bg = if active {
         theme.titlebar
     } else {
@@ -720,6 +869,29 @@ pub fn window_border(canvas: &mut Canvas, theme: &Theme, active: bool, maximized
     } else {
         theme.window_border
     };
+    if theme.is_vortexglass() {
+        // Composited ARGB windows receive Uinxed-Kernel's external Aero glass frame
+        // (`top/left/right/bottom.png`) and thin client rim from the Shell compositor.
+        if canvas.is_argb() {
+            return;
+        }
+        let r = theme.radius_window();
+        if bounds.w > 4 && bounds.h > 4 {
+            canvas.rounded_border(
+                bounds.inset(1),
+                (r - 1).max(1),
+                0xffffff,
+                if active {
+                    if theme.is_dark() { 0.26 } else { 0.56 }
+                } else {
+                    0.22
+                },
+                1,
+            );
+        }
+        canvas.rounded_border(bounds, r, color, 0.92, 1);
+        return;
+    }
     canvas.border_1px(bounds, color);
 }
 
@@ -727,6 +899,26 @@ pub fn popup_surface(canvas: &mut Canvas, theme: &Theme, rect: Rect, radius: i32
     if theme.is_win98() {
         canvas.fill(rect, theme.panel);
         window_outer_bevel(canvas, theme, rect);
+        return;
+    }
+    if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        canvas.rounded_rect(
+            rect,
+            radius,
+            theme.panel,
+            if canvas.is_argb() { 0.88 } else { 1.0 },
+        );
+        if rect.w > 4 && rect.h > 4 {
+            canvas.rounded_border(
+                rect.inset(1),
+                (radius - 1).max(1),
+                0xffffff,
+                if dark { 0.22 } else { 0.62 },
+                1,
+            );
+        }
+        canvas.rounded_border(rect, radius, theme.panel_border, 0.92, 1);
         return;
     }
     canvas.rounded_rect(rect, radius, theme.panel, 1.0);
@@ -749,8 +941,227 @@ pub fn card(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
         }
         return;
     }
+    if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        let top_c = if dark {
+            mix(theme.window_high, 0xffffff, 0.05)
+        } else {
+            mix(theme.window_high, 0xffffff, 0.45)
+        };
+        canvas.rounded_rect(rect, 6, theme.window_high, 1.0);
+        if rect.w > 4 && rect.h > 6 {
+            let gloss = Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, (rect.h / 2).clamp(4, 24));
+            canvas.with_clip(rect.inset(1), |c| {
+                c.fill_gradient_v(gloss, top_c, theme.window_high, 1.0, 0.0);
+            });
+            canvas.rounded_border(
+                rect.inset(1),
+                5,
+                0xffffff,
+                if dark { 0.16 } else { 0.72 },
+                1,
+            );
+        }
+        canvas.rounded_border(rect, 6, theme.window_border, 0.92, 1);
+        return;
+    }
     canvas.rounded_rect(rect, 6, theme.window_high, 1.0);
     canvas.rounded_border(rect, 6, theme.window_border, 1.0, 1);
+}
+
+/// Draw a Windows 7 Aero 4-stop glossy bevel pill/button surface.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_win7_glossy_box(
+    canvas: &mut Canvas,
+    rect: Rect,
+    radius: i32,
+    top_hi: u32,
+    top_lo: u32,
+    bot_hi: u32,
+    bot_lo: u32,
+    border: u32,
+    inner_rim: f32,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    canvas.rounded_glossy_4stop(rect, radius, top_hi, top_lo, bot_hi, bot_lo, 1.0);
+    if rect.w > 2 && rect.h > 2 && inner_rim > 0.002 {
+        canvas.rounded_border(
+            rect.inset(1),
+            (radius - 1).max(0),
+            0xffffff,
+            inner_rim,
+            1,
+        );
+    }
+    canvas.rounded_border(rect, radius, border, 1.0, 1);
+}
+
+/// Draw a Windows 7 Aero glossy crystal button/key surface with pearl/slate/accent variants.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_aero_surface(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    radius: i32,
+    accent: bool,
+    cool: bool,
+    hover_t: f32,
+    pressed: bool,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    let dark = theme.is_dark();
+    let h = hover_t.clamp(0.0, 1.0);
+    let (mut th, mut tl, mut bh, mut bl, base_border) = if dark {
+        if accent {
+            (
+                mix(0x2a5c8f, theme.accent, 0.55),
+                mix(0x1b4066, theme.accent, 0.50),
+                mix(0x122b47, theme.accent, 0.45),
+                mix(0x18395e, theme.accent, 0.50),
+                mix(0x4aa3e8, theme.accent, 0.55),
+            )
+        } else if cool {
+            (0x2f3c4f, 0x232e3e, 0x161f2c, 0x1c2737, 0x45556b)
+        } else {
+            (0x364254, 0x283242, 0x1c2431, 0x232d3d, 0x48586e)
+        }
+    } else if accent {
+        (
+            mix(0x9ed5fa, theme.accent, 0.35),
+            mix(0x52a6eb, theme.accent, 0.45),
+            mix(0x2178ca, theme.accent, 0.45),
+            mix(0x3a94df, theme.accent, 0.40),
+            theme.aero_press_border(),
+        )
+    } else if cool {
+        (0xfafcff, 0xecf3f9, 0xd8e3ef, 0xe5eef8, 0x9cb1c8)
+    } else {
+        (0xffffff, 0xf3f7fc, 0xe5ecf4, 0xf0f5fb, 0x8ea3b9)
+    };
+
+    if pressed {
+        let press_tint = if dark { 0x0b1624 } else { 0xb5d6f0 };
+        th = mix(th, press_tint, 0.28);
+        tl = mix(tl, press_tint, 0.25);
+        bh = mix(bh, press_tint, 0.18);
+        bl = mix(bl, press_tint, 0.22);
+    } else if h > 0.001 {
+        let glow_top = if dark { 0x4a75a6 } else { 0xf4faff };
+        let glow_bot = if dark { 0x2b5079 } else { 0xd0e8fb };
+        th = mix(th, glow_top, h * 0.52);
+        tl = mix(tl, glow_top, h * 0.42);
+        bh = mix(bh, glow_bot, h * 0.46);
+        bl = mix(bl, glow_bot, h * 0.48);
+    }
+
+    let brd = if pressed {
+        theme.aero_press_border()
+    } else if h > 0.001 {
+        mix(base_border, theme.aero_hover_border(), h)
+    } else {
+        base_border
+    };
+    let rim = if dark {
+        0.22 + h * 0.14
+    } else if accent {
+        0.58 + h * 0.16
+    } else {
+        0.84
+    };
+    draw_win7_glossy_box(canvas, rect, radius, th, tl, bh, bl, brd, rim);
+}
+
+/// Paint an extended DWM Aero glass toolbar region directly under the titlebar.
+///
+/// When `glass_transparent` is true, pixels in `rect` become ARGB transparent so
+/// the Shell compositor renders live blurred wallpaper/windows seamlessly behind
+/// both the titlebar and toolbar; otherwise paints standalone VortexGlass chrome.
+pub fn draw_aero_extended_toolbar(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    glass_transparent: bool,
+    active: bool,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    if glass_transparent {
+        let full_w = canvas.width as i32;
+        canvas.clear_transparent(Rect::new(0, rect.y, full_w, rect.h), theme.panel);
+    } else {
+        crate::vortex::draw_glass_chrome_overlay(canvas, rect, 0, theme, active, 0, 0, None);
+    }
+    if rect.h >= 2 {
+        let line_x = if glass_transparent { 0 } else { rect.x };
+        let line_w = if glass_transparent {
+            canvas.width as i32
+        } else {
+            rect.w
+        };
+        let gleam = if theme.is_dark() { 0x94b8de } else { 0xffffff };
+        canvas.fill_alpha(
+            Rect::new(line_x, rect.y + rect.h - 2, line_w, 1),
+            gleam,
+            if glass_transparent { 0.35 } else { 0.62 },
+        );
+        canvas.fill(
+            Rect::new(line_x, rect.y + rect.h - 1, line_w, 1),
+            theme.window_border,
+        );
+    }
+}
+
+/// Draw a dark/light Aero translucent floating pill or HUD overlay panel.
+pub fn draw_aero_floating_pill(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    radius: i32,
+    dark_hud: bool,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    let use_dark = dark_hud || theme.is_dark();
+    if rect.w > 4 && rect.h > 4 {
+        canvas.rounded_rect(
+            Rect::new(rect.x, rect.y + 1, rect.w, rect.h),
+            radius,
+            0x000000,
+            if use_dark { 0.38 } else { 0.18 },
+        );
+    }
+    let (bg_top, bg_bot, brd, rim) = if use_dark {
+        (0x283548, 0x131b26, 0x5c7799, 0x9ac5f0)
+    } else {
+        (0xf7fbff, 0xdfeaf6, 0x8ea7c4, 0xffffff)
+    };
+    canvas.rounded_rect(rect, radius, bg_bot, if use_dark { 0.86 } else { 0.90 });
+    let inner = rect.inset(1);
+    if !inner.is_empty() {
+        canvas.with_clip(inner, |c| {
+            c.fill_gradient_v(
+                inner,
+                bg_top,
+                bg_bot,
+                if use_dark { 0.88 } else { 0.94 },
+                if use_dark { 0.84 } else { 0.90 },
+            );
+        });
+        canvas.rounded_border(
+            inner,
+            (radius - 1).max(1),
+            rim,
+            if use_dark { 0.24 } else { 0.78 },
+            1,
+        );
+    }
+    canvas.rounded_border(rect, radius, brd, 0.92, 1);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -811,6 +1222,111 @@ pub fn button_anim(
                 canvas,
                 label,
                 rect.x as f32 + rect.w as f32 * 0.5 + shift as f32,
+                baseline,
+                12.5,
+                fg,
+                Face::Ui,
+            );
+        }
+        return;
+    }
+
+    if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        let hover_t = hover_t.clamp(0.0, 1.0);
+        let rad = theme.radius_control();
+        let draw_r = if pressed {
+            Rect::new(rect.x, rect.y + 1, rect.w, (rect.h - 1).max(1))
+        } else {
+            rect
+        };
+        let (mut th, mut tl, mut bh, mut bl, mut brd, rim) = if primary {
+            if dark {
+                (
+                    mix(0x3a6e9e, theme.accent, 0.35),
+                    mix(0x28547e, theme.accent, 0.35),
+                    mix(0x163858, theme.accent, 0.42),
+                    mix(0x244f78, theme.accent, 0.38),
+                    theme.aero_hover_border(),
+                    0.34,
+                )
+            } else {
+                (
+                    mix(0xf1f9fe, theme.accent, 0.14),
+                    mix(0xd6eefc, theme.accent, 0.22),
+                    mix(0xb3def7, theme.accent, 0.34),
+                    mix(0x94cef2, theme.accent, 0.38),
+                    theme.aero_hover_border(),
+                    0.82,
+                )
+            }
+        } else if dark {
+            (0x314154, 0x263445, 0x1a2533, 0x202d3d, theme.panel_border, 0.22)
+        } else {
+            (0xf4f5f6, 0xebedef, 0xdddddd, 0xcfcfcf, 0x707070, 0.85)
+        };
+        if pressed {
+            let p_c = if dark {
+                (0x182b3e, 0x1e354c, 0x24415e, 0x2b4d6e)
+            } else {
+                (0xbde1f4, 0xc9e8f8, 0xa2d6f2, 0x8cc9ec)
+            };
+            th = p_c.0;
+            tl = p_c.1;
+            bh = p_c.2;
+            bl = p_c.3;
+            brd = theme.aero_press_border();
+        } else if hover_t > 0.001 {
+            let (ht_hi, ht_lo, hb_hi, hb_lo) = if dark {
+                (
+                    mix(0x3a5a7a, theme.accent, 0.25),
+                    mix(0x2b4865, theme.accent, 0.25),
+                    mix(0x1d3650, theme.accent, 0.32),
+                    mix(0x264463, theme.accent, 0.30),
+                )
+            } else {
+                (
+                    mix(0xeaf6fd, theme.accent, 0.12),
+                    mix(0xd9f0fc, theme.accent, 0.18),
+                    mix(0xbee6fd, theme.accent, 0.24),
+                    mix(0xa7d9f5, theme.accent, 0.28),
+                )
+            };
+            th = mix(th, ht_hi, hover_t);
+            tl = mix(tl, ht_lo, hover_t);
+            bh = mix(bh, hb_hi, hover_t);
+            bl = mix(bl, hb_lo, hover_t);
+            brd = mix(brd, theme.aero_hover_border(), hover_t);
+        }
+        draw_win7_glossy_box(canvas, draw_r, rad, th, tl, bh, bl, brd, rim);
+        let fg = if dark {
+            0xf2f7fc
+        } else if primary {
+            0x0a1c30
+        } else {
+            0x14181f
+        };
+        let baseline = draw_r.y as f32 + draw_r.h as f32 * 0.5 + 4.5;
+        if let Some(ic) = leading_icon {
+            let label_w = text.measure(label, 12.5, Face::Ui);
+            let total_w = 16.0 + if label.is_empty() { 0.0 } else { 6.0 + label_w };
+            let start_x = draw_r.x as f32 + (draw_r.w as f32 - total_w) * 0.5;
+            icons::draw(
+                canvas,
+                ic,
+                start_x.round() as i32,
+                draw_r.y + (draw_r.h - 16) / 2,
+                16,
+                Some(fg),
+            );
+            if !label.is_empty() {
+                text.draw(canvas, label, start_x + 22.0, baseline, 12.5, fg, Face::Ui);
+            }
+        } else {
+            text.draw_centered(
+                canvas,
+                label,
+                draw_r.x as f32 + draw_r.w as f32 * 0.5,
                 baseline,
                 12.5,
                 fg,
@@ -981,6 +1497,71 @@ pub fn toggle_switch_anim(
     }
 
     let radius = (rect.h / 2).max(1);
+    if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        let (off_hi, off_lo) = if dark {
+            (0x16202c, 0x243344)
+        } else {
+            (0xc8d2dc, 0xeef3f8)
+        };
+        let (on_hi, on_lo) = if dark {
+            (
+                mix(0x3a82ba, theme.accent, 0.55),
+                mix(0x1b4c7a, theme.accent, 0.55),
+            )
+        } else {
+            (
+                mix(0x6ec3f7, theme.accent, 0.45),
+                mix(0x287bc0, theme.accent, 0.50),
+            )
+        };
+        let trk_hi = mix(off_hi, on_hi, p);
+        let trk_lo = mix(off_lo, on_lo, p);
+        let trk_mid_hi = mix(trk_hi, trk_lo, 0.35);
+        let trk_mid_lo = mix(trk_hi, trk_lo, 0.72);
+        let brd = if hover {
+            theme.aero_hover_border()
+        } else {
+            mix(theme.panel_border, theme.aero_hover_border(), p * 0.7)
+        };
+        draw_win7_glossy_box(
+            canvas,
+            rect,
+            radius,
+            trk_hi,
+            trk_mid_hi,
+            trk_mid_lo,
+            trk_lo,
+            brd,
+            if dark { 0.25 } else { 0.52 },
+        );
+        let pad = 2;
+        let knob_d = (rect.h - pad * 2).max(6);
+        let stretch = ((0.5 - (p - 0.5).abs()) * 2.0).clamp(0.0, 1.0);
+        let knob_w = knob_d + (stretch * 3.0).round() as i32;
+        let knob_r_rad = knob_d / 2;
+        let start_x = rect.x + pad;
+        let end_x = rect.right() - knob_w - pad;
+        let knob_x = (start_x as f32 + (end_x - start_x) as f32 * p).round() as i32;
+        let knob_r = Rect::new(knob_x, rect.y + pad, knob_w, knob_d);
+        canvas.rounded_rect(knob_r.offset(0, 1), knob_r_rad, 0x000000, 0.28);
+        draw_win7_glossy_box(
+            canvas,
+            knob_r,
+            knob_r_rad,
+            0xffffff,
+            0xf3f7fb,
+            0xdce5ef,
+            0xc4d2e0,
+            if hover {
+                theme.aero_hover_border()
+            } else {
+                0x6e8094
+            },
+            0.85,
+        );
+        return;
+    }
     let off_color = if theme.is_dark() { 0x36363e } else { 0xd4d4dc };
     let mut base = mix(off_color, theme.accent, p);
     if hover {
@@ -1061,6 +1642,49 @@ fn draw_progress_bar_impl(
         return;
     }
     let radius = (rect.h / 2).max(1);
+    if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        let (tr_hi, tr_lo) = if dark {
+            (0x131b24, 0x202d3c)
+        } else {
+            (0xc8cdd4, 0xf2f4f7)
+        };
+        draw_win7_glossy_box(
+            canvas,
+            rect,
+            radius,
+            tr_hi,
+            mix(tr_hi, tr_lo, 0.5),
+            tr_lo,
+            tr_lo,
+            theme.window_border,
+            if dark { 0.16 } else { 0.72 },
+        );
+        let fill_w = ((rect.w as f32) * p).round() as i32;
+        if fill_w > 2 {
+            let fill_col = color.unwrap_or(0x10b820);
+            let top_hi = mix(fill_col, 0xffffff, 0.62);
+            let top_lo = mix(fill_col, 0xffffff, 0.24);
+            let bot_hi = mix(fill_col, 0x000000, 0.10);
+            let bot_lo = mix(fill_col, 0xffffff, 0.18);
+            let fill_r = Rect::new(rect.x, rect.y, fill_w.min(rect.w), rect.h);
+            draw_win7_glossy_box(
+                canvas,
+                fill_r,
+                radius,
+                top_hi,
+                top_lo,
+                bot_hi,
+                bot_lo,
+                mix(fill_col, 0x000000, 0.32),
+                if dark { 0.35 } else { 0.72 },
+            );
+            canvas.with_clip(fill_r.inset(1), |c| {
+                c.diagonal_shimmer(fill_r.inset(1), 0.35, 32.0, 0xffffff, 0.26);
+            });
+        }
+        return;
+    }
     canvas.rounded_rect(rect, radius, theme.window_alt, 1.0);
     canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
     let fill_w = ((rect.w as f32) * p).round() as i32;
@@ -1146,6 +1770,60 @@ pub fn slider(
     }
 
     let hover_t = animate_bool(rect, hover || dragging, 0.12);
+    if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        let track_h = 4;
+        let track_y = rect.y + (rect.h - track_h) / 2;
+        let track_rect = Rect::new(rect.x, track_y, rect.w, track_h);
+        canvas.rounded_rect(
+            track_rect,
+            2,
+            if dark { 0x1a2533 } else { 0xd0d7df },
+            1.0,
+        );
+
+        let active_w = (((rect.w - 2).max(0) as f32) * p).round() as i32;
+        if active_w > 0 {
+            let active_r = Rect::new(rect.x + 1, track_y + 1, active_w, (track_h - 2).max(1));
+            canvas.fill(active_r, theme.accent);
+        }
+        canvas.rounded_border(track_rect, 2, theme.window_border, 0.9, 1);
+
+        let thumb_w = 11;
+        let thumb_h = rect.h.clamp(16, 20);
+        let travel = (rect.w - thumb_w).max(0);
+        let thumb_x = rect.x + ((travel as f32) * p).round() as i32;
+        let thumb_y = rect.y + (rect.h - thumb_h) / 2;
+        let thumb_r = Rect::new(thumb_x, thumb_y, thumb_w, thumb_h);
+        let (th, tl, bh, bl, brd) = if dragging {
+            (0xbee6fd, 0xa7d9f5, 0x89c7eb, 0x6cb7e2, theme.aero_press_border())
+        } else if hover_t > 0.01 {
+            (
+                mix(0xf4f5f6, 0xeaf6fd, hover_t),
+                mix(0xebedef, 0xd9f0fc, hover_t),
+                mix(0xdddddd, 0xbee6fd, hover_t),
+                mix(0xcfcfcf, 0xa7d9f5, hover_t),
+                mix(if dark { theme.panel_border } else { 0x707070 }, theme.aero_hover_border(), hover_t),
+            )
+        } else if dark {
+            (0x3a4c62, 0x2c3c4f, 0x202d3c, 0x28384a, theme.panel_border)
+        } else {
+            (0xf4f5f6, 0xebedef, 0xdddddd, 0xcfcfcf, 0x707070)
+        };
+        canvas.rounded_rect(thumb_r.offset(0, 1), 3, 0x000000, 0.22);
+        draw_win7_glossy_box(
+            canvas,
+            thumb_r,
+            3,
+            th,
+            tl,
+            bh,
+            bl,
+            brd,
+            if dark { 0.35 } else { 0.85 },
+        );
+        return;
+    }
     let track_h = 4;
     let track_y = rect.y + (rect.h - track_h) / 2;
     let track_rect = Rect::new(rect.x, track_y, rect.w, track_h);
@@ -1241,6 +1919,73 @@ pub fn segmented_control_anim(
         return;
     }
 
+    if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        let rad = theme.radius_control();
+        draw_win7_glossy_box(
+            canvas,
+            rect,
+            rad + 1,
+            if dark { 0x16202c } else { 0xd9e0e8 },
+            if dark { 0x1c2836 } else { 0xe6ebf2 },
+            if dark { 0x202d3d } else { 0xf0f4f8 },
+            if dark { 0x182330 } else { 0xe1e7ef },
+            theme.window_border,
+            if dark { 0.16 } else { 0.65 },
+        );
+        if !indicator_rect.is_empty() {
+            let (th, tl, bh, bl) = if dark {
+                (
+                    mix(0x366a9a, theme.accent, 0.35),
+                    mix(0x28547c, theme.accent, 0.35),
+                    mix(0x183858, theme.accent, 0.42),
+                    mix(0x244e76, theme.accent, 0.38),
+                )
+            } else {
+                (
+                    mix(0xf1f9fe, theme.accent, 0.14),
+                    mix(0xd6eefc, theme.accent, 0.24),
+                    mix(0xb3def7, theme.accent, 0.35),
+                    mix(0x94cef2, theme.accent, 0.40),
+                )
+            };
+            draw_win7_glossy_box(
+                canvas,
+                indicator_rect,
+                rad,
+                th,
+                tl,
+                bh,
+                bl,
+                theme.aero_hover_border(),
+                if dark { 0.35 } else { 0.82 },
+            );
+        }
+        let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.3;
+        for (i, label) in labels.iter().enumerate() {
+            let seg = segmented_item_rect(rect, labels.len(), i);
+            let is_sel = i == selected;
+            if hover_idx == Some(i) && !is_sel {
+                canvas.rounded_rect(seg, rad, if dark { 0x2c425a } else { 0xeef7fe }, 0.72);
+            }
+            let fg = if is_sel {
+                if dark { 0xf4f8fc } else { 0x0a1c30 }
+            } else {
+                theme.text_dim
+            };
+            text.draw_centered(
+                canvas,
+                label,
+                seg.x as f32 + seg.w as f32 * 0.5,
+                baseline,
+                12.0,
+                fg,
+                if is_sel { Face::Bold } else { Face::Ui },
+            );
+        }
+        return;
+    }
+
     canvas.rounded_rect(rect, RADIUS_CONTROL + 1, theme.window_alt, 1.0);
     canvas.rounded_border(rect, RADIUS_CONTROL + 1, theme.window_border, 1.0, 1);
     if !indicator_rect.is_empty() {
@@ -1331,6 +2076,9 @@ pub fn color_swatch(
     let cy = rect.y as f32 + rect.h as f32 * 0.5;
     let radius = (rect.w.min(rect.h) as f32 * 0.5 - 3.0).max(4.0);
     canvas.circle(cx, cy, radius, color, 1.0);
+    if theme.is_vortexglass() {
+        canvas.circle(cx, cy - radius * 0.25, radius * 0.58, 0xffffff, 0.26);
+    }
     canvas.ring(cx, cy, radius, 1.0, 0x000000, 0.18);
     if sel_t > 0.001 {
         canvas.ring(
@@ -1388,7 +2136,36 @@ pub fn icon_button(
         return;
     }
     let hover_t = animate_bool(rect, hover && enabled, MOTION_HOVER);
-    if pressed {
+    if theme.is_vortexglass() && enabled && (pressed || hover_t > 0.001) {
+        let dark = theme.is_dark();
+        let rad = theme.radius_control();
+        if pressed {
+            draw_win7_glossy_box(
+                canvas,
+                rect,
+                rad,
+                if dark { 0x1a2e44 } else { 0xbde1f4 },
+                if dark { 0x203852 } else { 0xc9e8f8 },
+                if dark { 0x254260 } else { 0xa2d6f2 },
+                if dark { 0x2a4b6d } else { 0x8cc9ec },
+                theme.aero_press_border(),
+                0.70,
+            );
+        } else {
+            let mix_a = hover_t.clamp(0.0, 1.0);
+            draw_win7_glossy_box(
+                canvas,
+                rect,
+                rad,
+                if dark { 0x354d66 } else { 0xf4f9fe },
+                if dark { 0x293e54 } else { 0xdcf0fc },
+                if dark { 0x1e2f42 } else { 0xc2e6fc },
+                if dark { 0x243a50 } else { 0xadd9f7 },
+                mix(theme.panel_border, theme.aero_hover_border(), mix_a),
+                if dark { 0.30 * mix_a } else { 0.80 * mix_a },
+            );
+        }
+    } else if pressed {
         canvas.rounded_rect(
             rect,
             RADIUS_CONTROL,
@@ -1436,6 +2213,29 @@ pub fn text_input(
     if theme.is_win98() {
         canvas.fill(rect, theme.input_bg);
         sunken_bevel(canvas, theme, rect);
+    } else if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        let rad = theme.radius_control();
+        let focus_t = animate_bool(rect, focused, 0.15);
+        canvas.rounded_rect(rect, rad, theme.input_bg, 1.0);
+        if rect.w > 4 && rect.h > 4 {
+            canvas.fill_alpha(
+                Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, 1),
+                0x000000,
+                if dark { 0.32 } else { 0.14 },
+            );
+        }
+        let idle_brd = if dark { theme.panel_border } else { 0xabadb3 };
+        let focus_brd = theme.aero_hover_border();
+        let border = if focus_t > 0.001 {
+            mix(idle_brd, focus_brd, focus_t)
+        } else {
+            idle_brd
+        };
+        canvas.rounded_border(rect, rad, border, 1.0, 1);
+        if focus_t > 0.001 {
+            canvas.rounded_border(rect.inset(-2), rad + 2, focus_brd, 0.32 * focus_t, 2);
+        }
     } else {
         let focus_t = animate_bool(rect, focused, 0.15);
         canvas.rounded_rect(rect, RADIUS_CONTROL, theme.input_bg, 1.0);
@@ -1786,6 +2586,50 @@ pub fn scrollbar_v_animated(
         return;
     }
     let expand_t = animate_bool(id, hovered || dragging || scrolling, 0.14);
+    if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        let bar_w = track.w.clamp(10, 13);
+        let bar_x = track.right() - bar_w;
+        let track_r = Rect::new(bar_x, track.y, bar_w, track.h);
+        canvas.horizontal_gradient(
+            track_r,
+            if dark { 0x151e29 } else { 0xe5e8ec },
+            if dark { 0x1d2937 } else { 0xf5f7fa },
+        );
+        let thumb_r = Rect::new(
+            bar_x + 1,
+            base_thumb.y,
+            (bar_w - 2).max(6),
+            base_thumb.h.max(20).min(track.h),
+        );
+        let (th, brd) = if dragging {
+            (
+                if dark { (0x244668, 0x1b3754, 0x152b44, 0x1e3c5c) } else { (0xd2ebfc, 0xbbe1fa, 0x9ed4f7, 0xb5dff9) },
+                theme.aero_press_border(),
+            )
+        } else if hovered {
+            (
+                if dark { (0x365270, 0x2b435c, 0x203347, 0x284058) } else { (0xeaf6fd, 0xd8effc, 0xbce4fc, 0xa8dbfa) },
+                theme.aero_hover_border(),
+            )
+        } else {
+            (
+                if dark { (0x2c3b4c, 0x243140, 0x1b2633, 0x212d3c) } else { (0xf6f7f9, 0xeef0f3, 0xdcdedf, 0xe8eaed) },
+                theme.window_border,
+            )
+        };
+        draw_win7_glossy_box(canvas, thumb_r, 3, th.0, th.1, th.2, th.3, brd, if dark { 0.25 } else { 0.72 });
+        if thumb_r.h >= 24 {
+            let cy = thumb_r.y + thumb_r.h / 2;
+            let gx = thumb_r.x + 2;
+            let gw = (thumb_r.w - 4).max(2);
+            let gc = if dark { 0x8096ad } else { 0x8f97a3 };
+            for dy in [-3, 0, 3] {
+                canvas.fill(Rect::new(gx, cy + dy, gw, 1), gc);
+            }
+        }
+        return;
+    }
     let track_alpha = 0.20 + 0.65 * expand_t;
     let track_pill = Rect::new(
         (track.right() - (4.0 + 4.0 * expand_t).round() as i32 - 3).max(track.x),
@@ -1958,5 +2802,32 @@ mod tests {
         assert_eq!(canvas.pixels()[14 * 32 + 14], 0x000000);
         assert_eq!(canvas.pixels()[14 * 32 + 15], 0xc0c0c0);
         assert_eq!(canvas.pixels()[14 * 32 + 16], 0x000000);
+    }
+
+    #[test]
+    fn vortex_caption_buttons_fit_win7_sprite_cluster_without_overlap() {
+        let mut cfg = uxconf::DesktopConfig::default();
+        cfg.theme_style = uxconf::ThemeStyle::VortexGlass;
+        let theme = Theme::from_config(&cfg);
+        assert!(theme.is_vortexglass());
+
+        for buttons_left in [false, true] {
+            let min_r = caption_button_rect_for(&theme, 640, CaptionHit::Minimize, buttons_left);
+            let max_r = caption_button_rect_for(&theme, 640, CaptionHit::Maximize, buttons_left);
+            let close_r = caption_button_rect_for(&theme, 640, CaptionHit::Close, buttons_left);
+            assert_eq!((min_r.w, min_r.h), (26, 18));
+            assert_eq!((max_r.w, max_r.h), (26, 18));
+            assert_eq!((close_r.w, close_r.h), (41, 18));
+            if buttons_left {
+                assert_eq!(close_r.right(), max_r.x);
+                assert_eq!(max_r.right(), min_r.x);
+                assert!(min_r.right() < 104);
+            } else {
+                assert_eq!(min_r.right(), max_r.x);
+                assert_eq!(max_r.right(), close_r.x);
+                assert!(close_r.right() < 640);
+                assert!(min_r.x > 640 - 104);
+            }
+        }
     }
 }

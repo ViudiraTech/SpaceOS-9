@@ -1,6 +1,6 @@
 use crate::net::{
-    decode_image_sprite, parse_headers_json, prefetch_subresources, resolve_url_ref,
-    serialize_headers_json, sync_fetch, sync_fetch_with_kind, AsyncFetchRequest, FetchKind,
+    decode_image_sprite, parse_headers_json, resolve_url_ref,
+    serialize_headers_json, AsyncFetchRequest, FetchKind,
     FetchPool, FetchResponse,
 };
 use crate::storage::{origin_for_url, BrowserStorage};
@@ -301,16 +301,20 @@ pub struct SpaceHostCallbacks {
     pub prefetch_urls: Option<unsafe extern "C" fn(ud: *mut c_void, urls_nl: *const c_char)>,
 }
 
+pub const SPACE_THEME_SPUI4: c_int = 0;
+pub const SPACE_THEME_WIN98: c_int = 1;
+pub const SPACE_THEME_VORTEXGLASS: c_int = 2;
+
 extern "C" {
     pub fn space_page_create(
         cb: *const SpaceHostCallbacks,
         viewport_w: c_int,
         viewport_h: c_int,
         dark_mode: c_int,
-        is_win98: c_int,
+        theme_style: c_int,
     ) -> *mut SpacePage;
     pub fn space_page_destroy(page: *mut SpacePage);
-    pub fn space_page_set_theme(page: *mut SpacePage, dark_mode: c_int, is_win98: c_int);
+    pub fn space_page_set_theme(page: *mut SpacePage, dark_mode: c_int, theme_style: c_int);
     pub fn space_page_load_html(
         page: *mut SpacePage,
         html: *const c_char,
@@ -449,6 +453,7 @@ pub struct HostState {
     pub fetch_pool: Option<Arc<FetchPool>>,
     pub dark_mode: bool,
     pub is_win98: bool,
+    pub theme_style: i32,
     pub page_url: String,
     pub base_url: String,
     pub title: String,
@@ -483,13 +488,34 @@ impl HostState {
         dark_mode: bool,
         is_win98: bool,
     ) -> Self {
+        Self::new_styled(
+            tab_id,
+            storage,
+            fetch_pool,
+            dark_mode,
+            if is_win98 {
+                SPACE_THEME_WIN98
+            } else {
+                SPACE_THEME_SPUI4
+            },
+        )
+    }
+
+    pub fn new_styled(
+        tab_id: u64,
+        storage: Arc<Mutex<BrowserStorage>>,
+        fetch_pool: Option<Arc<FetchPool>>,
+        dark_mode: bool,
+        theme_style: i32,
+    ) -> Self {
         Self {
             tab_id,
             nav_gen: 0,
             storage,
             fetch_pool,
             dark_mode,
-            is_win98,
+            is_win98: theme_style == SPACE_THEME_WIN98,
+            theme_style,
             page_url: String::from("about:blank"),
             base_url: String::from("about:blank"),
             title: String::new(),
@@ -1322,14 +1348,14 @@ unsafe extern "C" fn cb_load_image(
         || resolved.starts_with("file://")
         || resolved.starts_with("space://")
     {
-        let resp = sync_fetch(
+        let resp = crate::net::sync_fetch_styled(
             "GET",
             &resolved,
             &Default::default(),
             &[],
             Some(&host.storage),
             host.dark_mode,
-            host.is_win98,
+            host.theme_style,
         );
         if resp.status >= 200 && resp.status < 400 {
             if let Some(sprite) = decode_image_sprite(&resp.body, &resolved) {
@@ -1524,14 +1550,14 @@ unsafe extern "C" fn cb_fetch_sync(
     } else {
         &[]
     };
-    let resp = sync_fetch_with_kind(
+    let resp = crate::net::sync_fetch_with_kind_styled(
         if m.is_empty() { "GET" } else { &m },
         &u,
         &hdrs,
         req_body,
         Some(&host.storage),
         host.dark_mode,
-        host.is_win98,
+        host.theme_style,
         FetchKind::Subresource,
     );
     if !out_status.is_null() {
@@ -1599,7 +1625,12 @@ unsafe extern "C" fn cb_prefetch_urls(ud: *mut c_void, urls_nl: *const c_char) {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    prefetch_subresources(&urls, Some(&host.storage), host.dark_mode, host.is_win98);
+    crate::net::prefetch_subresources_styled(
+        &urls,
+        Some(&host.storage),
+        host.dark_mode,
+        host.theme_style,
+    );
 }
 
 unsafe extern "C" fn cb_free_host_buf(_ud: *mut c_void, ptr: *mut c_char) {
@@ -1864,7 +1895,37 @@ impl SpacePageHandle {
         dark_mode: bool,
         is_win98: bool,
     ) -> Self {
-        let mut host = Box::new(HostState::new(tab_id, storage, fetch_pool, dark_mode, is_win98));
+        Self::new_styled(
+            tab_id,
+            storage,
+            fetch_pool,
+            viewport_w,
+            viewport_h,
+            dark_mode,
+            if is_win98 {
+                SPACE_THEME_WIN98
+            } else {
+                SPACE_THEME_SPUI4
+            },
+        )
+    }
+
+    pub fn new_styled(
+        tab_id: u64,
+        storage: Arc<Mutex<BrowserStorage>>,
+        fetch_pool: Option<Arc<FetchPool>>,
+        viewport_w: i32,
+        viewport_h: i32,
+        dark_mode: bool,
+        theme_style: i32,
+    ) -> Self {
+        let mut host = Box::new(HostState::new_styled(
+            tab_id,
+            storage,
+            fetch_pool,
+            dark_mode,
+            theme_style,
+        ));
         let ud = (&mut *host as *mut HostState) as *mut c_void;
         let cb = SpaceHostCallbacks {
             user_data: ud,
@@ -1912,7 +1973,7 @@ impl SpacePageHandle {
                 viewport_w.max(64),
                 viewport_h.max(64),
                 i32::from(dark_mode),
-                i32::from(is_win98),
+                theme_style,
             )
         };
         Self { page, host }
@@ -1927,11 +1988,29 @@ impl SpacePageHandle {
     }
 
     pub fn set_theme(&mut self, dark_mode: bool, is_win98: bool, text: Option<&mut TextRenderer>) {
+        self.set_theme_style(
+            dark_mode,
+            if is_win98 {
+                SPACE_THEME_WIN98
+            } else {
+                SPACE_THEME_SPUI4
+            },
+            text,
+        );
+    }
+
+    pub fn set_theme_style(
+        &mut self,
+        dark_mode: bool,
+        theme_style: i32,
+        text: Option<&mut TextRenderer>,
+    ) {
         self.host.dark_mode = dark_mode;
-        self.host.is_win98 = is_win98;
+        self.host.is_win98 = theme_style == SPACE_THEME_WIN98;
+        self.host.theme_style = theme_style;
         let page = self.page;
         self.host.with_text(text, || unsafe {
-            space_page_set_theme(page, i32::from(dark_mode), i32::from(is_win98));
+            space_page_set_theme(page, i32::from(dark_mode), theme_style);
         });
     }
 

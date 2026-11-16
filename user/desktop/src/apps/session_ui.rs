@@ -593,14 +593,24 @@ fn session_backdrop(theme: &Theme, path: &str, width: usize, height: usize) -> V
     if theme.is_win98() {
         vec![theme.bg_top; width.saturating_mul(height)]
     } else {
-        wallpaper(path, width, height)
+        wallpaper(theme, path, width, height)
     }
 }
 
-fn wallpaper(path: &str, width: usize, height: usize) -> Vec<u32> {
+fn wallpaper(theme: &Theme, path: &str, width: usize, height: usize) -> Vec<u32> {
     let raw = icons::decode_jpeg(Path::new(path));
     let mut buffer = if let Some(sprite) = raw {
         sprite.scale_cover_opaque(width, height)
+    } else if theme.is_vortexglass() && width > 0 && height > 0 {
+        let mut c = crate::draw::Canvas::new(width, height, 0);
+        crate::vortex::draw_aero_aurora(
+            &mut c,
+            Rect::new(0, 0, width as i32, height as i32),
+            theme.accent,
+            theme.is_dark(),
+            0.35,
+        );
+        c.pixels().to_vec()
     } else {
         gradient(width, height)
     };

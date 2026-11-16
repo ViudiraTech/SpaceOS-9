@@ -411,13 +411,38 @@ impl TextRenderer {
         color: u32,
         face: Face,
     ) -> f32 {
+        self.draw_alpha(canvas, text, x, baseline, px, color, 1.0, face)
+    }
+
+    /// Draw `text` with explicit opacity `alpha` (`0.0..=1.0`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_alpha(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        x: f32,
+        baseline: f32,
+        px: f32,
+        color: u32,
+        alpha: f32,
+        face: Face,
+    ) -> f32 {
+        let op = (alpha.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         let mut pen = x;
         for ch in text.chars() {
             let glyph = self.glyph(face, ch, px);
-            if glyph.width != 0 && glyph.height != 0 {
+            if glyph.width != 0 && glyph.height != 0 && op > 0 {
                 let left = pen.round() as i32 + glyph.xmin;
                 let top = baseline.round() as i32 - glyph.ymin - glyph.height as i32;
-                canvas.blend_coverage(left, top, glyph.width, glyph.height, color, &glyph.coverage);
+                canvas.blend_coverage_alpha(
+                    left,
+                    top,
+                    glyph.width,
+                    glyph.height,
+                    color,
+                    &glyph.coverage,
+                    op,
+                );
             }
             pen += glyph.advance;
         }

@@ -216,6 +216,19 @@ fn draw_login(
     for (idx, acc) in accounts.iter().take(3).enumerate() {
         let ry = card.y + 68 + idx as i32 * 26;
         let is_cur = acc.uid == euid;
+        let row_fg = if theme.is_vortexglass() && is_cur {
+            ui::list_item_bg(
+                canvas,
+                theme,
+                Rect::new(card.x + 12, ry + 1, card.w - 24, 24),
+                true,
+                false,
+            )
+        } else if is_cur {
+            theme.text
+        } else {
+            theme.text_dim
+        };
         let line = format!(
             "{}  (UID {})  ·  {}  ·  {}",
             acc.name, acc.uid, acc.home, acc.shell
@@ -226,7 +239,7 @@ fn draw_login(
             (card.x + 18) as f32,
             (ry + 16) as f32,
             12.0,
-            if is_cur { theme.text } else { theme.text_dim },
+            row_fg,
             Face::Mono,
         );
         if is_cur {

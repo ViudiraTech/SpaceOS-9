@@ -60,6 +60,11 @@ enum DragState {
         orig_y: i16,
         press_rx: i16,
         press_ry: i16,
+        scr_w: i32,
+        scr_h: i32,
+        work_top: i32,
+        work_h: i32,
+        restore_pending: bool,
     },
     Resize {
         dir: ResizeDir,
@@ -122,6 +127,10 @@ pub struct App {
     /// repaints uncovered regions from it during a drag, so other applications
     /// never receive a redraw storm just because a window moved above them.
     backing: u32,
+    is_argb: bool,
+    depth: u8,
+    composited: bool,
+    glass_top_extra: i32,
     pub text: TextRenderer,
     pub config: DesktopConfig,
     pub uxconf: Option<UxConfClient>,
@@ -130,6 +139,8 @@ pub struct App {
     pub title: String,
     pub active: bool,
     pub maximized: bool,
+    snapped: bool,
+    drag_snap_zone: u32,
     pub needs_redraw: bool,
     pub close: bool,
     drawn: bool,
@@ -174,24 +185,49 @@ impl App {
             | EventMask::STRUCTURE_NOTIFY
             | EventMask::FOCUS_CHANGE
             | EventMask::LEAVE_WINDOW;
-        x.create_window(win, x.root, 0, 0, width, height, false, mask, theme.window)?;
+        let (win, is_argb) =
+            x.create_argb_window(win, x.root, 0, 0, width, height, false, mask, theme.window)?;
+        let depth = if is_argb { 32 } else { x.depth };
+        let composited = x.is_compositor_active();
         x.set_title(win, title)?;
         x.set_icon_name(win, icon.prop_name())?;
         x.set_class(win, "spui", "Spui")?;
         x.set_wm_type(win, x.atoms.net_wm_type_normal)?;
         x.set_pid(win, std::process::id())?;
         x.set_protocols(win)?;
+        let init_corner = if theme.is_win98() {
+            0
+        } else {
+            theme.radius_window()
+        };
+        let init_glass_top = if theme.is_vortexglass() {
+            theme.titlebar_height().min(height as i32)
+        } else {
+            0
+        };
+        let _ = x.set_glass_extents(win, init_glass_top, 0, 0, 0, init_corner);
+        if !is_argb && init_corner > 0 {
+            let _ = x.set_rounded_shape(win, width, height, init_corner);
+        }
         x.map(win)?;
         x.flush()?;
 
         let mut text =
             TextRenderer::load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         text.set_ui_scale(theme.ui_scale());
-        let canvas = x.create_canvas(width as usize, height as usize, theme.window);
+        let mut canvas = x.create_canvas(width as usize, height as usize, theme.window);
+        canvas.set_argb(is_argb && composited && theme.is_vortexglass());
+        if canvas.is_argb() {
+            canvas.clear(theme.window);
+            canvas.clear_transparent(
+                Rect::new(0, 0, i32::from(width), init_glass_top),
+                theme.titlebar,
+            );
+        }
         // Keep a server-side copy so Xorg can repaint exposed areas itself
         // while another window is dragged across this one.
-        let backing = x.create_backing(win, width, height)?;
-        x.put_canvas(backing, &canvas, canvas.bounds())?;
+        let backing = x.create_backing_depth(win, depth, width, height)?;
+        x.put_canvas_depth(backing, &canvas, canvas.bounds(), depth)?;
         x.set_background_pixmap(win, backing)?;
         x.flush()?;
         Ok(Self {
@@ -204,6 +240,10 @@ impl App {
             min_height: 220.min(height),
             canvas,
             backing,
+            is_argb,
+            depth,
+            composited,
+            glass_top_extra: 0,
             text,
             config,
             uxconf,
@@ -212,6 +252,8 @@ impl App {
             title: title.to_string(),
             active: true,
             maximized: false,
+            snapped: false,
+            drag_snap_zone: 0,
             needs_redraw: true,
             close: false,
             drawn: false,
@@ -308,6 +350,51 @@ impl App {
         self.sync_config_visuals();
     }
 
+    #[allow(dead_code)]
+    pub fn is_composited_glass(&self) -> bool {
+        self.is_argb && self.composited && self.theme.is_vortexglass()
+    }
+
+    #[allow(dead_code)]
+    pub fn set_glass_toolbar_height(&mut self, height: i32) {
+        let clamped = height.max(0);
+        if clamped != self.glass_top_extra {
+            self.glass_top_extra = clamped;
+            self.sync_glass_extents();
+        }
+    }
+
+    fn sync_glass_extents(&self) {
+        let corner_r = if self.maximized || self.snapped || self.theme.is_win98() {
+            0
+        } else {
+            self.theme.radius_window()
+        };
+        let top = if self.theme.is_vortexglass() {
+            (self.theme.titlebar_height() + self.glass_top_extra).min(self.height as i32)
+        } else {
+            0
+        };
+        let _ = self
+            .x
+            .set_glass_extents(self.win, top, 0, 0, 0, corner_r);
+    }
+
+    fn sync_shape_and_canvas_mode(&mut self) {
+        let argb_glass = self.is_composited_glass();
+        self.canvas.set_argb(argb_glass);
+        if !self.is_argb {
+            let corner_r = if self.maximized || self.snapped || self.theme.is_win98() {
+                0
+            } else {
+                self.theme.radius_window()
+            };
+            let _ = self
+                .x
+                .set_rounded_shape(self.win, self.width, self.height, corner_r);
+        }
+    }
+
     fn sync_config_visuals(&mut self) {
         self.theme = Theme::from_config(&self.config);
         self.text.set_ui_scale(self.theme.ui_scale());
@@ -328,6 +415,8 @@ impl App {
                 }
             }
         }
+        self.sync_shape_and_canvas_mode();
+        self.sync_glass_extents();
         self.needs_redraw = true;
     }
 
@@ -393,13 +482,17 @@ impl App {
     pub fn toggle_maximize(&mut self) -> Result<()> {
         if self.maximized {
             self.maximized = false;
+            self.snapped = false;
             if let Some((sx, sy, sw, sh)) = self.saved_geom.take() {
                 self.x.move_resize(self.win, sx, sy, sw, sh)?;
             }
         } else {
             let geom = self.x.conn.get_geometry(self.win)?.reply()?;
             let root_geom = self.x.conn.get_geometry(self.x.root)?.reply()?;
-            self.saved_geom = Some((geom.x, geom.y, self.width, self.height));
+            if !self.snapped {
+                self.saved_geom = Some((geom.x, geom.y, self.width, self.height));
+            }
+            self.snapped = false;
             self.maximized = true;
             let panel_h = self.panel_height() as u16;
             let max_y = if self.config.panel_position == PanelPosition::Top {
@@ -411,6 +504,8 @@ impl App {
             self.x
                 .move_resize(self.win, 0, max_y, root_geom.width, max_h)?;
         }
+        self.sync_shape_and_canvas_mode();
+        self.sync_glass_extents();
         self.needs_redraw = true;
         self.x.flush()?;
         Ok(())
@@ -531,7 +626,7 @@ impl App {
                             i32::from(e.width),
                             i32::from(e.height),
                         );
-                        self.x.put_canvas(self.win, &self.canvas, area)?;
+                        self.x.put_canvas_depth(self.win, &self.canvas, area, self.depth)?;
                         self.x.flush()?;
                     } else {
                         self.needs_redraw = true;
@@ -549,14 +644,23 @@ impl App {
                         e.height as usize,
                         self.theme.window,
                     );
+                    self.canvas.set_argb(self.is_composited_glass());
                     // Replace the backing store in lockstep with the canvas so
                     // exposes during the resize also come from the new pixmap.
                     let old_backing = self.backing;
-                    self.backing = self.x.create_backing(self.win, e.width, e.height)?;
-                    self.x
-                        .put_canvas(self.backing, &self.canvas, self.canvas.bounds())?;
+                    self.backing =
+                        self.x
+                            .create_backing_depth(self.win, self.depth, e.width, e.height)?;
+                    self.x.put_canvas_depth(
+                        self.backing,
+                        &self.canvas,
+                        self.canvas.bounds(),
+                        self.depth,
+                    )?;
                     self.x.set_background_pixmap(self.win, self.backing)?;
                     let _ = self.x.free_pixmap(old_backing);
+                    self.sync_shape_and_canvas_mode();
+                    self.sync_glass_extents();
                     self.drawn = false;
                     self.needs_redraw = true;
                     events.push(UiEvent::Configure {
@@ -596,6 +700,13 @@ impl App {
                         self.active = is_active;
                         self.needs_redraw = true;
                     }
+                } else if e.atom == self.x.atoms.spui_compositor {
+                    let active = self.x.is_compositor_active();
+                    if active != self.composited {
+                        self.composited = active;
+                        self.sync_shape_and_canvas_mode();
+                        self.needs_redraw = true;
+                    }
                 }
             }
             Event::KeyPress(e) => {
@@ -622,6 +733,7 @@ impl App {
 
                 let _ = self.x.focus(self.win);
                 let _ = self.x.set_active_window(self.win);
+                let _ = self.x.flush();
                 ui::notify_pointer_button(x, y, e.detail, true);
 
                 if e.detail == 1 {
@@ -674,20 +786,27 @@ impl App {
                             return Ok(());
                         }
                         self.last_title_click = Some(now);
-                        if !self.maximized {
-                            let geom = self.x.conn.get_geometry(self.win)?.reply()?;
-                            let min_y = if self.config.panel_position == PanelPosition::Top {
-                                self.panel_height() as i16
-                            } else {
-                                0
-                            };
-                            self.drag = Some(DragState::Move {
-                                orig_x: geom.x,
-                                orig_y: geom.y.max(min_y),
-                                press_rx: e.root_x,
-                                press_ry: e.root_y,
-                            });
-                        }
+                        let geom = self.x.conn.get_geometry(self.win)?.reply()?;
+                        let root_geom = self.x.conn.get_geometry(self.x.root)?.reply()?;
+                        let panel_h = self.panel_height();
+                        let work_top = if self.config.panel_position == PanelPosition::Top {
+                            panel_h
+                        } else {
+                            0
+                        };
+                        let work_h = i32::from(root_geom.height).saturating_sub(panel_h).max(200);
+                        self.drag_snap_zone = 0;
+                        self.drag = Some(DragState::Move {
+                            orig_x: geom.x,
+                            orig_y: geom.y.max(work_top as i16),
+                            press_rx: e.root_x,
+                            press_ry: e.root_y,
+                            scr_w: i32::from(root_geom.width),
+                            scr_h: i32::from(root_geom.height),
+                            work_top,
+                            work_h,
+                            restore_pending: self.maximized || self.snapped,
+                        });
                         return Ok(());
                     }
                 }
@@ -732,8 +851,62 @@ impl App {
                         return Ok(());
                     }
                 }
-                if self.drag.take().is_some() {
+                if let Some(drag) = self.drag.take() {
                     self.apply_cursor(CursorKind::Default);
+                    if let DragState::Move {
+                        scr_w,
+                        work_top,
+                        work_h,
+                        ..
+                    } = drag
+                    {
+                        let zone = self.drag_snap_zone;
+                        self.drag_snap_zone = 0;
+                        if zone != 0 {
+                            let _ = self.x.send_window_cmd_data(self.win, 10, 0, 0, 0, 0);
+                            match zone {
+                                3 => {
+                                    if !self.maximized {
+                                        let _ = self.toggle_maximize();
+                                    }
+                                }
+                                1 | 2 => {
+                                    if let Ok(cookie) = self.x.conn.get_geometry(self.win) {
+                                        if let Ok(geom) = cookie.reply() {
+                                            if !self.snapped && !self.maximized {
+                                                self.saved_geom = Some((
+                                                    geom.x,
+                                                    geom.y,
+                                                    self.width,
+                                                    self.height,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    self.maximized = false;
+                                    self.snapped = true;
+                                    let half = (scr_w / 2).max(200);
+                                    let (sx, sw) = if zone == 1 {
+                                        (0i16, half as u16)
+                                    } else {
+                                        (half as i16, (scr_w - half).max(200) as u16)
+                                    };
+                                    let _ = self.x.move_resize(
+                                        self.win,
+                                        sx,
+                                        work_top as i16,
+                                        sw,
+                                        work_h as u16,
+                                    );
+                                    self.sync_shape_and_canvas_mode();
+                                    self.sync_glass_extents();
+                                    self.needs_redraw = true;
+                                }
+                                _ => {}
+                            }
+                            let _ = self.x.flush();
+                        }
+                    }
                 }
                 events.push(UiEvent::Button {
                     x,
@@ -760,16 +933,71 @@ impl App {
                         };
                         match drag {
                             DragState::Move {
-                                orig_x,
-                                orig_y,
+                                mut orig_x,
+                                mut orig_y,
                                 press_rx,
                                 press_ry,
+                                scr_w,
+                                scr_h,
+                                work_top,
+                                work_h: _,
+                                restore_pending,
                             } => {
-                                let nx = orig_x.saturating_add(e.root_x.saturating_sub(press_rx));
-                                let ny = orig_y
-                                    .saturating_add(e.root_y.saturating_sub(press_ry))
-                                    .max(min_y as i16);
-                                self.x.move_window(self.win, nx, ny)?;
+                                let dx = e.root_x.saturating_sub(press_rx);
+                                let dy = e.root_y.saturating_sub(press_ry);
+                                if restore_pending && (dx.abs() >= 10 || dy.abs() >= 10) {
+                                    self.maximized = false;
+                                    self.snapped = false;
+                                    let (rw, rh) = self
+                                        .saved_geom
+                                        .take()
+                                        .map(|(_, _, sw, sh)| (sw, sh))
+                                        .unwrap_or((
+                                            (scr_w * 3 / 5).max(i32::from(self.min_width)) as u16,
+                                            (scr_h * 3 / 5).max(i32::from(self.min_height)) as u16,
+                                        ));
+                                    let new_x = (i32::from(e.root_x) - i32::from(rw) / 2)
+                                        .clamp(0, (scr_w - i32::from(rw)).max(0))
+                                        as i16;
+                                    let new_y = (i32::from(e.root_y) - 14).max(work_top) as i16;
+                                    orig_x = new_x;
+                                    orig_y = new_y;
+                                    self.x.move_resize(self.win, new_x, new_y, rw, rh)?;
+                                    self.drag = Some(DragState::Move {
+                                        orig_x,
+                                        orig_y,
+                                        press_rx: e.root_x,
+                                        press_ry: e.root_y,
+                                        scr_w,
+                                        scr_h,
+                                        work_top,
+                                        work_h: scr_h,
+                                        restore_pending: false,
+                                    });
+                                    self.sync_shape_and_canvas_mode();
+                                    self.sync_glass_extents();
+                                } else if !restore_pending {
+                                    let nx = orig_x.saturating_add(dx);
+                                    let ny = orig_y
+                                        .saturating_add(dy)
+                                        .max(work_top as i16);
+                                    self.x.move_window(self.win, nx, ny)?;
+                                }
+                                let zone = if i32::from(e.root_y) <= work_top + 6 {
+                                    3
+                                } else if e.root_x <= 10 {
+                                    1
+                                } else if i32::from(e.root_x) >= scr_w - 11 {
+                                    2
+                                } else {
+                                    0
+                                };
+                                if zone != self.drag_snap_zone {
+                                    self.drag_snap_zone = zone;
+                                    let _ = self
+                                        .x
+                                        .send_window_cmd_data(self.win, 10, zone, 0, 0, 0);
+                                }
                                 self.x.flush()?;
                             }
                             DragState::Resize {
@@ -828,6 +1056,11 @@ impl App {
                         return Ok(());
                     } else {
                         self.drag = None;
+                        if self.drag_snap_zone != 0 {
+                            self.drag_snap_zone = 0;
+                            let _ = self.x.send_window_cmd_data(self.win, 10, 0, 0, 0, 0);
+                            let _ = self.x.flush();
+                        }
                     }
                 }
 
@@ -898,13 +1131,44 @@ impl App {
         } else {
             dirty
         };
+        if self.is_argb {
+            let glass_top = if self.is_composited_glass() {
+                (self.theme.titlebar_height() + self.glass_top_extra).min(self.height as i32)
+            } else {
+                0
+            };
+            let opaque_body = Rect::new(
+                0,
+                glass_top,
+                self.width as i32,
+                (self.height as i32 - glass_top).max(0),
+            );
+            self.canvas.enforce_opaque_rect(opaque_body.intersect(area));
+            // Composited VortexGlass frames (`top.png`/`left.png`/`right.png`/`bottom.png`)
+            // provide the outer rounded Aero border around a square client edge (like
+            // Uinxed-Kernel); keep corner masking only for non-VortexGlass ARGB windows.
+            let r = if self.maximized
+                || self.snapped
+                || self.theme.is_win98()
+                || self.is_composited_glass()
+            {
+                0
+            } else {
+                self.theme.radius_window()
+            };
+            if r > 0 {
+                self.canvas.mask_rounded_corners_rect(r, area);
+            }
+        }
         if self.backing != 0 {
             // Update the server-side copy, then let Xorg blit it to the window.
             // The window keeps a valid backing store for later exposes.
-            self.x.put_canvas(self.backing, &self.canvas, area)?;
+            self.x
+                .put_canvas_depth(self.backing, &self.canvas, area, self.depth)?;
             self.x.clear_area(self.win, area)?;
         } else {
-            self.x.put_canvas(self.win, &self.canvas, area)?;
+            self.x
+                .put_canvas_depth(self.win, &self.canvas, area, self.depth)?;
         }
         self.x.flush()?;
         self.drawn = true;

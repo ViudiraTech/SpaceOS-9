@@ -1,7 +1,6 @@
 use crate::ffi::{HistoryCommand, SelectPopupRequest, SpacePageHandle};
 use crate::net::{
-    normalize_omnibox_input, resolve_url_ref, sync_fetch, AsyncFetchRequest, FetchPool,
-    FetchResponse,
+    normalize_omnibox_input, resolve_url_ref, AsyncFetchRequest, FetchPool, FetchResponse,
 };
 use crate::storage::BrowserStorage;
 use spui_ui::app::{App, UiEvent};
@@ -158,12 +157,20 @@ impl TabState {
         vw: i32,
         vh: i32,
         dark_mode: bool,
-        is_win98: bool,
+        theme_style: i32,
     ) -> Self {
         Self {
             id,
             nav_gen: 0,
-            page: SpacePageHandle::new(id, storage, Some(fetch_pool), vw, vh, dark_mode, is_win98),
+            page: SpacePageHandle::new_styled(
+                id,
+                storage,
+                Some(fetch_pool),
+                vw,
+                vh,
+                dark_mode,
+                theme_style,
+            ),
             url: String::from("space://home"),
             title: String::from("Space 浏览器"),
             history: Vec::new(),
@@ -393,6 +400,16 @@ fn compute_layout(
     }
 }
 
+fn browser_theme_style(theme: &Theme) -> i32 {
+    if theme.is_win98() {
+        crate::ffi::SPACE_THEME_WIN98
+    } else if theme.is_vortexglass() {
+        crate::ffi::SPACE_THEME_VORTEXGLASS
+    } else {
+        crate::ffi::SPACE_THEME_SPUI4
+    }
+}
+
 struct BrowserState {
     storage: Arc<Mutex<BrowserStorage>>,
     fetch_pool: Arc<FetchPool>,
@@ -418,6 +435,7 @@ struct BrowserState {
     hover_select_idx: Option<usize>,
     dark_mode: bool,
     is_win98: bool,
+    theme_style: i32,
 }
 
 impl BrowserState {
@@ -431,8 +449,9 @@ impl BrowserState {
         text: Option<&mut TextRenderer>,
     ) -> Self {
         let is_win98 = theme.is_win98();
+        let theme_style = browser_theme_style(theme);
         let dark_mode = !is_win98 && theme.is_dark();
-        fetch_pool.set_theme_flags(dark_mode, is_win98);
+        fetch_pool.set_theme_style(dark_mode, theme_style);
         let mut st = Self {
             storage,
             fetch_pool,
@@ -458,6 +477,7 @@ impl BrowserState {
             hover_select_idx: None,
             dark_mode,
             is_win98,
+            theme_style,
         };
         st.open_new_tab(initial_url, vw, vh, text);
         st
@@ -487,7 +507,7 @@ impl BrowserState {
             vw,
             vh,
             self.dark_mode,
-            self.is_win98,
+            self.theme_style,
         );
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
@@ -545,14 +565,14 @@ impl BrowserState {
             || target_url.starts_with("data:");
 
         if is_local {
-            let resp = sync_fetch(
+            let resp = crate::net::sync_fetch_styled(
                 "GET",
                 &target_url,
                 &BTreeMap::new(),
                 &[],
                 Some(&self.storage),
                 self.dark_mode,
-                self.is_win98,
+                self.theme_style,
             );
             self.apply_loaded_document(tab_idx, &target_url, &resp, push_history, text.as_deref_mut());
             return;
@@ -598,7 +618,7 @@ impl BrowserState {
             resp.final_url.clone()
         };
         let html = if let Some(err) = resp.error.as_ref() {
-            render_error_page(&final_url, err, self.dark_mode, self.is_win98)
+            render_error_page(&final_url, err, self.dark_mode, self.theme_style)
         } else {
             let ct = resp
                 .headers
@@ -763,29 +783,30 @@ impl BrowserState {
 
     fn sync_theme(&mut self, app: &mut App, vw: i32, vh: i32) {
         let win98 = app.theme.is_win98();
+        let theme_style = browser_theme_style(&app.theme);
         let dark = !win98 && app.theme.is_dark();
-        if win98 != self.is_win98 || dark != self.dark_mode {
+        if theme_style != self.theme_style || win98 != self.is_win98 || dark != self.dark_mode {
             self.is_win98 = win98;
+            self.theme_style = theme_style;
             self.dark_mode = dark;
-            self.fetch_pool.set_theme_flags(dark, win98);
-            for (idx, tab) in self.tabs.iter_mut().enumerate() {
-                tab.page.set_theme(dark, win98, Some(&mut app.text));
+            self.fetch_pool.set_theme_style(dark, theme_style);
+            for tab in self.tabs.iter_mut() {
+                tab.page.set_theme_style(dark, theme_style, Some(&mut app.text));
                 tab.page.resize(vw, vh, Some(&mut app.text));
-                if tab.url.starts_with("space://") {
+                if tab.url.starts_with("space://") || tab.url.starts_with("about:") {
                     let u = tab.url.clone();
-                    let resp = sync_fetch(
+                    let resp = crate::net::sync_fetch_styled(
                         "GET",
                         &u,
                         &BTreeMap::new(),
                         &[],
                         Some(&self.storage),
                         dark,
-                        win98,
+                        theme_style,
                     );
                     let html = String::from_utf8_lossy(&resp.body);
                     tab.page.load_html(&html, &u, Some(&mut app.text));
                 }
-                let _ = idx;
             }
         }
     }
@@ -934,9 +955,15 @@ fn escape_html(s: &str) -> String {
     out
 }
 
-fn render_error_page(url: &str, err: &str, dark: bool, win98: bool) -> String {
+fn render_error_page(url: &str, err: &str, dark: bool, theme_style: i32) -> String {
+    let win98 = theme_style == crate::ffi::SPACE_THEME_WIN98;
+    let vortex = theme_style == crate::ffi::SPACE_THEME_VORTEXGLASS;
     let bg = if win98 {
         "#ffffff"
+    } else if vortex && dark {
+        "linear-gradient(180deg, #162334 0%, #0e1622 100%)"
+    } else if vortex {
+        "linear-gradient(180deg, #eff6fd 0%, #dbeaf9 100%)"
     } else if dark {
         "#0f172a"
     } else {
@@ -944,10 +971,23 @@ fn render_error_page(url: &str, err: &str, dark: bool, win98: bool) -> String {
     };
     let card = if win98 {
         "#dfdfdf"
+    } else if vortex && dark {
+        "linear-gradient(180deg, #1b2839 0%, #121c2a 100%)"
+    } else if vortex {
+        "linear-gradient(180deg, #ffffff 0%, #eff6fd 100%)"
     } else if dark {
         "#1e293b"
     } else {
         "#ffffff"
+    };
+    let brd = if win98 {
+        "#808080"
+    } else if vortex && dark {
+        "#48688c"
+    } else if vortex {
+        "#9ab4cf"
+    } else {
+        "#64748b"
     };
     let fg = if dark && !win98 { "#e2e8f0" } else { "#0f172a" };
     let mut s = String::new();
@@ -955,7 +995,9 @@ fn render_error_page(url: &str, err: &str, dark: bool, win98: bool) -> String {
     s.push_str(bg);
     s.push_str(";color:");
     s.push_str(fg);
-    s.push_str("'><div style='max-width:620px;margin:0 auto;padding:24px;border:1px solid #64748b;border-radius:8px;background:");
+    s.push_str("'><div style='max-width:620px;margin:0 auto;padding:24px;border:1px solid ");
+    s.push_str(brd);
+    s.push_str(";border-radius:8px;background:");
     s.push_str(card);
     s.push_str("'><h2 style='margin-top:0'>无法连接到目标页面</h2><p>地址: <code>");
     s.push_str(&escape_html(url));
@@ -978,17 +1020,35 @@ fn select_popup_rect(vp: Rect, popup: &SelectPopupRequest) -> Rect {
 }
 
 fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
+    let glass_toolbar = app.is_composited_glass();
+    let win_active = app.active;
     let theme = &app.theme;
     let canvas = &mut app.canvas;
     let text = &mut app.text;
     let win98 = theme.is_win98();
+    let vortex = theme.is_vortexglass();
 
-    // 1. Tab Strip
-    canvas.fill(layout.tab_bar, theme.panel);
-    canvas.fill(
-        Rect::new(layout.tab_bar.x, layout.tab_bar.bottom() - 1, layout.tab_bar.w, 1),
-        theme.window_border,
-    );
+    // 1. Tab Strip (+ unified DWM Aero extended glass toolbar when VortexGlass)
+    if vortex {
+        ui::draw_aero_extended_toolbar(
+            canvas,
+            theme,
+            Rect::new(
+                layout.tab_bar.x,
+                layout.tab_bar.y,
+                layout.tab_bar.w,
+                TAB_BAR_H + TOOLBAR_H,
+            ),
+            glass_toolbar,
+            win_active,
+        );
+    } else {
+        canvas.fill(layout.tab_bar, theme.panel);
+        canvas.fill(
+            Rect::new(layout.tab_bar.x, layout.tab_bar.bottom() - 1, layout.tab_bar.w, 1),
+            theme.window_border,
+        );
+    }
     for (i, th) in layout.tabs.iter().enumerate() {
         let active = i == st.active_tab;
         let hov = th.tab_rect.contains(st.pointer.0, st.pointer.1);
@@ -1001,6 +1061,35 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
                 canvas.fill(
                     Rect::new(th.tab_rect.x + 1, th.tab_rect.bottom() - 2, th.tab_rect.w - 2, 2),
                     theme.window,
+                );
+            }
+        } else if vortex {
+            if active || hov {
+                ui::draw_aero_surface(
+                    canvas,
+                    theme,
+                    th.tab_rect,
+                    6,
+                    active,
+                    true,
+                    if hov { 0.85 } else { 0.25 },
+                    false,
+                );
+            } else {
+                let pill_bg = if theme.is_dark() { 0x1d2b3e } else { 0xeaf3fc };
+                canvas.rounded_rect(
+                    th.tab_rect,
+                    6,
+                    pill_bg,
+                    if glass_toolbar { 0.44 } else { 0.66 },
+                );
+                canvas.rounded_border(th.tab_rect, 6, theme.window_border, 0.50, 1);
+            }
+            if active && th.tab_rect.w > 24 {
+                canvas.fill_alpha(
+                    Rect::new(th.tab_rect.x + 8, th.tab_rect.y + 2, th.tab_rect.w - 16, 2),
+                    theme.accent,
+                    0.85,
                 );
             }
         } else {
@@ -1023,7 +1112,11 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
         let prefix = if tab.loading { "● " } else { "" };
         let title_str = format!("{prefix}{}", tab.display_title());
         let label = text.truncate(&title_str, (th.tab_rect.w - 34) as f32, 12.5, Face::Ui);
-        let fg = if active { theme.text } else { theme.text_muted };
+        let fg = if active || (vortex && hov) {
+            theme.text
+        } else {
+            theme.text_muted
+        };
         text.draw(
             canvas,
             &label,
@@ -1035,7 +1128,11 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
         );
         let close_hov = th.close_rect.contains(st.pointer.0, st.pointer.1);
         if close_hov {
-            canvas.rounded_rect(th.close_rect, 4, theme.panel_hover, 0.9);
+            if vortex {
+                ui::draw_aero_surface(canvas, theme, th.close_rect, 4, true, false, 0.85, false);
+            } else {
+                canvas.rounded_rect(th.close_rect, 4, theme.panel_hover, 0.9);
+            }
         }
         text.draw_centered(
             canvas,
@@ -1043,7 +1140,11 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
             (th.close_rect.x + th.close_rect.w / 2) as f32,
             (th.close_rect.y + 12) as f32,
             11.5,
-            theme.text_muted,
+            if close_hov && vortex {
+                theme.text
+            } else {
+                theme.text_muted
+            },
             Face::Mono,
         );
     }
@@ -1060,11 +1161,13 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
     );
 
     // 2. Navigation Toolbar
-    canvas.fill(layout.toolbar, theme.window_high);
-    canvas.fill(
-        Rect::new(layout.toolbar.x, layout.toolbar.bottom() - 1, layout.toolbar.w, 1),
-        theme.window_border,
-    );
+    if !vortex {
+        canvas.fill(layout.toolbar, theme.window_high);
+        canvas.fill(
+            Rect::new(layout.toolbar.x, layout.toolbar.bottom() - 1, layout.toolbar.w, 1),
+            theme.window_border,
+        );
+    }
 
     let can_back = st.current_tab().can_back();
     let can_fwd = st.current_tab().can_forward();
@@ -1378,11 +1481,19 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
     }
 
     // 6. Status Bar
-    canvas.fill(layout.status_bar, theme.panel);
-    canvas.fill(
-        Rect::new(layout.status_bar.x, layout.status_bar.y, layout.status_bar.w, 1),
-        theme.window_border,
-    );
+    if vortex {
+        ui::draw_aero_surface(canvas, theme, layout.status_bar, 0, false, false, 0.0, false);
+        canvas.fill(
+            Rect::new(layout.status_bar.x, layout.status_bar.y, layout.status_bar.w, 1),
+            theme.window_border,
+        );
+    } else {
+        canvas.fill(layout.status_bar, theme.panel);
+        canvas.fill(
+            Rect::new(layout.status_bar.x, layout.status_bar.y, layout.status_bar.w, 1),
+            theme.window_border,
+        );
+    }
     let err_cnt = st
         .tabs[st.active_tab]
         .page
@@ -1408,7 +1519,13 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
     );
     let right_s = format!(
         "JS err: {err_cnt}  |  {}",
-        if win98 { "Win98" } else { "SPUI 4.0" }
+        if win98 {
+            "Win98"
+        } else if vortex {
+            "VortexGlass 4.0"
+        } else {
+            "SPUI 4.0"
+        }
     );
     text.draw_right(
         canvas,
@@ -1449,10 +1566,16 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
         ui::popup_surface(canvas, theme, ar, 6);
         for (i, (title, url, is_bm)) in st.suggestions.iter().enumerate() {
             let row = Rect::new(ar.x + 4, ar.y + 4 + i as i32 * 28, ar.w - 8, 26);
-            let sel = st.suggest_sel == Some(i) || row.contains(st.pointer.0, st.pointer.1);
-            if sel {
-                canvas.rounded_rect(row, 4, theme.accent_soft, 1.0);
-            }
+            let sel = st.suggest_sel == Some(i);
+            let hov = row.contains(st.pointer.0, st.pointer.1);
+            let fg = if vortex {
+                ui::list_item_bg(canvas, theme, row, sel, hov)
+            } else {
+                if sel || hov {
+                    canvas.rounded_rect(row, 4, theme.accent_soft, 1.0);
+                }
+                theme.text
+            };
             let prefix = if *is_bm { "★ " } else { "· " };
             let line = format!("{prefix}{title} — {url}");
             let trunc = text.truncate(&line, (row.w - 14) as f32, 12.0, Face::Ui);
@@ -1462,7 +1585,7 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
                 (row.x + 8) as f32,
                 (row.y + 17) as f32,
                 12.0,
-                theme.text,
+                fg,
                 Face::Ui,
             );
         }
@@ -1500,12 +1623,18 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
         let max_rows = ((dr.h - 42) / 34).max(1) as usize;
         for (idx, (title, url, _orig_i)) in st.drawer_items.iter().take(max_rows).enumerate() {
             let row = Rect::new(dr.x + 8, dr.y + 34 + idx as i32 * 34, dr.w - 16, 30);
-            if row.contains(st.pointer.0, st.pointer.1) {
-                canvas.rounded_rect(row, 4, theme.panel_hover, 0.9);
-            }
+            let hov = row.contains(st.pointer.0, st.pointer.1);
+            let fg = if vortex {
+                ui::list_item_bg(canvas, theme, row, false, hov)
+            } else {
+                if hov {
+                    canvas.rounded_rect(row, 4, theme.panel_hover, 0.9);
+                }
+                theme.text
+            };
             let t = text.truncate(title, (row.w - 12) as f32, 12.0, Face::Bold);
             let u = text.truncate(url, (row.w - 12) as f32, 11.0, Face::Mono);
-            text.draw(canvas, &t, (row.x + 6) as f32, (row.y + 13) as f32, 12.0, theme.text, Face::Bold);
+            text.draw(canvas, &t, (row.x + 6) as f32, (row.y + 13) as f32, 12.0, fg, Face::Bold);
             text.draw(canvas, &u, (row.x + 6) as f32, (row.y + 26) as f32, 11.0, theme.text_muted, Face::Mono);
         }
     }
@@ -1518,12 +1647,18 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
             if row.bottom() > pr.bottom() - 2 {
                 break;
             }
-            let hov = st.hover_select_idx == Some(i) || i == popup.selected_idx;
-            if hov {
-                canvas.rounded_rect(row, 4, theme.accent_soft, 1.0);
-            }
+            let sel = i == popup.selected_idx;
+            let hov = st.hover_select_idx == Some(i);
+            let fg = if vortex {
+                ui::list_item_bg(canvas, theme, row, sel, hov)
+            } else {
+                if sel || hov {
+                    canvas.rounded_rect(row, 4, theme.accent_soft, 1.0);
+                }
+                theme.text
+            };
             let s = text.truncate(label, (row.w - 12) as f32, 12.5, Face::Ui);
-            text.draw(canvas, &s, (row.x + 8) as f32, (row.y + 16) as f32, 12.5, theme.text, Face::Ui);
+            text.draw(canvas, &s, (row.x + 8) as f32, (row.y + 16) as f32, 12.5, fg, Face::Ui);
         }
     }
     let _ = icons::draw;
@@ -2154,6 +2289,11 @@ pub fn run_browser(initial_url: Option<String>) -> Result<(), String> {
                 st.drawer,
             );
             app.draw_chrome();
+            app.set_glass_toolbar_height(if app.theme.is_vortexglass() {
+                TAB_BAR_H + TOOLBAR_H
+            } else {
+                0
+            });
             render_browser(&mut app, &mut st, &final_layout);
             app.present().map_err(|e| format!("present error: {e}"))?;
         }

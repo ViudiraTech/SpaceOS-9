@@ -403,6 +403,7 @@ impl ThemeMode {
 /// Visual chrome / widget geometry family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ThemeStyle {
+    VortexGlass,
     Spui,
     Win98,
 }
@@ -410,16 +411,20 @@ pub enum ThemeStyle {
 impl ThemeStyle {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::VortexGlass => "vortexglass",
             Self::Spui => "spui",
             Self::Win98 => "win98",
         }
     }
 
     pub fn parse(raw: &str) -> Self {
-        if raw.trim().eq_ignore_ascii_case("win98") {
+        let lower = raw.trim().to_ascii_lowercase();
+        if lower == "win98" || lower == "windows98" {
             Self::Win98
-        } else {
+        } else if lower == "spui" || lower == "spui-4" || lower == "spui4" {
             Self::Spui
+        } else {
+            Self::VortexGlass
         }
     }
 }
@@ -427,6 +432,7 @@ impl ThemeStyle {
 /// Built-in complete desktop theme packs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ThemePreset {
+    VortexGlass,
     Spui4,
     Win98,
 }
@@ -434,6 +440,7 @@ pub enum ThemePreset {
 impl ThemePreset {
     pub const fn id(self) -> &'static str {
         match self {
+            Self::VortexGlass => "vortexglass",
             Self::Spui4 => "spui-4",
             Self::Win98 => "win98",
         }
@@ -441,6 +448,7 @@ impl ThemePreset {
 
     pub const fn name(self) -> &'static str {
         match self {
+            Self::VortexGlass => "VortexGlass 4.0",
             Self::Spui4 => "SPUI 4.0",
             Self::Win98 => "Windows 98",
         }
@@ -448,6 +456,7 @@ impl ThemePreset {
 
     pub const fn subtitle(self) -> &'static str {
         match self {
+            Self::VortexGlass => "Win7 Aero 水晶毛玻璃 · 实时合成光影动效",
             Self::Spui4 => "现代圆角纯色风格 · 深浅双色可调",
             Self::Win98 => "经典 98 立体浮雕边框 · #008080 青绿桌面",
         }
@@ -455,6 +464,7 @@ impl ThemePreset {
 
     pub const fn style(self) -> ThemeStyle {
         match self {
+            Self::VortexGlass => ThemeStyle::VortexGlass,
             Self::Spui4 => ThemeStyle::Spui,
             Self::Win98 => ThemeStyle::Win98,
         }
@@ -462,6 +472,7 @@ impl ThemePreset {
 
     pub const fn from_style(style: ThemeStyle) -> Self {
         match style {
+            ThemeStyle::VortexGlass => Self::VortexGlass,
             ThemeStyle::Spui => Self::Spui4,
             ThemeStyle::Win98 => Self::Win98,
         }
@@ -471,14 +482,53 @@ impl ThemePreset {
         let lower = raw.trim().to_ascii_lowercase();
         if lower == "win98" || lower == "windows98" {
             Self::Win98
-        } else {
+        } else if lower == "spui" || lower == "spui-4" || lower == "spui4" {
             Self::Spui4
+        } else {
+            Self::VortexGlass
         }
     }
 
     /// Canonical `(channel, property, value)` bundle applied when switching theme packs.
     pub fn properties(self) -> Vec<(&'static str, &'static str, Value)> {
         match self {
+            Self::VortexGlass => vec![
+                (
+                    "appearance",
+                    "/theme/id",
+                    Value::String("vortexglass".to_string()),
+                ),
+                (
+                    "appearance",
+                    "/theme/style",
+                    Value::String("vortexglass".to_string()),
+                ),
+                ("appearance", "/theme/mode", Value::String("light".to_string())),
+                (
+                    "appearance",
+                    "/theme/accent",
+                    Value::String("#5898d8".to_string()),
+                ),
+                ("appearance", "/font/scale", Value::Int(100)),
+                (
+                    "desktop",
+                    "/backdrop/style",
+                    Value::String("cover".to_string()),
+                ),
+                (
+                    "desktop",
+                    "/backdrop/wallpaper",
+                    Value::String(WALLPAPERS[0].file.to_string()),
+                ),
+                (
+                    "desktop",
+                    "/backdrop/solid-color",
+                    Value::String("#14385c".to_string()),
+                ),
+                ("panel", "/position", Value::String("bottom".to_string())),
+                ("panel", "/size", Value::Int(44)),
+                ("panel", "/start-fullscreen", Value::Bool(false)),
+            ],
             Self::Spui4 => vec![
                 ("appearance", "/theme/id", Value::String("spui-4".to_string())),
                 ("appearance", "/theme/style", Value::String("spui".to_string())),
@@ -504,6 +554,8 @@ impl ThemePreset {
                     "/backdrop/solid-color",
                     Value::String("#1e293b".to_string()),
                 ),
+                ("panel", "/size", Value::Int(46)),
+                ("panel", "/start-fullscreen", Value::Bool(true)),
             ],
             Self::Win98 => vec![
                 ("appearance", "/theme/id", Value::String("win98".to_string())),
@@ -525,12 +577,15 @@ impl ThemePreset {
                     "/backdrop/solid-color",
                     Value::String("#008080".to_string()),
                 ),
+                ("panel", "/position", Value::String("bottom".to_string())),
+                ("panel", "/start-fullscreen", Value::Bool(false)),
             ],
         }
     }
 }
 
-pub const THEME_PRESETS: [ThemePreset; 2] = [ThemePreset::Spui4, ThemePreset::Win98];
+pub const THEME_PRESETS: [ThemePreset; 3] =
+    [ThemePreset::VortexGlass, ThemePreset::Spui4, ThemePreset::Win98];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackdropStyle {
@@ -749,7 +804,8 @@ pub const WALLPAPERS: [WallpaperInfo; 4] = [
     },
 ];
 
-pub const ACCENT_PRESETS: [(u32, &str); 9] = [
+pub const ACCENT_PRESETS: [(u32, &str); 10] = [
+    (0x5898d8, "Aero 冰晶"),
     (0x3b82f6, "湛蓝"),
     (0x0ea5e9, "天青"),
     (0x10b981, "翡翠"),
@@ -995,20 +1051,20 @@ pub struct DesktopConfig {
 impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
-            theme_id: ThemePreset::Spui4.id().to_string(),
-            theme_style: ThemeStyle::Spui,
-            mode: ThemeMode::Dark,
+            theme_id: ThemePreset::VortexGlass.id().to_string(),
+            theme_style: ThemeStyle::VortexGlass,
+            mode: ThemeMode::Light,
             accent: ACCENT_PRESETS[0].0,
             font_scale: 100,
             wallpaper: WALLPAPERS[0].file.to_string(),
             backdrop_style: BackdropStyle::Cover,
-            solid_color: SOLID_BG_PRESETS[0].0,
+            solid_color: 0x14385c,
             desktop_icons_visible: true,
             desktop_icon_size: 40,
             panel_position: PanelPosition::Bottom,
-            panel_size: 46,
+            panel_size: 44,
             panel_show_pinned: true,
-            panel_start_fullscreen: true,
+            panel_start_fullscreen: false,
             panel_start_tiles: crate::schema::DEFAULT_START_TILES.to_string(),
             wm_button_layout: ButtonLayout::Right,
             wm_double_click: DoubleClickAction::Maximize,
@@ -1478,8 +1534,11 @@ mod tests {
     #[test]
     fn theme_preset_roundtrip_and_overrides() {
         let mut cfg = DesktopConfig::default();
-        assert_eq!(cfg.theme_id, "spui-4");
-        assert_eq!(cfg.theme_style, ThemeStyle::Spui);
+        assert_eq!(cfg.theme_id, "vortexglass");
+        assert_eq!(cfg.theme_style, ThemeStyle::VortexGlass);
+        assert_eq!(cfg.mode, ThemeMode::Light);
+        assert_eq!(cfg.accent, 0x5898d8);
+        assert!(!cfg.panel_start_fullscreen);
 
         assert!(cfg.apply_theme_preset(ThemePreset::Win98));
         assert_eq!(cfg.theme_id, "win98");
@@ -1503,5 +1562,13 @@ mod tests {
         assert_eq!(cfg.theme_style, ThemeStyle::Spui);
         assert_eq!(cfg.mode, ThemeMode::Dark);
         assert_eq!(cfg.backdrop_style, BackdropStyle::Cover);
+        assert!(cfg.panel_start_fullscreen);
+
+        assert!(cfg.apply_theme_preset(ThemePreset::VortexGlass));
+        assert_eq!(cfg.theme_id, "vortexglass");
+        assert_eq!(cfg.theme_style, ThemeStyle::VortexGlass);
+        assert_eq!(cfg.mode, ThemeMode::Light);
+        assert_eq!(cfg.panel_size, 44);
+        assert!(!cfg.panel_start_fullscreen);
     }
 }

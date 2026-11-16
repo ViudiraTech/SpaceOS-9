@@ -999,6 +999,22 @@ fn draw_player(
     if is_win98 {
         canvas.fill(art, theme.accent);
         ui::sunken_bevel(canvas, theme, art);
+    } else if theme.is_vortexglass() {
+        ui::draw_aero_surface(
+            canvas,
+            theme,
+            art,
+            theme.radius_card(),
+            true,
+            false,
+            if state.play_state == PlayState::Playing {
+                0.35
+            } else {
+                0.0
+            },
+            false,
+        );
+        crate::vortex::blit_aero_sheen(canvas, art.inset(1), 0, 0, None, 0.42);
     } else {
         canvas.rounded_rect(art, theme.radius_card(), theme.accent, 1.0);
         canvas.circle(
@@ -1193,7 +1209,7 @@ fn draw_player(
             let selected = idx == state.current;
             let is_hover = hover == Some(HitTarget::TrackRow(idx));
             let win98_sel = is_win98 && selected;
-            let row_fg = if is_win98 {
+            let row_fg = if is_win98 || theme.is_vortexglass() {
                 ui::list_item_bg(cv, theme, row, selected, is_hover)
             } else {
                 if selected {
@@ -1408,18 +1424,21 @@ fn draw_progress_row(
 
     let bar = layout.progress_bar;
     let is_win98 = theme.is_win98();
-    let track_h = if is_win98 { 8 } else { 5 };
+    let is_vortex = theme.is_vortexglass();
+    let track_h = if is_win98 { 8 } else if is_vortex { 7 } else { 5 };
     let track = Rect::new(bar.x, bar.y + (bar.h - track_h) / 2, bar.w, track_h);
     if is_win98 {
         canvas.fill(track, theme.input_bg);
         ui::sunken_bevel(canvas, theme, track);
+    } else if is_vortex {
+        ui::progress_bar(canvas, theme, track, frac, Some(theme.accent));
     } else {
         canvas.rounded_rect(track, 2, theme.window_alt, 1.0);
         canvas.rounded_border(track, 2, theme.window_border, 1.0, 1);
     }
 
     let fill_w = ((track.w as f32) * frac).round() as i32;
-    if fill_w > 0 {
+    if fill_w > 0 && !is_vortex {
         if is_win98 {
             let inner_w = (fill_w - 2).min(track.w - 2).max(0);
             if inner_w > 0 {
@@ -1439,6 +1458,21 @@ fn draw_progress_row(
             let thumb = Rect::new(kx, track.y - 3, 10, track_h + 6);
             canvas.fill(thumb, theme.panel);
             ui::raised_bevel(canvas, theme, thumb);
+        } else if is_vortex {
+            let knob_d = if hot { 14 } else { 11 };
+            let kx = (track.x + fill_w).clamp(track.x, track.right()) - knob_d / 2;
+            let ky = track.y + track_h / 2 - knob_d / 2;
+            let knob_r = Rect::new(kx, ky, knob_d, knob_d);
+            ui::draw_aero_surface(
+                canvas,
+                theme,
+                knob_r,
+                knob_d / 2,
+                true,
+                false,
+                if hot { 1.0 } else { 0.25 },
+                false,
+            );
         } else {
             let knob_d = if hot { 12 } else { 9 };
             let kx = (track.x + fill_w).clamp(track.x, track.right()) - knob_d / 2;
@@ -1484,6 +1518,19 @@ fn draw_transport_button(
         canvas.fill(rect, bg);
         ui::raised_bevel(canvas, theme, rect);
         if primary { theme.accent } else { theme.text }
+    } else if theme.is_vortexglass() {
+        let radius = if primary { rect.h / 2 } else { 6 };
+        ui::draw_aero_surface(
+            canvas,
+            theme,
+            rect,
+            radius,
+            primary,
+            !primary,
+            if hover { 1.0 } else { 0.0 },
+            false,
+        );
+        if primary { 0xffffff } else { theme.text }
     } else {
         let base = if primary {
             theme.accent
@@ -1557,6 +1604,17 @@ fn draw_mute_button(canvas: &mut Canvas, theme: &Theme, rect: Rect, muted: bool,
         } else {
             ui::raised_bevel(canvas, theme, rect);
         }
+    } else if theme.is_vortexglass() {
+        ui::draw_aero_surface(
+            canvas,
+            theme,
+            rect,
+            5,
+            muted,
+            !muted,
+            if hover { 1.0 } else { 0.0 },
+            false,
+        );
     } else {
         let bg = if hover {
             theme.panel_hover

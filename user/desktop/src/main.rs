@@ -14,6 +14,7 @@
 
 mod app;
 mod apps;
+mod compositor;
 mod ddm;
 mod draw;
 mod icons;
@@ -24,6 +25,7 @@ mod start_screen;
 mod text;
 mod theme;
 mod ui;
+mod vortex;
 mod x11;
 mod xprobe;
 

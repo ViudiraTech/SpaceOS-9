@@ -505,6 +505,12 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         }
 
         if app.needs_redraw {
+            app.set_glass_toolbar_height(if app.theme.is_vortexglass() {
+                TOOLBAR_H
+            } else {
+                0
+            });
+            let glass_toolbar = app.is_composited_glass();
             draw_editor(
                 &mut app.canvas,
                 &mut app.text,
@@ -512,6 +518,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 &mut editor,
                 prefs,
                 app.active,
+                glass_toolbar,
             );
             app.draw_chrome();
             app.present()?;
@@ -527,6 +534,7 @@ fn draw_editor(
     editor: &mut Editor,
     prefs: EditorPrefs,
     window_active: bool,
+    glass_toolbar: bool,
 ) {
     let w = canvas.width as i32;
     let h = canvas.height as i32;
@@ -535,24 +543,30 @@ fn draw_editor(
     let line_h = prefs.line_h;
     let font_px = prefs.font_px;
     let is_win98 = theme.is_win98();
+    let is_vortex = theme.is_vortexglass();
     canvas.clear(theme.window);
 
-    // Top toolbar
-    canvas.fill(Rect::new(content.x, content.y, content.w, TOOLBAR_H), theme.panel);
-    if is_win98 {
-        canvas.fill(
-            Rect::new(content.x, content.y + TOOLBAR_H - 2, content.w, 1),
-            theme.bevel_shadow,
-        );
-        canvas.fill(
-            Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
-            theme.bevel_hi,
-        );
+    // Top toolbar (extended DWM Aero glass band under titlebar in VortexGlass)
+    let toolbar_r = Rect::new(content.x, content.y, content.w, TOOLBAR_H);
+    if is_vortex {
+        ui::draw_aero_extended_toolbar(canvas, theme, toolbar_r, glass_toolbar, window_active);
     } else {
-        canvas.fill(
-            Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
-            theme.window_border,
-        );
+        canvas.fill(toolbar_r, theme.panel);
+        if is_win98 {
+            canvas.fill(
+                Rect::new(content.x, content.y + TOOLBAR_H - 2, content.w, 1),
+                theme.bevel_shadow,
+            );
+            canvas.fill(
+                Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
+                theme.bevel_hi,
+            );
+        } else {
+            canvas.fill(
+                Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
+                theme.window_border,
+            );
+        }
     }
 
     ui::button(
@@ -610,6 +624,12 @@ fn draw_editor(
     if is_win98 {
         canvas.fill(body, paper_bg);
         ui::sunken_bevel(canvas, theme, body);
+    } else if is_vortex {
+        canvas.fill_alpha(
+            Rect::new(body.x, body.y, body.w, 1),
+            0xffffff,
+            if theme.is_dark() { 0.08 } else { 0.65 },
+        );
     }
     let gx = content.x + gutter_w;
     let bpad = if is_win98 { 2 } else { 0 };

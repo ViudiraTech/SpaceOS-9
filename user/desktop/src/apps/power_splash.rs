@@ -290,7 +290,7 @@ fn draw_frame(
         draw_frame_win98(canvas, text, theme, action, elapsed_s, tailer);
         return;
     }
-    draw_frame_spui(canvas, text, action, elapsed_s, tailer);
+    draw_frame_spui(canvas, text, theme, action, elapsed_s, tailer);
 }
 
 fn draw_frame_win98(
@@ -448,14 +448,12 @@ fn draw_frame_win98(
 fn draw_frame_spui(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
+    theme: &Theme,
     action: PowerAction,
     elapsed_s: f32,
     tailer: &LogTailer,
 ) {
-    draw_backdrop(canvas);
-    let w = canvas.bounds().w;
-    let h = canvas.bounds().h;
-    let cx = (w as f32) * 0.5;
+    let bounds = canvas.bounds();
     let is_reboot = matches!(action, PowerAction::Reboot);
     let accent = if tailer.done {
         0x34d399
@@ -464,6 +462,14 @@ fn draw_frame_spui(
     } else {
         0x38bdf8
     };
+    if theme.is_vortexglass() {
+        crate::vortex::draw_aero_aurora(canvas, bounds, accent, true, elapsed_s * 0.30);
+    } else {
+        draw_backdrop(canvas);
+    }
+    let w = canvas.bounds().w;
+    let h = canvas.bounds().h;
+    let cx = (w as f32) * 0.5;
 
     // Top telemetry HUD header.
     let header_y = 46.0f32;
@@ -557,16 +563,27 @@ fn draw_frame_spui(
     let box_h = (h - panel_top - 40).max(160);
     let log_rect = Rect::new(box_x, panel_top, box_w, box_h);
 
-    canvas.rounded_rect(log_rect, 8, 0x050b18, 0.90);
-    canvas.rounded_border(log_rect, 8, accent, 0.50, 1);
+    if theme.is_vortexglass() {
+        ui::draw_aero_floating_pill(canvas, theme, log_rect, 8, true);
+        let bar = Rect::new(box_x + 1, panel_top + 1, box_w - 2, 30);
+        canvas.fill_alpha(bar, 0x162944, 0.78);
+        canvas.fill_alpha(
+            Rect::new(box_x + 1, panel_top + 31, box_w - 2, 1),
+            0x9ec9f2,
+            0.35,
+        );
+    } else {
+        canvas.rounded_rect(log_rect, 8, 0x050b18, 0.90);
+        canvas.rounded_border(log_rect, 8, accent, 0.50, 1);
 
-    let bar = Rect::new(box_x + 1, panel_top + 1, box_w - 2, 30);
-    canvas.fill_alpha(bar, 0x0f1f3a, 0.92);
-    canvas.fill_alpha(
-        Rect::new(box_x + 1, panel_top + 31, box_w - 2, 1),
-        accent,
-        0.35,
-    );
+        let bar = Rect::new(box_x + 1, panel_top + 1, box_w - 2, 30);
+        canvas.fill_alpha(bar, 0x0f1f3a, 0.92);
+        canvas.fill_alpha(
+            Rect::new(box_x + 1, panel_top + 31, box_w - 2, 1),
+            accent,
+            0.35,
+        );
+    }
 
     text.draw(
         canvas,
