@@ -14,11 +14,10 @@ use crate::draw::{
     Rect,
 };
 use crate::icons::{self, Icon};
-use crate::text::{Face, TextRenderer};
+use crate::text::{Face, TextGlow, TextRenderer};
 use crate::theme::Theme;
 use crate::vortex::{
-    blit_aero_sheen, draw_glass_chrome_overlay, draw_vortexglass_fog, smootherstep,
-    AERO_BLUR_RADIUS,
+    blit_aero_sheen, draw_glass_chrome_overlay, smootherstep, AERO_BLUR_RADIUS,
 };
 use crate::x11::{ShmReadBuf, X};
 use std::time::Instant;
@@ -1082,13 +1081,9 @@ pub fn draw_alt_tab_hud(
     }
 
     if let Some(sel_ent) = entries.get(selected) {
-        let cap_rect = Rect::new(hud.x + 20, hud.bottom() - 32, hud.w - 40, 22);
-        if !theme.is_dark() {
-            draw_vortexglass_fog(dst, cap_rect, 0xffffff, 0.65);
-        }
         let fg = if theme.is_dark() { 0xf4f8fc } else { 0x0b1626 };
         let shown = text.truncate(sel_ent.title, (hud.w - 48) as f32, 13.0, Face::Bold);
-        text.draw_centered(
+        text.draw_centered_with_glow(
             dst,
             &shown,
             hud.x as f32 + hud.w as f32 * 0.5,
@@ -1096,6 +1091,7 @@ pub fn draw_alt_tab_hud(
             13.0,
             fg,
             Face::Bold,
+            TextGlow::aero_compact(theme.is_dark(), true),
         );
     }
 }
@@ -1223,15 +1219,12 @@ pub fn draw_thumb_preview(
 
     icons::draw(dst, icon, r.x + 10, r.y + 8, 16, None);
     let fg = if theme.is_dark() { 0xf4f8fc } else { 0x0f1a28 };
-    if !theme.is_dark() {
-        draw_vortexglass_fog(
-            dst,
-            Rect::new(r.x + 30, r.y + 6, r.w - 64, 20),
-            0xffffff,
-            0.55,
-        );
-    }
     let shown = text.truncate(title, (r.w - 66) as f32, 11.5, Face::Bold);
+    let glow = TextGlow::aero_compact(theme.is_dark(), true);
+    let title_clip = Rect::new(r.x + 28, r.y + 1, (r.w - 60).max(1), 28);
+    dst.with_clip(title_clip, |c| {
+        text.draw_glow(c, &shown, (r.x + 32) as f32, (r.y + 20) as f32, 11.5, Face::Bold, glow);
+    });
     text.draw(
         dst,
         &shown,

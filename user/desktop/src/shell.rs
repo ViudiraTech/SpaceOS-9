@@ -24,12 +24,11 @@ use crate::ddm::wire::PowerAction;
 use crate::draw::{mix, Canvas, Rect, Sprite};
 use crate::icons::{self, Icon};
 use crate::start_screen::{ShellConfigHost, StartAction, StartScreenState};
-use crate::text::{Face, TextRenderer};
+use crate::text::{Face, TextGlow, TextRenderer};
 use crate::theme::{Theme, VORTEX_TITLEBAR_HEIGHT};
 use crate::ui;
 use crate::vortex::{
-    draw_space_start_orb, draw_vortex_frame_chrome, draw_vortexglass_fog, smootherstep,
-    AERO_BLUR_RADIUS,
+    draw_space_start_orb, draw_vortex_frame_chrome, smootherstep, AERO_BLUR_RADIUS,
 };
 use crate::x11::{CursorKind, Key, Result, X};
 use std::collections::HashMap;
@@ -4431,27 +4430,20 @@ impl Shell {
             } else {
                 self.theme.text_dim
             };
-            if is_vortex && !self.theme.is_dark() {
-                draw_vortexglass_fog(
-                    canvas,
-                    Rect::new(rect.x + 29, rect.y + 6, (rect.w - 34).max(16), rect.h - 12),
-                    0xffffff,
-                    if is_active { 0.58 } else { 0.42 },
-                );
+            let face = if (is_win98 || is_vortex) && is_active {
+                Face::Bold
+            } else {
+                Face::Ui
+            };
+            let label_x = (rect.x + 31 + win_shift) as f32;
+            let label_y = rect.y as f32 + rect.h as f32 * 0.5 + 4.5 + win_shift as f32;
+            if is_vortex {
+                let glow = TextGlow::aero_compact(self.theme.is_dark(), is_active);
+                canvas.with_clip(rect.inset(1), |c| {
+                    self.text.draw_glow(c, &label, label_x, label_y, 12.0, face, glow);
+                });
             }
-            self.text.draw(
-                canvas,
-                &label,
-                (rect.x + 31 + win_shift) as f32,
-                rect.y as f32 + rect.h as f32 * 0.5 + 4.5 + win_shift as f32,
-                12.0,
-                fg,
-                if (is_win98 || is_vortex) && is_active {
-                    Face::Bold
-                } else {
-                    Face::Ui
-                },
-            );
+            self.text.draw(canvas, &label, label_x, label_y, 12.0, fg, face);
         }
 
         // Right tray: wired network status, speaker volume icon, notification bell & clock.
@@ -4608,14 +4600,6 @@ impl Shell {
         } else {
             (w - 14) as f32
         };
-        if is_vortex && !self.theme.is_dark() {
-            draw_vortexglass_fog(
-                canvas,
-                Rect::new(layout.clock_sep_x + 4, 4, (w - 20 - layout.clock_sep_x).max(40), h - 8),
-                0xffffff,
-                0.50,
-            );
-        }
         let clock_fg = if is_vortex {
             if self.theme.is_dark() { 0xf4f8fc } else { 0x0d1826 }
         } else {
@@ -4626,30 +4610,48 @@ impl Shell {
         } else {
             self.theme.text_muted
         };
+        let clock_clip = Rect::new(
+            layout.clock_sep_x + 2,
+            1,
+            (layout.show_desktop.x - layout.clock_sep_x - 3).max(1),
+            (h - 2).max(1),
+        );
+        let clock_glow = TextGlow::aero_compact(self.theme.is_dark(), true);
         if self.config.clock_show_date {
             let weeks = ["日", "一", "二", "三", "四", "五", "六"];
             let mid = h as f32 * 0.5;
-            self.text.draw_right(
-                canvas,
-                &time_str,
-                right_x,
-                mid - 2.0,
-                12.5,
-                clock_fg,
-                Face::Bold,
+            let date_str = format!(
+                "{year}/{month:02}/{day:02} 周{}",
+                weeks[(weekday.max(0) as usize).min(6)]
             );
-            self.text.draw_right(
-                canvas,
-                &format!(
-                    "{year}/{month:02}/{day:02} 周{}",
-                    weeks[(weekday.max(0) as usize).min(6)]
-                ),
-                right_x,
-                mid + 13.0,
-                10.0,
-                date_fg,
-                Face::Ui,
-            );
+            if is_vortex {
+                canvas.with_clip(clock_clip, |c| {
+                    self.text.draw_right_with_glow(
+                        c, &time_str, right_x, mid - 2.0, 12.5, clock_fg, Face::Bold, clock_glow,
+                    );
+                    self.text.draw_right_with_glow(
+                        c, &date_str, right_x, mid + 13.0, 10.0, date_fg, Face::Ui, clock_glow,
+                    );
+                });
+            } else {
+                self.text
+                    .draw_right(canvas, &time_str, right_x, mid - 2.0, 12.5, clock_fg, Face::Bold);
+                self.text
+                    .draw_right(canvas, &date_str, right_x, mid + 13.0, 10.0, date_fg, Face::Ui);
+            }
+        } else if is_vortex {
+            canvas.with_clip(clock_clip, |c| {
+                self.text.draw_right_with_glow(
+                    c,
+                    &time_str,
+                    right_x,
+                    h as f32 * 0.5 + 4.8,
+                    13.0,
+                    clock_fg,
+                    Face::Bold,
+                    clock_glow,
+                );
+            });
         } else {
             self.text.draw_right(
                 canvas,
@@ -4761,18 +4763,26 @@ impl Shell {
 
         let identity = session_identity();
         let shown_id = self.text.truncate(&identity, 96.0, 13.0, Face::Bold);
-        if !self.theme.is_dark() {
-            draw_vortexglass_fog(canvas, Rect::new(334, 20, 102, 34), 0xffffff, 0.65);
-        }
-        self.text.draw(canvas, &shown_id, 338.0, 38.0, 13.0, right_fg, Face::Bold);
-        self.text.draw(
+        let dark = self.theme.is_dark();
+        self.text.draw_with_glow(
+            canvas,
+            &shown_id,
+            338.0,
+            38.0,
+            13.0,
+            right_fg,
+            Face::Bold,
+            TextGlow::aero_compact(dark, true),
+        );
+        self.text.draw_with_glow(
             canvas,
             "SpaceOS 9",
             338.0,
             54.0,
             10.5,
-            if self.theme.is_dark() { 0xb0c4d8 } else { 0x26384c },
+            if dark { 0xb0c4d8 } else { 0x26384c },
             Face::Ui,
+            TextGlow::aero_compact(dark, false),
         );
         canvas.fill_alpha(Rect::new(274, 72, w - 288, 1), 0xffffff, 0.35);
 
@@ -4786,11 +4796,8 @@ impl Shell {
                 canvas.rounded_rect(pr, 4, 0xffffff, 0.34);
                 canvas.rounded_border(pr, 4, self.theme.aero_hover_border(), 0.72, 1);
             }
-            if !self.theme.is_dark() {
-                draw_vortexglass_fog(canvas, pr, 0xffffff, if hovered { 0.72 } else { 0.48 });
-            }
             icons::draw(canvas, place.icon, pr.x + 8, pr.y + 7, 20, None);
-            self.text.draw(
+            self.text.draw_with_glow(
                 canvas,
                 place.label,
                 (pr.x + 34) as f32,
@@ -4798,6 +4805,7 @@ impl Shell {
                 12.0,
                 right_fg,
                 if hovered { Face::Bold } else { Face::Ui },
+                TextGlow::aero_compact(dark, hovered),
             );
         }
 
@@ -4807,11 +4815,16 @@ impl Shell {
                 PowerAction::Reboot => ("确认重启？", "重启", Icon::Refresh),
                 PowerAction::PowerOff => ("确认关机？", "关机", Icon::Shutdown),
             };
-            if !self.theme.is_dark() {
-                draw_vortexglass_fog(canvas, Rect::new(274, h - 78, 160, 22), 0xffffff, 0.75);
-            }
-            self.text
-                .draw(canvas, prompt, 276.0, (h - 60) as f32, 12.0, right_fg, Face::Bold);
+            self.text.draw_with_glow(
+                canvas,
+                prompt,
+                276.0,
+                (h - 60) as f32,
+                12.0,
+                right_fg,
+                Face::Bold,
+                TextGlow::aero_compact(dark, true),
+            );
             ui::button(
                 canvas,
                 &mut self.text,

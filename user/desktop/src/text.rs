@@ -214,6 +214,137 @@ pub struct TextRenderer {
     cyber_mono: Option<Font>,
     ui_scale: f32,
     cache: HashMap<(Face, char, u16), Arc<Glyph>>,
+    glow_buf_a: Vec<f32>,
+    glow_buf_b: Vec<f32>,
+    glow_buf_c: Vec<f32>,
+    glow_cov: Vec<u8>,
+}
+
+/// Configuration for Windows Vista/7 DWM-style glyph-mask Gaussian text glow
+/// (`DrawThemeTextEx` / `DTT_GLOWSIZE`).
+#[derive(Clone, Copy, Debug)]
+pub struct TextGlow {
+    pub color: u32,
+    pub sigma_inner: f32,
+    pub sigma_outer: f32,
+    pub gain: f32,
+    pub intensity: f32,
+    pub offset_y: i32,
+}
+
+impl TextGlow {
+    pub const fn aero_light(active: bool) -> Self {
+        Self {
+            color: 0xffffff,
+            sigma_inner: 2.0,
+            sigma_outer: 4.8,
+            gain: 4.4,
+            intensity: if active { 0.94 } else { 0.62 },
+            offset_y: 0,
+        }
+    }
+
+    pub const fn aero_dark(active: bool) -> Self {
+        Self {
+            color: 0x040a12,
+            sigma_inner: 1.6,
+            sigma_outer: 3.4,
+            gain: 3.8,
+            intensity: if active { 0.70 } else { 0.44 },
+            offset_y: 1,
+        }
+    }
+
+    pub const fn aero_title(dark: bool, active: bool) -> Self {
+        if dark {
+            Self::aero_dark(active)
+        } else {
+            Self::aero_light(active)
+        }
+    }
+
+    pub const fn aero_compact(dark: bool, active: bool) -> Self {
+        if dark {
+            Self {
+                color: 0x040a12,
+                sigma_inner: 1.4,
+                sigma_outer: 2.8,
+                gain: 3.4,
+                intensity: if active { 0.62 } else { 0.42 },
+                offset_y: 1,
+            }
+        } else {
+            Self {
+                color: 0xffffff,
+                sigma_inner: 1.7,
+                sigma_outer: 3.8,
+                gain: 4.0,
+                intensity: if active { 0.86 } else { 0.64 },
+                offset_y: 0,
+            }
+        }
+    }
+}
+
+fn build_gaussian_kernel(sigma: f32) -> (usize, [f32; 41]) {
+    let s = sigma.clamp(0.4, 8.0);
+    let radius = (s * 2.5).ceil().clamp(1.0, 20.0) as usize;
+    let mut kernel = [0.0f32; 41];
+    let inv_2s2 = -0.5 / (s * s);
+    let mut sum = 0.0f32;
+    for (i, slot) in kernel[..=2 * radius].iter_mut().enumerate() {
+        let d = i as f32 - radius as f32;
+        let w = (inv_2s2 * d * d).exp();
+        *slot = w;
+        sum += w;
+    }
+    let inv_sum = 1.0 / sum;
+    for slot in &mut kernel[..=2 * radius] {
+        *slot *= inv_sum;
+    }
+    (radius, kernel)
+}
+
+fn blur_separable_zero(
+    src: &[f32],
+    tmp: &mut [f32],
+    dst: &mut [f32],
+    w: usize,
+    h: usize,
+    radius: usize,
+    kernel: &[f32],
+) {
+    for y in 0..h {
+        let row_off = y * w;
+        for x in 0..w {
+            let k_start = radius.saturating_sub(x);
+            let x_start = x + k_start - radius;
+            let x_end = (x + radius + 1).min(w);
+            let mut acc = 0.0f32;
+            let mut k = k_start;
+            for sx in x_start..x_end {
+                acc += src[row_off + sx] * kernel[k];
+                k += 1;
+            }
+            tmp[row_off + x] = acc;
+        }
+    }
+    for y in 0..h {
+        let dst_row = &mut dst[y * w..(y + 1) * w];
+        dst_row.fill(0.0);
+        let k_start = radius.saturating_sub(y);
+        let y_start = y + k_start - radius;
+        let y_end = (y + radius + 1).min(h);
+        let mut k = k_start;
+        for sy in y_start..y_end {
+            let wt = kernel[k];
+            let src_row = &tmp[sy * w..(sy + 1) * w];
+            for x in 0..w {
+                dst_row[x] += src_row[x] * wt;
+            }
+            k += 1;
+        }
+    }
 }
 
 fn be16(data: &[u8], offset: usize) -> u16 {
@@ -323,6 +454,10 @@ impl TextRenderer {
             cyber_mono,
             ui_scale: 1.0,
             cache: HashMap::with_capacity(512),
+            glow_buf_a: Vec::new(),
+            glow_buf_b: Vec::new(),
+            glow_buf_c: Vec::new(),
+            glow_cov: Vec::new(),
         })
     }
 
@@ -484,11 +619,212 @@ impl TextRenderer {
         let width = self.measure(text, px, face);
         self.draw(canvas, text, right_x - width, baseline, px, color, face);
     }
+
+    /// Render a Windows 7 DWM-style glyph-mask dual-lobe Gaussian glow behind `text`.
+    /// Call `draw` afterward to paint crisp glyph foreground strokes on top.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_glow(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        x: f32,
+        baseline: f32,
+        px: f32,
+        face: Face,
+        glow: TextGlow,
+    ) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        if glow.intensity <= 0.001 {
+            return self.measure(text, px, face);
+        }
+
+        let mut glyphs: Vec<(i32, i32, Arc<Glyph>)> =
+            Vec::with_capacity(text.chars().count().min(128));
+        let mut pen = x;
+        let base_y = baseline.round() as i32;
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for ch in text.chars() {
+            let g = self.glyph(face, ch, px);
+            let g_adv = g.advance;
+            if g.width != 0 && g.height != 0 {
+                let gx0 = pen.round() as i32 + g.xmin;
+                let gy0 = base_y - g.ymin - g.height as i32;
+                let gx1 = gx0 + g.width as i32;
+                let gy1 = gy0 + g.height as i32;
+                min_x = min_x.min(gx0);
+                min_y = min_y.min(gy0);
+                max_x = max_x.max(gx1);
+                max_y = max_y.max(gy1);
+                glyphs.push((gx0, gy0, g));
+            }
+            pen += g_adv;
+        }
+        let adv = pen - x;
+        if glyphs.is_empty() || max_x <= min_x || max_y <= min_y {
+            return adv;
+        }
+
+        let sigma1 = glow.sigma_inner.clamp(0.4, 8.0);
+        let sigma2 = glow.sigma_outer.max(sigma1).clamp(0.4, 10.0);
+        let pad = (sigma2 * 2.5).ceil().clamp(2.0, 20.0) as i32;
+        let origin_x = min_x - pad;
+        let origin_y = min_y - pad;
+        let bw = (max_x - min_x + 2 * pad) as usize;
+        let bh = (max_y - min_y + 2 * pad) as usize;
+        let len = bw.saturating_mul(bh);
+        if len == 0 || len > 512 * 1024 {
+            return adv;
+        }
+
+        self.glow_buf_a.clear();
+        self.glow_buf_a.resize(len, 0.0);
+        self.glow_buf_b.clear();
+        self.glow_buf_b.resize(len, 0.0);
+        self.glow_buf_c.clear();
+        self.glow_buf_c.resize(len, 0.0);
+        self.glow_cov.clear();
+        self.glow_cov.resize(len, 0);
+
+        for (gx0, gy0, g) in &glyphs {
+            let lx = (gx0 - origin_x) as usize;
+            let ly = (gy0 - origin_y) as usize;
+            for row in 0..g.height {
+                let src_off = row * g.width;
+                let dst_off = (ly + row) * bw + lx;
+                for col in 0..g.width {
+                    let cov = g.coverage[src_off + col];
+                    if cov != 0 {
+                        let s = cov as f32 * (1.0 / 255.0);
+                        let slot = &mut self.glow_buf_a[dst_off + col];
+                        *slot = *slot + s - *slot * s;
+                    }
+                }
+            }
+        }
+
+        let (r1, k1) = build_gaussian_kernel(sigma1);
+        blur_separable_zero(
+            &self.glow_buf_a,
+            &mut self.glow_buf_b,
+            &mut self.glow_buf_c,
+            bw,
+            bh,
+            r1,
+            &k1,
+        );
+        let sigma_delta = (sigma2 * sigma2 - sigma1 * sigma1).max(0.0).sqrt();
+        let intensity = glow.intensity.clamp(0.0, 1.0);
+        if sigma_delta >= 0.35 {
+            let (r2, k2) = build_gaussian_kernel(sigma_delta);
+            blur_separable_zero(
+                &self.glow_buf_c,
+                &mut self.glow_buf_b,
+                &mut self.glow_buf_a,
+                bw,
+                bh,
+                r2,
+                &k2,
+            );
+            for i in 0..len {
+                let u = 0.56 * self.glow_buf_c[i] + 0.44 * self.glow_buf_a[i];
+                let sat = 1.0 - (-glow.gain * u).exp();
+                self.glow_cov[i] = (sat * intensity * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        } else {
+            for i in 0..len {
+                let sat = 1.0 - (-glow.gain * self.glow_buf_c[i]).exp();
+                self.glow_cov[i] = (sat * intensity * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
+
+        canvas.blend_coverage_alpha(
+            origin_x,
+            origin_y + glow.offset_y,
+            bw,
+            bh,
+            glow.color,
+            &self.glow_cov,
+            255,
+        );
+        adv
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_with_glow(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        x: f32,
+        baseline: f32,
+        px: f32,
+        color: u32,
+        face: Face,
+        glow: TextGlow,
+    ) -> f32 {
+        self.draw_glow(canvas, text, x, baseline, px, face, glow);
+        self.draw(canvas, text, x, baseline, px, color, face)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_centered_with_glow(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        center_x: f32,
+        baseline: f32,
+        px: f32,
+        color: u32,
+        face: Face,
+        glow: TextGlow,
+    ) {
+        let width = self.measure(text, px, face);
+        self.draw_with_glow(
+            canvas,
+            text,
+            center_x - width / 2.0,
+            baseline,
+            px,
+            color,
+            face,
+            glow,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_right_with_glow(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        right_x: f32,
+        baseline: f32,
+        px: f32,
+        color: u32,
+        face: Face,
+        glow: TextGlow,
+    ) {
+        let width = self.measure(text, px, face);
+        self.draw_with_glow(
+            canvas,
+            text,
+            right_x - width,
+            baseline,
+            px,
+            color,
+            face,
+            glow,
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::draw::Rect;
 
     #[test]
     fn cjk_faces_share_collection_and_rasterize_on_demand() {
@@ -517,6 +853,89 @@ mod tests {
         assert_eq!(
             mono.rasterize('i', 18.0).advance,
             mono.rasterize('W', 18.0).advance
+        );
+    }
+
+    #[test]
+    fn aero_dwm_glow_hugs_glyphs_respects_clip_and_handles_argb() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build/rootfs/stage");
+        let path = root.join(theme::FONT_UI.trim_start_matches('/'));
+        let path = path.to_str().unwrap();
+        let mut files = HashMap::new();
+        let ui = load(path, "CJK SC", &mut files).unwrap();
+        let bold = Font {
+            data: ui.data.clone(),
+            index: ui.index,
+        };
+        let mono = load(path, "Mono CJK SC", &mut files).unwrap();
+        let mut renderer = TextRenderer {
+            ui,
+            bold,
+            mono,
+            cyber_display: None,
+            cyber_mono: None,
+            ui_scale: 1.0,
+            cache: HashMap::with_capacity(64),
+            glow_buf_a: Vec::new(),
+            glow_buf_b: Vec::new(),
+            glow_buf_c: Vec::new(),
+            glow_cov: Vec::new(),
+        };
+
+        // 1. ARGB transparent glass canvas + clip keeping y=0 dark hairline clean
+        let mut glass = Canvas::new(140, 32, 0);
+        glass.set_argb(true);
+        let glow = TextGlow::aero_title(false, true);
+        glass.with_clip(Rect::new(0, 1, 140, 29), |c| {
+            renderer.draw_glow(c, "文件管理器", 24.0, 20.0, 12.5, Face::Ui, glow);
+        });
+        for x in 0..140 {
+            assert_eq!(glass.pixels()[x], 0, "top row x={x} should stay clear");
+        }
+        let non_zero_glow = glass.pixels().iter().filter(|&&p| (p >> 24) > 0).count();
+        assert!(non_zero_glow > 150, "expected generous soft glyph halo");
+        assert_eq!(glass.pixels()[15 * 140 + 138], 0);
+
+        let sample_near = glass.pixels()[12 * 140 + 28];
+        let a = sample_near >> 24;
+        let r = (sample_near >> 16) & 0xff;
+        let g = (sample_near >> 8) & 0xff;
+        let b = sample_near & 0xff;
+        assert!(r <= a && g <= a && b <= a);
+
+        // 2. Opaque canvas convenience helper + no-op edge cases
+        let mut opaque = Canvas::new(140, 32, 0x204060);
+        let adv = renderer.draw_with_glow(
+            &mut opaque,
+            "设置",
+            24.0,
+            20.0,
+            12.5,
+            0x000000,
+            Face::Ui,
+            TextGlow::aero_compact(false, true),
+        );
+        assert!(adv > 10.0);
+        assert_ne!(opaque.pixels()[15 * 140 + 28], 0x204060);
+        assert_eq!(
+            renderer.draw_glow(&mut glass, "", 10.0, 20.0, 12.5, Face::Ui, glow),
+            0.0
+        );
+        assert!(renderer.draw_glow(&mut glass, "   ", 10.0, 20.0, 12.5, Face::Ui, glow) > 0.0);
+        assert!(
+            renderer.draw_glow(
+                &mut glass,
+                "Test",
+                10.0,
+                20.0,
+                12.5,
+                Face::Ui,
+                TextGlow {
+                    intensity: 0.0,
+                    ..glow
+                }
+            ) > 0.0
         );
     }
 }

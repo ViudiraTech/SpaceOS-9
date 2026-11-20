@@ -468,16 +468,16 @@ pub fn caption_button_rect_for(
     if theme.is_vortexglass() {
         return if buttons_left {
             match kind {
-                CaptionHit::Close => Rect::new(2, 0, 41, 18),
-                CaptionHit::Maximize => Rect::new(43, 0, 26, 18),
-                CaptionHit::Minimize => Rect::new(69, 0, 26, 18),
+                CaptionHit::Close => Rect::new(2, 1, 41, 18),
+                CaptionHit::Maximize => Rect::new(43, 1, 26, 18),
+                CaptionHit::Minimize => Rect::new(69, 1, 26, 18),
                 CaptionHit::None => Rect::default(),
             }
         } else {
             match kind {
-                CaptionHit::Close => Rect::new(window_width - 43, 0, 41, 18),
-                CaptionHit::Maximize => Rect::new(window_width - 69, 0, 26, 18),
-                CaptionHit::Minimize => Rect::new(window_width - 95, 0, 26, 18),
+                CaptionHit::Close => Rect::new(window_width - 43, 1, 41, 18),
+                CaptionHit::Maximize => Rect::new(window_width - 69, 1, 26, 18),
+                CaptionHit::Minimize => Rect::new(window_width - 95, 1, 26, 18),
                 CaptionHit::None => Rect::default(),
             }
         };
@@ -685,35 +685,17 @@ pub fn titlebar(
 
         let max_title_w = (width - 108 - 38).max(40) as f32;
         let shown = text.truncate(title, max_title_w, 12.5, Face::Ui);
-        if !theme.is_dark() {
-            let tw = (text.measure(&shown, 12.5, Face::Ui).ceil() as i32 + 16)
-                .clamp(24, max_title_w as i32 + 16);
-            vortex::draw_vortexglass_fog(
-                canvas,
-                Rect::new((title_x as i32 - 8).max(2), 3, tw, VORTEX_TITLEBAR_HEIGHT - 7),
-                0xffffff,
-                if active { 0.68 } else { 0.40 },
-            );
-            // Vista/Win7 Aero white outer title halo (`draw_vortexglass_title` in Uinxed-Kernel).
-            for (gx, gy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-                text.draw_alpha(
-                    canvas,
-                    &shown,
-                    title_x + gx,
-                    20.0 + gy,
-                    12.5,
-                    0xffffff,
-                    if active { 0.78 } else { 0.45 },
-                    Face::Ui,
-                );
-            }
-        }
+        let glow = crate::text::TextGlow::aero_title(theme.is_dark(), active);
+        let glow_clip = Rect::new(0, 1, width, (VORTEX_TITLEBAR_HEIGHT - 2).max(1));
+        canvas.with_clip(glow_clip, |c| {
+            text.draw_glow(c, &shown, title_x, 20.0, 12.5, Face::Ui, glow);
+        });
         let title_color = if theme.is_dark() {
             if active { 0xf4f8fc } else { 0xb8c8da }
         } else if active {
             0x000000
         } else {
-            0x50555f
+            0x3a4350
         };
         text.draw(canvas, &shown, title_x, 20.0, 12.5, title_color, Face::Ui);
 
@@ -2818,6 +2800,7 @@ mod tests {
             assert_eq!((min_r.w, min_r.h), (26, 18));
             assert_eq!((max_r.w, max_r.h), (26, 18));
             assert_eq!((close_r.w, close_r.h), (41, 18));
+            assert_eq!((min_r.y, max_r.y, close_r.y), (1, 1, 1));
             if buttons_left {
                 assert_eq!(close_r.right(), max_r.x);
                 assert_eq!(max_r.right(), min_r.x);

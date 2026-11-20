@@ -152,6 +152,7 @@ pub fn smootherstep(t: f32) -> f32 {
 
 /// Paint Uinxed-Kernel's 8px white luminous fog halo (`draw_vortexglass_fog`)
 /// behind titlebar text so dark Aero titles remain crisp over any wallpaper.
+#[allow(dead_code)]
 pub fn draw_vortexglass_fog(canvas: &mut Canvas, text_rect: Rect, color: u32, max_alpha: f32) {
     if text_rect.w <= 0 || text_rect.h <= 0 || max_alpha <= 0.002 {
         return;
@@ -811,14 +812,14 @@ pub fn draw_vortex_frame_chrome(
                     0,
                     draw_rect.y,
                     scr_w,
-                    5,
-                    20,
-                    20,
+                    4,
+                    21,
+                    21,
                     false,
                     24,
                     edge_op,
                 );
-                let body_start = draw_rect.y + 20;
+                let body_start = draw_rect.y + 21;
                 let rim_y = (client_y - 2).max(body_start);
                 if rim_y > body_start {
                     draw_h_3slice_rows(
