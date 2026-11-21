@@ -15,6 +15,7 @@ pub mod http;
 pub mod i18n;
 pub mod journal;
 pub mod ops;
+pub mod overwrite;
 pub mod query;
 pub mod remote;
 pub mod repair;

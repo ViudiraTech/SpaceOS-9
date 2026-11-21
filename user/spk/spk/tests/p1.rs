@@ -634,3 +634,79 @@ fn installs_through_symlinked_directory() {
     assert!(root.file("/usr/bin").exists());
     assert!(root.check().status.success());
 }
+
+#[test]
+fn overwrite_unowned_owned_and_glob() {
+    let repo = TestRepo::new();
+    repo.add(&Pkg::new("over-a", "1.0.0").file("/usr/share/ow/shared", b"a\n", 0o644));
+    repo.add(&Pkg::new("over-b", "1.0.0").file("/usr/share/ow/shared", b"b\n", 0o644));
+    repo.add(&Pkg::new("over-dir", "1.0.0").file("/usr/share/ow/existing/inner", b"i\n", 0o644));
+    repo.publish();
+    let root = Root::new(&repo);
+
+    // Unowned path: default is a file conflict.
+    fs::create_dir_all(root.file("/usr/share/ow")).unwrap();
+    fs::write(root.file("/usr/share/ow/shared"), b"unowned\n").unwrap();
+    let conflict = root.run(&["install", "--repo", repo_arg(&repo), "over-a"]);
+    assert_code(&conflict, 5);
+    assert!(text(&conflict).contains("not owned") || text(&conflict).contains("exists"));
+    assert_eq!(
+        fs::read(root.file("/usr/share/ow/shared")).unwrap(),
+        b"unowned\n"
+    );
+
+    // Exact overwrite works and check remains green.
+    assert_ok(&root.run(&[
+        "install",
+        "--repo",
+        repo_arg(&repo),
+        "--overwrite",
+        "/usr/share/ow/shared",
+        "over-a",
+    ]));
+    assert_eq!(fs::read(root.file("/usr/share/ow/shared")).unwrap(), b"a\n");
+    assert_ok(&root.check());
+
+    // Owned path: default fails; glob overwrite transfers ownership.
+    let conflict = root.run(&["install", "--repo", repo_arg(&repo), "over-b"]);
+    assert_code(&conflict, 5);
+    assert_ok(&root.run(&[
+        "install",
+        "--repo",
+        repo_arg(&repo),
+        "--overwrite",
+        "/usr/share/ow/*",
+        "over-b",
+    ]));
+    assert_eq!(fs::read(root.file("/usr/share/ow/shared")).unwrap(), b"b\n");
+    let owns = text(&root.run(&["owns", "/usr/share/ow/shared"]));
+    assert!(owns.contains("over-b"), "{owns}");
+    let files_a = text(&root.run(&["files", "over-a"]));
+    assert!(!files_a.contains("/usr/share/ow/shared"), "{files_a}");
+    assert_ok(&root.check());
+
+    // Existing directory is not a conflict.
+    fs::create_dir_all(root.file("/usr/share/ow/existing")).unwrap();
+    assert_ok(&root.run(&["install", "--repo", repo_arg(&repo), "over-dir"]));
+    assert_ok(&root.check());
+}
+
+#[test]
+fn overwrite_rejects_relative_and_parent_globs() {
+    let repo = TestRepo::new();
+    repo.add(&Pkg::new("over-bad", "1.0.0").file("/usr/share/owbad", b"x\n", 0o644));
+    repo.publish();
+    let root = Root::new(&repo);
+    for pattern in ["usr/share/owbad", "/usr/../etc/passwd", "/usr/share/[bad"] {
+        let out = root.run(&[
+            "install",
+            "--repo",
+            repo_arg(&repo),
+            "--overwrite",
+            pattern,
+            "over-bad",
+        ]);
+        assert_code(&out, 2);
+    }
+    assert_ok(&root.check());
+}
