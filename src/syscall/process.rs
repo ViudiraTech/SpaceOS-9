@@ -480,6 +480,7 @@ const CLONE_SIGHAND: u64 = 0x0000_0800;
 const CLONE_VFORK: u64 = 0x0000_4000;
 const CLONE_PARENT: u64 = 0x0000_8000;
 const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_NEWNS: u64 = 0x0002_0000;
 // SysV semaphore operations are not implemented, so there can be no undo
 // list to share yet. Keep this flag accepted for pthread implementations.
 const CLONE_SYSVSEM: u64 = 0x0004_0000;
@@ -503,7 +504,40 @@ const CLONE_KNOWN: u64 = CLONE_VM
     | CLONE_CHILD_CLEARTID
     | CLONE_DETACHED
     | CLONE_CHILD_SETTID
+    | CLONE_NEWNS
     | 0xff;
+
+/// `unshare(2)` for the namespaces P3 sandbox needs. Mount namespace
+/// unsharing implies CLONE_FS, matching Linux.
+pub fn unshare(flags: u64) -> i64 {
+    const CLONE_FILES: u64 = 0x0000_0400;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    if flags & !(CLONE_NEWNS | CLONE_FS | CLONE_FILES) != 0 {
+        return -abi::EINVAL;
+    }
+    let Some(task) = crate::sched::current() else {
+        return -abi::ESRCH;
+    };
+    if task.credentials().euid != 0 {
+        return -abi::EPERM;
+    }
+    if flags & CLONE_NEWNS != 0 {
+        let ns = crate::vfs::copy_mount_namespace(&task.mount_namespace());
+        task.set_mount_namespace(ns);
+        let fs = Arc::new(SpinLock::new((*task.fs().lock()).clone()));
+        task.set_fs(fs);
+    } else if flags & CLONE_FS != 0 {
+        let fs = Arc::new(SpinLock::new((*task.fs().lock()).clone()));
+        task.set_fs(fs);
+    }
+    if flags & CLONE_FILES != 0 {
+        // File descriptor table sharing is not represented as a flag on the
+        // task; a private copy is the safe unshare behaviour.
+        let table = Arc::new(SpinLock::new(task.files().lock().clone()));
+        task.set_fd_table(table);
+    }
+    0
+}
 
 /// Linux clone with process and thread semantics.  CLONE_VFORK is reported as
 /// unimplemented rather than silently emulated with different semantics.
@@ -518,6 +552,11 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
     }
     if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 {
         return -abi::EINVAL;
+    }
+    if flags & CLONE_NEWNS != 0
+        && crate::sched::current().is_some_and(|t| t.credentials().euid != 0)
+    {
+        return -abi::EPERM;
     }
     let Some(parent) = crate::sched::current() else {
         return -abi::ESRCH;
@@ -562,6 +601,11 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
         parent.fs()
     } else {
         Arc::new(SpinLock::new((*parent.fs().lock()).clone()))
+    };
+    let mount_ns = if flags & CLONE_NEWNS != 0 {
+        crate::vfs::copy_mount_namespace(&parent.mount_namespace())
+    } else {
+        parent.mount_namespace()
     };
     let signals = if flags & CLONE_SIGHAND != 0 {
         parent.signals()
@@ -622,6 +666,8 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
         fd_table: files,
         files_shared,
         fs,
+        mount_ns,
+        seccomp_filters: parent.seccomp_filters(),
         signals,
         thread_signals,
         address_space: child_space,

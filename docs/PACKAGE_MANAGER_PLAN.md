@@ -618,6 +618,13 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - 线上 `spk-host verify`：hello 0.1.0-1 OK、hello 0.2.0-1 OK、index.json OK
   - 公钥未变；0.1 保留，支持 downgrade
 
+- 2026-11-21：P2 发布 `sudo 0.1.0`，索引同时包含 hello 0.1/0.2 与 sudo。
+  - `sudo-0.1.0-1-x86_64.spk`：sha256 `67931fc98e552994ef7903bf8be99f64f7fa3cd91a4dcbdedfdaf02912943b99`
+  - `index.json`：sha256 `78cefc4c62ff6c24ce966d47fa2778fce3ab11c716649c6d7e4452c14e341e75`
+  - `index.json.sig`：sha256 `c2a17fea6216a8e59c6965bed322d6d9cc2d97aedad646d61232fb7260c853a8`
+  - 线上 `spk-host verify`：hello 0.1/0.2、sudo 0.1、index.json 全部 OK
+  - sudo 安装前置：镜像需提供 root:root、0644 的 `/etc/spk/setuid.allow`，包含 `/usr/bin/sudo`、`/usr/bin/doas`
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
@@ -691,6 +698,7 @@ CI：
 
 - `.INSTALL`、hooks.d、文件 triggers、沙箱、幂等与失败策略。
 - 验收：busybox 式 trigger、升级脚本、沙箱逃逸测试。
+- P3a 实现记录（2026-11-22，内核）：`openat2(437)`（`open_how`/RESOLVE_* /OPENAT2_REGULAR/O_NOFOLLOW/O_PATH）、`chroot(161)` 与 per-task root、private mount namespace（`clone(CLONE_NEWNS)`/`unshare(272)`）、`mount(2)` 5 参数/MS_BIND/MS_REC/MS_RDONLY/MS_REMOUNT、bind 子树、只读写拒绝、`pivot_root(155)`、procfs `hidepid=1|2`、`seccomp(317)` cBPF（ALLOW/ERRNO/KILL/TRAP/LOG、TSYNC/LOG、no_new_privs、fork/exec 继承）。新增用户态 P3 探针与 boot-self-test 通过；P3b 将在此之上实现脚本/hooks/triggers/sudo 校验。
 
 ### P4 仓库与信任
 
@@ -740,6 +748,8 @@ SpaceKernel/
 - `copy_file_range`（x86_64 syscall 326）未实现；std 会回退并打印 unimplemented 告警。`spk` 的备份/恢复改用 read/write 复制，目标端不再触发该路径。
 - 已实现（2026-11-21）：内核 setuid/setgid exec（euid/suid、egid/sgid、fsuid/fsgid 重置、`no_new_privs` 与 `MS_NOSUID` 抑制、`AT_SECURE`、dumpable=0、`MS_NOEXEC`/`MS_NOSUID` 挂载标志）。修复 `setgid`/`setregid`/`setresgid`/`setfsgid` 以 egid==0 判断特权、导致 4755 setuid-root sudo（egid 仍为调用者）无法切换主组的问题；按 Linux 语义改为 euid==0。QEMU sudo/doas 全链路（含 `-u` 非 root 目标）通过。
 - OOBE 空密码已支持：DDM 对空字符串生成 `$6$` 哈希并验证；sudo 接受空 shadow 哈希/空密码；首次授权成功提示包含空密码警告；OOBE 界面注明“空密码账户首次 sudo/doas 授权会收到一次性安全提示”。
+- P3a 内核原语已落地：`openat2` + `O_NOFOLLOW/O_PATH` + `RESOLVE_BENEATH/IN_ROOT/NO_SYMLINKS/NO_XDEV/NO_MAGICLINKS`；`chroot` 使 `FsContext.root` 参与绝对路径/绝对符号链接/`..` 解析；private mount namespace 与 bind/只读挂载；procfs `hidepid`；seccomp cBPF。沙箱仍按 P3b 以非 root `spk-script` + 只读 source + staging 视图组合使用。
+- P3a 的 mount namespace 目前是 private 传播语义；shared/slave peer group 传播、seccomp `USER_NOTIF/NEW_LISTENER/TRACE` 未接入（沙箱不使用），列入 P4。
 - `pkgver` 现要求首尾为字母数字；alpm `rpmvercmp` 对前导/尾随分隔符的字符串不满足传递性（与上游一致），fuzz 在合法 `pkgver` 域验证全序，避免求解器排序出现不一致。
 - 已修复（2026-11-21）：ext4 `extent_truncate()` 释放目录数据块时使用 `metadata=false`，没有写 revoke；掉电后 jbd2 回放会把旧目录块覆盖到复用该块的文件（QEMU 第三阶段复现 `files.json` 指向目录块）。修复为目录数据块按元数据释放并生成 revoke。QEMU 三阶段在阶段 1↔2 不调用 `sync`、强制日志回放：boot 2/3 分别回放 14/98 个事务、6/28 条 revoke，最终阶段 sync 供离线检查，矩阵全部通过。
 - TLS 根证书与离线信任链；`rustls` 在 SpaceOS 上的 ring 后端可用性。
@@ -848,3 +858,5 @@ sudo -e file...
 - [x] sudo setuid 安装/卸载与凭据矩阵的 QEMU 测试。
 - [ ] sudo 包升级/事务回滚的 QEMU 测试（P3）。
 - [x] P2 hold/pin、多仓库、`--print`/`--json`、复杂图/环/provides/replaces、fuzz 与性能测试。
+- [x] P3a 内核：openat2/O_NOFOLLOW/O_PATH、chroot、mount namespace/bind/RO/pivot_root、proc hidepid、seccomp cBPF 与内核/QEMU 测试。
+- [ ] P3b：.INSTALL/hooks.d/triggers、非 root 沙箱、sudoers 校验、setuid 包升级回滚与 CI。

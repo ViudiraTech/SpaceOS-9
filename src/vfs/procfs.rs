@@ -39,7 +39,7 @@ const PROCESS: &[&str] = &[
 ];
 const SYS_FS: &[&str] = &["dentry-state", "inode-nr", "inode-state"];
 enum View {
-    Root,
+    Root(u8),
     Sys,
     SysFs,
     SysFsFile(String),
@@ -394,7 +394,7 @@ fn sys_fs(name: &str) -> Result<String, VfsError> {
 impl Inode for Node {
     fn metadata(&self) -> Result<Stat, VfsError> {
         let kind = match &self.view {
-            View::Root | View::Sys | View::SysFs => InodeKind::Directory,
+            View::Root(_) | View::Sys | View::SysFs => InodeKind::Directory,
             View::Process(w) | View::Tasks(w) | View::Fds(w, _) => {
                 Self::task(w)?;
                 InodeKind::Directory
@@ -480,7 +480,7 @@ impl Inode for Node {
     }
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, VfsError> {
         match &self.view {
-            View::Root => {
+            View::Root(_hidepid) => {
                 if name == "self" || name == "thread-self" {
                     return Ok(Self::make(
                         View::Link(None, String::from(name)),
@@ -500,10 +500,17 @@ impl Inode for Node {
                         100 + index as u64,
                     ));
                 }
+                let hidepid = match &self.view {
+                    View::Root(hidepid) => *hidepid,
+                    _ => 0,
+                };
                 let pid = name.parse::<u64>().map_err(|_| VfsError::NotFound)?;
                 let task = sched::find_tgid(pid)
                     .or_else(|| sched::find_task(pid))
                     .ok_or(VfsError::NotFound)?;
+                if hidepid >= 1 && !process_visible(&task) {
+                    return Err(VfsError::NotFound);
+                }
                 Ok(Self::make(
                     View::Process(task.downgrade()),
                     0x10000 + pid * 64,
@@ -579,10 +586,12 @@ impl Inode for Node {
     }
     fn readdir(&self) -> Result<Vec<DirEntry>, VfsError> {
         let names: Vec<String> = match &self.view {
-            View::Root => {
+            View::Root(hidepid) => {
+                let hidepid = *hidepid;
                 let mut process_ids: Vec<u64> = sched::task_list()
                     .iter()
                     .filter(|task| task.user)
+                    .filter(|task| hidepid < 2 || process_visible_task(task))
                     .map(|task| task.tgid)
                     .collect();
                 process_ids.sort_unstable();
@@ -651,11 +660,44 @@ impl Inode for Node {
         Ok(entries)
     }
 }
-pub struct ProcFs;
+pub struct ProcFs {
+    hidepid: u8,
+}
+impl Default for ProcFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcFs {
     pub fn new() -> Self {
-        Self
+        Self { hidepid: 0 }
     }
+    pub fn with_hidepid(hidepid: u8) -> Self {
+        Self {
+            hidepid: hidepid.min(2),
+        }
+    }
+}
+
+fn process_visible(target: &sched::TaskRef) -> bool {
+    let Some(current) = sched::current() else {
+        return true;
+    };
+    if current.credentials().euid == 0 {
+        return true;
+    }
+    current.stats().tgid == target.stats().tgid
+}
+
+fn process_visible_task(target: &sched::TaskStats) -> bool {
+    let Some(current) = sched::current() else {
+        return true;
+    };
+    if current.credentials().euid == 0 {
+        return true;
+    }
+    current.stats().tgid == target.tgid
 }
 impl FileSystem for ProcFs {
     fn fs_type(&self) -> &'static str {
@@ -665,7 +707,7 @@ impl FileSystem for ProcFs {
         super::CacheMode::Revalidate
     }
     fn root_inode(&self) -> Arc<dyn Inode> {
-        Node::make(View::Root, 1)
+        Node::make(View::Root(self.hidepid), 1)
     }
     fn statfs(&self) -> Result<StatFs, VfsError> {
         Ok(StatFs {

@@ -20,6 +20,37 @@ impl Inode for TestDevice {
     }
 }
 pub fn devices() {
+    // chroot/openat2 path policy: rooted absolute paths, IN_ROOT `..` clamp
+    // and BENEATH escape rejection.
+    assert_eq!(normalize_rooted("/etc/passwd", "/jail"), "/jail/etc/passwd");
+    assert_eq!(
+        normalize_rooted("/jail/etc/passwd", "/jail"),
+        "/jail/etc/passwd"
+    );
+    let in_root = LookupOptions {
+        root: String::from("/jail"),
+        anchor: Some(String::from("/jail")),
+        in_root: true,
+        ..LookupOptions::default()
+    };
+    assert_eq!(
+        normalize_scoped("/jail", "/../etc/passwd", &in_root).unwrap(),
+        "/jail/etc/passwd"
+    );
+    let beneath = LookupOptions {
+        root: String::from("/"),
+        anchor: Some(String::from("/jail")),
+        beneath: true,
+        ..LookupOptions::default()
+    };
+    assert_eq!(
+        normalize_scoped("/jail", "../etc/passwd", &beneath).unwrap_err(),
+        VfsError::CrossDevice
+    );
+    assert_eq!(
+        normalize_scoped("/jail", "/etc/passwd", &beneath).unwrap_err(),
+        VfsError::CrossDevice
+    );
     let counter = Arc::new(AtomicU64::new(0));
     let c = counter.clone();
     let device = crate::device::register(

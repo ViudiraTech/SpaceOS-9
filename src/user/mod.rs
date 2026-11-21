@@ -102,6 +102,22 @@ pub fn process_signal_self_test() -> Result<(), &'static str> {
     Err("process/signal user self-test failed or timed out")
 }
 
+/// x86_64 P3a kernel test: mount namespace, bind/read-only, chroot, seccomp.
+#[cfg(target_arch = "x86_64")]
+pub fn p3_syscall_self_test() -> Result<(), &'static str> {
+    crate::syscall::set_last_user_exit_code(-1);
+    let pid = spawn_user_elf(test_binaries::P3_SYSCALLS_ELF, "p3_syscalls")?;
+    if crate::syscall::wait_user_exit_code(44, SELF_TEST_TIMEOUT_MICROS) {
+        let _ = crate::sched::take_zombie(pid);
+        crate::verbose::log(format_args!(
+            "P3 mount/chroot/seccomp user self-test passed"
+        ));
+        return Ok(());
+    }
+    dump_user_tasks();
+    Err("P3 syscall user self-test failed or timed out")
+}
+
 /// Print every user task with its state and the syscall it is blocked in, so
 /// a hung self-test names the wait it is stuck on.
 #[cfg(target_arch = "x86_64")]
