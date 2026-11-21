@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{flock, FlockOperation};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use spk_core::db::{FileDb, InstalledDb, ReposDb, WorldDb, DB_SCHEMA};
+use spk_core::db::{FileDb, HoldsDb, InstalledDb, ReposDb, WorldDb, DB_SCHEMA};
 
 use crate::error::{Result, SpkError};
 
@@ -86,6 +86,7 @@ pub struct State {
     pub files: FileDb,
     pub world: WorldDb,
     pub repos: ReposDb,
+    pub holds: HoldsDb,
 }
 
 impl State {
@@ -95,6 +96,7 @@ impl State {
             files: load_db(paths, "files.json")?,
             world: load_db(paths, "world.json")?,
             repos: load_db(paths, "repos.json")?,
+            holds: load_db(paths, "holds.json")?,
         })
     }
 
@@ -123,6 +125,11 @@ impl Schema for WorldDb {
     }
 }
 impl Schema for ReposDb {
+    fn schema(&self) -> u32 {
+        self.schema
+    }
+}
+impl Schema for HoldsDb {
     fn schema(&self) -> u32 {
         self.schema
     }

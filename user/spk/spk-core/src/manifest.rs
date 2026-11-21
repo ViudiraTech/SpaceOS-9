@@ -25,6 +25,7 @@ pub const MAX_COMPONENT_LEN: usize = 255;
 /// Package payloads may never replace the package database, the lock file or
 /// the trust store.
 pub const RESERVED_PREFIXES: &[&str] = &["/var/lib/spk", "/etc/spk/trusted.d"];
+pub const RESERVED_PATHS: &[&str] = &["/etc/spk/setuid.allow"];
 pub const META_MANIFEST: &str = "manifest.toml";
 pub const META_INSTALL: &str = ".INSTALL";
 pub const META_CHANGELOG: &str = ".CHANGELOG";
@@ -357,6 +358,11 @@ pub fn validate_absolute_path(path: &str) -> Result<()> {
     if RESERVED_ROOT_FILES.contains(&&path[1..]) {
         return Err(Error::UnsafePath(format!(
             "'{path}' collides with package metadata"
+        )));
+    }
+    if RESERVED_PATHS.contains(&path) {
+        return Err(Error::UnsafePath(format!(
+            "'{path}' is reserved for the package manager"
         )));
     }
     if RESERVED_PREFIXES.iter().any(|prefix| {

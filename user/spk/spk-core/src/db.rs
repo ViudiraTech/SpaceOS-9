@@ -232,5 +232,50 @@ mod tests {
         let text = serde_json::to_string_pretty(&repos).unwrap();
         let back: ReposDb = serde_json::from_str(&text).unwrap();
         assert_eq!(back.repos.len(), 1);
+
+        let mut holds = HoldsDb::default();
+        holds.packages.insert(
+            "hello".into(),
+            HeldPackage {
+                epoch: 0,
+                version: "0.1.0".into(),
+                release: 1,
+            },
+        );
+        let text = serde_json::to_string_pretty(&holds).unwrap();
+        let back: HoldsDb = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.packages["hello"].version().to_string(), "0.1.0-1");
+    }
+}
+
+/// Explicit version holds. A held package is never changed by the solver
+/// unless the user passes `--override-hold` on an explicit target.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct HoldsDb {
+    pub schema: u32,
+    pub packages: BTreeMap<String, HeldPackage>,
+}
+
+impl Default for HoldsDb {
+    fn default() -> Self {
+        Self {
+            schema: DB_SCHEMA,
+            packages: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HeldPackage {
+    pub epoch: u64,
+    pub version: String,
+    pub release: u64,
+}
+
+impl HeldPackage {
+    pub fn version(&self) -> crate::version::Version {
+        crate::version::Version::new(self.epoch, self.version.clone(), self.release)
     }
 }

@@ -9,10 +9,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use spk_core::archive::extract_spk;
-use spk_core::db::{FileDb, FileRecord, InstallReason, InstalledDb, InstalledPackage, WorldDb};
+use spk_core::db::{
+    FileDb, FileRecord, HoldsDb, InstallReason, InstalledDb, InstalledPackage, WorldDb,
+};
 use spk_core::fsutil::sha256_file;
 use spk_core::index::IndexPackage;
 use spk_core::manifest::{validate_absolute_path, FileType, Manifest, PackageFile};
@@ -144,6 +147,7 @@ struct Plan {
     installed: InstalledDb,
     files: FileDb,
     world: WorldDb,
+    holds: HoldsDb,
     warnings: Vec<String>,
     download_size: u64,
     installed_size: u64,
@@ -387,6 +391,7 @@ fn stage_packages(
         if scanned.install_script.is_some() {
             eprintln!("{}", i18n::warning_script_unsupported(lang, &index.name));
         }
+        check_setuid_policy(paths, &scanned.manifest)?;
         let conffiles = scanned.manifest.conffiles.iter().cloned().collect();
         staged.insert(
             index.name.clone(),
@@ -398,6 +403,60 @@ fn stage_packages(
         );
     }
     Ok(staged)
+}
+
+fn check_setuid_policy(paths: &Paths, manifest: &Manifest) -> Result<()> {
+    let setuid: Vec<&PackageFile> = manifest
+        .files
+        .iter()
+        .filter(|file| {
+            file.mode_bits()
+                .map(|mode| mode & 0o6000 != 0)
+                .unwrap_or(false)
+        })
+        .collect();
+    if setuid.is_empty() {
+        return Ok(());
+    }
+    if !manifest.allow_setuid {
+        return Err(SpkError::General(format!(
+            "{}: setuid bits require allow_setuid",
+            manifest.name
+        )));
+    }
+    let whitelist = paths.root.join("etc/spk/setuid.allow");
+    let metadata = fs::symlink_metadata(&whitelist).map_err(|error| {
+        SpkError::General(format!(
+            "{}: cannot read setuid whitelist: {error}",
+            whitelist.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(SpkError::General(format!(
+            "{} must be a root-owned file not writable by group/other",
+            whitelist.display()
+        )));
+    }
+    let text = fs::read_to_string(&whitelist)?;
+    let allowed: BTreeSet<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    for file in setuid {
+        if !allowed.contains(file.path.as_str()) {
+            return Err(SpkError::General(format!(
+                "setuid path {} is not listed in {}",
+                file.path,
+                whitelist.display()
+            )));
+        }
+    }
+    eprintln!(
+        "warning: preserving setuid/setgid bits from signed package {}",
+        manifest.name
+    );
+    Ok(())
 }
 
 fn index_matches(index: &IndexPackage, manifest: &Manifest) -> bool {
@@ -487,8 +546,12 @@ fn build_plan(
         }
     }
     for path in dirs.keys() {
-        if let Some(on_disk) = fs.on_disk(path)? {
-            if on_disk.kind != OnDiskKind::Dir && !fs.is_dir(path)? {
+        let on_disk = fs.on_disk(path).map_err(|_| SpkError::FileConflict {
+            message: i18n::file_conflict_header(options.lang).to_string(),
+            lines: vec![i18n::file_conflict_unowned(options.lang, path, "package")],
+        })?;
+        if let Some(on_disk) = on_disk {
+            if on_disk.kind != OnDiskKind::Dir && !fs.is_dir(path).unwrap_or(false) {
                 return Err(SpkError::FileConflict {
                     message: i18n::file_conflict_header(options.lang).to_string(),
                     lines: vec![i18n::file_conflict_unowned(options.lang, path, "package")],
@@ -509,7 +572,14 @@ fn build_plan(
             }
             installed_size += file.size;
             let old_record = state.files.files.get(&file.path);
-            let on_disk = fs.on_disk(&file.path)?;
+            let on_disk = fs.on_disk(&file.path).map_err(|_| SpkError::FileConflict {
+                message: i18n::file_conflict_header(options.lang).to_string(),
+                lines: vec![i18n::file_conflict_unowned(
+                    options.lang,
+                    &file.path,
+                    &action.to.name,
+                )],
+            })?;
             if old_record.is_none() {
                 if on_disk.is_some() {
                     return Err(SpkError::FileConflict {
@@ -680,6 +750,13 @@ fn build_plan(
         files.files.insert(path.clone(), owner.to_record());
     }
     let total_installed_size: u64 = files.files.values().map(|record| record.size).sum();
+    let mut holds = state.holds.clone();
+    for name in &removed {
+        holds.packages.remove(name);
+    }
+    for name in &solution.cleared_holds {
+        holds.packages.remove(name);
+    }
     let final_count = installed.packages.len();
     let download_size: u64 = solution
         .actions
@@ -700,6 +777,7 @@ fn build_plan(
         installed,
         files,
         world,
+        holds,
         warnings,
         download_size,
         installed_size,
@@ -918,6 +996,7 @@ fn apply(
         &plan.installed,
         &plan.files,
         &plan.world,
+        &plan.holds,
         txid,
         &mut journal,
     )?;
@@ -930,6 +1009,7 @@ fn commit_db(
     installed: &InstalledDb,
     files: &FileDb,
     world: &WorldDb,
+    holds: &HoldsDb,
     txid: &str,
     journal: &mut Journal,
 ) -> Result<()> {
@@ -945,6 +1025,10 @@ fn commit_db(
         (
             "world.json",
             write_temp_json(paths, "world.json", world, txid)?,
+        ),
+        (
+            "holds.json",
+            write_temp_json(paths, "holds.json", holds, txid)?,
         ),
     ];
     let db_backup = paths.backup.join(txid).join("db");

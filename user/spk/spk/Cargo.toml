@@ -36,4 +36,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+proptest.workspace = true
 spk-host = { path = "../spk-host" }

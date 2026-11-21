@@ -156,6 +156,25 @@ pub fn collect_errors(paths: &Paths, state: &State) -> Result<Vec<String>> {
         }
     }
 
+    for (name, held) in &state.holds.packages {
+        match state.installed.packages.get(name) {
+            None => errors.push(format!("holds: {name} is not installed")),
+            Some(package) => {
+                let version = spk_core::version::Version::new(
+                    package.epoch,
+                    package.version.clone(),
+                    package.release,
+                );
+                if version != held.version() {
+                    errors.push(format!(
+                        "holds: {name} is held at {}, installed at {version}",
+                        held.version()
+                    ));
+                }
+            }
+        }
+    }
+
     for name in &state.world.packages {
         match state.installed.packages.get(name) {
             None => errors.push(format!("world: {name} is not installed")),

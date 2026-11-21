@@ -6,6 +6,7 @@
 //       Copyright (C) 2026 ViudiraTech.
 //
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,8 @@ pub struct LoadedRepo {
     pub key_id: String,
     pub dir: PathBuf,
     pub index: Index,
+    pub priority: i32,
+    pub order: usize,
 }
 
 impl LoadedRepo {
@@ -35,23 +38,103 @@ pub fn target_arch() -> &'static str {
 }
 
 pub fn load_repos(paths: &Paths, urls: &[String]) -> Result<Vec<LoadedRepo>> {
-    let mut chosen = urls.to_vec();
-    if chosen.is_empty() {
+    let mut repos = Vec::new();
+    if urls.is_empty() {
         let state = crate::state::State::load(paths)?;
-        for repo in state.repos.repos.iter().filter(|repo| repo.enabled) {
-            chosen.extend(repo.urls.iter().cloned());
+        let mut configs: Vec<_> = state
+            .repos
+            .repos
+            .iter()
+            .filter(|repo| repo.enabled)
+            .enumerate()
+            .collect();
+        configs.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
+        if configs.is_empty() {
+            return Err(SpkError::General(
+                "no repositories configured; pass --repo <path> or add a repository".into(),
+            ));
+        }
+        for (order, (_, config)) in configs.into_iter().enumerate() {
+            let mut loaded = None;
+            for url in &config.urls {
+                match load_repo(paths, url, config.priority, order) {
+                    Ok(mut repo) => {
+                        repo.name = config.name.clone();
+                        loaded = Some(repo);
+                        break;
+                    }
+                    Err(SpkError::Signature(error)) => {
+                        return Err(SpkError::Signature(format!(
+                            "repository '{}': {error}",
+                            config.name
+                        )))
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: repository '{}' mirror {} unavailable: {error}",
+                            config.name, url
+                        );
+                    }
+                }
+            }
+            match loaded {
+                Some(repo) => repos.push(repo),
+                None => eprintln!("warning: repository '{}' has no usable mirror", config.name),
+            }
+        }
+    } else {
+        for (order, url) in urls.iter().enumerate() {
+            match load_repo(paths, url, 0, order) {
+                Ok(repo) => repos.push(repo),
+                Err(SpkError::Signature(error)) => return Err(SpkError::Signature(error)),
+                Err(error) => {
+                    eprintln!("warning: repository {} unavailable: {error}", url);
+                }
+            }
+        }
+        if repos.is_empty() {
+            return Err(SpkError::General(
+                "no usable repositories; check --repo paths and signatures".into(),
+            ));
         }
     }
-    if chosen.is_empty() {
-        return Err(SpkError::General(
-            "no repositories configured; pass --repo <path> or add a repository".into(),
-        ));
-    }
-    let mut repos = Vec::new();
-    for url in chosen {
-        repos.push(load_repo(paths, &url)?);
-    }
+    validate_consistency(&repos)?;
     Ok(repos)
+}
+
+type PackageIdentity = (String, u64, String, u64, String);
+type SeenPackage<'a> = (&'a str, &'a spk_core::index::IndexPackage);
+
+fn validate_consistency(repos: &[LoadedRepo]) -> Result<()> {
+    let mut seen: BTreeMap<PackageIdentity, SeenPackage> = BTreeMap::new();
+    for repo in repos {
+        for package in &repo.index.packages {
+            let key = package.identity();
+            if let Some((other_repo, other)) = seen.get(&key) {
+                if package.sha256 != other.sha256
+                    || package.size != other.size
+                    || package.filename != other.filename
+                    || package.abi != other.abi
+                    || package.depends != other.depends
+                    || package.provides != other.provides
+                    || package.conflicts != other.conflicts
+                    || package.replaces != other.replaces
+                    || package.summary != other.summary
+                {
+                    return Err(SpkError::General(format!(
+                        "package {} {} differs between repositories '{}' and '{}'",
+                        package.name,
+                        package.version(),
+                        other_repo,
+                        repo.name
+                    )));
+                }
+            } else {
+                seen.insert(key, (&repo.name, package));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn local_path(url: &str) -> Result<PathBuf> {
@@ -69,7 +152,7 @@ pub fn local_path(url: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(url))
 }
 
-pub fn load_repo(paths: &Paths, url: &str) -> Result<LoadedRepo> {
+pub fn load_repo(paths: &Paths, url: &str, priority: i32, order: usize) -> Result<LoadedRepo> {
     let dir = local_path(url)?;
     let index_path = dir.join("index.json");
     let sig_path = dir.join("index.json.sig");
@@ -115,6 +198,8 @@ pub fn load_repo(paths: &Paths, url: &str) -> Result<LoadedRepo> {
         key_id: index.key_id.clone(),
         dir,
         index,
+        priority,
+        order,
     })
 }
 
@@ -167,4 +252,80 @@ pub fn trust_add(paths: &Paths, key_path: &Path) -> Result<PublicKey> {
 
 pub fn trust_list(paths: &Paths) -> Result<Vec<PublicKey>> {
     trust_keys(paths)
+}
+
+pub fn add(paths: &Paths, name: &str, url: &str, priority: Option<i32>) -> Result<()> {
+    spk_core::index::validate_repo_name(name)?;
+    if url.trim().is_empty() {
+        return Err(SpkError::Usage("repository URL must not be empty".into()));
+    }
+    let _lock = crate::state::lock_exclusive(paths)?;
+    let mut state = crate::state::State::load(paths)?;
+    if let Some(repo) = state.repos.repos.iter_mut().find(|repo| repo.name == name) {
+        if !repo.urls.iter().any(|existing| existing == url) {
+            repo.urls.push(url.to_string());
+        }
+        if let Some(priority) = priority {
+            repo.priority = priority;
+        }
+        repo.enabled = true;
+    } else {
+        state.repos.repos.push(spk_core::db::RepoConfig {
+            name: name.to_string(),
+            arch: target_arch().to_string(),
+            urls: vec![url.to_string()],
+            priority: priority.unwrap_or(0),
+            key_id: String::new(),
+            last_sync: 0,
+            enabled: true,
+        });
+    }
+    write_repos(paths, &state.repos)
+}
+
+pub fn remove(paths: &Paths, name: &str) -> Result<()> {
+    let _lock = crate::state::lock_exclusive(paths)?;
+    let mut state = crate::state::State::load(paths)?;
+    let before = state.repos.repos.len();
+    state.repos.repos.retain(|repo| repo.name != name);
+    if state.repos.repos.len() == before {
+        return Err(SpkError::General(format!(
+            "repository '{name}' is not configured"
+        )));
+    }
+    write_repos(paths, &state.repos)
+}
+
+pub fn set_priority(paths: &Paths, name: &str, priority: i32) -> Result<()> {
+    let _lock = crate::state::lock_exclusive(paths)?;
+    let mut state = crate::state::State::load(paths)?;
+    let repo = state
+        .repos
+        .repos
+        .iter_mut()
+        .find(|repo| repo.name == name)
+        .ok_or_else(|| SpkError::General(format!("repository '{name}' is not configured")))?;
+    repo.priority = priority;
+    write_repos(paths, &state.repos)
+}
+
+pub fn list(paths: &Paths) -> Result<()> {
+    let state = crate::state::State::load(paths)?;
+    for repo in &state.repos.repos {
+        println!(
+            "{} priority={} arch={} enabled={}",
+            repo.name, repo.priority, repo.arch, repo.enabled
+        );
+        for url in &repo.urls {
+            println!("  {url}");
+        }
+    }
+    Ok(())
+}
+
+fn write_repos(paths: &Paths, repos: &spk_core::db::ReposDb) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(repos)?;
+    bytes.push(b'\n');
+    spk_core::fsutil::atomic_write(&paths.db_path("repos.json"), &bytes, 0o644)?;
+    Ok(())
 }

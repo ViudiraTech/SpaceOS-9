@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use spk_ops::error::SpkError;
 use spk_ops::i18n::Lang;
-use spk_ops::ops;
+use spk_ops::ops::{self, ReportOptions};
 use spk_ops::state::Paths;
 
 #[derive(Parser)]
@@ -27,6 +27,9 @@ struct Cli {
     /// Output language: en or zh_CN
     #[arg(long, global = true)]
     lang: Option<String>,
+    /// Machine-readable transaction plans and errors
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -37,6 +40,10 @@ enum Command {
     Install {
         #[arg(long)]
         needed: bool,
+        #[arg(long)]
+        override_hold: bool,
+        #[arg(long)]
+        print: bool,
         #[arg(long = "repo")]
         repos: Vec<String>,
         targets: Vec<String>,
@@ -47,20 +54,36 @@ enum Command {
         repos: Vec<String>,
         #[arg(long)]
         allow_partial: bool,
+        #[arg(long)]
+        override_hold: bool,
+        #[arg(long)]
+        print: bool,
         targets: Vec<String>,
     },
     /// Downgrade packages to name=<version>
     Downgrade {
         #[arg(long = "repo")]
         repos: Vec<String>,
+        #[arg(long)]
+        override_hold: bool,
+        #[arg(long)]
+        print: bool,
         targets: Vec<String>,
     },
     /// Reinstall packages at their installed version
     Reinstall {
         #[arg(long = "repo")]
         repos: Vec<String>,
+        #[arg(long)]
+        override_hold: bool,
+        #[arg(long)]
+        print: bool,
         targets: Vec<String>,
     },
+    /// Hold packages at their installed versions
+    Hold { targets: Vec<String> },
+    /// Release held packages
+    Unhold { targets: Vec<String> },
     /// Remove packages (-Rs removes orphaned dependencies)
     Remove {
         #[arg(short = 'R', long)]
@@ -69,6 +92,8 @@ enum Command {
         recursive_short: bool,
         #[arg(long)]
         purge: bool,
+        #[arg(long)]
+        print: bool,
         targets: Vec<String>,
     },
     /// List installed packages
@@ -83,11 +108,33 @@ enum Command {
     Check,
     /// Recover an interrupted transaction
     Repair,
+    /// Manage configured repositories
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
     /// Manage trusted repository keys
     Trust {
         #[command(subcommand)]
         command: TrustCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Add or update a repository URL
+    Add {
+        name: String,
+        url: String,
+        #[arg(long)]
+        priority: Option<i32>,
+    },
+    /// Remove a repository
+    Remove { name: String },
+    /// List repositories
+    List,
+    /// Change a repository priority
+    Priority { name: String, priority: i32 },
 }
 
 #[derive(Subcommand)]
@@ -100,12 +147,22 @@ enum TrustCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error}");
-            for line in error.lines() {
-                eprintln!("{line}");
+            if json {
+                let payload = serde_json::json!({
+                    "schema": 1,
+                    "error": error.to_string(),
+                    "lines": error.lines(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+            } else {
+                eprintln!("error: {error}");
+                for line in error.lines() {
+                    eprintln!("{line}");
+                }
             }
             ExitCode::from(error.exit_code())
         }
@@ -118,24 +175,83 @@ fn run(cli: Cli) -> Result<(), SpkError> {
     match cli.command {
         Command::Install {
             needed,
+            override_hold,
+            print,
             repos,
             targets,
-        } => ops::install(&paths, &repos, &targets, needed, cli.noconfirm, lang),
+        } => ops::install(
+            &paths,
+            &repos,
+            &targets,
+            needed,
+            override_hold,
+            cli.noconfirm,
+            ReportOptions {
+                json: cli.json,
+                print,
+            },
+            lang,
+        ),
         Command::Upgrade {
             repos,
             allow_partial,
+            override_hold,
+            print,
             targets,
-        } => ops::upgrade(&paths, &repos, &targets, allow_partial, cli.noconfirm, lang),
-        Command::Downgrade { repos, targets } => {
-            ops::downgrade(&paths, &repos, &targets, cli.noconfirm, lang)
-        }
-        Command::Reinstall { repos, targets } => {
-            ops::reinstall(&paths, &repos, &targets, cli.noconfirm, lang)
-        }
+        } => ops::upgrade(
+            &paths,
+            &repos,
+            &targets,
+            allow_partial,
+            override_hold,
+            cli.noconfirm,
+            ReportOptions {
+                json: cli.json,
+                print,
+            },
+            lang,
+        ),
+        Command::Downgrade {
+            repos,
+            override_hold,
+            print,
+            targets,
+        } => ops::downgrade(
+            &paths,
+            &repos,
+            &targets,
+            override_hold,
+            cli.noconfirm,
+            ReportOptions {
+                json: cli.json,
+                print,
+            },
+            lang,
+        ),
+        Command::Reinstall {
+            repos,
+            override_hold,
+            print,
+            targets,
+        } => ops::reinstall(
+            &paths,
+            &repos,
+            &targets,
+            override_hold,
+            cli.noconfirm,
+            ReportOptions {
+                json: cli.json,
+                print,
+            },
+            lang,
+        ),
+        Command::Hold { targets } => ops::hold(&paths, &targets, lang),
+        Command::Unhold { targets } => ops::unhold(&paths, &targets, lang),
         Command::Remove {
             recursive,
             recursive_short,
             purge,
+            print,
             targets,
         } => ops::remove(
             &paths,
@@ -143,6 +259,10 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             recursive || recursive_short,
             purge,
             cli.noconfirm,
+            ReportOptions {
+                json: cli.json,
+                print,
+            },
             lang,
         ),
         Command::List => ops::list(&paths),
@@ -151,6 +271,18 @@ fn run(cli: Cli) -> Result<(), SpkError> {
         Command::Owns { path } => ops::owns(&paths, &path, lang),
         Command::Check => ops::check_database(&paths, lang),
         Command::Repair => ops::repair_database(&paths, lang),
+        Command::Repo { command } => match command {
+            RepoCommand::Add {
+                name,
+                url,
+                priority,
+            } => spk_ops::repo::add(&paths, &name, &url, priority),
+            RepoCommand::Remove { name } => spk_ops::repo::remove(&paths, &name),
+            RepoCommand::List => spk_ops::repo::list(&paths),
+            RepoCommand::Priority { name, priority } => {
+                spk_ops::repo::set_priority(&paths, &name, priority)
+            }
+        },
         Command::Trust { command } => match command {
             TrustCommand::Add { key } => ops::trust_add(&paths, &key, lang),
             TrustCommand::List => ops::trust_list(&paths),

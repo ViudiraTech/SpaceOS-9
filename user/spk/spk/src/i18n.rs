@@ -429,3 +429,19 @@ pub fn trust_added(lang: Lang, key_id: &str) -> String {
         format!(":: Trusted key {key_id}")
     }
 }
+
+pub fn solver_held(lang: Lang, name: &str, held: &str, attempted: &str) -> String {
+    if lang.is_zh() {
+        format!(":: 软件包 {name} 被锁定在 {held}；拒绝使用 {attempted}")
+    } else {
+        format!(":: package {name} is held at {held}; refusing {attempted}")
+    }
+}
+
+pub fn held_back(lang: Lang, name: &str, installed: &str, available: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：{name} 被锁定在 {installed}（可升级到 {available}）")
+    } else {
+        format!("warning: {name} is held back ({installed} -> {available})")
+    }
+}
