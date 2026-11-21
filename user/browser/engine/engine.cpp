@@ -509,6 +509,7 @@ void space_page_draw(SpacePage* page, int scroll_x, int scroll_y, int clip_w, in
     page->scroll_x = scroll_x;
     page->scroll_y = scroll_y;
     page->ensure_layout();
+    page->ime_caret_h = 0;
     litehtml::position clip(0, 0, static_cast<litehtml::pixel_t>(clip_w), static_cast<litehtml::pixel_t>(clip_h));
     page->doc->draw(0, static_cast<litehtml::pixel_t>(-scroll_x),
                     static_cast<litehtml::pixel_t>(-scroll_y), &clip);
@@ -560,6 +561,7 @@ void space_page_mouse_down(SpacePage* page, int x, int y, int scroll_x, int scro
         auto prev = page->focused_el.lock();
         if (prev.get() != focus_target.get()) {
             if (prev && page->dom) page->dom->dispatch_ui_event(prev, "blur", false, false);
+            page->ime_preedit.clear();
             page->focused_el = focus_target;
             if (focus_target && page->dom) page->dom->dispatch_ui_event(focus_target, "focus", false, false);
             page->mark_dirty(false, true);
@@ -769,6 +771,45 @@ void space_page_set_focused(SpacePage* page, int focused) {
         page->page_focused = f;
         page->mark_dirty(false, true);
     }
+}
+
+void space_page_set_ime_preedit(SpacePage* page, const char* preedit) {
+    if (!page) return;
+    std::string next = preedit ? preedit : "";
+    if (page->ime_preedit != next) {
+        page->ime_preedit = std::move(next);
+        page->mark_dirty(false, true);
+    }
+}
+
+int space_page_ime_commit(SpacePage* page, const char* utf8_text) {
+    if (!page || !page->doc || !utf8_text || !utf8_text[0]) return 0;
+    auto focus = page->focused_el.lock();
+    if (auto* inp = dynamic_cast<space::el_space_input*>(focus.get())) {
+        if (inp->is_text_like() && inp->input_type() != "password") {
+            return inp->on_key(0, utf8_text, 0) ? 1 : 0;
+        }
+    } else if (auto* ta = dynamic_cast<space::el_space_textarea*>(focus.get())) {
+        return ta->on_key(0, utf8_text, 0) ? 1 : 0;
+    }
+    return 0;
+}
+
+int space_page_ime_caret_info(SpacePage* page, int* out_x, int* out_y, int* out_h) {
+    if (!page || !page->doc) return 0;
+    auto focus = page->focused_el.lock();
+    bool editable = false;
+    if (auto* inp = dynamic_cast<space::el_space_input*>(focus.get())) {
+        editable = inp->is_text_like() && inp->input_type() != "password"
+            && !inp->get_attr("disabled") && !inp->get_attr("readonly");
+    } else if (auto* ta = dynamic_cast<space::el_space_textarea*>(focus.get())) {
+        editable = !ta->get_attr("disabled") && !ta->get_attr("readonly");
+    }
+    if (!editable) return 0;
+    if (out_x) *out_x = page->ime_caret_x;
+    if (out_y) *out_y = page->ime_caret_y;
+    if (out_h) *out_h = page->ime_caret_h;
+    return 1;
 }
 
 } // extern "C"

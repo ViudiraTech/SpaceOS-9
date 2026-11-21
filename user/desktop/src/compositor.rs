@@ -11,16 +11,16 @@
 
 use crate::draw::{
     lerp_f32, mix, premultiply_u8, scale_premul, src_over_premul, src_over_u8, BlurScratch, Canvas,
-    Rect,
+    Rect, RectRegion,
 };
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextGlow, TextRenderer};
 use crate::theme::Theme;
 use crate::vortex::{
-    blit_aero_sheen, draw_glass_chrome_overlay, smootherstep, AERO_BLUR_RADIUS,
+    blit_aero_sheen, draw_glass_chrome_overlay, smootherstep, VortexFrameCache, AERO_BLUR_RADIUS,
 };
 use crate::x11::{ShmReadBuf, X};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use x11rb::protocol::xproto::Window;
 
 /// Retained per-window Composite backing pixmap, XDamage handle, and premultiplied snapshot.
@@ -28,6 +28,8 @@ pub struct CompWindow {
     pub window: Window,
     pub damage: u32,
     pub pixmap: u32,
+    pub pixmap_w: usize,
+    pub pixmap_h: usize,
     pub depth: u8,
     /// DWM extended client glass `[top, bottom, left, right, corner_r]` if SPUI app.
     pub glass_extents: Option<[i32; 5]>,
@@ -37,6 +39,9 @@ pub struct CompWindow {
     pub has_pixels: bool,
     pub needs_capture: bool,
     pub dirty_bounds: Option<Rect>,
+    pub resize_wait_until: Option<Instant>,
+    pub awaiting_sync_commit: bool,
+    pub frame_cache: Option<VortexFrameCache>,
     pub anim: Option<WindowAnim>,
 }
 
@@ -46,6 +51,8 @@ impl CompWindow {
             window,
             damage: 0,
             pixmap: 0,
+            pixmap_w: 0,
+            pixmap_h: 0,
             depth,
             glass_extents,
             pixels: Vec::new(),
@@ -54,6 +61,9 @@ impl CompWindow {
             has_pixels: false,
             needs_capture: true,
             dirty_bounds: None,
+            resize_wait_until: None,
+            awaiting_sync_commit: false,
+            frame_cache: None,
             anim: None,
         }
     }
@@ -70,11 +80,28 @@ impl CompWindow {
     }
 
     pub fn mark_damage(&mut self, rect: Rect) {
+        if self.awaiting_sync_commit {
+            // Delay capture until the client commits its first drawn resize frame (cmd=22) or timeout.
+            self.dirty_bounds = Some(match self.dirty_bounds {
+                Some(prev) => prev.union(rect),
+                None => rect,
+            });
+            return;
+        }
         self.needs_capture = true;
         self.dirty_bounds = Some(match self.dirty_bounds {
             Some(prev) => prev.union(rect),
             None => rect,
         });
+    }
+
+    pub fn confirm_sync_commit(&mut self) {
+        self.awaiting_sync_commit = false;
+        self.resize_wait_until = None;
+        self.needs_capture = true;
+        if self.pixmap_w > 0 && self.pixmap_h > 0 {
+            self.dirty_bounds = Some(Rect::new(0, 0, self.pixmap_w as i32, self.pixmap_h as i32));
+        }
     }
 }
 
@@ -222,6 +249,102 @@ pub struct TickOutcome {
     pub orb_changed: bool,
 }
 
+/// Bounded disjoint dirty-rectangle tracker preventing localized updates from ballooning to full-screen redraws.
+#[derive(Default, Clone, Debug)]
+pub struct DirtyRegion {
+    pub rects: Vec<Rect>,
+    pub full: bool,
+}
+
+impl DirtyRegion {
+    const MAX_RECTS: usize = 6;
+    const MERGE_PAD: i32 = 32;
+
+    pub fn mark_full(&mut self) {
+        self.full = true;
+        self.rects.clear();
+    }
+
+    pub fn clear(&mut self) {
+        self.full = false;
+        self.rects.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.full && self.rects.is_empty()
+    }
+
+    pub fn mark(&mut self, rect: Rect, bounds: Rect) {
+        if self.full || rect.is_empty() || bounds.is_empty() {
+            return;
+        }
+        let mut r = rect.intersect(bounds);
+        if r.is_empty() {
+            return;
+        }
+        let screen_area = i64::from(bounds.w) * i64::from(bounds.h);
+        if i64::from(r.w) * i64::from(r.h) * 4 >= screen_area * 3 {
+            self.mark_full();
+            return;
+        }
+        loop {
+            let probe = r.expand(Self::MERGE_PAD);
+            let mut merged_any = false;
+            let mut i = 0;
+            while i < self.rects.len() {
+                if !self.rects[i].intersect(probe).is_empty() {
+                    r = r.union(self.rects.swap_remove(i));
+                    merged_any = true;
+                } else {
+                    i += 1;
+                }
+            }
+            if !merged_any {
+                break;
+            }
+        }
+        r = r.intersect(bounds);
+        if i64::from(r.w) * i64::from(r.h) * 4 >= screen_area * 3 {
+            self.mark_full();
+            return;
+        }
+        if self.rects.len() < Self::MAX_RECTS {
+            self.rects.push(r);
+        } else {
+            let mut best_idx = 0usize;
+            let mut best_waste = i64::MAX;
+            for (idx, &ex) in self.rects.iter().enumerate() {
+                let u = ex.union(r);
+                let waste = i64::from(u.w) * i64::from(u.h) - i64::from(ex.w) * i64::from(ex.h);
+                if waste < best_waste {
+                    best_waste = waste;
+                    best_idx = idx;
+                }
+            }
+            self.rects[best_idx] = self.rects[best_idx].union(r).intersect(bounds);
+        }
+    }
+
+    pub fn take_into(&mut self, bounds: Rect, out: &mut Vec<Rect>) {
+        out.clear();
+        if bounds.is_empty() {
+            self.clear();
+            return;
+        }
+        if self.full {
+            out.push(bounds);
+        } else {
+            for r in self.rects.drain(..) {
+                let clipped = r.intersect(bounds);
+                if !clipped.is_empty() {
+                    out.push(clipped);
+                }
+            }
+        }
+        self.full = false;
+    }
+}
+
 /// Software compositor state owned by `Shell`.
 pub struct Compositor {
     pub active: bool,
@@ -229,12 +352,16 @@ pub struct Compositor {
     pub canvas: Option<Canvas>,
     pub frost_tmp: Option<Canvas>,
     pub shm_read: Option<ShmReadBuf>,
-    pub dirty: Option<Rect>,
-    pub force_full: bool,
+    pub dirty: DirtyRegion,
+    pub bounds: Rect,
     pub blur_scratch: BlurScratch,
     pub desktop_blur_cache: Vec<u32>,
     pub desktop_blur_size: (usize, usize),
     pub desktop_blur_valid: bool,
+    pub desktop_serial: u64,
+    pub need_region: RectRegion,
+    pub desktop_need: RectRegion,
+    pub strip_scratch: Vec<Rect>,
     pub ghosts: Vec<ClosingGhost>,
     pub snap_zone: SnapZone,
     pub snap_rect: Option<Rect>,
@@ -268,18 +395,24 @@ impl Compositor {
         } else {
             (None, None, None)
         };
+        let mut dirty = DirtyRegion::default();
+        dirty.mark_full();
         Self {
             active,
             overlay,
             canvas,
             frost_tmp,
             shm_read,
-            dirty: None,
-            force_full: true,
+            dirty,
+            bounds: Rect::new(0, 0, i32::from(x.width), i32::from(x.height)),
             blur_scratch: BlurScratch::default(),
             desktop_blur_cache: Vec::new(),
             desktop_blur_size: (0, 0),
             desktop_blur_valid: false,
+            desktop_serial: 1,
+            need_region: RectRegion::new(),
+            desktop_need: RectRegion::new(),
+            strip_scratch: Vec::with_capacity(16),
             ghosts: Vec::new(),
             snap_zone: SnapZone::None,
             snap_rect: None,
@@ -329,31 +462,28 @@ impl Compositor {
         next.set_argb(false);
         self.canvas = Some(next);
         self.frost_tmp = Some(Canvas::new(w as usize, h as usize, bg));
+        self.bounds = Rect::new(0, 0, i32::from(w), i32::from(h));
 
         if let Some(old_buf) = self.shm_read.take() {
             x.release_shm_read_buffer(&old_buf);
         }
         self.shm_read = x.create_shm_read_buffer(w as usize, h as usize);
         self.desktop_blur_valid = false;
+        self.desktop_serial = self.desktop_serial.wrapping_add(1);
         self.mark_full_dirty();
     }
 
     pub fn mark_full_dirty(&mut self) {
-        self.force_full = true;
+        self.dirty.mark_full();
     }
 
     pub fn mark_dirty(&mut self, rect: Rect) {
-        if rect.is_empty() || self.force_full {
-            return;
-        }
-        self.dirty = Some(match self.dirty {
-            Some(prev) => prev.union(rect),
-            None => rect,
-        });
+        self.dirty.mark(rect, self.bounds);
     }
 
     pub fn invalidate_desktop_blur(&mut self) {
         self.desktop_blur_valid = false;
+        self.desktop_serial = self.desktop_serial.wrapping_add(1);
         self.mark_full_dirty();
     }
 
@@ -504,7 +634,7 @@ impl Compositor {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.force_full || self.dirty.is_some()
+        !self.dirty.is_empty()
     }
 }
 
@@ -539,11 +669,26 @@ pub fn attach_window_pixmap(x: &X, cw: &mut CompWindow, w: u16, h: u16, depth: u
         }
     }
     cw.depth = depth;
-    cw.ensure_buffer(usize::from(w.max(1)), usize::from(h.max(1)));
+    let pw = usize::from(w.max(1));
+    let ph = usize::from(h.max(1));
+    cw.pixmap_w = pw;
+    cw.pixmap_h = ph;
     if let Ok(px) = x.name_window_pixmap(cw.window) {
         cw.pixmap = px;
-        cw.needs_capture = true;
-        cw.dirty_bounds = Some(Rect::new(0, 0, i32::from(w), i32::from(h)));
+    }
+    if !cw.has_pixels {
+        cw.ensure_buffer(pw, ph);
+        cw.needs_capture = cw.pixmap != 0;
+        cw.dirty_bounds = Some(Rect::new(0, 0, pw as i32, ph as i32));
+        cw.resize_wait_until = None;
+        cw.awaiting_sync_commit = false;
+    } else if cw.pw != pw || cw.ph != ph {
+        // Hold off reading the new backing pixmap until the client commits `present()` (cmd=22)
+        // (or the short safety deadline elapses) so resize never flashes a cleared blank frame.
+        cw.needs_capture = false;
+        cw.dirty_bounds = None;
+        cw.awaiting_sync_commit = true;
+        cw.resize_wait_until = Some(Instant::now() + Duration::from_millis(85));
     }
 }
 
@@ -558,45 +703,76 @@ pub fn detach_window_resources(x: &X, cw: &mut CompWindow) {
     }
 }
 
-/// Pull pending `XDamage` dirty rectangles from off-screen window pixmaps into `CompWindow::pixels`
-/// and return `(window, local_dirty_rect, was_first_capture)` for each updated window.
-pub fn capture_dirty_windows<'a, I>(
+/// Pull pending `XDamage` dirty rectangles from one off-screen window pixmap into `CompWindow::pixels`.
+pub fn capture_one_window(
     x: &X,
     shm: Option<&ShmReadBuf>,
-    comps: I,
-) -> Vec<(Window, Rect, bool)>
-where
-    I: IntoIterator<Item = &'a mut CompWindow>,
-{
-    let mut updated = Vec::new();
-    for cw in comps {
-        if !cw.needs_capture {
-            continue;
+    cw: &mut CompWindow,
+    now: Instant,
+) -> Option<(Rect, bool)> {
+    if !cw.needs_capture && cw.resize_wait_until.is_some_and(|dl| now >= dl) {
+        cw.awaiting_sync_commit = false;
+        cw.resize_wait_until = None;
+        if cw.pixmap_w > 0 && cw.pixmap_h > 0 {
+            cw.needs_capture = true;
+            cw.dirty_bounds = Some(Rect::new(0, 0, cw.pixmap_w as i32, cw.pixmap_h as i32));
         }
-        if cw.pixmap == 0 {
-            if let Ok(px) = x.name_window_pixmap(cw.window) {
-                cw.pixmap = px;
-            } else {
-                continue;
-            }
+    }
+    if !cw.needs_capture {
+        return None;
+    }
+    if cw.pixmap == 0 {
+        if let Ok(px) = x.name_window_pixmap(cw.window) {
+            cw.pixmap = px;
+        } else {
+            return None;
         }
-        if cw.pw == 0 || cw.ph == 0 {
-            continue;
-        }
-        x.damage_subtract(cw.damage);
-        let bounds = Rect::new(0, 0, cw.pw as i32, cw.ph as i32);
-        let area = cw
-            .dirty_bounds
+    }
+    let target_w = if cw.pixmap_w > 0 { cw.pixmap_w } else { cw.pw };
+    let target_h = if cw.pixmap_h > 0 { cw.pixmap_h } else { cw.ph };
+    if target_w == 0 || target_h == 0 {
+        return None;
+    }
+    x.damage_subtract(cw.damage);
+    let bounds = Rect::new(0, 0, target_w as i32, target_h as i32);
+    let resizing = cw.pw != target_w || cw.ph != target_h || cw.pixels.len() != target_w * target_h;
+    let area = if resizing {
+        cw.dirty_bounds = None;
+        bounds
+    } else {
+        cw.dirty_bounds
             .take()
             .map(|r| r.intersect(bounds))
-            .unwrap_or(bounds);
-        cw.dirty_bounds = None;
-        cw.needs_capture = false;
-        if area.is_empty() {
-            continue;
+            .unwrap_or(bounds)
+    };
+    cw.needs_capture = false;
+    cw.awaiting_sync_commit = false;
+    cw.resize_wait_until = None;
+    if area.is_empty() {
+        return None;
+    }
+    let first_capture = !cw.has_pixels || resizing;
+    let ok = if resizing {
+        let mut next = vec![0u32; target_w * target_h];
+        let read_ok = x.read_pixmap_rect(
+            cw.pixmap,
+            shm,
+            0,
+            0,
+            target_w as u16,
+            target_h as u16,
+            cw.depth,
+            &mut next,
+            target_w,
+        );
+        if read_ok {
+            cw.pixels = next;
+            cw.pw = target_w;
+            cw.ph = target_h;
         }
-        let first_capture = !cw.has_pixels;
-        let ok = x.read_pixmap_rect(
+        read_ok
+    } else {
+        x.read_pixmap_rect(
             cw.pixmap,
             shm,
             area.x as i16,
@@ -606,10 +782,41 @@ where
             cw.depth,
             &mut cw.pixels,
             cw.pw,
-        );
-        if ok {
-            cw.has_pixels = true;
-            updated.push((cw.window, area, first_capture));
+        )
+    };
+    if ok {
+        cw.has_pixels = true;
+        Some((area, first_capture))
+    } else {
+        None
+    }
+}
+
+/// Pull pending `XDamage` dirty rectangles from visible/eligible off-screen window pixmaps.
+pub fn capture_dirty_windows<'a, I, F>(
+    x: &X,
+    shm: Option<&ShmReadBuf>,
+    comps: I,
+    now: Instant,
+    should_capture: F,
+) -> Vec<(Window, Rect, bool)>
+where
+    I: IntoIterator<Item = &'a mut CompWindow>,
+    F: Fn(&CompWindow) -> bool,
+{
+    let mut updated = Vec::new();
+    for cw in comps {
+        if !should_capture(cw) {
+            if cw.needs_capture {
+                // Force a full read once this occluded window becomes exposed again so
+                // XDamage BoundingBox throttling cannot drop interim interior updates.
+                cw.dirty_bounds = None;
+            }
+            continue;
+        }
+        let win = cw.window;
+        if let Some((area, first_capture)) = capture_one_window(x, shm, cw, now) {
+            updated.push((win, area, first_capture));
         }
     }
     updated
@@ -628,6 +835,24 @@ pub fn blit_window_pixels(
     corner_r: i32,
     is_argb_source: bool,
 ) {
+    blit_window_pixels_split(dst, src, sw, sh, dx, dy, opacity, corner_r, is_argb_source, 0);
+}
+
+/// Composite a window snapshot onto `dst`, splitting `[0..glass_top]` (ARGB blend) from
+/// `[glass_top..sh]` (SIMD row `copy_from_slice`) when the client body is known opaque.
+#[allow(clippy::too_many_arguments)]
+pub fn blit_window_pixels_split(
+    dst: &mut Canvas,
+    src: &[u32],
+    sw: usize,
+    sh: usize,
+    dx: i32,
+    dy: i32,
+    opacity: u8,
+    corner_r: i32,
+    is_argb_source: bool,
+    opaque_split_y: i32,
+) {
     if sw == 0 || sh == 0 || opacity == 0 || src.len() < sw * sh {
         return;
     }
@@ -640,6 +865,11 @@ pub fn blit_window_pixels(
     let stride = dst.width;
     let out = dst.pixels_mut();
     let full_opaque = !is_argb_source && opacity == 255 && corner_r <= 0;
+    let split_row = if is_argb_source && opacity == 255 && corner_r <= 0 && opaque_split_y > 0 {
+        opaque_split_y as usize
+    } else {
+        usize::MAX
+    };
 
     for py in clip.y..clip.bottom() {
         let sy = (py - dy) as usize;
@@ -649,10 +879,8 @@ pub fn blit_window_pixels(
         let drow = &mut out[py as usize * stride + clip.x as usize
             ..py as usize * stride + clip.x as usize + count];
 
-        if full_opaque {
-            for (d, &s) in drow.iter_mut().zip(srow.iter()) {
-                *d = s & 0x00ff_ffff;
-            }
+        if full_opaque || sy >= split_row {
+            drow.copy_from_slice(srow);
         } else if opacity == 255 {
             for (d, &s) in drow.iter_mut().zip(srow.iter()) {
                 let a = (s >> 24) & 0xff;
@@ -1361,5 +1589,23 @@ mod tests {
         let orig = Rect::new(100, 100, 200, 100);
         let half = scaled_rect_around_center(orig, 0.5, 0);
         assert_eq!(half, Rect::new(150, 125, 100, 50));
+    }
+
+    #[test]
+    fn dirty_region_keeps_disjoint_rects_and_merges_neighbors() {
+        let screen = Rect::new(0, 0, 1280, 800);
+        let mut reg = DirtyRegion::default();
+        reg.mark(Rect::new(20, 20, 60, 40), screen);
+        reg.mark(Rect::new(1100, 740, 140, 44), screen);
+        assert_eq!(reg.rects.len(), 2);
+
+        // Adjacent rect within MERGE_PAD coalesces with top-left rect only.
+        reg.mark(Rect::new(88, 25, 40, 30), screen);
+        assert_eq!(reg.rects.len(), 2);
+
+        let mut out = Vec::new();
+        reg.take_into(screen, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(reg.is_empty());
     }
 }

@@ -332,6 +332,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     app.min_width = 480;
     app.min_height = 300;
     app.set_content_cursor(CursorKind::Text);
+    app.set_ime_focus(true);
 
     let mut prefs = EditorPrefs::from_config(&app.config);
     let mut editor = Editor::open(path, prefs.tab_width);
@@ -416,6 +417,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         } else if let Some((line, col)) =
                             hit_text_cursor(&editor, &mut app.text, prefs, content, x, y)
                         {
+                            app.reset_ime();
                             editor.cur_line = line;
                             editor.cur_col = col;
                             editor.preferred_col = col;
@@ -423,6 +425,12 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         }
                     }
                 }
+                UiEvent::CommitText(text) => {
+                    editor.insert_str(&text);
+                    editor.ensure_cursor_visible(content, prefs.line_h);
+                    app.needs_redraw = true;
+                }
+                UiEvent::Preedit(_) => app.needs_redraw = true,
                 UiEvent::Key(key) => {
                     if key.control() {
                         if key.text().is_some_and(|c| c.eq_ignore_ascii_case(&'s')) {
@@ -511,7 +519,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 0
             });
             let glass_toolbar = app.is_composited_glass();
-            draw_editor(
+            let caret = draw_editor(
                 &mut app.canvas,
                 &mut app.text,
                 &app.theme,
@@ -519,7 +527,11 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 prefs,
                 app.active,
                 glass_toolbar,
+                &app.ime_preedit,
             );
+            if let Some(c) = caret {
+                app.set_ime_spot(c);
+            }
             app.draw_chrome();
             app.present()?;
         }
@@ -527,6 +539,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_editor(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
@@ -535,7 +548,8 @@ fn draw_editor(
     prefs: EditorPrefs,
     window_active: bool,
     glass_toolbar: bool,
-) {
+    ime_preedit: &str,
+) -> Option<Rect> {
     let w = canvas.width as i32;
     let h = canvas.height as i32;
     let content = content_rect(theme, w, h);
@@ -708,6 +722,7 @@ fn draw_editor(
     }
 
     // Text lines + caret
+    let mut caret_rect = None;
     canvas.with_clip(text_clip, |c| {
         for (line_idx, line) in editor
             .lines
@@ -721,16 +736,49 @@ fn draw_editor(
                 break;
             }
             let baseline = ly as f32 + prefs.baseline_off;
-            if !line.is_empty() {
-                text.draw(c, line, text_x, baseline, font_px, theme.text, Face::Mono);
-            }
             if line_idx == editor.cur_line && window_active {
                 let byte_idx = Editor::char_to_byte(line, editor.cur_col);
-                let caret_x = text_x + text.measure(&line[..byte_idx], font_px, Face::Mono);
-                c.fill(
-                    Rect::new(caret_x.round() as i32, ly + 2, 2, line_h - 4),
-                    theme.accent,
-                );
+                let head = &line[..byte_idx];
+                let tail = &line[byte_idx..];
+                let mut caret_x = text_x;
+                if !head.is_empty() {
+                    caret_x += text.draw(c, head, text_x, baseline, font_px, theme.text, Face::Mono);
+                }
+                if !ime_preedit.is_empty() {
+                    let pre_w = text.measure(ime_preedit, font_px, Face::Mono);
+                    c.fill_alpha(
+                        Rect::new(caret_x.floor() as i32, ly + 2, pre_w.ceil() as i32 + 2, line_h - 4),
+                        theme.accent,
+                        0.16,
+                    );
+                    text.draw(
+                        c,
+                        ime_preedit,
+                        caret_x,
+                        baseline,
+                        font_px,
+                        theme.text,
+                        Face::Mono,
+                    );
+                    c.fill(
+                        Rect::new(
+                            caret_x.floor() as i32,
+                            (baseline + 2.5) as i32,
+                            pre_w.ceil().max(1.0) as i32,
+                            2,
+                        ),
+                        theme.accent,
+                    );
+                    caret_x += pre_w;
+                }
+                if !tail.is_empty() {
+                    text.draw(c, tail, caret_x, baseline, font_px, theme.text, Face::Mono);
+                }
+                let cr = Rect::new(caret_x.round() as i32, ly + 2, 2, line_h - 4);
+                c.fill(cr, theme.accent);
+                caret_rect = Some(cr);
+            } else if !line.is_empty() {
+                text.draw(c, line, text_x, baseline, font_px, theme.text, Face::Mono);
             }
         }
     });
@@ -780,4 +828,5 @@ fn draw_editor(
         theme.text_muted,
         Face::Ui,
     );
+    caret_rect
 }

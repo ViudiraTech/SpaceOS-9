@@ -393,6 +393,14 @@ extern "C" {
         out_y: *mut c_int,
     ) -> c_int;
     pub fn space_page_set_focused(page: *mut SpacePage, focused: c_int);
+    pub fn space_page_set_ime_preedit(page: *mut SpacePage, preedit: *const c_char);
+    pub fn space_page_ime_commit(page: *mut SpacePage, utf8_text: *const c_char) -> c_int;
+    pub fn space_page_ime_caret_info(
+        page: *mut SpacePage,
+        out_x: *mut c_int,
+        out_y: *mut c_int,
+        out_h: *mut c_int,
+    ) -> c_int;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2275,5 +2283,31 @@ impl SpacePageHandle {
 
     pub fn set_focused(&mut self, focused: bool) {
         unsafe { space_page_set_focused(self.page, i32::from(focused)) };
+    }
+
+    pub fn set_ime_preedit(&mut self, preedit: &str) {
+        let c = CString::new(preedit.as_bytes()).unwrap_or_default();
+        unsafe { space_page_set_ime_preedit(self.page, c.as_ptr()) };
+    }
+
+    pub fn ime_commit(&mut self, utf8_text: &str, text: Option<&mut TextRenderer>) -> bool {
+        let c = match CString::new(utf8_text.as_bytes()) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let page = self.page;
+        self.host.with_text(text, || unsafe {
+            space_page_ime_commit(page, c.as_ptr()) != 0
+        })
+    }
+
+    pub fn ime_caret_info(&self) -> Option<(i32, i32, i32)> {
+        let (mut x, mut y, mut h) = (0, 0, 0);
+        let ok = unsafe { space_page_ime_caret_info(self.page, &mut x, &mut y, &mut h) };
+        if ok != 0 {
+            Some((x, y, h))
+        } else {
+            None
+        }
     }
 }

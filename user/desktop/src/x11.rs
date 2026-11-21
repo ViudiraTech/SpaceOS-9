@@ -111,6 +111,8 @@ pub struct Atoms {
     pub spui_icon: Atom,
     pub spui_glass_extents: Atom,
     pub spui_compositor: Atom,
+    pub spime_status: Atom,
+    pub spime_notify: Atom,
 }
 
 /// Reusable MIT-SHM readback buffer for incremental `XDamage` window captures.
@@ -590,6 +592,16 @@ impl X {
     /// Acquire an async pointer grab scoped to `window` so popup menus/sliders
     /// reliably catch outside dismissal clicks and off-window drag releases.
     pub fn grab_pointer(&self, window: Window) -> bool {
+        self.grab_pointer_with_cursor(window, 0)
+    }
+
+    /// Acquire an async pointer grab scoped to `window` displaying `cursor`.
+    pub fn grab_pointer_cursor(&self, window: Window, cursor: CursorKind) -> bool {
+        let cid = self.cursors[cursor.index()];
+        self.grab_pointer_with_cursor(window, cid)
+    }
+
+    fn grab_pointer_with_cursor(&self, window: Window, cursor: Cursor) -> bool {
         let mask = EventMask::BUTTON_PRESS
             | EventMask::BUTTON_RELEASE
             | EventMask::POINTER_MOTION
@@ -602,7 +614,7 @@ impl X {
             GrabMode::ASYNC,
             GrabMode::ASYNC,
             x11rb::NONE,
-            x11rb::NONE,
+            cursor,
             x11rb::CURRENT_TIME,
         ) else {
             return false;
@@ -611,6 +623,12 @@ impl X {
         cookie
             .reply()
             .is_ok_and(|r| r.status == x11rb::protocol::xproto::GrabStatus::SUCCESS)
+    }
+
+    /// Query current root pointer coordinates and button/modifier mask.
+    pub fn query_pointer_root(&self) -> Option<(i16, i16, u16)> {
+        let reply = self.conn.query_pointer(self.root).ok()?.reply().ok()?;
+        Some((reply.root_x, reply.root_y, u16::from(reply.mask)))
     }
 
     /// Release any active pointer grab held by this X11 connection.
@@ -816,6 +834,59 @@ impl X {
             .is_some_and(|r| r.value.len() >= 4 && u32::from_ne_bytes([r.value[0], r.value[1], r.value[2], r.value[3]]) != 0)
     }
 
+    /// Read `(chinese_mode, ime_enabled)` published by `spimed` on `_SPIME_STATUS`.
+    pub fn get_spime_status(&self) -> Option<(bool, bool)> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                self.atoms.spime_status,
+                AtomEnum::CARDINAL,
+                0,
+                2,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        let mut iter = reply.value32()?;
+        let ch = iter.next()? != 0;
+        let en = iter.next().unwrap_or(1) != 0;
+        Some((ch, en))
+    }
+
+    /// Publish `(chinese_mode, ime_enabled)` on `root` so the Shell taskbar syncs instantly.
+    pub fn set_spime_status(&self, chinese_mode: bool, enabled: bool) {
+        let vals = [u32::from(chinese_mode), u32::from(enabled)];
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&vals[0].to_ne_bytes());
+        bytes[4..8].copy_from_slice(&vals[1].to_ne_bytes());
+        let _ = self.conn.change_property(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.spime_status,
+            AtomEnum::CARDINAL,
+            32,
+            2,
+            &bytes,
+        );
+    }
+
+    /// Wake an X11 SPUI window when the candidate bar completes an asynchronous click commit.
+    pub fn send_spime_notify(&self, target_window: Window) {
+        let ev = ClientMessageEvent {
+            response_type: x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: target_window,
+            type_: self.atoms.spime_notify,
+            data: x11rb::protocol::xproto::ClientMessageData::from([1u32, 0, 0, 0, 0]),
+        };
+        let _ = self
+            .conn
+            .send_event(false, target_window, EventMask::NO_EVENT, ev);
+    }
+
     pub fn name_window_pixmap(&self, window: Window) -> Result<u32> {
         let pixmap = self.conn.generate_id()?;
         self.conn
@@ -937,7 +1008,7 @@ impl X {
                                 d_row.copy_from_slice(s_row);
                             } else {
                                 for (d, &p) in d_row.iter_mut().zip(s_row.iter()) {
-                                    *d = 0xff00_0000 | (p & 0x00ff_ffff);
+                                    *d = 0xff00_0000 | p;
                                 }
                             }
                         }
@@ -1051,6 +1122,27 @@ impl X {
     /// Send a window-management command (`cmd`: 1 = minimize, 2 = toggle maximize) to the root WM.
     pub fn send_window_cmd(&self, window: Window, cmd: u32) -> Result<()> {
         self.send_window_cmd_data(window, cmd, 0, 0, 0, 0)
+    }
+
+    /// Send a window-management notification (`spui_window_cmd`) directly to a managed `window`.
+    pub fn send_window_notify_data(
+        &self,
+        window: Window,
+        cmd: u32,
+        d1: u32,
+        d2: u32,
+        d3: u32,
+        d4: u32,
+    ) -> Result<()> {
+        let event = ClientMessageEvent::new(
+            32,
+            window,
+            self.atoms.spui_window_cmd,
+            [cmd, d1, d2, d3, d4],
+        );
+        self.conn
+            .send_event(false, window, EventMask::NO_EVENT, event)?;
+        Ok(())
     }
 
     /// Send a window-management command with payload arguments to the root WM.
@@ -1249,8 +1341,17 @@ impl X {
         self.get_string_property(window, self.atoms.spui_icon, self.atoms.utf8)
     }
 
+    pub fn sync(&self) -> Result<()> {
+        self.conn.sync()?;
+        Ok(())
+    }
+
     pub fn put_canvas(&self, window: Window, canvas: &Canvas, area: Rect) -> Result<()> {
-        self.put_canvas_depth(window, canvas, area, self.depth)
+        self.put_canvas_depth_sync(window, canvas, area, self.depth, true)
+    }
+
+    pub fn put_canvas_unsynced(&self, window: Window, canvas: &Canvas, area: Rect) -> Result<()> {
+        self.put_canvas_depth_sync(window, canvas, area, self.depth, false)
     }
 
     pub fn put_canvas_depth(
@@ -1259,6 +1360,17 @@ impl X {
         canvas: &Canvas,
         area: Rect,
         depth: u8,
+    ) -> Result<()> {
+        self.put_canvas_depth_sync(window, canvas, area, depth, true)
+    }
+
+    fn put_canvas_depth_sync(
+        &self,
+        window: Window,
+        canvas: &Canvas,
+        area: Rect,
+        depth: u8,
+        sync_shm: bool,
     ) -> Result<()> {
         let area = area.intersect(Rect::new(0, 0, canvas.width as i32, canvas.height as i32));
         if area.is_empty() {
@@ -1287,9 +1399,11 @@ impl X {
                 seg,
                 0,
             )?;
-            // Synchronize so Xorg finishes reading the SHM buffer into ShadowFB
-            // before the client mutates `canvas` on the next frame.
-            self.conn.sync()?;
+            if sync_shm {
+                // Synchronize so Xorg finishes reading the SHM buffer into ShadowFB
+                // before the client mutates `canvas` on the next frame.
+                self.conn.sync()?;
+            }
             return Ok(());
         }
 
@@ -1417,6 +1531,42 @@ impl X {
         (x_ready, ext_ready)
     }
 
+    /// Query `(x, y, width, height, depth, override_redirect, viewable)` for any X11 window.
+    pub fn get_window_info(&self, window: Window) -> Option<(i16, i16, u16, u16, u8, bool, bool)> {
+        let geom_cookie = self.conn.get_geometry(window).ok()?;
+        let attr_cookie = self.conn.get_window_attributes(window).ok()?;
+        let geom = geom_cookie.reply().ok()?;
+        let attr = attr_cookie.reply().ok()?;
+        Some((
+            geom.x,
+            geom.y,
+            geom.width,
+            geom.height,
+            geom.depth,
+            attr.override_redirect,
+            attr.map_state == x11rb::protocol::xproto::MapState::VIEWABLE,
+        ))
+    }
+
+    /// Query mapped `override_redirect` direct children of `root` in stacking order.
+    pub fn query_override_children(&self) -> Vec<(Window, i16, i16, u16, u16, u8)> {
+        let Ok(cookie) = self.conn.query_tree(self.root) else {
+            return Vec::new();
+        };
+        let Ok(reply) = cookie.reply() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for w in reply.children {
+            if let Some((x, y, width, height, depth, or_flag, viewable)) = self.get_window_info(w) {
+                if or_flag && viewable && width > 0 && height > 0 {
+                    out.push((w, x, y, width, height, depth));
+                }
+            }
+        }
+        out
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.conn.flush()?;
         Ok(())
@@ -1483,6 +1633,8 @@ impl Atoms {
             spui_icon: get("_SPUI_ICON")?,
             spui_glass_extents: get("_SPUI_GLASS_EXTENTS")?,
             spui_compositor: get("_SPUI_COMPOSITOR")?,
+            spime_status: get("_SPIME_STATUS")?,
+            spime_notify: get("_SPIME_NOTIFY")?,
         })
     }
 }

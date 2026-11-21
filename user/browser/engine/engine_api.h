@@ -138,6 +138,9 @@ int space_page_eval(SpacePage* page, const char* code, int code_len, char* out_b
 int space_page_dump_dom(SpacePage* page, char* out_buf, int out_cap);
 int space_page_find_text(SpacePage* page, const char* query, int occurrence_idx, int* out_y);
 void space_page_set_focused(SpacePage* page, int focused);
+void space_page_set_ime_preedit(SpacePage* page, const char* preedit);
+int space_page_ime_commit(SpacePage* page, const char* utf8_text);
+int space_page_ime_caret_info(SpacePage* page, int* out_x, int* out_y, int* out_h);
 
 #ifdef __cplusplus
 }

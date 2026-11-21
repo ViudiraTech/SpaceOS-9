@@ -743,6 +743,7 @@ impl Daemon {
             ("XDG_CURRENT_DESKTOP".to_string(), desktop_names),
             ("DESKTOP_SESSION".to_string(), session.id.clone()),
             ("LANG".to_string(), locale),
+            ("XMODIFIERS".to_string(), "@im=spime".to_string()),
             ("XDG_SEAT".to_string(), "seat0".to_string()),
             ("XDG_VTNR".to_string(), "1".to_string()),
             ("MAIL".to_string(), format!("/var/mail/{}", user.name)),

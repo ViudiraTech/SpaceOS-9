@@ -13,5 +13,10 @@
 
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export XDG_CURRENT_DESKTOP=SPUI
+export XMODIFIERS="@im=spime"
+
+if [ -x /usr/bin/spimed ]; then
+    /usr/bin/spimed >/tmp/spimed.log 2>&1 &
+fi
 
 exec /usr/bin/spui shell

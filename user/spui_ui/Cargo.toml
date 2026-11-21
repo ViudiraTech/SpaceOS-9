@@ -14,6 +14,7 @@ description = "Shared SPUI windowing, Canvas, TTF text, SVG/PNG/JPEG, Theme and 
 license = "LicenseRef-Proprietary"
 
 [dependencies]
+spime = { path = "../spime" }
 uxconf = { package = "spui", path = "../desktop" }
 x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "render", "shape", "randr", "composite", "damage", "xfixes"] }
 ttf-parser = "0.25"

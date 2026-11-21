@@ -50,6 +50,11 @@ struct SpacePage {
     std::weak_ptr<litehtml::element> focused_el;
     std::weak_ptr<litehtml::element> active_el;
 
+    std::string ime_preedit;
+    int ime_caret_x = 0;
+    int ime_caret_y = 0;
+    int ime_caret_h = 0;
+
     uint64_t ui_font = 0;
 
     SpacePage(const SpaceHostCallbacks* host_cb, int vw, int vh, bool dark, int theme_style);

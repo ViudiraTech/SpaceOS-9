@@ -234,31 +234,59 @@ pub fn blit_aero_sheen(
     let argb = canvas.is_argb();
     let stride = canvas.width;
     let pixels = canvas.pixels_mut();
+    let rw_u = rw as usize;
+    let start_sx = (screen_origin_x + (clip.x - dst_rect.x)).rem_euclid(rw) as usize;
     for py in clip.y..clip.bottom() {
         let sy = (py - dst_rect.y).rem_euclid(rh) as usize;
-        let src_row = &refl.pixels[sy * rw as usize..(sy + 1) * rw as usize];
+        let src_row = &refl.pixels[sy * rw_u..(sy + 1) * rw_u];
         let dst_row = &mut pixels[py as usize * stride..py as usize * stride + stride];
-        for px in clip.x..clip.right() {
-            let sx = (screen_origin_x + (px - dst_rect.x)).rem_euclid(rw) as usize;
-            let mut spx = src_row[sx];
-            if (spx >> 24) == 0 {
-                continue;
-            }
-            let mut local_op = op_u8;
-            if let Some(av) = title_avoid {
-                if px >= av.x && px < av.right() && py >= av.y && py < av.bottom() {
-                    local_op /= 3;
+        let mut sx = start_sx;
+        let in_avoid_y = title_avoid.is_some_and(|av| py >= av.y && py < av.bottom());
+        if !in_avoid_y && op_u8 == 255 {
+            for px in clip.x..clip.right() {
+                let spx = src_row[sx];
+                sx += 1;
+                if sx == rw_u {
+                    sx = 0;
                 }
+                if (spx >> 24) == 0 {
+                    continue;
+                }
+                let slot = &mut dst_row[px as usize];
+                *slot = if argb {
+                    src_over_premul(*slot, spx)
+                } else {
+                    blend_premul(*slot, spx)
+                };
             }
-            if local_op < 255 {
-                spx = scale_premul(spx, local_op);
+        } else {
+            for px in clip.x..clip.right() {
+                let mut spx = src_row[sx];
+                sx += 1;
+                if sx == rw_u {
+                    sx = 0;
+                }
+                if (spx >> 24) == 0 {
+                    continue;
+                }
+                let mut local_op = op_u8;
+                if in_avoid_y {
+                    if let Some(av) = title_avoid {
+                        if px >= av.x && px < av.right() {
+                            local_op /= 3;
+                        }
+                    }
+                }
+                if local_op < 255 {
+                    spx = scale_premul(spx, local_op);
+                }
+                let slot = &mut dst_row[px as usize];
+                *slot = if argb {
+                    src_over_premul(*slot, spx)
+                } else {
+                    blend_premul(*slot, spx)
+                };
             }
-            let slot = &mut dst_row[px as usize];
-            *slot = if argb {
-                src_over_premul(*slot, spx)
-            } else {
-                blend_premul(*slot, spx)
-            };
         }
     }
 }
@@ -709,251 +737,448 @@ fn build_slim_aero_borders(top_src: Option<&Sprite>) -> (Sprite, Sprite, Sprite,
     )
 }
 
-/// Draw Uinxed-Kernel's authentic 3-slice VortexGlass Aero window frame, reflection sheen,
-/// top peek light, and subtle accent tinting around `draw_rect` (where `glass_top` is the
-/// titlebar + extended glass toolbar height inside `draw_rect`).
-pub fn draw_vortex_frame_chrome(
+/// Reusable cached static Aero window chrome strips (`top`, `left`, `right`, `bottom`)
+/// rebuilt only when size, `glass_top`, `active`, `maximized`, or theme palette changes.
+pub struct VortexFrameCache {
+    w: i32,
+    h: i32,
+    scr_w: i32,
+    glass_top: i32,
+    active: bool,
+    maximized: bool,
+    accent: u32,
+    dark: bool,
+    top: Sprite,
+    left: Option<Sprite>,
+    right: Option<Sprite>,
+    bottom: Option<Sprite>,
+}
+
+fn sprite_from_argb_canvas(c: Canvas) -> Sprite {
+    Sprite {
+        width: c.width as u32,
+        height: c.height as u32,
+        pixels: c.pixels().to_vec(),
+    }
+}
+
+fn paint_top_chrome_base(
+    canvas: &mut Canvas,
+    tstrip_x: i32,
+    head_y: i32,
+    tstrip_w: i32,
+    glass_x: i32,
+    glass_y: i32,
+    glass_w: i32,
+    top_glass_h: i32,
+    client_y: i32,
+    maximized: bool,
+    tint: u32,
+    tint_a: u8,
+    edge_op: u8,
+) {
+    let assets = VortexAssets::global();
+    let top_glass_rect = Rect::new(glass_x, glass_y, glass_w, (top_glass_h - 1).max(1));
+    canvas.fill_u8(top_glass_rect, tint, tint_a);
+    if let Some(ref top) = assets.top {
+        if !maximized {
+            draw_h_3slice_rows(
+                canvas, top, tstrip_x, head_y, tstrip_w, 0, 25, 25, false, 24, edge_op,
+            );
+            let body_start = (head_y + AERO_FRAME_TOP_SHADOW) + (25 - AERO_FRAME_TOP_SHADOW);
+            let rim_y = (client_y - 2).max(body_start);
+            if rim_y > body_start {
+                draw_h_3slice_rows(
+                    canvas,
+                    top,
+                    tstrip_x,
+                    body_start,
+                    tstrip_w,
+                    24,
+                    1,
+                    rim_y - body_start,
+                    true,
+                    24,
+                    edge_op,
+                );
+            }
+            if client_y - 2 >= glass_y {
+                draw_h_3slice_rows(
+                    canvas,
+                    top,
+                    tstrip_x,
+                    client_y - 2,
+                    tstrip_w,
+                    25,
+                    2,
+                    2,
+                    false,
+                    24,
+                    edge_op,
+                );
+            }
+        } else {
+            draw_h_3slice_rows(
+                canvas, top, tstrip_x, head_y, tstrip_w, 4, 21, 21, false, 24, edge_op,
+            );
+            let body_start = head_y + 21;
+            let rim_y = (client_y - 2).max(body_start);
+            if rim_y > body_start {
+                draw_h_3slice_rows(
+                    canvas,
+                    top,
+                    tstrip_x,
+                    body_start,
+                    tstrip_w,
+                    24,
+                    1,
+                    rim_y - body_start,
+                    true,
+                    24,
+                    edge_op,
+                );
+            }
+            if client_y - 2 >= head_y {
+                draw_h_3slice_rows(
+                    canvas,
+                    top,
+                    tstrip_x,
+                    client_y - 2,
+                    tstrip_w,
+                    25,
+                    2,
+                    2,
+                    false,
+                    24,
+                    edge_op,
+                );
+            }
+        }
+    }
+    let sheen_h = (top_glass_h - 2).max(1);
+    draw_vortexglass_peek(
+        canvas,
+        Rect::new(glass_x, glass_y, glass_w, sheen_h.min(28)),
+        12,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_side_chrome_base(
+    canvas: &mut Canvas,
+    band_x: i32,
+    tint_x: i32,
+    side_y: i32,
+    side_h: i32,
+    tint: u32,
+    rim_tint_a: u8,
+    edge_op: u8,
+    sprite: Option<&Sprite>,
+) {
+    canvas.fill_u8(Rect::new(tint_x, side_y, 3, side_h), tint, rim_tint_a);
+    if let Some(sp) = sprite {
+        draw_v_3slice(canvas, sp, band_x, side_y, side_h, edge_op);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_bottom_chrome_base(
+    canvas: &mut Canvas,
+    band: Rect,
+    glass_x: i32,
+    glass_w: i32,
+    tint: u32,
+    rim_tint_a: u8,
+    edge_op: u8,
+) {
+    canvas.fill_u8(Rect::new(glass_x, band.y, glass_w, 4), tint, rim_tint_a);
+    if let Some(ref bot) = VortexAssets::global().bottom {
+        draw_h_3slice_rows(
+            canvas,
+            bot,
+            band.x,
+            band.y,
+            band.w,
+            0,
+            bot.height as i32,
+            bot.height as i32,
+            false,
+            24,
+            edge_op,
+        );
+    }
+}
+
+impl VortexFrameCache {
+    fn build(
+        w: i32,
+        h: i32,
+        scr_w: i32,
+        glass_top: i32,
+        theme: &Theme,
+        active: bool,
+        maximized: bool,
+    ) -> Self {
+        let assets = VortexAssets::global();
+        let edge_op = if active { 255u8 } else { 175u8 };
+        let (tint, tint_a) = theme.glass_tint(active);
+        let top_glass_h = glass_top.clamp(1, h.max(1));
+        let tstrip_w = if maximized {
+            scr_w.max(1)
+        } else {
+            (w + AERO_FRAME_SIDE * 2).max(1)
+        };
+        let top_pad = if maximized { 0 } else { AERO_FRAME_TOP_SHADOW };
+        let top_h = (top_glass_h + top_pad).max(1);
+        let mut top_c = Canvas::new(tstrip_w as usize, top_h as usize, 0);
+        top_c.set_argb(true);
+        let glass_x_loc = if maximized { 0 } else { AERO_FRAME_SIDE - 4 };
+        let glass_w = if maximized {
+            tstrip_w
+        } else {
+            (w + 8).max(1)
+        };
+        let glass_y_loc = top_pad + 1;
+        paint_top_chrome_base(
+            &mut top_c,
+            0,
+            0,
+            tstrip_w,
+            glass_x_loc,
+            glass_y_loc,
+            glass_w,
+            top_glass_h,
+            top_pad + top_glass_h,
+            maximized,
+            tint,
+            tint_a,
+            edge_op,
+        );
+        let top = sprite_from_argb_canvas(top_c);
+
+        let (left, right, bottom) = if maximized {
+            (None, None, None)
+        } else {
+            let rim_tint_a = tint_a / 3;
+            let client_h = (h - top_glass_h).max(0);
+            let (ls, rs) = if client_h > 0 {
+                let mut lc = Canvas::new(AERO_FRAME_SIDE as usize, client_h as usize, 0);
+                lc.set_argb(true);
+                paint_side_chrome_base(
+                    &mut lc,
+                    0,
+                    AERO_FRAME_SIDE - 4,
+                    0,
+                    client_h,
+                    tint,
+                    rim_tint_a,
+                    edge_op,
+                    assets.left.as_ref(),
+                );
+                let mut rc = Canvas::new(AERO_FRAME_SIDE as usize, client_h as usize, 0);
+                rc.set_argb(true);
+                paint_side_chrome_base(
+                    &mut rc,
+                    0,
+                    1,
+                    0,
+                    client_h,
+                    tint,
+                    rim_tint_a,
+                    edge_op,
+                    assets.right.as_ref(),
+                );
+                (Some(sprite_from_argb_canvas(lc)), Some(sprite_from_argb_canvas(rc)))
+            } else {
+                (None, None)
+            };
+            let mut bc = Canvas::new(tstrip_w as usize, AERO_FRAME_BOTTOM as usize, 0);
+            bc.set_argb(true);
+            paint_bottom_chrome_base(
+                &mut bc,
+                Rect::new(0, 0, tstrip_w, AERO_FRAME_BOTTOM),
+                glass_x_loc,
+                glass_w,
+                tint,
+                rim_tint_a,
+                edge_op,
+            );
+            (ls, rs, Some(sprite_from_argb_canvas(bc)))
+        };
+
+        Self {
+            w,
+            h,
+            scr_w,
+            glass_top: top_glass_h,
+            active,
+            maximized,
+            accent: theme.accent,
+            dark: theme.is_dark(),
+            top,
+            left,
+            right,
+            bottom,
+        }
+    }
+
+    fn matches(
+        &self,
+        w: i32,
+        h: i32,
+        scr_w: i32,
+        glass_top: i32,
+        theme: &Theme,
+        active: bool,
+        maximized: bool,
+    ) -> bool {
+        self.w == w
+            && self.h == h
+            && self.scr_w == scr_w
+            && self.glass_top == glass_top
+            && self.active == active
+            && self.maximized == maximized
+            && self.accent == theme.accent
+            && self.dark == theme.is_dark()
+    }
+}
+
+/// Draw VortexGlass Aero frame chrome using a per-window cached border sprite set.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_vortex_frame_chrome_cached(
     canvas: &mut Canvas,
     draw_rect: Rect,
     glass_top: i32,
     theme: &Theme,
     active: bool,
     maximized: bool,
+    with_sheen: bool,
+    cache: &mut Option<VortexFrameCache>,
 ) {
     if draw_rect.is_empty() {
         return;
     }
-    let assets = VortexAssets::global();
-    let edge_op = if active { 255u8 } else { 175u8 };
-    let (tint, tint_a) = theme.glass_tint(active);
+    let scr_w = canvas.width as i32;
+    let top_glass_h = glass_top.clamp(1, draw_rect.h);
+    let need_rebuild = cache
+        .as_ref()
+        .is_none_or(|c| !c.matches(draw_rect.w, draw_rect.h, scr_w, top_glass_h, theme, active, maximized));
+    if need_rebuild {
+        *cache = Some(VortexFrameCache::build(
+            draw_rect.w,
+            draw_rect.h,
+            scr_w,
+            top_glass_h,
+            theme,
+            active,
+            maximized,
+        ));
+    }
+    let Some(ref c) = *cache else {
+        return;
+    };
+
     let refl_op = if theme.is_dark() {
-        if active {
-            0.48
-        } else {
-            0.28
-        }
+        if active { 0.48 } else { 0.28 }
     } else if active {
         0.72
     } else {
         0.38
     };
-
-    let top_glass_h = glass_top.clamp(1, draw_rect.h);
-    let client_y = draw_rect.y + top_glass_h;
-    let client_h = (draw_rect.h - top_glass_h).max(0);
-    let scr_w = canvas.width as i32;
     let tstrip_x = if maximized {
         0
     } else {
         draw_rect.x - AERO_FRAME_SIDE
     };
-    let tstrip_w = if maximized {
-        scr_w
-    } else {
-        draw_rect.w + AERO_FRAME_SIDE * 2
-    };
     let glass_x = if maximized { 0 } else { draw_rect.x - 4 };
     let glass_w = if maximized { scr_w } else { draw_rect.w + 8 };
-
-    // 1) Top titlebar / extended glass strip (tint -> top.png -> reflection -> top peek).
-    let top_glass_rect = Rect::new(glass_x, draw_rect.y + 1, glass_w, (top_glass_h - 1).max(1));
-    if !canvas
-        .clip_rect(Rect::new(
-            tstrip_x,
-            draw_rect.y - AERO_FRAME_TOP_SHADOW,
-            tstrip_w,
-            top_glass_h + AERO_FRAME_TOP_SHADOW,
-        ))
-        .is_empty()
-    {
-        canvas.fill_u8(top_glass_rect, tint, tint_a);
-        if let Some(ref top) = assets.top {
-            if !maximized {
-                let head_y = draw_rect.y - AERO_FRAME_TOP_SHADOW;
-                draw_h_3slice_rows(
-                    canvas, top, tstrip_x, head_y, tstrip_w, 0, 25, 25, false, 24, edge_op,
-                );
-                let body_start = draw_rect.y + (25 - AERO_FRAME_TOP_SHADOW);
-                let rim_y = (client_y - 2).max(body_start);
-                if rim_y > body_start {
-                    draw_h_3slice_rows(
-                        canvas,
-                        top,
-                        tstrip_x,
-                        body_start,
-                        tstrip_w,
-                        24,
-                        1,
-                        rim_y - body_start,
-                        true,
-                        24,
-                        edge_op,
-                    );
-                }
-                if client_y - 2 >= draw_rect.y + 1 {
-                    draw_h_3slice_rows(
-                        canvas,
-                        top,
-                        tstrip_x,
-                        client_y - 2,
-                        tstrip_w,
-                        25,
-                        2,
-                        2,
-                        false,
-                        24,
-                        edge_op,
-                    );
-                }
-            } else {
-                draw_h_3slice_rows(
-                    canvas,
-                    top,
-                    0,
-                    draw_rect.y,
-                    scr_w,
-                    4,
-                    21,
-                    21,
-                    false,
-                    24,
-                    edge_op,
-                );
-                let body_start = draw_rect.y + 21;
-                let rim_y = (client_y - 2).max(body_start);
-                if rim_y > body_start {
-                    draw_h_3slice_rows(
-                        canvas,
-                        top,
-                        0,
-                        body_start,
-                        scr_w,
-                        24,
-                        1,
-                        rim_y - body_start,
-                        true,
-                        24,
-                        edge_op,
-                    );
-                }
-                if client_y - 2 >= draw_rect.y {
-                    draw_h_3slice_rows(
-                        canvas,
-                        top,
-                        0,
-                        client_y - 2,
-                        scr_w,
-                        25,
-                        2,
-                        2,
-                        false,
-                        24,
-                        edge_op,
-                    );
-                }
-            }
+    let head_y = if maximized {
+        draw_rect.y
+    } else {
+        draw_rect.y - AERO_FRAME_TOP_SHADOW
+    };
+    let top_bounds = Rect::new(tstrip_x, head_y, c.top.width as i32, c.top.height as i32);
+    if !canvas.clip_rect(top_bounds).is_empty() {
+        canvas.blit_sprite(tstrip_x, head_y, &c.top);
+        if with_sheen {
+            let sheen_h = (top_glass_h - 2).max(1);
+            blit_aero_sheen(
+                canvas,
+                Rect::new(glass_x, draw_rect.y + 1, glass_w, sheen_h),
+                glass_x,
+                draw_rect.y + 1,
+                None,
+                refl_op,
+            );
         }
-        let sheen_h = (top_glass_h - 2).max(1);
-        blit_aero_sheen(
-            canvas,
-            Rect::new(glass_x, draw_rect.y + 1, glass_w, sheen_h),
-            glass_x,
-            draw_rect.y + 1,
-            None,
-            refl_op,
-        );
-        draw_vortexglass_peek(
-            canvas,
-            Rect::new(glass_x, draw_rect.y + 1, glass_w, sheen_h.min(28)),
-            12,
-        );
     }
-
     if maximized {
         return;
     }
 
-    // 2) Left, Right, and Bottom Aero borders (slim 5px visible glass frame + soft shadow).
-    let rim_tint_a = tint_a / 3;
-    if client_h > 0 {
-        let side_y = client_y;
-        let side_h = client_h;
-        let left_band = Rect::new(
+    let client_y = draw_rect.y + top_glass_h;
+    if let Some(ref left) = c.left {
+        let lb = Rect::new(
             draw_rect.x - AERO_FRAME_SIDE,
-            side_y,
-            AERO_FRAME_SIDE,
-            side_h,
+            client_y,
+            left.width as i32,
+            left.height as i32,
         );
-        if !canvas.clip_rect(left_band).is_empty() {
-            canvas.fill_u8(
-                Rect::new(draw_rect.x - 4, side_y, 3, side_h),
-                tint,
-                rim_tint_a,
-            );
-            if let Some(ref left) = assets.left {
-                draw_v_3slice(canvas, left, left_band.x, side_y, side_h, edge_op);
+        if !canvas.clip_rect(lb).is_empty() {
+            canvas.blit_sprite(lb.x, lb.y, left);
+            if with_sheen {
+                blit_aero_sheen(
+                    canvas,
+                    Rect::new(draw_rect.x - 4, client_y, 3, lb.h),
+                    draw_rect.x - 4,
+                    client_y,
+                    None,
+                    refl_op * 0.65,
+                );
             }
-            blit_aero_sheen(
-                canvas,
-                Rect::new(draw_rect.x - 4, side_y, 3, side_h),
-                draw_rect.x - 4,
-                side_y,
-                None,
-                refl_op * 0.65,
-            );
-        }
-
-        let right_band = Rect::new(draw_rect.right(), side_y, AERO_FRAME_SIDE, side_h);
-        if !canvas.clip_rect(right_band).is_empty() {
-            canvas.fill_u8(
-                Rect::new(draw_rect.right() + 1, side_y, 3, side_h),
-                tint,
-                rim_tint_a,
-            );
-            if let Some(ref right) = assets.right {
-                draw_v_3slice(canvas, right, right_band.x, side_y, side_h, edge_op);
-            }
-            blit_aero_sheen(
-                canvas,
-                Rect::new(draw_rect.right() + 1, side_y, 3, side_h),
-                draw_rect.right() + 1,
-                side_y,
-                None,
-                refl_op * 0.65,
-            );
         }
     }
-
-    let bot_band = Rect::new(tstrip_x, draw_rect.bottom(), tstrip_w, AERO_FRAME_BOTTOM);
-    if !canvas.clip_rect(bot_band).is_empty() {
-        canvas.fill_u8(
-            Rect::new(glass_x, draw_rect.bottom(), glass_w, 4),
-            tint,
-            rim_tint_a,
+    if let Some(ref right) = c.right {
+        let rb = Rect::new(
+            draw_rect.right(),
+            client_y,
+            right.width as i32,
+            right.height as i32,
         );
-        if let Some(ref bot) = assets.bottom {
-            draw_h_3slice_rows(
-                canvas,
-                bot,
-                bot_band.x,
-                bot_band.y,
-                bot_band.w,
-                0,
-                bot.height as i32,
-                bot.height as i32,
-                false,
-                24,
-                edge_op,
-            );
+        if !canvas.clip_rect(rb).is_empty() {
+            canvas.blit_sprite(rb.x, rb.y, right);
+            if with_sheen {
+                blit_aero_sheen(
+                    canvas,
+                    Rect::new(draw_rect.right() + 1, client_y, 3, rb.h),
+                    draw_rect.right() + 1,
+                    client_y,
+                    None,
+                    refl_op * 0.65,
+                );
+            }
         }
-        blit_aero_sheen(
-            canvas,
-            Rect::new(glass_x, draw_rect.bottom(), glass_w, 4),
-            glass_x,
+    }
+    if let Some(ref bot) = c.bottom {
+        let bb = Rect::new(
+            tstrip_x,
             draw_rect.bottom(),
-            None,
-            refl_op * 0.65,
+            bot.width as i32,
+            bot.height as i32,
         );
+        if !canvas.clip_rect(bb).is_empty() {
+            canvas.blit_sprite(bb.x, bb.y, bot);
+            if with_sheen {
+                blit_aero_sheen(
+                    canvas,
+                    Rect::new(glass_x, draw_rect.bottom(), glass_w, 4),
+                    glass_x,
+                    draw_rect.bottom(),
+                    None,
+                    refl_op * 0.65,
+                );
+            }
+        }
     }
 }
 

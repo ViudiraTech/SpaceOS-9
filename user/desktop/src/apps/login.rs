@@ -107,11 +107,17 @@ pub fn run() -> Result<()> {
                     ..
                 } if content.contains(x, y) => {
                     focused = input_rect(content).contains(x, y);
+                    app.set_ime_focus(focused);
                     if action_btn_rect(content).contains(x, y) {
                         status = inspect_or_open(&accounts, query.trim(), euid);
                     }
                     app.needs_redraw = true;
                 }
+                UiEvent::CommitText(s) if focused => {
+                    query.push_str(&s);
+                    app.needs_redraw = true;
+                }
+                UiEvent::Preedit(_) => app.needs_redraw = true,
                 UiEvent::Key(key) => {
                     if key.is_backspace() && focused {
                         query.pop();
@@ -131,17 +137,19 @@ pub fn run() -> Result<()> {
         }
 
         if app.needs_redraw {
-            draw_login(
+            let caret = draw_login(
                 &mut app.canvas,
                 &mut app.text,
                 &app.theme,
                 &accounts,
                 euid,
                 &query,
+                &app.ime_preedit,
                 focused,
                 btn_hover,
                 &status,
             );
+            app.set_ime_spot(caret);
             app.draw_chrome();
             app.present()?;
         }
@@ -181,10 +189,11 @@ fn draw_login(
     accounts: &[AccountInfo],
     euid: u32,
     query: &str,
+    ime_preedit: &str,
     focused: bool,
     btn_hover: bool,
     status: &str,
-) {
+) -> Rect {
     let w = canvas.width as i32;
     canvas.clear(theme.window);
     let bw = theme.window_border_width();
@@ -264,12 +273,13 @@ fn draw_login(
         theme.text_muted,
         Face::Ui,
     );
-    ui::text_input(
+    let caret = ui::text_input_ime(
         canvas,
         text,
         theme,
         input_rect(content),
         query,
+        ime_preedit,
         "输入账户名...",
         focused,
         None,
@@ -295,4 +305,5 @@ fn draw_login(
         theme.text_dim,
         Face::Ui,
     );
+    caret
 }

@@ -1,0 +1,18 @@
+#
+#       user/spime/Cargo.toml
+#       Self-made industrial-grade Chinese Pinyin IME engine, dictionary reader,
+#       language model decoder, user lexicon and IPC protocol crate.
+#
+#       2026/11/20 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+[package]
+name = "spime"
+version = "1.0.0"
+edition = "2021"
+description = "SpaceOS-9 self-made Chinese Pinyin & Shuangpin IME engine and IPC protocol"
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+libc = "0.2"

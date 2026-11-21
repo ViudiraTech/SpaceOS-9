@@ -302,6 +302,7 @@ pub fn apply_settings(settings: &SystemSettings<'_>) -> Result<(), String> {
              export TERM=${{TERM:-xterm-256color}}\n\
              export COLORTERM=truecolor\n\
              export LANG={locale}\n\
+             export XMODIFIERS=@im=spime\n\
              export PS1='\\u@\\h:\\w\\$ '\n"
         )
         .as_bytes(),

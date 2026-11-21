@@ -22,6 +22,8 @@ use crate::draw::Rect;
 use crate::text::Face;
 use crate::ui;
 use crate::x11::{Key, Result};
+use spime::client::SpimeClient;
+use spime::proto::DaemonReply;
 use std::time::{Duration, Instant};
 use x11rb::protocol::Event;
 
@@ -69,6 +71,10 @@ struct Oobe {
     caps_lock: bool,
     last_clock: Instant,
     clock: String,
+    ime: SpimeClient,
+    ime_preedit: String,
+    ime_focus_sent: bool,
+    ime_spot: Option<(i32, i32, i32)>,
 }
 
 pub fn run(arguments: &[String]) -> Result<()> {
@@ -121,6 +127,7 @@ impl Oobe {
             backend.config.suggested_user.clone()
         };
         let (clock, _) = clock_string();
+        let ime = SpimeClient::new(screen.window);
         Self {
             screen,
             backend,
@@ -142,6 +149,10 @@ impl Oobe {
             caps_lock: false,
             last_clock: Instant::now(),
             clock,
+            ime,
+            ime_preedit: String::new(),
+            ime_focus_sent: false,
+            ime_spot: None,
         }
     }
 
@@ -179,6 +190,19 @@ impl Oobe {
                 }
                 match event {
                     Event::KeyPress(key) => self.handle_key(key),
+                    Event::KeyRelease(key) => self.handle_key_release(key),
+                    Event::ClientMessage(msg) if msg.type_ == self.screen.x.atoms.spime_notify => {
+                        for _ in 0..8 {
+                            let Some(reply) = self.ime.poll_pending() else {
+                                break;
+                            };
+                            let more = reply.consumed;
+                            self.apply_ime_reply(reply);
+                            if !more {
+                                break;
+                            }
+                        }
+                    }
                     Event::ButtonPress(button) => {
                         let _ = self.screen.x.focus(self.screen.window);
                         self.handle_click(button.event_x as i32, button.event_y as i32);
@@ -219,15 +243,84 @@ impl Oobe {
         Ok(false)
     }
 
+    fn sync_ime_focus(&mut self) {
+        let want = !self.waiting && self.focus == Focus::FullName;
+        if want != self.ime_focus_sent {
+            self.ime_focus_sent = want;
+            if want {
+                self.ime.focus_in(self.screen.window);
+                if let Some((rx, ry, h)) = self.ime_spot {
+                    self.ime.set_spot(rx, ry, h);
+                }
+            } else {
+                self.ime.focus_out(self.screen.window);
+                self.ime_spot = None;
+                if !self.ime_preedit.is_empty() {
+                    self.ime_preedit.clear();
+                    self.screen.needs_redraw = true;
+                }
+            }
+        }
+    }
+
+    fn apply_ime_reply(&mut self, reply: DaemonReply) {
+        if reply.preedit.text != self.ime_preedit {
+            self.ime_preedit = reply.preedit.text;
+            self.screen.needs_redraw = true;
+        }
+        if !reply.commit_text.is_empty() && self.focus == Focus::FullName {
+            for ch in reply.commit_text.chars() {
+                if !ch.is_control() && self.full_name.chars().count() < 64 {
+                    self.full_name.push(ch);
+                    self.error.clear();
+                }
+            }
+            self.screen.needs_redraw = true;
+        }
+    }
+
+    fn handle_key_release(&mut self, event: x11rb::protocol::xproto::KeyReleaseEvent) {
+        self.sync_ime_focus();
+        if !self.ime_focus_sent {
+            return;
+        }
+        let state: u16 = event.state.into();
+        let sym = self.screen.x.key_symbol(event.detail, state);
+        if let Some(reply) =
+            self.ime
+                .key_event(self.screen.window, false, sym, state, u16::from(event.detail))
+        {
+            self.apply_ime_reply(reply);
+        }
+    }
+
     fn handle_key(&mut self, event: x11rb::protocol::xproto::KeyPressEvent) {
-        let key = Key {
-            code: event.detail,
-            state: event.state.into(),
-            sym: self.screen.x.key_symbol(event.detail, event.state.into()),
-        };
+        let state: u16 = event.state.into();
+        let sym = self.screen.x.key_symbol(event.detail, state);
         self.caps_lock = event
             .state
             .contains(x11rb::protocol::xproto::KeyButMask::LOCK);
+        self.sync_ime_focus();
+        if self.ime_focus_sent {
+            if let Some(reply) = self.ime.key_event(
+                self.screen.window,
+                true,
+                sym,
+                state,
+                u16::from(event.detail),
+            ) {
+                let consumed = reply.consumed;
+                self.apply_ime_reply(reply);
+                if consumed {
+                    return;
+                }
+            }
+        }
+        let key = Key {
+            code: event.detail,
+            state,
+            sym,
+        };
         if self.waiting {
             return;
         }
@@ -1012,16 +1105,25 @@ impl Oobe {
     fn draw_account(&mut self, layout: &Layout) {
         let theme = self.screen.theme;
         field_label(&mut self.screen, layout.full_name, "显示名称");
-        ui::text_input(
+        let caret = ui::text_input_ime(
             &mut self.screen.canvas,
             &mut self.screen.text,
             &theme,
             layout.full_name,
             &self.full_name,
+            &self.ime_preedit,
             "例如：SpaceOS User",
             self.focus == Focus::FullName,
             None,
         );
+        self.sync_ime_focus();
+        if self.ime_focus_sent {
+            let spot = (caret.x, caret.y, caret.h.max(1));
+            if self.ime_spot != Some(spot) {
+                self.ime_spot = Some(spot);
+                self.ime.set_spot(spot.0, spot.1, spot.2);
+            }
+        }
         field_label(&mut self.screen, layout.username, "用户名");
         ui::text_input(
             &mut self.screen.canvas,

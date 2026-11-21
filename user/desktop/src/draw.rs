@@ -82,6 +82,210 @@ impl Rect {
     pub fn expand(&self, amount: i32) -> Rect {
         self.inset(-amount)
     }
+
+    #[inline(always)]
+    pub const fn contains_rect(&self, other: Rect) -> bool {
+        !other.is_empty()
+            && self.x <= other.x
+            && self.y <= other.y
+            && self.right() >= other.right()
+            && self.bottom() >= other.bottom()
+    }
+}
+
+/// Exact 2D non-overlapping rectangle region for compositor occlusion culling.
+#[derive(Clone, Debug, Default)]
+pub struct RectRegion {
+    pub rects: Vec<Rect>,
+}
+
+impl RectRegion {
+    const MAX_RECTS: usize = 64;
+
+    pub fn new() -> Self {
+        Self {
+            rects: Vec::with_capacity(16),
+        }
+    }
+
+    pub fn from_rect(r: Rect) -> Self {
+        let mut reg = Self::new();
+        if !r.is_empty() {
+            reg.rects.push(r);
+        }
+        reg
+    }
+
+    pub fn clear(&mut self) {
+        self.rects.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
+
+    pub fn reset_to_slice(&mut self, src: &[Rect]) {
+        self.rects.clear();
+        for &r in src {
+            if !r.is_empty() {
+                self.rects.push(r);
+            }
+        }
+    }
+
+    /// Subtract `cut` from every rectangle in this region in place without introducing overlap.
+    pub fn subtract_rect(&mut self, cut: Rect) {
+        if self.rects.is_empty() || cut.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.rects.len() {
+            let r = self.rects[i];
+            let ix = r.intersect(cut);
+            if ix.is_empty() {
+                i += 1;
+                continue;
+            }
+            self.rects.swap_remove(i);
+            // Top strip (full width of r)
+            if ix.y > r.y {
+                self.rects.push(Rect::new(r.x, r.y, r.w, ix.y - r.y));
+            }
+            // Bottom strip (full width of r)
+            if ix.bottom() < r.bottom() {
+                self.rects
+                    .push(Rect::new(r.x, ix.bottom(), r.w, r.bottom() - ix.bottom()));
+            }
+            // Middle-left strip
+            if ix.x > r.x {
+                self.rects.push(Rect::new(r.x, ix.y, ix.x - r.x, ix.h));
+            }
+            // Middle-right strip
+            if ix.right() < r.right() {
+                self.rects
+                    .push(Rect::new(ix.right(), ix.y, r.right() - ix.right(), ix.h));
+            }
+        }
+        self.coalesce_if_needed();
+    }
+
+    /// Add `add` to this region, keeping existing parts covered and bounding region complexity.
+    pub fn add_rect(&mut self, add: Rect) {
+        if add.is_empty() {
+            return;
+        }
+        // Fast reject if already fully covered by one existing rectangle.
+        if self.rects.iter().any(|r| r.contains_rect(add)) {
+            return;
+        }
+        // Remove existing rectangles completely contained in `add`.
+        self.rects.retain(|r| !add.contains_rect(*r));
+        // Subtract any overlap from `add`? Instead, subtract existing rects or simply subtract `add`
+        // from existing first so the region stays disjoint.
+        self.subtract_rect_no_coalesce(add);
+        self.rects.push(add);
+        self.coalesce_if_needed();
+    }
+
+    fn subtract_rect_no_coalesce(&mut self, cut: Rect) {
+        let mut i = 0;
+        while i < self.rects.len() {
+            let r = self.rects[i];
+            let ix = r.intersect(cut);
+            if ix.is_empty() {
+                i += 1;
+                continue;
+            }
+            self.rects.swap_remove(i);
+            if ix.y > r.y {
+                self.rects.push(Rect::new(r.x, r.y, r.w, ix.y - r.y));
+            }
+            if ix.bottom() < r.bottom() {
+                self.rects
+                    .push(Rect::new(r.x, ix.bottom(), r.w, r.bottom() - ix.bottom()));
+            }
+            if ix.x > r.x {
+                self.rects.push(Rect::new(r.x, ix.y, ix.x - r.x, ix.h));
+            }
+            if ix.right() < r.right() {
+                self.rects
+                    .push(Rect::new(ix.right(), ix.y, r.right() - ix.right(), ix.h));
+            }
+        }
+    }
+
+    fn coalesce_if_needed(&mut self) {
+        if self.rects.len() <= Self::MAX_RECTS {
+            return;
+        }
+        // First merge horizontally adjacent bands sharing (y, h).
+        self.rects.sort_unstable_by_key(|r| (r.y, r.h, r.x));
+        let mut i = 0;
+        while i + 1 < self.rects.len() {
+            let a = self.rects[i];
+            let b = self.rects[i + 1];
+            if a.y == b.y && a.h == b.h && a.right() >= b.x {
+                self.rects[i] = Rect::new(a.x, a.y, a.right().max(b.right()) - a.x, a.h);
+                self.rects.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+        // If still over budget, iteratively union minimal-waste pairs and preserve strict disjointness.
+        let mut guard = 0usize;
+        while self.rects.len() > Self::MAX_RECTS {
+            guard += 1;
+            if guard > Self::MAX_RECTS * 2 {
+                let bb = self.bounding_box();
+                self.rects.clear();
+                if !bb.is_empty() {
+                    self.rects.push(bb);
+                }
+                break;
+            }
+            let last = self.rects.pop().unwrap();
+            let mut best_idx = 0usize;
+            let mut best_waste = i64::MAX;
+            for (idx, &ex) in self.rects.iter().enumerate() {
+                let u = ex.union(last);
+                let waste = i64::from(u.w) * i64::from(u.h)
+                    - i64::from(ex.w) * i64::from(ex.h)
+                    - i64::from(last.w) * i64::from(last.h);
+                if waste < best_waste {
+                    best_waste = waste;
+                    best_idx = idx;
+                }
+            }
+            let merged = self.rects.swap_remove(best_idx).union(last);
+            self.subtract_rect_no_coalesce(merged);
+            self.rects.push(merged);
+        }
+    }
+
+    pub fn intersects_rect(&self, target: Rect) -> bool {
+        !target.is_empty() && self.rects.iter().any(|r| !r.intersect(target).is_empty())
+    }
+
+    pub fn intersect_rect_into(&self, target: Rect, out: &mut Vec<Rect>) {
+        out.clear();
+        if target.is_empty() {
+            return;
+        }
+        for &r in &self.rects {
+            let ix = r.intersect(target);
+            if !ix.is_empty() {
+                out.push(ix);
+            }
+        }
+    }
+
+    pub fn bounding_box(&self) -> Rect {
+        let mut bb = Rect::default();
+        for &r in &self.rects {
+            bb = bb.union(r);
+        }
+        bb
+    }
 }
 
 #[inline(always)]
@@ -1972,28 +2176,30 @@ pub struct BlurScratch {
     down_a: Vec<u32>,
     down_b: Vec<u32>,
     down_c: Vec<u32>,
+    col_r: Vec<u32>,
+    col_g: Vec<u32>,
+    col_b: Vec<u32>,
+    x_lut: Vec<(usize, usize, u32)>,
 }
 
 /// One-dimensional $O(1)$ per-pixel sliding box pass over a packed `0xRRGGBB` buffer
 /// (separable H+V passes approximate Gaussian blur at fixed-point arithmetic speed).
 fn box_blur_h(src: &[u32], dst: &mut [u32], w: usize, h: usize, radius: usize) {
     if w == 0 || h == 0 || radius == 0 {
-        dst.copy_from_slice(src);
+        dst[..w * h].copy_from_slice(&src[..w * h]);
         return;
     }
     let r = radius.min(32);
     let win = (r * 2 + 1) as u32;
     let inv = ((1u32 << 16) + win / 2) / win;
+    let init_mul = r as u32 + 1;
     for y in 0..h {
         let row = &src[y * w..(y + 1) * w];
         let out = &mut dst[y * w..(y + 1) * w];
-        let mut sr = 0u32;
-        let mut sg = 0u32;
-        let mut sb = 0u32;
         let first = row[0];
-        sr += ((first >> 16) & 0xff) * (r as u32 + 1);
-        sg += ((first >> 8) & 0xff) * (r as u32 + 1);
-        sb += (first & 0xff) * (r as u32 + 1);
+        let mut sr = ((first >> 16) & 0xff) * init_mul;
+        let mut sg = ((first >> 8) & 0xff) * init_mul;
+        let mut sb = (first & 0xff) * init_mul;
         for i in 1..=r {
             let p = row[i.min(w - 1)];
             sr += (p >> 16) & 0xff;
@@ -2014,39 +2220,90 @@ fn box_blur_h(src: &[u32], dst: &mut [u32], w: usize, h: usize, radius: usize) {
     }
 }
 
-fn box_blur_v(src: &[u32], dst: &mut [u32], w: usize, h: usize, radius: usize) {
+/// Cache-friendly row-major vertical sliding box pass over `0xRRGGBB` using streaming column sums.
+fn box_blur_v(
+    src: &[u32],
+    dst: &mut [u32],
+    w: usize,
+    h: usize,
+    radius: usize,
+    col_r: &mut Vec<u32>,
+    col_g: &mut Vec<u32>,
+    col_b: &mut Vec<u32>,
+) {
     if w == 0 || h == 0 || radius == 0 {
-        dst.copy_from_slice(src);
+        dst[..w * h].copy_from_slice(&src[..w * h]);
         return;
     }
     let r = radius.min(32);
     let win = (r * 2 + 1) as u32;
     let inv = ((1u32 << 16) + win / 2) / win;
+
+    col_r.resize(w, 0);
+    col_g.resize(w, 0);
+    col_b.resize(w, 0);
+    let col_r = &mut col_r[..w];
+    let col_g = &mut col_g[..w];
+    let col_b = &mut col_b[..w];
+
+    let row0 = &src[..w];
+    let top_mul = (r + 1) as u32;
     for x in 0..w {
-        let first = src[x];
-        let mut sr = ((first >> 16) & 0xff) * (r as u32 + 1);
-        let mut sg = ((first >> 8) & 0xff) * (r as u32 + 1);
-        let mut sb = (first & 0xff) * (r as u32 + 1);
-        for i in 1..=r {
-            let p = src[i.min(h - 1) * w + x];
-            sr += (p >> 16) & 0xff;
-            sg += (p >> 8) & 0xff;
-            sb += p & 0xff;
+        let p = row0[x];
+        col_r[x] = ((p >> 16) & 0xff) * top_mul;
+        col_g[x] = ((p >> 8) & 0xff) * top_mul;
+        col_b[x] = (p & 0xff) * top_mul;
+    }
+    for i in 1..=r {
+        let row = &src[i.min(h - 1) * w..][..w];
+        for x in 0..w {
+            let p = row[x];
+            col_r[x] += (p >> 16) & 0xff;
+            col_g[x] += (p >> 8) & 0xff;
+            col_b[x] += p & 0xff;
         }
-        for y in 0..h {
+    }
+
+    for y in 0..h {
+        let out_row = &mut dst[y * w..][..w];
+        let y_in = (y + r + 1).min(h - 1);
+        let y_out = y.saturating_sub(r);
+        let in_row = &src[y_in * w..][..w];
+        let sub_row = &src[y_out * w..][..w];
+        for x in 0..w {
+            let sr = col_r[x];
+            let sg = col_g[x];
+            let sb = col_b[x];
             let cr = ((sr * inv) >> 16).min(255);
             let cg = ((sg * inv) >> 16).min(255);
             let cb = ((sb * inv) >> 16).min(255);
-            dst[y * w + x] = (cr << 16) | (cg << 8) | cb;
-            let y_in = (y + r + 1).min(h - 1);
-            let y_out = y.saturating_sub(r);
-            let p_in = src[y_in * w + x];
-            let p_out = src[y_out * w + x];
-            sr = sr + ((p_in >> 16) & 0xff) - ((p_out >> 16) & 0xff);
-            sg = sg + ((p_in >> 8) & 0xff) - ((p_out >> 8) & 0xff);
-            sb = sb + (p_in & 0xff) - (p_out & 0xff);
+            out_row[x] = (cr << 16) | (cg << 8) | cb;
+            let p_in = in_row[x];
+            let p_out = sub_row[x];
+            col_r[x] = sr + ((p_in >> 16) & 0xff) - ((p_out >> 16) & 0xff);
+            col_g[x] = sg + ((p_in >> 8) & 0xff) - ((p_out >> 8) & 0xff);
+            col_b[x] = sb + (p_in & 0xff) - (p_out & 0xff);
         }
     }
+}
+
+#[inline(always)]
+fn avg4_rgb(p00: u32, p10: u32, p01: u32, p11: u32) -> u32 {
+    let rb = (((p00 & 0x00ff_00ff)
+        + (p10 & 0x00ff_00ff)
+        + (p01 & 0x00ff_00ff)
+        + (p11 & 0x00ff_00ff)
+        + 0x0002_0002)
+        >> 2)
+        & 0x00ff_00ff;
+    let g = (((p00 & 0x0000_ff00)
+        + (p10 & 0x0000_ff00)
+        + (p01 & 0x0000_ff00)
+        + (p11 & 0x0000_ff00)
+        + 0x0000_0200)
+        >> 2)
+        & 0x0000_ff00;
+    rb | g
 }
 
 fn downsample_2x_region(
@@ -2061,34 +2318,21 @@ fn downsample_2x_region(
     let dw = (rw + 1) / 2;
     let dh = (rh + 1) / 2;
     dst.resize(dw * dh, 0);
+    let pairs_w = rw / 2;
+    let has_tail = (rw & 1) != 0;
     for dy in 0..dh {
         let sy0 = ry + (dy * 2).min(rh - 1);
         let sy1 = ry + (dy * 2 + 1).min(rh - 1);
-        let r0 = &src[sy0 * stride..];
-        let r1 = &src[sy1 * stride..];
+        let r0 = &src[sy0 * stride + rx..][..rw];
+        let r1 = &src[sy1 * stride + rx..][..rw];
         let out_row = &mut dst[dy * dw..(dy + 1) * dw];
-        for dx in 0..dw {
-            let sx0 = rx + (dx * 2).min(rw - 1);
-            let sx1 = rx + (dx * 2 + 1).min(rw - 1);
-            let p00 = r0[sx0];
-            let p10 = r0[sx1];
-            let p01 = r1[sx0];
-            let p11 = r1[sx1];
-            let rb = (((p00 & 0x00ff_00ff)
-                + (p10 & 0x00ff_00ff)
-                + (p01 & 0x00ff_00ff)
-                + (p11 & 0x00ff_00ff)
-                + 0x0002_0002)
-                >> 2)
-                & 0x00ff_00ff;
-            let g = (((p00 & 0x0000_ff00)
-                + (p10 & 0x0000_ff00)
-                + (p01 & 0x0000_ff00)
-                + (p11 & 0x0000_ff00)
-                + 0x0000_0200)
-                >> 2)
-                & 0x0000_ff00;
-            out_row[dx] = rb | g;
+        for dx in 0..pairs_w {
+            let sx = dx * 2;
+            out_row[dx] = avg4_rgb(r0[sx], r0[sx + 1], r1[sx], r1[sx + 1]);
+        }
+        if has_tail {
+            let sx = rw - 1;
+            out_row[pairs_w] = avg4_rgb(r0[sx], r0[sx], r1[sx], r1[sx]);
         }
     }
     (dw, dh)
@@ -2104,10 +2348,24 @@ fn upsample_bilinear_to_region(
     ry: usize,
     rw: usize,
     rh: usize,
+    x_lut: &mut Vec<(usize, usize, u32)>,
 ) {
     if sw == 0 || sh == 0 || rw == 0 || rh == 0 {
         return;
     }
+    x_lut.clear();
+    x_lut.reserve(rw);
+    for x in 0..rw {
+        let fx_fp = ((x * sw * 256 + 128) / rw)
+            .saturating_sub(128)
+            .min((sw - 1) * 256);
+        let sx0 = fx_fp >> 8;
+        let sx1 = (sx0 + 1).min(sw - 1);
+        let fx = (fx_fp & 0xff) as u32;
+        x_lut.push((sx0, sx1, fx));
+    }
+    let x_lut = &x_lut[..rw];
+
     for y in 0..rh {
         let fy_fp = ((y * sh * 256 + 128) / rh)
             .saturating_sub(128)
@@ -2118,14 +2376,8 @@ fn upsample_bilinear_to_region(
         let inv_fy = 256 - fy;
         let row0 = &src[sy0 * sw..];
         let row1 = &src[sy1 * sw..];
-        let dst_row = &mut dst[(ry + y) * stride + rx..];
-        for x in 0..rw {
-            let fx_fp = ((x * sw * 256 + 128) / rw)
-                .saturating_sub(128)
-                .min((sw - 1) * 256);
-            let sx0 = fx_fp >> 8;
-            let sx1 = (sx0 + 1).min(sw - 1);
-            let fx = (fx_fp & 0xff) as u32;
+        let dst_row = &mut dst[(ry + y) * stride + rx..][..rw];
+        for (dst_px, &(sx0, sx1, fx)) in dst_row.iter_mut().zip(x_lut.iter()) {
             let inv_fx = 256 - fx;
 
             let p00 = row0[sx0];
@@ -2145,7 +2397,7 @@ fn upsample_bilinear_to_region(
                 & 0x0000_ff00;
             let out_g = ((top_g * inv_fy + bot_g * fy) >> 8) & 0x0000_ff00;
 
-            dst_row[x] = out_rb | out_g;
+            *dst_px = out_rb | out_g;
         }
     }
 }
@@ -2174,21 +2426,70 @@ pub fn blur_rect_fast(
 
     if radius >= 4 && rw >= 8 && rh >= 8 {
         let (w1, h1) = downsample_2x_region(buf, width, rx, ry, rw, rh, &mut scratch.down_a);
-        if radius >= 10 && w1 >= 8 && h1 >= 8 {
+        if radius >= 8 && rw >= 16 && rh >= 16 && w1 >= 8 && h1 >= 8 {
             let (w2, h2) = downsample_2x_region(&scratch.down_a, w1, 0, 0, w1, h1, &mut scratch.down_b);
             let r_scaled = ((radius + 2) / 4).max(1) as usize;
             scratch.down_c.resize(w2 * h2, 0);
             box_blur_h(&scratch.down_b, &mut scratch.down_c, w2, h2, r_scaled);
-            box_blur_v(&scratch.down_c, &mut scratch.down_b, w2, h2, r_scaled);
+            box_blur_v(
+                &scratch.down_c,
+                &mut scratch.down_b,
+                w2,
+                h2,
+                r_scaled,
+                &mut scratch.col_r,
+                &mut scratch.col_g,
+                &mut scratch.col_b,
+            );
             box_blur_h(&scratch.down_b, &mut scratch.down_c, w2, h2, r_scaled.max(1));
-            box_blur_v(&scratch.down_c, &mut scratch.down_b, w2, h2, r_scaled.max(1));
-            upsample_bilinear_to_region(&scratch.down_b, w2, h2, buf, width, rx, ry, rw, rh);
+            box_blur_v(
+                &scratch.down_c,
+                &mut scratch.down_b,
+                w2,
+                h2,
+                r_scaled.max(1),
+                &mut scratch.col_r,
+                &mut scratch.col_g,
+                &mut scratch.col_b,
+            );
+            upsample_bilinear_to_region(
+                &scratch.down_b,
+                w2,
+                h2,
+                buf,
+                width,
+                rx,
+                ry,
+                rw,
+                rh,
+                &mut scratch.x_lut,
+            );
         } else {
             let r_scaled = ((radius + 1) / 2).max(1) as usize;
             scratch.down_b.resize(w1 * h1, 0);
             box_blur_h(&scratch.down_a, &mut scratch.down_b, w1, h1, r_scaled);
-            box_blur_v(&scratch.down_b, &mut scratch.down_a, w1, h1, r_scaled);
-            upsample_bilinear_to_region(&scratch.down_a, w1, h1, buf, width, rx, ry, rw, rh);
+            box_blur_v(
+                &scratch.down_b,
+                &mut scratch.down_a,
+                w1,
+                h1,
+                r_scaled,
+                &mut scratch.col_r,
+                &mut scratch.col_g,
+                &mut scratch.col_b,
+            );
+            upsample_bilinear_to_region(
+                &scratch.down_a,
+                w1,
+                h1,
+                buf,
+                width,
+                rx,
+                ry,
+                rw,
+                rh,
+                &mut scratch.x_lut,
+            );
         }
         return;
     }
@@ -2201,7 +2502,16 @@ pub fn blur_rect_fast(
         scratch.down_a[y * rw..(y + 1) * rw].copy_from_slice(&buf[src_start..src_start + rw]);
     }
     box_blur_h(&scratch.down_a, &mut scratch.down_b, rw, rh, r);
-    box_blur_v(&scratch.down_b, &mut scratch.down_a, rw, rh, r);
+    box_blur_v(
+        &scratch.down_b,
+        &mut scratch.down_a,
+        rw,
+        rh,
+        r,
+        &mut scratch.col_r,
+        &mut scratch.col_g,
+        &mut scratch.col_b,
+    );
     for y in 0..rh {
         let dst_start = (ry + y) * width + rx;
         buf[dst_start..dst_start + rw].copy_from_slice(&scratch.down_a[y * rw..(y + 1) * rw]);
@@ -2291,12 +2601,35 @@ mod tests {
 
     #[test]
     fn downsampled_blur_smooths_edges() {
-        let mut canvas = Canvas::new(64, 64, 0x000000);
-        canvas.fill(Rect::new(16, 16, 32, 32), 0xffffff);
+        let mut canvas = Canvas::new(65, 63, 0x000000);
+        canvas.fill(Rect::new(16, 16, 33, 31), 0xffffff);
         let mut scratch = BlurScratch::default();
-        canvas.blur_rect(Rect::new(0, 0, 64, 64), 10, &mut scratch);
-        let edge = canvas.pixels()[16 * 64 + 14];
+        canvas.blur_rect(Rect::new(0, 0, 65, 63), 10, &mut scratch);
+        let edge = canvas.pixels()[16 * 65 + 14];
         let edge_r = (edge >> 16) & 0xff;
         assert!(edge_r > 0 && edge_r < 255, "expected blurred edge, got {edge_r}");
+    }
+
+    #[test]
+    fn rect_region_subtraction_and_union_remain_disjoint() {
+        let mut reg = RectRegion::from_rect(Rect::new(0, 0, 100, 100));
+        reg.subtract_rect(Rect::new(20, 20, 40, 50));
+        let total_area: i64 = reg.rects.iter().map(|r| i64::from(r.w) * i64::from(r.h)).sum();
+        assert_eq!(total_area, 100 * 100 - 40 * 50);
+
+        for i in 0..reg.rects.len() {
+            for j in (i + 1)..reg.rects.len() {
+                assert!(reg.rects[i].intersect(reg.rects[j]).is_empty());
+            }
+        }
+
+        reg.add_rect(Rect::new(10, 10, 30, 30));
+        let new_area: i64 = reg.rects.iter().map(|r| i64::from(r.w) * i64::from(r.h)).sum();
+        assert_eq!(new_area, 8000 + 20 * 20); // overlaps (20,20)-(40,40) which was missing, i.e. 400 px restored
+        for i in 0..reg.rects.len() {
+            for j in (i + 1)..reg.rects.len() {
+                assert!(reg.rects[i].intersect(reg.rects[j]).is_empty());
+            }
+        }
     }
 }

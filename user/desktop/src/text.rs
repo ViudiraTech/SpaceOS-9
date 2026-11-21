@@ -206,6 +206,27 @@ impl Font {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GlowCacheKey {
+    text: String,
+    face: Face,
+    px_tenths: u16,
+    subpx_x: u8,
+    sigma_in_tenths: u16,
+    sigma_out_tenths: u16,
+    gain_tenths: u16,
+    intensity_u8: u8,
+}
+
+struct CachedGlow {
+    dx: i32,
+    dy: i32,
+    w: usize,
+    h: usize,
+    adv: f32,
+    cov: Vec<u8>,
+}
+
 pub struct TextRenderer {
     ui: Font,
     bold: Font,
@@ -218,6 +239,7 @@ pub struct TextRenderer {
     glow_buf_b: Vec<f32>,
     glow_buf_c: Vec<f32>,
     glow_cov: Vec<u8>,
+    glow_cache: HashMap<GlowCacheKey, CachedGlow>,
 }
 
 /// Configuration for Windows Vista/7 DWM-style glyph-mask Gaussian text glow
@@ -458,11 +480,16 @@ impl TextRenderer {
             glow_buf_b: Vec::new(),
             glow_buf_c: Vec::new(),
             glow_cov: Vec::new(),
+            glow_cache: HashMap::with_capacity(64),
         })
     }
 
     pub fn set_ui_scale(&mut self, scale: f32) {
-        self.ui_scale = scale.clamp(0.75, 1.5);
+        let clamped = scale.clamp(0.75, 1.5);
+        if (clamped - self.ui_scale).abs() > 0.001 {
+            self.glow_cache.clear();
+        }
+        self.ui_scale = clamped;
     }
 
     fn font_for_char(&self, face: Face, ch: char) -> &Font {
@@ -640,10 +667,42 @@ impl TextRenderer {
             return self.measure(text, px, face);
         }
 
+        let eff_px = if matches!(face, Face::Ui | Face::Bold) {
+            px * self.ui_scale
+        } else {
+            px
+        };
+        let key = GlowCacheKey {
+            text: text.to_owned(),
+            face,
+            px_tenths: (eff_px * 10.0).round() as u16,
+            subpx_x: ((x - x.floor()) * 8.0).round().clamp(0.0, 7.0) as u8,
+            sigma_in_tenths: (glow.sigma_inner.clamp(0.4, 8.0) * 10.0).round() as u16,
+            sigma_out_tenths: (glow.sigma_outer.max(glow.sigma_inner).clamp(0.4, 10.0) * 10.0)
+                .round() as u16,
+            gain_tenths: (glow.gain * 10.0).round() as u16,
+            intensity_u8: (glow.intensity.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+        };
+        let anchor_x = x.round() as i32;
+        let base_y = baseline.round() as i32;
+        if let Some(cached) = self.glow_cache.get(&key) {
+            if cached.w > 0 && cached.h > 0 {
+                canvas.blend_coverage_alpha(
+                    anchor_x + cached.dx,
+                    base_y + cached.dy + glow.offset_y,
+                    cached.w,
+                    cached.h,
+                    glow.color,
+                    &cached.cov,
+                    255,
+                );
+            }
+            return cached.adv;
+        }
+
         let mut glyphs: Vec<(i32, i32, Arc<Glyph>)> =
             Vec::with_capacity(text.chars().count().min(128));
         let mut pen = x;
-        let base_y = baseline.round() as i32;
         let mut min_x = i32::MAX;
         let mut min_y = i32::MAX;
         let mut max_x = i32::MIN;
@@ -666,6 +725,22 @@ impl TextRenderer {
         }
         let adv = pen - x;
         if glyphs.is_empty() || max_x <= min_x || max_y <= min_y {
+            if text.len() <= 96 {
+                if self.glow_cache.len() >= 64 {
+                    self.glow_cache.clear();
+                }
+                self.glow_cache.insert(
+                    key,
+                    CachedGlow {
+                        dx: 0,
+                        dy: 0,
+                        w: 0,
+                        h: 0,
+                        adv,
+                        cov: Vec::new(),
+                    },
+                );
+            }
             return adv;
         }
 
@@ -751,6 +826,22 @@ impl TextRenderer {
             &self.glow_cov,
             255,
         );
+        if text.len() <= 96 && len <= 64 * 1024 {
+            if self.glow_cache.len() >= 64 {
+                self.glow_cache.clear();
+            }
+            self.glow_cache.insert(
+                key,
+                CachedGlow {
+                    dx: origin_x - anchor_x,
+                    dy: origin_y - base_y,
+                    w: bw,
+                    h: bh,
+                    adv,
+                    cov: self.glow_cov.clone(),
+                },
+            );
+        }
         adv
     }
 
@@ -881,6 +972,7 @@ mod tests {
             glow_buf_b: Vec::new(),
             glow_buf_c: Vec::new(),
             glow_cov: Vec::new(),
+            glow_cache: HashMap::with_capacity(64),
         };
 
         // 1. ARGB transparent glass canvas + clip keeping y=0 dark hairline clean
@@ -890,6 +982,13 @@ mod tests {
         glass.with_clip(Rect::new(0, 1, 140, 29), |c| {
             renderer.draw_glow(c, "文件管理器", 24.0, 20.0, 12.5, Face::Ui, glow);
         });
+        let first_pass = glass.pixels().to_vec();
+        let mut glass_cached = Canvas::new(140, 32, 0);
+        glass_cached.set_argb(true);
+        glass_cached.with_clip(Rect::new(0, 1, 140, 29), |c| {
+            renderer.draw_glow(c, "文件管理器", 24.0, 20.0, 12.5, Face::Ui, glow);
+        });
+        assert_eq!(glass_cached.pixels(), first_pass.as_slice());
         for x in 0..140 {
             assert_eq!(glass.pixels()[x], 0, "top row x={x} should stay clear");
         }

@@ -18,6 +18,7 @@ mod compositor;
 mod ddm;
 mod draw;
 mod icons;
+mod ime;
 mod netmgr;
 mod shell;
 mod sound;
@@ -33,9 +34,16 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().collect();
-    let mode = arguments.get(1).map(String::as_str).unwrap_or("shell");
+    let prog = arguments.first().map(String::as_str).unwrap_or("");
+    let default_mode = if prog.ends_with("spimed") {
+        "imed"
+    } else {
+        "shell"
+    };
+    let mode = arguments.get(1).map(String::as_str).unwrap_or(default_mode);
     let result = match mode {
         "shell" => shell::Shell::run(),
+        "imed" => ime::run(),
         "term" => apps::term::run(arguments.get(2).map(String::as_str)),
         "files" => apps::files::run(arguments.get(2).map(String::as_str)),
         "edit" => apps::edit::run(arguments.get(2).map(String::as_str)),

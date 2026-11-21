@@ -732,6 +732,35 @@ impl WindowPlacement {
     }
 }
 
+/// Software compositor rendering fidelity vs speed trade-off (`wm:/compositor-quality`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CompositorQuality {
+    /// Full live Aero glass behind all moving & static windows (backed by lower-scene & blur cache).
+    Quality,
+    /// Live Aero glass when settled; switches to cached wallpaper blur while actively dragging/resizing.
+    Balanced,
+    /// Lightweight translucent Aero tint without per-frame live blur convolution (QEMU / low-spec boost).
+    Fast,
+}
+
+impl CompositorQuality {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quality => "quality",
+            Self::Balanced => "balanced",
+            Self::Fast => "fast",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "balanced" => Self::Balanced,
+            "fast" => Self::Fast,
+            _ => Self::Quality,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorStyle {
     Block,
@@ -999,6 +1028,7 @@ pub struct DesktopConfig {
     pub wm_focus_mode: FocusMode,
     pub wm_auto_raise: bool,
     pub wm_placement: WindowPlacement,
+    pub wm_compositor_quality: CompositorQuality,
     // display
     pub display_resolution: String,
     pub display_blank_timeout_sec: i32,
@@ -1010,6 +1040,14 @@ pub struct DesktopConfig {
     pub key_repeat_enabled: bool,
     pub key_repeat_delay_ms: i32,
     pub key_repeat_rate_hz: i32,
+    pub ime_enabled: bool,
+    pub ime_scheme: String,
+    pub ime_layout: String,
+    pub ime_page_size: i32,
+    pub ime_fuzzy_pinyin: bool,
+    pub ime_toggle_key: String,
+    pub ime_cn_punct: bool,
+    pub ime_mixed_english: bool,
     // sound
     pub sound_master_volume: i32,
     pub sound_muted: bool,
@@ -1071,6 +1109,7 @@ impl Default for DesktopConfig {
             wm_focus_mode: FocusMode::Click,
             wm_auto_raise: false,
             wm_placement: WindowPlacement::Cascade,
+            wm_compositor_quality: CompositorQuality::Quality,
             display_resolution: "1280x800".to_string(),
             display_blank_timeout_sec: 0,
             mouse_left_handed: false,
@@ -1080,6 +1119,14 @@ impl Default for DesktopConfig {
             key_repeat_enabled: true,
             key_repeat_delay_ms: 400,
             key_repeat_rate_hz: 30,
+            ime_enabled: true,
+            ime_scheme: "full".to_string(),
+            ime_layout: "horizontal".to_string(),
+            ime_page_size: 5,
+            ime_fuzzy_pinyin: false,
+            ime_toggle_key: "shift".to_string(),
+            ime_cn_punct: true,
+            ime_mixed_english: true,
             sound_master_volume: 80,
             sound_muted: false,
             sound_enabled: true,
@@ -1236,6 +1283,11 @@ impl DesktopConfig {
                     self.wm_placement = WindowPlacement::parse(s);
                 }
             }
+            ("wm", "/compositor-quality") => {
+                if let Some(s) = value.as_str() {
+                    self.wm_compositor_quality = CompositorQuality::parse(s);
+                }
+            }
             ("display", "/resolution") => {
                 if let Some(s) = value.as_str() {
                     if !s.is_empty() {
@@ -1281,6 +1333,58 @@ impl DesktopConfig {
             ("input", "/keyboard/repeat-rate-hz") => {
                 if let Some(v) = value.as_int() {
                     self.key_repeat_rate_hz = (v as i32).clamp(5, 80);
+                }
+            }
+            ("input", "/ime/enabled") => {
+                if let Some(b) = value.as_bool() {
+                    self.ime_enabled = b;
+                }
+            }
+            ("input", "/ime/scheme") => {
+                if let Some(s) = value.as_str() {
+                    let norm = s.trim().to_ascii_lowercase();
+                    if matches!(
+                        norm.as_str(),
+                        "full" | "xiaohe" | "ziranma" | "microsoft" | "sogou" | "abc"
+                    ) {
+                        self.ime_scheme = norm;
+                    }
+                }
+            }
+            ("input", "/ime/layout") => {
+                if let Some(s) = value.as_str() {
+                    let norm = s.trim().to_ascii_lowercase();
+                    if matches!(norm.as_str(), "horizontal" | "vertical") {
+                        self.ime_layout = norm;
+                    }
+                }
+            }
+            ("input", "/ime/page-size") => {
+                if let Some(v) = value.as_int() {
+                    self.ime_page_size = (v as i32).clamp(5, 9);
+                }
+            }
+            ("input", "/ime/fuzzy-pinyin") => {
+                if let Some(b) = value.as_bool() {
+                    self.ime_fuzzy_pinyin = b;
+                }
+            }
+            ("input", "/ime/toggle-key") => {
+                if let Some(s) = value.as_str() {
+                    let norm = s.trim().to_ascii_lowercase();
+                    if matches!(norm.as_str(), "shift" | "ctrl-space") {
+                        self.ime_toggle_key = norm;
+                    }
+                }
+            }
+            ("input", "/ime/cn-punct") => {
+                if let Some(b) = value.as_bool() {
+                    self.ime_cn_punct = b;
+                }
+            }
+            ("input", "/ime/mixed-english") => {
+                if let Some(b) = value.as_bool() {
+                    self.ime_mixed_english = b;
                 }
             }
             ("sound", "/master-volume") => {

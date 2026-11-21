@@ -55,6 +55,14 @@ impl EditableLine {
         self.select_all = select_all;
     }
 
+    fn insert_str(&mut self, s: &str) {
+        if self.select_all {
+            self.text.clear();
+            self.select_all = false;
+        }
+        self.text.push_str(s);
+    }
+
     fn handle_key(&mut self, key: &Key) -> (bool, bool) {
         // Returns (text_changed, enter_pressed)
         match key.sym {
@@ -1019,9 +1027,11 @@ fn select_popup_rect(vp: Rect, popup: &SelectPopupRequest) -> Rect {
     Rect::new(x, y, w, total_h)
 }
 
-fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
+fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) -> Option<Rect> {
     let glass_toolbar = app.is_composited_glass();
     let win_active = app.active;
+    let ime_preedit = app.ime_preedit.clone();
+    let mut ui_caret: Option<Rect> = None;
     let theme = &app.theme;
     let canvas = &mut app.canvas;
     let text = &mut app.text;
@@ -1219,16 +1229,21 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
         layout.home_btn.contains(st.pointer.0, st.pointer.1),
     );
 
-    ui::text_input(
+    let omni_focused = st.focus == FocusTarget::Omnibox;
+    let omni_caret = ui::text_input_ime(
         canvas,
         text,
         theme,
         layout.omnibox,
         &st.omnibox.text,
+        if omni_focused { &ime_preedit } else { "" },
         "输入网址或搜索词...",
-        st.focus == FocusTarget::Omnibox,
+        omni_focused,
         Some(Icon::Search),
     );
+    if omni_focused {
+        ui_caret = Some(omni_caret);
+    }
 
     let is_bookmarked = st
         .storage
@@ -1283,16 +1298,21 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
             Rect::new(fb.x, fb.bottom() - 1, fb.w, 1),
             theme.window_border,
         );
-        ui::text_input(
+        let find_focused = st.focus == FocusTarget::FindBar;
+        let find_caret = ui::text_input_ime(
             canvas,
             text,
             theme,
             layout.find_input,
             &st.find_query.text,
+            if find_focused { &ime_preedit } else { "" },
             "在页面中查找...",
-            st.focus == FocusTarget::FindBar,
+            find_focused,
             Some(Icon::Search),
         );
+        if find_focused {
+            ui_caret = Some(find_caret);
+        }
         let cnt_txt = if st.find_query.text.is_empty() {
             String::new()
         } else if st.find_total > 0 {
@@ -1468,16 +1488,21 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
             }
         });
 
-        ui::text_input(
+        let repl_focused = st.focus == FocusTarget::DevRepl;
+        let repl_caret = ui::text_input_ime(
             canvas,
             text,
             theme,
             layout.dev_repl_rect,
             &st.dev_repl.text,
+            if repl_focused { &ime_preedit } else { "" },
             "> 输入 JavaScript 表达式并按 Enter 求值...",
-            st.focus == FocusTarget::DevRepl,
+            repl_focused,
             None,
         );
+        if repl_focused {
+            ui_caret = Some(repl_caret);
+        }
     }
 
     // 6. Status Bar
@@ -1662,6 +1687,52 @@ fn render_browser(app: &mut App, st: &mut BrowserState, layout: &LayoutRects) {
         }
     }
     let _ = icons::draw;
+    ui_caret
+}
+
+fn set_browser_focus(app: &mut App, st: &mut BrowserState, target: FocusTarget) {
+    if st.focus != target {
+        app.reset_ime();
+        st.current_tab_mut().page.set_ime_preedit("");
+        st.focus = target;
+        app.needs_redraw = true;
+    }
+    let enable = match target {
+        FocusTarget::Omnibox | FocusTarget::FindBar | FocusTarget::DevRepl => true,
+        FocusTarget::Page => st.current_tab().page.ime_caret_info().is_some(),
+    };
+    app.set_ime_focus(enable);
+}
+
+fn sync_browser_ime(
+    app: &mut App,
+    st: &mut BrowserState,
+    layout: &LayoutRects,
+    ui_caret: Option<Rect>,
+) {
+    match st.focus {
+        FocusTarget::Omnibox | FocusTarget::FindBar | FocusTarget::DevRepl => {
+            app.set_ime_focus(true);
+            if let Some(caret) = ui_caret {
+                app.set_ime_spot(caret);
+            }
+        }
+        FocusTarget::Page => {
+            if let Some((vx, vy, vh)) = st.current_tab().page.ime_caret_info() {
+                app.set_ime_focus(true);
+                if vh > 0 {
+                    app.set_ime_spot(Rect::new(
+                        layout.viewport.x + vx,
+                        layout.viewport.y + vy,
+                        2,
+                        vh,
+                    ));
+                }
+            } else {
+                app.set_ime_focus(false);
+            }
+        }
+    }
 }
 
 fn handle_key(app: &mut App, st: &mut BrowserState, layout: &LayoutRects, key: Key) {
@@ -1669,7 +1740,7 @@ fn handle_key(app: &mut App, st: &mut BrowserState, layout: &LayoutRects, key: K
         match key.sym {
             0x006c | 0x004c => {
                 // Ctrl+L: focus omnibox & select all
-                st.focus = FocusTarget::Omnibox;
+                set_browser_focus(app, st, FocusTarget::Omnibox);
                 st.omnibox.select_all = true;
                 st.current_tab_mut().page.set_focused(false);
                 st.refresh_suggestions();
@@ -1679,7 +1750,7 @@ fn handle_key(app: &mut App, st: &mut BrowserState, layout: &LayoutRects, key: K
             0x0074 | 0x0054 => {
                 // Ctrl+T: new tab
                 st.open_new_tab("space://home", layout.viewport.w, layout.viewport.h, Some(&mut app.text));
-                st.focus = FocusTarget::Omnibox;
+                set_browser_focus(app, st, FocusTarget::Omnibox);
                 st.omnibox.select_all = true;
                 app.needs_redraw = true;
                 return;
@@ -1694,7 +1765,7 @@ fn handle_key(app: &mut App, st: &mut BrowserState, layout: &LayoutRects, key: K
             0x0066 | 0x0046 => {
                 // Ctrl+F: find bar
                 st.find_open = true;
-                st.focus = FocusTarget::FindBar;
+                set_browser_focus(app, st, FocusTarget::FindBar);
                 st.find_query.select_all = true;
                 app.needs_redraw = true;
                 return;
@@ -1739,13 +1810,13 @@ fn handle_key(app: &mut App, st: &mut BrowserState, layout: &LayoutRects, key: K
             }
             if st.focus == FocusTarget::FindBar {
                 st.find_open = false;
-                st.focus = FocusTarget::Page;
+                set_browser_focus(app, st, FocusTarget::Page);
                 app.needs_redraw = true;
                 return;
             }
             if st.focus == FocusTarget::Omnibox {
                 st.sync_omnibox_from_tab();
-                st.focus = FocusTarget::Page;
+                set_browser_focus(app, st, FocusTarget::Page);
                 app.needs_redraw = true;
                 return;
             }
@@ -1791,7 +1862,7 @@ fn handle_key(app: &mut App, st: &mut BrowserState, layout: &LayoutRects, key: K
             if enter {
                 let raw = st.omnibox.text.clone();
                 st.suggestions.clear();
-                st.focus = FocusTarget::Page;
+                set_browser_focus(app, st, FocusTarget::Page);
                 st.current_tab_mut().page.set_focused(true);
                 st.navigate_tab(st.active_tab, &raw, true, Some(&mut app.text));
                 app.needs_redraw = true;
@@ -2053,7 +2124,7 @@ fn handle_button(
         return;
     }
     if layout.omnibox.contains(x, y) {
-        st.focus = FocusTarget::Omnibox;
+        set_browser_focus(app, st, FocusTarget::Omnibox);
         st.omnibox.select_all = true;
         st.suggestions.clear();
         st.current_tab_mut().page.set_focused(false);
@@ -2064,7 +2135,7 @@ fn handle_button(
     // Find bar clicks
     if layout.find_bar.is_some() {
         if layout.find_input.contains(x, y) {
-            st.focus = FocusTarget::FindBar;
+            set_browser_focus(app, st, FocusTarget::FindBar);
             app.needs_redraw = true;
             return;
         }
@@ -2080,7 +2151,7 @@ fn handle_button(
         }
         if layout.find_close_btn.contains(x, y) {
             st.find_open = false;
-            st.focus = FocusTarget::Page;
+            set_browser_focus(app, st, FocusTarget::Page);
             app.needs_redraw = true;
             return;
         }
@@ -2091,7 +2162,7 @@ fn handle_button(
         if dr.contains(x, y) {
             if layout.dev_close_btn.contains(x, y) {
                 st.devtools_open = false;
-                st.focus = FocusTarget::Page;
+                set_browser_focus(app, st, FocusTarget::Page);
                 app.needs_redraw = true;
                 return;
             }
@@ -2107,7 +2178,7 @@ fn handle_button(
                 }
             }
             if layout.dev_repl_rect.contains(x, y) {
-                st.focus = FocusTarget::DevRepl;
+                set_browser_focus(app, st, FocusTarget::DevRepl);
                 app.needs_redraw = true;
                 return;
             }
@@ -2123,7 +2194,7 @@ fn handle_button(
 
     // Web page viewport click
     if layout.viewport.contains(x, y) {
-        st.focus = FocusTarget::Page;
+        set_browser_focus(app, st, FocusTarget::Page);
         st.suggestions.clear();
         st.current_tab_mut().page.set_focused(true);
         let lx = x - layout.viewport.x;
@@ -2133,6 +2204,8 @@ fn handle_button(
         st.tabs[st.active_tab]
             .page
             .mouse_down(lx, ly, sx, sy, button as i32, Some(&mut app.text));
+        let dom_ime = st.current_tab().page.ime_caret_info().is_some();
+        app.set_ime_focus(dom_ime);
         app.needs_redraw = true;
     }
 }
@@ -2256,6 +2329,35 @@ pub fn run_browser(initial_url: Option<String>) -> Result<(), String> {
                     st.pointer = (x, y);
                     handle_button(&mut app, &mut st, &layout, x, y, button, down);
                 }
+                UiEvent::Preedit(s) => {
+                    if st.focus == FocusTarget::Page {
+                        st.current_tab_mut().page.set_ime_preedit(&s);
+                    }
+                    app.needs_redraw = true;
+                }
+                UiEvent::CommitText(s) => {
+                    if !s.is_empty() {
+                        match st.focus {
+                            FocusTarget::Omnibox => {
+                                st.omnibox.insert_str(&s);
+                                st.refresh_suggestions();
+                            }
+                            FocusTarget::FindBar => {
+                                st.find_query.insert_str(&s);
+                                st.find_idx = 0;
+                                st.find_total = 0;
+                                st.run_find(0);
+                            }
+                            FocusTarget::DevRepl => {
+                                st.dev_repl.insert_str(&s);
+                            }
+                            FocusTarget::Page => {
+                                st.current_tab_mut().page.ime_commit(&s, Some(&mut app.text));
+                            }
+                        }
+                        app.needs_redraw = true;
+                    }
+                }
                 UiEvent::Key(key) => {
                     handle_key(&mut app, &mut st, &layout, key);
                 }
@@ -2294,7 +2396,8 @@ pub fn run_browser(initial_url: Option<String>) -> Result<(), String> {
             } else {
                 0
             });
-            render_browser(&mut app, &mut st, &final_layout);
+            let ui_caret = render_browser(&mut app, &mut st, &final_layout);
+            sync_browser_ime(&mut app, &mut st, &final_layout, ui_caret);
             app.present().map_err(|e| format!("present error: {e}"))?;
         }
     }

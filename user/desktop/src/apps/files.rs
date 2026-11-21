@@ -530,6 +530,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         }
                     }
                 }
+                UiEvent::CommitText(_) | UiEvent::Preedit(_) => {}
                 UiEvent::Key(key) => {
                     if key.is_backspace() {
                         if state.go_up() {

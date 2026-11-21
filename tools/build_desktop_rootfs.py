@@ -630,6 +630,7 @@ def configure() -> None:
             '# uxconf channel: wm\n'
             '/auto-raise = bool:false\n'
             '/button-layout = string:"right"\n'
+            '/compositor-quality = string:"quality"\n'
             '/double-click-action = string:"maximize"\n'
             '/focus-mode = string:"click"\n'
             '/placement = string:"cascade"\n'
@@ -714,7 +715,7 @@ def configure() -> None:
         "root:*::\nwheel:*::\nddm:!::\n",
         0o600,
     )
-    write("/etc/profile", "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\nexport TERM=${TERM:-xterm-256color}\nexport COLORTERM=truecolor\nexport LANG=zh_CN.UTF-8\nexport PS1='\\u@\\h:\\w\\$ '\n")
+    write("/etc/profile", "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\nexport TERM=${TERM:-xterm-256color}\nexport COLORTERM=truecolor\nexport LANG=zh_CN.UTF-8\nexport XMODIFIERS=@im=spime\nexport PS1='\\u@\\h:\\w\\$ '\n")
     write("/etc/os-release", 'NAME="SpaceOS"\nVERSION="9"\nID=spaceos9\nID_LIKE=alpine\nVERSION_ID="9"\nPRETTY_NAME="SpaceOS 9"\nHOME_URL="https://github.com/ViudiraTech/SpaceOS-9"\n')
     write("/etc/fstab", "/dev/nvme0n1 / ext4 defaults 0 1\nproc /proc proc defaults 0 0\nsysfs /sys sysfs defaults 0 0\ndevtmpfs /dev devtmpfs defaults 0 0\ntmpfs /tmp tmpfs defaults 0 0\n")
     write("/etc/motd", "SpaceOS 9 desktop (Alpine userland, ext4 + jbd2)\nGraphical login is provided by DDM; root graphical login is disabled.\n")
@@ -859,11 +860,27 @@ EndSection
                 "spui", "space-browser", "uxconfd", "uxconf-query", "NetworkManager", "nmcli"
             ):
                 install_binary(path, f"/usr/bin/{path.name}")
+        if (STAGE / "usr/bin/spui").exists():
+            spimed = STAGE / "usr/bin/spimed"
+            if spimed.is_symlink() or spimed.exists():
+                spimed.unlink()
+            spimed.symlink_to("/usr/bin/spui")
         if (STAGE / "usr/bin/NetworkManager").exists():
             nm_sbin = STAGE / "usr/sbin/NetworkManager"
             if nm_sbin.is_symlink() or nm_sbin.exists():
                 nm_sbin.unlink()
             nm_sbin.symlink_to("/usr/bin/NetworkManager")
+    spime_build = ROOT / "build" / "spime"
+    if not (spime_build / "spime.dict").is_file() or not (spime_build / "spime.lm").is_file():
+        log("compiling SPIME Chinese IME dictionary and language model")
+        subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "build_spime_dict.py"), "--out-dir", str(spime_build)],
+            check=True,
+        )
+    for fname in ("spime.dict", "spime.lm", "NOTICE.txt"):
+        src = spime_build / fname
+        if src.is_file():
+            install_binary(src, f"/usr/share/spime/{fname}", 0o644)
     music_dir = ROOT / "user" / "assets" / "music"
     if music_dir.is_dir():
         for track in sorted(music_dir.glob("*.mp3")):

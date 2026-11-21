@@ -46,8 +46,11 @@ SCREEN = (1280, 800)
 
 
 def iso_path() -> pathlib.Path:
-    for profile in ("debug", "release"):
-        candidate = ROOT / "build" / "x86_64" / profile / "SpaceKernel-x86_64.iso"
+    for candidate in (
+        ROOT / "build" / "spacekernel-release-try.iso",
+        ROOT / "build" / "x86_64" / "release" / "SpaceKernel-x86_64.iso",
+        ROOT / "build" / "x86_64" / "debug" / "SpaceKernel-x86_64.iso",
+    ):
         if candidate.exists():
             return candidate
     raise SystemExit("no ISO; run `make desktop-iso` first")
@@ -97,6 +100,23 @@ def _audio_env_and_args(arguments: argparse.Namespace) -> tuple[dict[str, str], 
     ]
 
 
+def _gpu_and_display_args(arguments: argparse.Namespace) -> tuple[str, list[str]]:
+    """Build QEMU `-display` value and `virtio-gpu` device args."""
+    use_gl = arguments.gpu == "gl" or (
+        arguments.gpu == "auto" and os.access("/dev/dri/renderD128", os.R_OK | os.W_OK)
+    )
+    if use_gl:
+        gpu_args = ["-device", "virtio-gpu-gl-pci,id=desktop-gpu,xres=1280,yres=800"]
+        if arguments.display == "none":
+            display_arg = "egl-headless,rendernode=/dev/dri/renderD128"
+        elif arguments.display in ("sdl", "gtk") and "gl=" not in arguments.display:
+            display_arg = f"{arguments.display},gl=on"
+        else:
+            display_arg = arguments.display
+        return display_arg, gpu_args
+    return arguments.display, ["-device", "virtio-gpu-pci,id=desktop-gpu,xres=1280,yres=800"]
+
+
 def start(arguments: argparse.Namespace) -> int:
     RUN.mkdir(parents=True, exist_ok=True)
     for path in (SERIAL, QMP):
@@ -106,20 +126,21 @@ def start(arguments: argparse.Namespace) -> int:
     iso = pathlib.Path(arguments.iso) if arguments.iso else iso_path()
     accel = ["-enable-kvm", "-cpu", "host"] if os.access("/dev/kvm", os.W_OK) else ["-cpu", "max"]
     env, audio_args = _audio_env_and_args(arguments)
+    display_arg, gpu_args = _gpu_and_display_args(arguments)
     command = [
         "qemu-system-x86_64", *accel,
         "-machine", "q35",
         "-m", str(arguments.memory),
         "-smp", str(arguments.cpus),
         "-vga", "none",
-        "-display", arguments.display,
+        "-display", display_arg,
         "-no-reboot",
         "-chardev", f"socket,id=ser0,path={SERIAL},server=on,wait=off,logfile={LOG}",
         "-serial", "chardev:ser0",
         "-qmp", f"unix:{QMP},server=on,wait=off",
         "-monitor", "none",
         *(["-s"] if arguments.gdb else []),
-        "-device", "virtio-gpu-pci,id=desktop-gpu,xres=1280,yres=800",
+        *gpu_args,
         "-device", "virtio-tablet-pci",
         "-device", "virtio-keyboard-pci",
         *audio_args,
@@ -346,6 +367,9 @@ def main() -> int:
     start_parser.add_argument("--iso")
     start_parser.add_argument("--display", default="none",
                               help="QEMU display backend (none, sdl, gtk)")
+    start_parser.add_argument("--gpu", default="auto",
+                              choices=["auto", "gl", "2d"],
+                              help="virtio-gpu backend (default: auto -> virtio-gpu-gl-pci when DRI render node is accessible)")
     start_parser.add_argument("--audio", default="auto",
                               choices=["auto", "pipewire", "pa", "sdl", "alsa", "wav", "none"],
                               help="QEMU HDA audio backend (default: auto for graphical display, none for headless)")

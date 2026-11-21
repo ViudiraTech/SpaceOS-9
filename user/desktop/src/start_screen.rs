@@ -363,6 +363,8 @@ impl HeaderLayout {
 pub struct StartScreenState {
     pub tab: StartTab,
     pub query: String,
+    pub ime_preedit: String,
+    search_caret: Rect,
     pub app_filter: AppCabinetFilter,
     pub settings: Option<SettingsState>,
     home_scroll: ui::SmoothScroll,
@@ -394,6 +396,8 @@ impl StartScreenState {
         Self {
             tab: StartTab::Home,
             query: String::new(),
+            ime_preedit: String::new(),
+            search_caret: Rect::new(0, 0, 0, 0),
             app_filter: AppCabinetFilter::All,
             settings: None,
             home_scroll: ui::SmoothScroll::new("start_home_scroll"),
@@ -428,6 +432,7 @@ impl StartScreenState {
     pub fn on_open(&mut self) {
         self.tab = StartTab::Home;
         self.query.clear();
+        self.ime_preedit.clear();
         self.ctx = None;
         self.confirm_power = None;
         self.hover = None;
@@ -824,6 +829,55 @@ impl StartScreenState {
         StartAction::None
     }
 
+    pub fn wants_ime(&self) -> bool {
+        self.ctx.is_none()
+            && self.confirm_power.is_none()
+            && (self.tab != StartTab::Settings
+                || self
+                    .settings
+                    .as_ref()
+                    .is_none_or(|s| !s.is_text_input_focused()))
+    }
+
+    pub fn on_preedit(&mut self, preedit: &str) -> bool {
+        if self.ime_preedit != preedit {
+            self.ime_preedit = preedit.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn on_commit(&mut self, committed: &str) -> StartAction {
+        if !self.wants_ime() || committed.is_empty() {
+            return StartAction::None;
+        }
+        let mut changed = false;
+        for ch in committed.chars() {
+            if !ch.is_control() && self.query.chars().count() < 28 {
+                self.query.push(ch);
+                changed = true;
+            }
+        }
+        if changed {
+            let q = self.query.clone();
+            if let Some(s) = self.settings.as_mut() {
+                s.set_search_query(&q);
+            }
+            StartAction::Redraw
+        } else {
+            StartAction::None
+        }
+    }
+
+    pub fn ime_spot(&self, win_w: i32, win_h: i32) -> Rect {
+        if self.search_caret.w > 0 {
+            self.search_caret
+        } else {
+            HeaderLayout::compute(win_w, win_h).search
+        }
+    }
+
     fn handle_hit(
         &mut self,
         host: &mut ShellConfigHost<'_>,
@@ -854,6 +908,7 @@ impl StartScreenState {
             }
             StartHit::ClearSearch => {
                 self.query.clear();
+                self.ime_preedit.clear();
                 if let Some(s) = self.settings.as_mut() {
                     s.clear_text_focus();
                     s.set_search_query("");
@@ -1308,20 +1363,23 @@ impl StartScreenState {
             StartTab::Settings => "搜索设置项（跨分类跳转）...",
             _ => "键入搜索应用或系统设置...",
         };
-        ui::text_input(
+        let search_focused = self.tab != StartTab::Settings
+            || self
+                .settings
+                .as_ref()
+                .is_none_or(|s| !s.is_text_input_focused());
+        let search_caret = ui::text_input_ime(
             canvas,
             text,
             theme,
             hdr.search,
             &self.query,
+            &self.ime_preedit,
             placeholder,
-            self.tab != StartTab::Settings
-                || self
-                    .settings
-                    .as_ref()
-                    .is_none_or(|s| !s.is_text_input_focused()),
+            search_focused,
             Some(Icon::Search),
         );
+        self.search_caret = search_caret;
         self.push_hit(hdr.search, StartHit::SearchBox);
         if !self.query.is_empty() {
             let clr_r = Rect::new(hdr.search.right() - 26, hdr.search.y + 5, 22, 24);

@@ -477,7 +477,16 @@ void el_space_input::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml:
         }
     }
 
-    std::string disp = display_text();
+    std::string base_disp = display_text();
+    const bool active_ime =
+        focused && page_ && !page_->ime_preedit.empty() && input_type() != "password";
+    const size_t safe_caret = std::min(caret_, base_disp.size());
+    std::string disp;
+    if (active_ime) {
+        disp = base_disp.substr(0, safe_caret) + page_->ime_preedit + base_disp.substr(safe_caret);
+    } else {
+        disp = base_disp;
+    }
     const char* ph_attr = get_attr("placeholder");
     bool showing_placeholder = disp.empty() && ph_attr && *ph_attr;
     if (showing_placeholder) disp = ph_attr;
@@ -488,9 +497,15 @@ void el_space_input::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml:
 
     int pad_x = 6;
     int inner_w = std::max(1, pw - pad_x * 2);
-    std::string before_caret = display_text().substr(0, std::min(caret_, display_text().size()));
-    int caret_px = cb.text_width ? cb.text_width(cb.user_data, before_caret.c_str(), fh)
-                                 : static_cast<int>(before_caret.size() * 8);
+    std::string before_caret = base_disp.substr(0, safe_caret);
+    int before_px = cb.text_width ? cb.text_width(cb.user_data, before_caret.c_str(), fh)
+                                  : static_cast<int>(before_caret.size() * 8);
+    int pre_px = 0;
+    if (active_ime) {
+        pre_px = cb.text_width ? cb.text_width(cb.user_data, page_->ime_preedit.c_str(), fh)
+                               : static_cast<int>(page_->ime_preedit.size() * 8);
+    }
+    int caret_px = before_px + pre_px;
     int scroll_text_x = 0;
     if (caret_px > inner_w - 4) {
         scroll_text_x = caret_px - (inner_w - 4);
@@ -498,12 +513,26 @@ void el_space_input::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, litehtml:
 
     if (cb.set_clip) cb.set_clip(cb.user_data, px + 3, py + 2, std::max(1, pw - 6), std::max(1, ph - 4), nullptr);
     int ty = py + std::max(2, (ph - fh_px) / 2);
+    if (active_ime && cb.fill_rect && pre_px > 0) {
+        int pre_draw_x = px + pad_x + before_px - scroll_text_x;
+        cb.fill_rect(cb.user_data, pre_draw_x, py + 3, pre_px + 2, std::max(8, ph - 6), 0x263b82f6u, nullptr);
+    }
     if (cb.draw_text && !disp.empty()) {
         cb.draw_text(cb.user_data, disp.c_str(), fh, fg, px + pad_x - scroll_text_x, ty,
                      inner_w + scroll_text_x, ph - 4, 0);
     }
+    if (active_ime && cb.fill_rect && pre_px > 0) {
+        int pre_draw_x = px + pad_x + before_px - scroll_text_x;
+        cb.fill_rect(cb.user_data, pre_draw_x, ty + fh_px + 1, pre_px, 2,
+                     win98 ? 0xff000080u : 0xff3b82f6u, nullptr);
+    }
+    if (focused && page_ && input_type() != "password") {
+        page_->ime_caret_x = px + pad_x + caret_px - scroll_text_x;
+        page_->ime_caret_y = py + 2;
+        page_->ime_caret_h = std::max(14, ph - 4);
+    }
     if (focused && cb.fill_rect) {
-        bool blink_on = (static_cast<int>(page_->now_ms / 500.0) % 2) == 0;
+        bool blink_on = active_ime || (static_cast<int>(page_->now_ms / 500.0) % 2) == 0;
         if (blink_on) {
             int cx = px + pad_x + caret_px - scroll_text_x;
             cb.fill_rect(cb.user_data, cx, py + 4, 1, std::max(8, ph - 8),
@@ -788,7 +817,13 @@ void el_space_textarea::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, liteht
 
     int fh_px = 16;
     litehtml::uint_ptr fh = pick_font(this, page_, fh_px);
-    const std::string& val = current_value();
+    const std::string& raw_val = current_value();
+    const bool active_ime = focused && page_ && !page_->ime_preedit.empty();
+    const size_t safe_caret = std::min(caret_, raw_val.size());
+    std::string val = active_ime
+        ? (raw_val.substr(0, safe_caret) + page_->ime_preedit + raw_val.substr(safe_caret))
+        : raw_val;
+    const size_t visual_caret = active_ime ? (safe_caret + page_->ime_preedit.size()) : safe_caret;
     const char* ph_attr = get_attr("placeholder");
     bool show_ph = val.empty() && ph_attr && *ph_attr;
     const std::string text_to_draw = show_ph ? std::string(ph_attr) : val;
@@ -800,20 +835,35 @@ void el_space_textarea::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, liteht
     int line_y = py + 6;
     int line_step = std::max(16, fh_px + 2);
     size_t start = 0;
-    size_t caret_drawn = false;
+    bool caret_drawn = false;
     while (start <= text_to_draw.size()) {
         size_t nl = text_to_draw.find('\n', start);
         size_t end = (nl == std::string::npos) ? text_to_draw.size() : nl;
         std::string line = text_to_draw.substr(start, end - start);
+        if (active_ime && cb.fill_rect && visual_caret >= start && visual_caret <= end && safe_caret >= start) {
+            std::string before_pre = text_to_draw.substr(start, safe_caret - start);
+            int pre_x = px + 6 + (cb.text_width ? cb.text_width(cb.user_data, before_pre.c_str(), fh)
+                                                : static_cast<int>(before_pre.size() * 8));
+            int pre_w = cb.text_width ? cb.text_width(cb.user_data, page_->ime_preedit.c_str(), fh)
+                                      : static_cast<int>(page_->ime_preedit.size() * 8);
+            cb.fill_rect(cb.user_data, pre_x, line_y, pre_w + 2, line_step, 0x263b82f6u, nullptr);
+            cb.fill_rect(cb.user_data, pre_x, line_y + fh_px + 1, std::max(2, pre_w), 2,
+                         win98 ? 0xff000080u : 0xff3b82f6u, nullptr);
+        }
         if (!line.empty() && cb.draw_text) {
             cb.draw_text(cb.user_data, line.c_str(), fh, fg, px + 6, line_y, pw - 12, line_step, 0);
         }
-        if (focused && !show_ph && !caret_drawn && caret_ >= start && caret_ <= end && cb.fill_rect) {
+        if (focused && !show_ph && !caret_drawn && visual_caret >= start && visual_caret <= end) {
             caret_drawn = true;
-            if ((static_cast<int>(page_->now_ms / 500.0) % 2) == 0) {
-                std::string before = text_to_draw.substr(start, caret_ - start);
-                int cw = cb.text_width ? cb.text_width(cb.user_data, before.c_str(), fh)
-                                       : static_cast<int>(before.size() * 8);
+            std::string before = text_to_draw.substr(start, visual_caret - start);
+            int cw = cb.text_width ? cb.text_width(cb.user_data, before.c_str(), fh)
+                                   : static_cast<int>(before.size() * 8);
+            if (page_) {
+                page_->ime_caret_x = px + 6 + cw;
+                page_->ime_caret_y = line_y;
+                page_->ime_caret_h = line_step;
+            }
+            if (cb.fill_rect && (active_ime || (static_cast<int>(page_->now_ms / 500.0) % 2) == 0)) {
                 cb.fill_rect(cb.user_data, px + 6 + cw, line_y, 1, std::max(12, fh_px),
                              win98 ? 0xff000000u : (dark ? 0xfff8fafcu : 0xff0f172au), nullptr);
             }
@@ -822,9 +872,16 @@ void el_space_textarea::draw(litehtml::uint_ptr hdc, litehtml::pixel_t x, liteht
         if (nl == std::string::npos || line_y > py + ph) break;
         start = nl + 1;
     }
-    if (focused && show_ph && cb.fill_rect && (static_cast<int>(page_->now_ms / 500.0) % 2) == 0) {
-        cb.fill_rect(cb.user_data, px + 6, py + 6, 1, std::max(12, fh_px),
-                     win98 ? 0xff000000u : (dark ? 0xfff8fafcu : 0xff0f172au), nullptr);
+    if (focused && show_ph) {
+        if (page_) {
+            page_->ime_caret_x = px + 6;
+            page_->ime_caret_y = py + 6;
+            page_->ime_caret_h = line_step;
+        }
+        if (cb.fill_rect && (static_cast<int>(page_->now_ms / 500.0) % 2) == 0) {
+            cb.fill_rect(cb.user_data, px + 6, py + 6, 1, std::max(12, fh_px),
+                         win98 ? 0xff000000u : (dark ? 0xfff8fafcu : 0xff0f172au), nullptr);
+        }
     }
     if (cb.del_clip) cb.del_clip(cb.user_data);
 }

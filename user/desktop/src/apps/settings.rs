@@ -29,10 +29,10 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uxconf::{
-    format_hex_rgb, BackdropStyle, ButtonLayout, ConfError, CursorStyle, DesktopConfig,
-    DoubleClickAction, FocusMode, NetMode, PanelPosition, ThemeMode, ThemePreset, Value,
-    WindowPlacement, ACCENT_PRESETS, RESOLUTIONS, SOLID_BG_PRESETS, THEME_PRESETS, TIMEZONES,
-    WALLPAPERS, WALLPAPER_DIR,
+    format_hex_rgb, BackdropStyle, ButtonLayout, CompositorQuality, ConfError, CursorStyle,
+    DesktopConfig, DoubleClickAction, FocusMode, NetMode, PanelPosition, ThemeMode, ThemePreset,
+    Value, WindowPlacement, ACCENT_PRESETS, RESOLUTIONS, SOLID_BG_PRESETS, THEME_PRESETS,
+    TIMEZONES, WALLPAPERS, WALLPAPER_DIR,
 };
 use x11rb::protocol::xproto::ConnectionExt;
 
@@ -127,6 +127,15 @@ const MOUSE_SPEEDS: [(i64, &str); 5] =
 const DOUBLE_CLICK_SPEEDS: [(i64, &str); 3] = [(250, "快"), (380, "适中"), (550, "慢")];
 const KEY_DELAYS: [(i64, &str); 3] = [(250, "短"), (400, "适中"), (600, "长")];
 const KEY_RATES: [(i64, &str); 3] = [(15, "慢"), (30, "适中"), (45, "快")];
+const IME_SCHEMES: [(&str, &str); 6] = [
+    ("full", "全拼"),
+    ("xiaohe", "小鹤"),
+    ("ziranma", "自然"),
+    ("microsoft", "微软"),
+    ("sogou", "搜狗"),
+    ("abc", "智能"),
+];
+const IME_PAGE_SIZES: [(i64, &str); 5] = [(5, "5"), (6, "6"), (7, "7"), (8, "8"), (9, "9")];
 const VOLUME_PRESETS: [(i64, &str); 4] = [(25, "25%"), (50, "50%"), (80, "80%"), (100, "100%")];
 const CODE_FONT_SIZES: [(i64, &str); 4] = [(12, "12"), (14, "14"), (16, "16"), (18, "18")];
 const SCROLLBACK_PRESETS: [(i64, &str); 3] =
@@ -281,6 +290,13 @@ pub const SETTING_ITEMS: &[SettingSearchItem] = &[
         subtitle: "点击/悬停激活、自动前置与级联/居中布局",
         keywords: "focus raise cascade center 焦点 自动前置 级联 居中",
     },
+    SettingSearchItem {
+        page: Page::Windows,
+        category: "窗口",
+        title: "窗口合成与 Aero 性能模式",
+        subtitle: "切换高画质全实时毛玻璃、均衡（拖拽轻采样）与极速流畅模式",
+        keywords: "compositor quality blur performance drag qemu aero 合成 性能 流畅 毛玻璃 拖拽",
+    },
     // 显示
     SettingSearchItem {
         page: Page::Display,
@@ -325,6 +341,20 @@ pub const SETTING_ITEMS: &[SettingSearchItem] = &[
         title: "键盘按键连发设置",
         subtitle: "连发开关、首次延迟与连发速率 (Hz)",
         keywords: "keyboard repeat delay rate 键盘 连发 延迟 速率",
+    },
+    SettingSearchItem {
+        page: Page::Input,
+        category: "鼠标与键盘",
+        title: "中文输入法与双拼方案",
+        subtitle: "启用原研 SPIME 输入法，切换全拼与五种双拼方案",
+        keywords: "ime input pinyin shuangpin chinese xiaohe ziranma sogou 输入法 拼音 双拼 中文",
+    },
+    SettingSearchItem {
+        page: Page::Input,
+        category: "鼠标与键盘",
+        title: "候选词排版与标点联想",
+        subtitle: "横竖排候选框、每页词数、模糊音、中文标点与中英混输",
+        keywords: "ime candidate layout fuzzy punct mixed 候选词 横排 竖排 模糊音 标点 混输",
     },
     // 应用程序
     SettingSearchItem {
@@ -451,6 +481,7 @@ enum HitTarget {
     WmFocusMode(usize),
     WmAutoRaise,
     WmPlacement(usize),
+    WmCompositorQuality(usize),
     Resolution(usize),
     BlankTimeout(usize),
     SoundMuted,
@@ -470,6 +501,14 @@ enum HitTarget {
     KeyRepeatEnabled,
     KeyRepeatDelay(usize),
     KeyRepeatRate(usize),
+    ImeEnabled,
+    ImeScheme(usize),
+    ImeLayout(usize),
+    ImePageSize(usize),
+    ImeToggleKey(usize),
+    ImeFuzzyPinyin,
+    ImeCnPunct,
+    ImeMixedEnglish,
     TermFontSize(usize),
     TermCursorStyle(usize),
     TermScrollback(usize),
@@ -1434,6 +1473,7 @@ pub fn run(initial_page: Option<&str>) -> Result<()> {
                     state.on_config_changed(&app);
                     app.needs_redraw = true;
                 }
+                UiEvent::CommitText(_) | UiEvent::Preedit(_) => {}
                 UiEvent::Key(key) => {
                     if state.on_key(&mut app, key) {
                         app.needs_redraw = true;
@@ -1748,6 +1788,24 @@ impl SettingsState {
                     Value::String(pl.as_str().to_string()),
                 );
             }
+            HitTarget::WmCompositorQuality(i) => {
+                let q = match i {
+                    1 => CompositorQuality::Balanced,
+                    2 => CompositorQuality::Fast,
+                    _ => CompositorQuality::Quality,
+                };
+                host.set_config_property(
+                    "wm",
+                    "/compositor-quality",
+                    Value::String(q.as_str().to_string()),
+                );
+                let label = match q {
+                    CompositorQuality::Quality => "高画质（全实时毛玻璃）",
+                    CompositorQuality::Balanced => "均衡（拖拽期轻采样）",
+                    CompositorQuality::Fast => "极速（低配 / QEMU 优化）",
+                };
+                self.status = format!("已切换窗口合成性能模式为「{label}」");
+            }
             HitTarget::Resolution(i) => {
                 let (mode_arg, _) = RESOLUTIONS[i];
                 host.set_config_property(
@@ -1799,6 +1857,52 @@ impl SettingsState {
                     "/keyboard/repeat-rate-hz",
                     Value::Int(KEY_RATES[i].0),
                 );
+            }
+            HitTarget::ImeEnabled => {
+                let next = !host.config().ime_enabled;
+                host.set_config_property("input", "/ime/enabled", Value::Bool(next));
+            }
+            HitTarget::ImeScheme(i) => {
+                if let Some((scheme, _)) = IME_SCHEMES.get(i) {
+                    host.set_config_property(
+                        "input",
+                        "/ime/scheme",
+                        Value::String((*scheme).to_string()),
+                    );
+                }
+            }
+            HitTarget::ImeLayout(i) => {
+                let layout = if i == 1 { "vertical" } else { "horizontal" };
+                host.set_config_property(
+                    "input",
+                    "/ime/layout",
+                    Value::String(layout.to_string()),
+                );
+            }
+            HitTarget::ImePageSize(i) => {
+                if let Some(&(ps, _)) = IME_PAGE_SIZES.get(i) {
+                    host.set_config_property("input", "/ime/page-size", Value::Int(ps));
+                }
+            }
+            HitTarget::ImeToggleKey(i) => {
+                let tk = if i == 1 { "ctrl-space" } else { "shift" };
+                host.set_config_property(
+                    "input",
+                    "/ime/toggle-key",
+                    Value::String(tk.to_string()),
+                );
+            }
+            HitTarget::ImeFuzzyPinyin => {
+                let next = !host.config().ime_fuzzy_pinyin;
+                host.set_config_property("input", "/ime/fuzzy-pinyin", Value::Bool(next));
+            }
+            HitTarget::ImeCnPunct => {
+                let next = !host.config().ime_cn_punct;
+                host.set_config_property("input", "/ime/cn-punct", Value::Bool(next));
+            }
+            HitTarget::ImeMixedEnglish => {
+                let next = !host.config().ime_mixed_english;
+                host.set_config_property("input", "/ime/mixed-english", Value::Bool(next));
             }
             HitTarget::TermFontSize(i) => {
                 host.set_config_property(
@@ -3563,7 +3667,34 @@ impl SettingsState {
                         HitTarget::WmPlacement,
                         hover,
                     );
-                    y += c2.h + 18;
+                    y += c2.h + 16;
+
+                    y = draw_section_heading(canvas, text, theme, content_x, y, "合成与性能");
+                    let c3 = Rect::new(content_x, y, card_w, ROW_H);
+                    ui::card(canvas, theme, c3);
+                    let qual_idx = match cfg.wm_compositor_quality {
+                        CompositorQuality::Quality => 0,
+                        CompositorQuality::Balanced => 1,
+                        CompositorQuality::Fast => 2,
+                    };
+                    draw_segmented_row(
+                        canvas,
+                        text,
+                        theme,
+                        viewport,
+                        hits,
+                        content_x,
+                        card_w,
+                        y,
+                        "窗口合成性能模式",
+                        "高画质：全实时毛玻璃；均衡：拖拽期轻采样；极速：QEMU/低配流畅优先",
+                        240,
+                        &["高画质", "均衡", "极速"],
+                        qual_idx,
+                        HitTarget::WmCompositorQuality,
+                        hover,
+                    );
+                    y += c3.h + 18;
                 }
 
                 Page::Display => {
@@ -4025,7 +4156,157 @@ impl SettingsState {
                         HitTarget::KeyRepeatRate,
                         hover,
                     );
-                    y += c2.h + 18;
+                    y += c2.h + 16;
+
+                    y = draw_section_heading(canvas, text, theme, content_x, y, "中文输入法");
+                    let c3 = Rect::new(content_x, y, card_w, ROW_H * 8);
+                    ui::card(canvas, theme, c3);
+                    draw_toggle_row(
+                        canvas,
+                        text,
+                        theme,
+                        viewport,
+                        hits,
+                        content_x,
+                        card_w,
+                        y,
+                        "启用中文输入法",
+                        "系统全局启用自研 SPIME 中文输入引擎 (VortexGlass / Win98)",
+                        cfg.ime_enabled,
+                        HitTarget::ImeEnabled,
+                        hover,
+                    );
+                    draw_row_divider(canvas, theme, content_x, card_w, y + ROW_H);
+                    let scheme_idx = IME_SCHEMES
+                        .iter()
+                        .position(|(k, _)| *k == cfg.ime_scheme)
+                        .unwrap_or(0);
+                    draw_segmented_row(
+                        canvas,
+                        text,
+                        theme,
+                        viewport,
+                        hits,
+                        content_x,
+                        card_w,
+                        y + ROW_H,
+                        "输入方案",
+                        "全拼或小鹤 / 自然码 / 微软 / 搜狗 / 智能ABC 双拼",
+                        318,
+                        &["全拼", "小鹤", "自然", "微软", "搜狗", "智能"],
+                        scheme_idx,
+                        HitTarget::ImeScheme,
+                        hover,
+                    );
+                    draw_row_divider(canvas, theme, content_x, card_w, y + ROW_H * 2);
+                    let layout_idx = usize::from(cfg.ime_layout == "vertical");
+                    draw_segmented_row(
+                        canvas,
+                        text,
+                        theme,
+                        viewport,
+                        hits,
+                        content_x,
+                        card_w,
+                        y + ROW_H * 2,
+                        "候选栏排版",
+                        "设置候选词窗口采用横向或纵向列表呈现",
+                        188,
+                        &["横排", "竖排"],
+                        layout_idx,
+                        HitTarget::ImeLayout,
+                        hover,
+                    );
+                    draw_row_divider(canvas, theme, content_x, card_w, y + ROW_H * 3);
+                    let ps_idx = nearest_preset_index(
+                        &IME_PAGE_SIZES,
+                        i64::from(cfg.ime_page_size),
+                    );
+                    draw_segmented_row(
+                        canvas,
+                        text,
+                        theme,
+                        viewport,
+                        hits,
+                        content_x,
+                        card_w,
+                        y + ROW_H * 3,
+                        "每页候选数",
+                        "调节单页展示的候选词条数量 (5 - 9)",
+                        220,
+                        &["5", "6", "7", "8", "9"],
+                        ps_idx,
+                        HitTarget::ImePageSize,
+                        hover,
+                    );
+                    draw_row_divider(canvas, theme, content_x, card_w, y + ROW_H * 4);
+                    let tk_idx = usize::from(cfg.ime_toggle_key == "ctrl-space");
+                    draw_segmented_row(
+                        canvas,
+                        text,
+                        theme,
+                        viewport,
+                        hits,
+                        content_x,
+                        card_w,
+                        y + ROW_H * 4,
+                        "中英切换键",
+                        "轻按左 Shift 快速切换，或使用 Ctrl+Space",
+                        220,
+                        &["左 Shift", "Ctrl+Space"],
+                        tk_idx,
+                        HitTarget::ImeToggleKey,
+                        hover,
+                    );
+                    draw_row_divider(canvas, theme, content_x, card_w, y + ROW_H * 5);
+                    draw_toggle_row(
+                        canvas,
+                        text,
+                        theme,
+                        viewport,
+                        hits,
+                        content_x,
+                        card_w,
+                        y + ROW_H * 5,
+                        "模糊音匹配",
+                        "智能容错平翘舌 (z/zh, c/ch, s/sh) 与前后鼻音输入",
+                        cfg.ime_fuzzy_pinyin,
+                        HitTarget::ImeFuzzyPinyin,
+                        hover,
+                    );
+                    draw_row_divider(canvas, theme, content_x, card_w, y + ROW_H * 6);
+                    draw_toggle_row(
+                        canvas,
+                        text,
+                        theme,
+                        viewport,
+                        hits,
+                        content_x,
+                        card_w,
+                        y + ROW_H * 6,
+                        "中文智能标点",
+                        "中文状态下输出全角标点并自动配对引号与括号",
+                        cfg.ime_cn_punct,
+                        HitTarget::ImeCnPunct,
+                        hover,
+                    );
+                    draw_row_divider(canvas, theme, content_x, card_w, y + ROW_H * 7);
+                    draw_toggle_row(
+                        canvas,
+                        text,
+                        theme,
+                        viewport,
+                        hits,
+                        content_x,
+                        card_w,
+                        y + ROW_H * 7,
+                        "中英混合输入",
+                        "允许直接在中文拼音状态下搜索并上屏英文词条",
+                        cfg.ime_mixed_english,
+                        HitTarget::ImeMixedEnglish,
+                        hover,
+                    );
+                    y += c3.h + 18;
                 }
 
                 Page::Applications => {

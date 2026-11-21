@@ -2192,6 +2192,32 @@ pub fn text_input(
     focused: bool,
     leading_icon: Option<Icon>,
 ) {
+    let _ = text_input_ime(
+        canvas,
+        text,
+        theme,
+        rect,
+        value,
+        "",
+        placeholder,
+        focused,
+        leading_icon,
+    );
+}
+
+/// Draw a single-line text input box with optional inline IME preedit composition and return
+/// the window-local caret rectangle for candidate popup positioning.
+pub fn text_input_ime(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    rect: Rect,
+    value: &str,
+    preedit: &str,
+    placeholder: &str,
+    focused: bool,
+    leading_icon: Option<Icon>,
+) -> Rect {
     if theme.is_win98() {
         canvas.fill(rect, theme.input_bg);
         sunken_bevel(canvas, theme, rect);
@@ -2251,6 +2277,7 @@ pub fn text_input(
         text_x = rect.x + 31;
     }
 
+    let active_preedit = if focused { preedit } else { "" };
     let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.5;
     let inner_clip = Rect::new(
         text_x,
@@ -2258,8 +2285,9 @@ pub fn text_input(
         (rect.right() - text_x - 8).max(0),
         rect.h - 4,
     );
+    let mut caret_x = text_x;
     canvas.with_clip(inner_clip, |c| {
-        if value.is_empty() {
+        if value.is_empty() && active_preedit.is_empty() {
             text.draw(
                 c,
                 placeholder,
@@ -2276,28 +2304,65 @@ pub fn text_input(
                 );
             }
         } else {
-            let adv = text.draw(
-                c,
-                value,
-                text_x as f32,
-                baseline,
-                12.5,
-                theme.text,
-                Face::Ui,
-            );
-            if focused {
+            let val_w = if value.is_empty() {
+                0.0
+            } else {
+                text.measure(value, 12.5, Face::Ui)
+            };
+            let pre_w = if active_preedit.is_empty() {
+                0.0
+            } else {
+                text.measure(active_preedit, 12.5, Face::Ui)
+            };
+            let max_w = (inner_clip.w - 4).max(1) as f32;
+            let total_w = val_w + pre_w;
+            let draw_x = if total_w > max_w {
+                text_x as f32 - (total_w - max_w)
+            } else {
+                text_x as f32
+            };
+            if !value.is_empty() {
+                text.draw(c, value, draw_x, baseline, 12.5, theme.text, Face::Ui);
+            }
+            if !active_preedit.is_empty() {
+                let pre_x = draw_x + val_w;
+                let bg_rect = Rect::new(
+                    pre_x.floor() as i32,
+                    rect.y + (rect.h - 18) / 2,
+                    pre_w.ceil() as i32 + 2,
+                    18,
+                );
+                c.fill_alpha(bg_rect, theme.accent, 0.14);
+                text.draw(
+                    c,
+                    active_preedit,
+                    pre_x,
+                    baseline,
+                    12.5,
+                    theme.text,
+                    Face::Ui,
+                );
                 c.fill(
                     Rect::new(
-                        (text_x as f32 + adv + 1.0) as i32,
-                        rect.y + (rect.h - 16) / 2,
-                        1,
-                        16,
+                        pre_x.floor() as i32,
+                        (baseline + 2.5) as i32,
+                        pre_w.ceil().max(1.0) as i32,
+                        2,
                     ),
+                    theme.accent,
+                );
+            }
+            caret_x = (draw_x + val_w + pre_w + 1.0) as i32;
+            if focused {
+                c.fill(
+                    Rect::new(caret_x, rect.y + (rect.h - 16) / 2, 1, 16),
                     theme.accent,
                 );
             }
         }
     });
+    let clamped_cx = caret_x.clamp(rect.x + 4, (rect.right() - 2).max(rect.x + 4));
+    Rect::new(clamped_cx, rect.y + 4, 1, (rect.h - 8).max(16))
 }
 
 /// Smooth inertial & interactive vertical scroll state shared across scrollable apps.

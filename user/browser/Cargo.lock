@@ -633,6 +633,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "spime"
+version = "1.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "spui"
 version = "4.0.0"
 dependencies = [
@@ -640,6 +647,7 @@ dependencies = [
  "libc",
  "png",
  "resvg",
+ "spime",
  "ttf-parser",
  "x11rb",
  "zune-jpeg",
@@ -653,6 +661,7 @@ dependencies = [
  "libc",
  "png",
  "resvg",
+ "spime",
  "spui",
  "ttf-parser",
  "x11rb",

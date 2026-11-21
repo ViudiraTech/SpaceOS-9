@@ -1320,6 +1320,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
     app.min_width = 420;
     app.min_height = 240;
     app.set_content_cursor(CursorKind::Text);
+    app.set_ime_focus(true);
 
     let mut metrics = compute_metrics(&mut app.text, app.config.term_font_size);
     let (init_cols, init_rows) = calc_grid(app.content(), metrics.cell_w, metrics.cell_h);
@@ -1501,6 +1502,26 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                         app.needs_redraw = true;
                     }
                 }
+                UiEvent::CommitText(s) => {
+                    if !s.is_empty() {
+                        if !term_is_at_bottom(&vt, &term_scroll, metrics.cell_h)
+                            || vt.scroll_offset != 0
+                        {
+                            sync_term_scroll(
+                                &mut vt,
+                                &mut term_scroll,
+                                content,
+                                metrics.cell_h,
+                                true,
+                            );
+                            app.needs_redraw = true;
+                        }
+                        if let Some(p) = &pty {
+                            p.write_all(s.as_bytes());
+                        }
+                    }
+                }
+                UiEvent::Preedit(_) => app.needs_redraw = true,
                 UiEvent::Key(key) => {
                     if key.shift() && key.is_page_up() {
                         sync_term_scroll(&mut vt, &mut term_scroll, content, metrics.cell_h, false);
@@ -1536,7 +1557,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         }
 
         if app.needs_redraw {
-            draw_terminal(
+            let caret = draw_terminal(
                 &mut app.canvas,
                 &mut app.text,
                 &app.theme,
@@ -1545,7 +1566,11 @@ pub fn run(argument: Option<&str>) -> Result<()> {
                 metrics,
                 app.config.term_cursor_style,
                 app.active,
+                &app.ime_preedit,
             );
+            if let Some(c) = caret {
+                app.set_ime_spot(c);
+            }
             app.draw_chrome();
             app.present()?;
         }
@@ -1563,7 +1588,8 @@ fn draw_terminal(
     metrics: TermMetrics,
     cursor_style: CursorStyle,
     window_active: bool,
-) {
+    ime_preedit: &str,
+) -> Option<Rect> {
     let cell_w = metrics.cell_w;
     let cell_h = metrics.cell_h;
     let font_px = metrics.font_px;
@@ -1599,6 +1625,7 @@ fn draw_terminal(
     let content_clip = Rect::new(body.x, body.y, (body.w - SCROLLBAR_W - 2).max(1), body.h);
     let vis_span = ((content_clip.h + cell_h - 1) / cell_h + 2).max(2) as usize;
 
+    let mut caret_rect = None;
     canvas.with_clip(content_clip, |c| {
         for row_idx in first_row..(first_row + vis_span).min(total_rows) {
             let line = vt.global_row(row_idx);
@@ -1675,7 +1702,7 @@ fn draw_terminal(
         }
 
         // Draw cursor relative to live screen rows.
-        if vt.cursor_visible && vt.cur_row < vt.rows && vt.cur_col < vt.cols {
+        if vt.cur_row < vt.rows && vt.cur_col < vt.cols {
             let cur_cell = vt.screen[vt.cur_row][vt.cur_col];
             let cur_w = if !cur_cell.wide_cont && char_display_width(cur_cell.ch) == 2 {
                 cell_w * 2
@@ -1684,7 +1711,8 @@ fn draw_terminal(
             };
             let cx = origin_x + vt.cur_col as i32 * cell_w;
             let cy = origin_y + (total_sb + vt.cur_row) as i32 * cell_h - scroll_px;
-            if cy + cell_h > body.y && cy < body.bottom() {
+            caret_rect = Some(Rect::new(cx, cy, cur_w, cell_h));
+            if vt.cursor_visible && cy + cell_h > body.y && cy < body.bottom() {
                 let cursor_color = theme.accent;
                 match cursor_style {
                     CursorStyle::Beam => {
@@ -1721,10 +1749,32 @@ fn draw_terminal(
                     }
                 }
             }
+            if window_active && !ime_preedit.is_empty() && cy + cell_h > body.y && cy < body.bottom() {
+                let pre_w = text.measure(ime_preedit, font_px, Face::Mono).ceil().max(4.0) as i32;
+                let pill_w = (pre_w + 6).min((content_clip.w - 4).max(16));
+                let pill_x = cx.clamp(body.x + 2, (content_clip.right() - pill_w - 2).max(body.x + 2));
+                let pill_r = Rect::new(pill_x, cy, pill_w, cell_h);
+                c.fill(pill_r, theme.input_bg);
+                c.fill(
+                    Rect::new(pill_r.x, pill_r.bottom() - 2, pill_r.w, 2),
+                    theme.accent,
+                );
+                text.draw(
+                    c,
+                    ime_preedit,
+                    (pill_r.x + 3) as f32,
+                    cy as f32 + metrics.baseline_off,
+                    font_px,
+                    theme.text,
+                    Face::Mono,
+                );
+                caret_rect = Some(Rect::new(pill_r.right(), cy, 2, cell_h));
+            }
         }
     });
 
     scroll.draw_v(canvas, theme, track, vp_h, total_h);
+    caret_rect
 }
 
 #[cfg(test)]

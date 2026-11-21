@@ -68,6 +68,10 @@ pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {
         "wm" => vec![
             ("/button-layout", Value::String("right".to_string())),
             (
+                "/compositor-quality",
+                Value::String("quality".to_string()),
+            ),
+            (
                 "/double-click-action",
                 Value::String("maximize".to_string()),
             ),
@@ -87,6 +91,14 @@ pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {
             ("/keyboard/repeat-enabled", Value::Bool(true)),
             ("/keyboard/repeat-delay-ms", Value::Int(400)),
             ("/keyboard/repeat-rate-hz", Value::Int(30)),
+            ("/ime/enabled", Value::Bool(true)),
+            ("/ime/scheme", Value::String("full".to_string())),
+            ("/ime/layout", Value::String("horizontal".to_string())),
+            ("/ime/page-size", Value::Int(5)),
+            ("/ime/fuzzy-pinyin", Value::Bool(false)),
+            ("/ime/toggle-key", Value::String("shift".to_string())),
+            ("/ime/cn-punct", Value::Bool(true)),
+            ("/ime/mixed-english", Value::Bool(true)),
         ],
         "sound" => vec![
             ("/master-volume", Value::Int(80)),

@@ -14,21 +14,24 @@
 //! search) and notification toasts, synchronized live with `uxconfd`.
 
 use crate::compositor::{
-    attach_window_pixmap, blit_scaled_window, blit_window_pixels, capture_dirty_windows,
-    composite_shell_layer, compute_thumb_popup, detach_window_resources, draw_aero_peek_sheet,
-    draw_alt_tab_hud, draw_flip3d_scene, draw_thumb_preview, lerp_rect, paint_shell_glass_region,
-    scaled_rect_around_center, window_damage_bounds, AltTabState, AnimKind, ClosingGhost,
-    CompWindow, Compositor, Flip3dState, SnapZone, SwitcherEntry, WindowAnim,
+    attach_window_pixmap, blit_scaled_window, blit_window_pixels_split, capture_dirty_windows,
+    capture_one_window, composite_shell_layer, compute_thumb_popup, detach_window_resources,
+    draw_aero_peek_sheet, draw_alt_tab_hud, draw_flip3d_scene, draw_thumb_preview, lerp_rect,
+    paint_shell_glass_region, scaled_rect_around_center, window_damage_bounds, AltTabState,
+    AnimKind, ClosingGhost, CompWindow, Compositor, Flip3dState, SnapZone, SwitcherEntry,
+    WindowAnim,
 };
 use crate::ddm::wire::PowerAction;
-use crate::draw::{mix, Canvas, Rect, Sprite};
+use crate::draw::{mix, BlurScratch, Canvas, Rect, RectRegion, Sprite};
 use crate::icons::{self, Icon};
 use crate::start_screen::{ShellConfigHost, StartAction, StartScreenState};
+use spime::client::SpimeClient;
+use spime::proto::DaemonReply;
 use crate::text::{Face, TextGlow, TextRenderer};
 use crate::theme::{Theme, VORTEX_TITLEBAR_HEIGHT};
 use crate::ui;
 use crate::vortex::{
-    draw_space_start_orb, draw_vortex_frame_chrome, smootherstep, AERO_BLUR_RADIUS,
+    draw_space_start_orb, draw_vortex_frame_chrome_cached, smootherstep, AERO_BLUR_RADIUS,
 };
 use crate::x11::{CursorKind, Key, Result, X};
 use std::collections::HashMap;
@@ -37,7 +40,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use uxconf::client::{UxConfClient, UxConfWatch};
-use uxconf::{BackdropStyle, DesktopConfig, FocusMode, PanelPosition, WindowPlacement};
+use uxconf::{
+    BackdropStyle, CompositorQuality, DesktopConfig, FocusMode, PanelPosition, WindowPlacement,
+};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux,
     ConnectionExt, EventMask, ModMask, NotifyDetail, NotifyMode, PropMode, StackMode, Window,
@@ -236,6 +241,7 @@ enum Hit {
     Start,
     Pinned(usize),
     Window(usize),
+    ImeTray,
     Network,
     Volume,
     Bell,
@@ -271,6 +277,63 @@ struct Toast {
     deadline: Instant,
 }
 
+/// Tracked external `override_redirect` popup/menu/IME candidate window.
+struct OverrideWin {
+    window: Window,
+    rect: Rect,
+    cw: CompWindow,
+}
+
+/// Per-window geometry and visibility plan computed during single-pass occlusion culling.
+#[derive(Default)]
+struct WinCompPlan {
+    window: Window,
+    draw_rect: Rect,
+    cull_bounds: Rect,
+    opaque_rect: Rect,
+    glass_strips: [Rect; 4],
+    glass_count: usize,
+    is_max: bool,
+    is_anim: bool,
+    peeking_out: bool,
+    has_vortex_glass: bool,
+    active: bool,
+    glass_top: i32,
+    eff_op: u8,
+    cw_pw: usize,
+    cw_ph: usize,
+    cw_depth: u8,
+    win_vis: Vec<Rect>,
+    glass_vis: Vec<(Rect, bool)>,
+}
+
+impl WinCompPlan {
+    fn reset(&mut self) {
+        self.glass_count = 0;
+        self.win_vis.clear();
+        self.glass_vis.clear();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WmDrag {
+    window: Window,
+    mode: u32,
+    orig_x: i32,
+    orig_y: i32,
+    orig_w: i32,
+    orig_h: i32,
+    press_rx: i32,
+    press_ry: i32,
+    min_w: i32,
+    min_h: i32,
+    pending_x: i32,
+    pending_y: i32,
+    pending_w: i32,
+    pending_h: i32,
+    has_pending: bool,
+}
+
 pub struct Shell {
     x: X,
     text: TextRenderer,
@@ -281,6 +344,7 @@ pub struct Shell {
     comp: Compositor,
     comps: HashMap<Window, CompWindow>,
     z_stack: Vec<Window>,
+    override_wins: Vec<OverrideWin>,
     wallpaper_raw: Option<Sprite>,
     wallpaper_scaled: Vec<u32>,
     wallpaper_file: String,
@@ -297,12 +361,20 @@ pub struct Shell {
     menu_canvas: Canvas,
     menu_open: bool,
     menu_query: String,
+    menu_ime_preedit: String,
+    menu_ime_focused: bool,
+    menu_ime_spot: Option<(i32, i32, i32)>,
     menu_confirm_power: Option<PowerAction>,
     start_screen: StartScreenState,
     ctx_menu: Window,
     ctx_canvas: Canvas,
     ctx_open: bool,
+    ctx_is_ime: bool,
     ctx_pos: (i16, i16),
+    ime_client: SpimeClient,
+    ime_chinese: bool,
+    ime_active: bool,
+    comp_shm_pending_sync: bool,
     vol_popup: Window,
     vol_canvas: Canvas,
     vol_open: bool,
@@ -310,6 +382,7 @@ pub struct Shell {
     vol_persist: VolumePersistState,
     pointer_grab: Option<Window>,
     kbd_grabbed: bool,
+    wm_drag: Option<WmDrag>,
     toast_window: Window,
     toast_canvas: Canvas,
     toast: Option<Toast>,
@@ -322,6 +395,10 @@ pub struct Shell {
     net_status: crate::netmgr::NetStatus,
     last_net_refresh: Instant,
     last_launch: Option<(&'static str, Instant)>,
+    last_composite: Instant,
+    dirty_rects_buf: Vec<Rect>,
+    comp_plan_buf: Vec<WinCompPlan>,
+    capture_keep_buf: Vec<Window>,
     running: bool,
 }
 
@@ -335,6 +412,9 @@ impl Drop for Shell {
         self.x.ungrab_pointer();
         for (_, mut cw) in self.comps.drain() {
             detach_window_resources(&self.x, &mut cw);
+        }
+        for mut ov in self.override_wins.drain(..) {
+            detach_window_resources(&self.x, &mut ov.cw);
         }
         self.comp.shutdown(&self.x);
         self.flush_volume_persist();
@@ -671,11 +751,23 @@ fn infer_window_icon(title: &str) -> Icon {
     }
 }
 
+fn next_ime_scheme(cur: &str) -> &'static str {
+    match cur {
+        "full" => "xiaohe",
+        "xiaohe" => "ziranma",
+        "ziranma" => "microsoft",
+        "microsoft" => "sogou",
+        "sogou" => "abc",
+        _ => "full",
+    }
+}
+
 struct TaskbarLayout {
     start: Rect,
     start_sep_x: i32,
     pinned_sep_x: i32,
     win_start_x: i32,
+    ime: Rect,
     net: Rect,
     volume: Rect,
     bell: Rect,
@@ -718,6 +810,7 @@ impl TaskbarLayout {
         let bell = Rect::new(clock_sep_x - 40, tray_y, 32, tray_bh);
         let volume = Rect::new(bell.x - 36, tray_y, 32, tray_bh);
         let net = Rect::new(volume.x - 36, tray_y, 32, tray_bh);
+        let ime = Rect::new(net.x - 34, tray_y, 28, tray_bh);
         let show_desktop = if is_vortex {
             Rect::new(screen_w - 14, 0, 14, panel_h)
         } else {
@@ -728,6 +821,7 @@ impl TaskbarLayout {
             start_sep_x,
             pinned_sep_x,
             win_start_x,
+            ime,
             net,
             volume,
             bell,
@@ -748,7 +842,7 @@ impl TaskbarLayout {
 
     fn window_button_rect(&self, panel_h: i32, count: usize, index: usize) -> Rect {
         let bh = (panel_h - 12).clamp(24, 40);
-        let available = (self.net.x - 10 - self.win_start_x).max(80);
+        let available = (self.ime.x - 10 - self.win_start_x).max(80);
         let count = count.clamp(1, 6) as i32;
         let btn_w = ((available - (count - 1) * 4) / count).clamp(28, 160);
         Rect::new(
@@ -1016,6 +1110,8 @@ impl Shell {
             comp.active, x.has_composite, x.has_damage, x.has_xfixes
         );
 
+        let ime_chinese = x.get_spime_status().map(|(c, _)| c).unwrap_or(true);
+        let ime_active = config.ime_enabled;
         let mut shell = Self {
             x,
             text,
@@ -1026,6 +1122,7 @@ impl Shell {
             comp,
             comps: HashMap::new(),
             z_stack: Vec::new(),
+            override_wins: Vec::new(),
             wallpaper_raw: None,
             wallpaper_scaled: Vec::new(),
             wallpaper_file: String::new(),
@@ -1040,12 +1137,20 @@ impl Shell {
             menu_canvas,
             menu_open: false,
             menu_query: String::new(),
+            menu_ime_preedit: String::new(),
+            menu_ime_focused: false,
+            menu_ime_spot: None,
             menu_confirm_power: None,
             start_screen: StartScreenState::new(),
             ctx_menu,
             ctx_canvas,
             ctx_open: false,
+            ctx_is_ime: false,
             ctx_pos: (0, 0),
+            ime_client: SpimeClient::new(menu),
+            ime_chinese,
+            ime_active,
+            comp_shm_pending_sync: false,
             vol_popup,
             vol_canvas,
             vol_open: false,
@@ -1053,6 +1158,7 @@ impl Shell {
             vol_persist,
             pointer_grab: None,
             kbd_grabbed: false,
+            wm_drag: None,
             toast_window,
             toast_canvas,
             toast: None,
@@ -1065,10 +1171,15 @@ impl Shell {
             net_status,
             last_net_refresh: Instant::now(),
             last_launch: None,
+            last_composite: Instant::now() - Duration::from_millis(32),
+            dirty_rects_buf: Vec::with_capacity(16),
+            comp_plan_buf: Vec::with_capacity(8),
+            capture_keep_buf: Vec::with_capacity(16),
             running: true,
         };
         shell.sync_argb_canvases();
         shell.claim_wm()?;
+        shell.sync_initial_override_windows();
         shell.apply_x11_settings(None);
         crate::sound::apply_mixer_volume(
             shell.config.sound_master_volume,
@@ -1441,6 +1552,12 @@ impl Shell {
             self.draw_vol_popup();
             self.present_vol_popup()?;
         }
+        if prev.wm_compositor_quality != self.config.wm_compositor_quality
+            || theme_style_changed
+            || desktop_redraw_needed
+        {
+            self.comp.invalidate_desktop_blur();
+        }
         self.comp.mark_full_dirty();
         self.composite_frame()?;
         if self.toast.is_some() {
@@ -1587,6 +1704,7 @@ impl Shell {
     }
 
     fn event_loop(&mut self) -> Result<()> {
+        const FRAME_BUDGET: Duration = Duration::from_millis(16);
         let mut comp_animating = false;
         while self.running {
             self.poll_uxconf()?;
@@ -1622,6 +1740,27 @@ impl Shell {
                 if self.comp.thumb_hover_start.is_some() || self.comp.thumb_leave_at.is_some() {
                     timeout = timeout.min(25);
                 }
+                if self.comp.active {
+                    let now_idle = Instant::now();
+                    if self.comp.is_dirty() || self.wm_drag.as_ref().is_some_and(|d| d.has_pending) {
+                        let budget = if self.wm_drag.is_some() {
+                            Duration::from_millis(12)
+                        } else {
+                            FRAME_BUDGET
+                        };
+                        let rem = budget
+                            .saturating_sub(now_idle.duration_since(self.last_composite))
+                            .as_millis()
+                            .clamp(1, 16) as i32;
+                        timeout = timeout.min(rem);
+                    }
+                    for cw in self.comps.values() {
+                        if let Some(dl) = cw.resize_wait_until {
+                            let rem = dl.saturating_duration_since(now_idle).as_millis().clamp(1, 85) as i32;
+                            timeout = timeout.min(rem);
+                        }
+                    }
+                }
                 let (_, ux_ready, net_ready) = self.x.wait_fds(ux_fd, self.net_fd, timeout);
                 if ux_ready {
                     self.poll_uxconf()?;
@@ -1642,7 +1781,7 @@ impl Shell {
                 net_dirty |= self.refresh_net_status();
             }
 
-            // Coalesce burst MotionNotify & ConfigureNotify events cleanly while preserving event ordering.
+            // Coalesce burst MotionNotify, ConfigureNotify & geometry ConfigureRequest events cleanly.
             let mut events: Vec<Event> = Vec::with_capacity(raw.len());
             for ev in raw {
                 match &ev {
@@ -1656,6 +1795,7 @@ impl Shell {
                                     Event::MotionNotify(_)
                                         | Event::ConfigureNotify(_)
                                         | Event::DamageNotify(_)
+                                        | Event::ConfigureRequest(_)
                                 )
                             })
                             .find_map(|p| match p {
@@ -1677,6 +1817,7 @@ impl Shell {
                                     Event::MotionNotify(_)
                                         | Event::ConfigureNotify(_)
                                         | Event::DamageNotify(_)
+                                        | Event::ConfigureRequest(_)
                                 )
                             })
                             .find_map(|p| match p {
@@ -1687,6 +1828,46 @@ impl Shell {
                             })
                         {
                             *slot = ev;
+                            continue;
+                        }
+                    }
+                    Event::ConfigureRequest(curr)
+                        if u16::from(curr.value_mask) & u16::from(ConfigWindow::STACK_MODE) == 0 =>
+                    {
+                        if let Some(prev) = events
+                            .iter_mut()
+                            .rev()
+                            .take_while(|p| match p {
+                                Event::MotionNotify(_)
+                                | Event::ConfigureNotify(_)
+                                | Event::DamageNotify(_) => true,
+                                Event::ConfigureRequest(cr) => {
+                                    u16::from(cr.value_mask) & u16::from(ConfigWindow::STACK_MODE)
+                                        == 0
+                                }
+                                _ => false,
+                            })
+                            .find_map(|p| match p {
+                                Event::ConfigureRequest(prev) if prev.window == curr.window => {
+                                    Some(prev)
+                                }
+                                _ => None,
+                            })
+                        {
+                            let cm = u16::from(curr.value_mask);
+                            if cm & u16::from(ConfigWindow::X) != 0 {
+                                prev.x = curr.x;
+                            }
+                            if cm & u16::from(ConfigWindow::Y) != 0 {
+                                prev.y = curr.y;
+                            }
+                            if cm & u16::from(ConfigWindow::WIDTH) != 0 {
+                                prev.width = curr.width;
+                            }
+                            if cm & u16::from(ConfigWindow::HEIGHT) != 0 {
+                                prev.height = curr.height;
+                            }
+                            prev.value_mask = (u16::from(prev.value_mask) | cm).into();
                             continue;
                         }
                     }
@@ -1788,8 +1969,20 @@ impl Shell {
                     let _ = self.present_taskbar();
                 }
                 self.mark_tick_dirty(tick_out, pre_anim_dirty);
-                self.composite_frame()?;
+                let frame_elapsed = now.duration_since(self.last_composite);
+                let drag_due = self.wm_drag.is_some() && frame_elapsed >= Duration::from_millis(12);
+                let non_drag_due = self.wm_drag.is_none()
+                    && (frame_elapsed >= Duration::from_millis(14) || tick_out.peek_or_flip_changed);
+                if drag_due {
+                    self.apply_pending_wm_drag()?;
+                    self.composite_frame()?;
+                } else if non_drag_due {
+                    self.composite_frame()?;
+                }
             } else {
+                if self.wm_drag.as_ref().is_some_and(|d| d.has_pending) {
+                    self.apply_pending_wm_drag()?;
+                }
                 comp_animating = false;
             }
             self.x.flush()?;
@@ -1857,10 +2050,7 @@ impl Shell {
             self.draw_vol_popup();
             self.present_vol_popup()?;
         }
-        self.x.raise(self.taskbar)?;
-        if self.menu_open {
-            self.x.raise(self.menu)?;
-        }
+        self.raise_chrome_above_clients()?;
         self.composite_frame()?;
         Ok(())
     }
@@ -1895,8 +2085,8 @@ impl Shell {
                         );
                         if let Some(cw) = self.comps.get_mut(&e.window) {
                             if size_changed
-                                || cw.pw != usize::from(e.width)
-                                || cw.ph != usize::from(e.height)
+                                || cw.pixmap_w != usize::from(e.width)
+                                || cw.pixmap_h != usize::from(e.height)
                             {
                                 let depth = cw.depth;
                                 attach_window_pixmap(&self.x, cw, e.width, e.height, depth);
@@ -1905,10 +2095,36 @@ impl Shell {
                         if self.comp.active {
                             let old_max = old_rect.w >= scr_w - 2 && old_rect.h >= work_h - 2;
                             let new_max = new_rect.w >= scr_w - 2 && new_rect.h >= work_h - 2;
-                            dirty_move = Some(
-                                window_damage_bounds(old_rect, is_vortex, old_max)
-                                    .union(window_damage_bounds(new_rect, is_vortex, new_max)),
-                            );
+                            if old_rect != new_rect {
+                                dirty_move = Some(
+                                    window_damage_bounds(old_rect, is_vortex, old_max)
+                                        .union(window_damage_bounds(new_rect, is_vortex, new_max)),
+                                );
+                            }
+                        }
+                    } else if let Some(ov) =
+                        self.override_wins.iter_mut().find(|o| o.window == e.window)
+                    {
+                        let old_rect = ov.rect;
+                        let new_rect = Rect::new(
+                            i32::from(e.x),
+                            i32::from(e.y),
+                            i32::from(e.width),
+                            i32::from(e.height),
+                        );
+                        let size_changed = ov.cw.pixmap_w != usize::from(e.width)
+                            || ov.cw.pixmap_h != usize::from(e.height);
+                        ov.rect = new_rect;
+                        if size_changed && e.width > 0 && e.height > 0 {
+                            let depth = ov.cw.depth;
+                            attach_window_pixmap(&self.x, &mut ov.cw, e.width, e.height, depth);
+                            // Override-redirect popups never send WM present sync (cmd=22),
+                            // so capture their resized pixmap immediately instead of holding
+                            // stale dimensions for the 85ms managed-resize timeout.
+                            ov.cw.confirm_sync_commit();
+                        }
+                        if self.comp.active && old_rect != new_rect {
+                            dirty_move = Some(old_rect.union(new_rect).expand(20));
                         }
                     }
                     if let Some(d) = dirty_move {
@@ -1918,33 +2134,66 @@ impl Shell {
             }
             Event::DamageNotify(e) => {
                 if self.comp.active {
-                    let target = self
+                    let local = Rect::new(
+                        i32::from(e.area.x),
+                        i32::from(e.area.y),
+                        i32::from(e.area.width),
+                        i32::from(e.area.height),
+                    );
+                    if let Some(cw) = self
                         .comps
                         .values_mut()
-                        .find(|c| c.window == e.drawable || c.damage == e.damage);
-                    if let Some(cw) = target {
-                        let local = Rect::new(
-                            i32::from(e.area.x),
-                            i32::from(e.area.y),
-                            i32::from(e.area.width),
-                            i32::from(e.area.height),
-                        );
+                        .find(|c| c.window == e.drawable || c.damage == e.damage)
+                    {
                         cw.mark_damage(local);
-                        if let Some(m) = self.windows.iter().find(|w| w.window == cw.window) {
-                            let scr = Rect::new(
-                                i32::from(m.x) + local.x - 16,
-                                i32::from(m.y) + local.y - 16,
-                                local.w + 32,
-                                local.h + 32,
-                            );
-                            self.comp.mark_dirty(scr);
-                        } else {
-                            self.comp.mark_full_dirty();
+                        if !cw.awaiting_sync_commit {
+                            if let Some(m) = self.windows.iter().find(|w| w.window == cw.window) {
+                                let scr = Rect::new(
+                                    i32::from(m.x) + local.x - 16,
+                                    i32::from(m.y) + local.y - 16,
+                                    local.w + 32,
+                                    local.h + 32,
+                                );
+                                self.comp.mark_dirty(scr);
+                            }
                         }
+                    } else if let Some(ov) = self
+                        .override_wins
+                        .iter_mut()
+                        .find(|o| o.window == e.drawable || o.cw.damage == e.damage)
+                    {
+                        if ov.cw.awaiting_sync_commit {
+                            ov.cw.confirm_sync_commit();
+                        }
+                        ov.cw.mark_damage(local);
+                        self.comp.mark_dirty(Rect::new(
+                            ov.rect.x + local.x - 16,
+                            ov.rect.y + local.y - 16,
+                            local.w + 32,
+                            local.h + 32,
+                        ));
                     }
                 }
             }
             Event::MapRequest(e) => self.manage(e.window)?,
+            Event::MapNotify(e) => {
+                if self.comp.active
+                    && !self.is_internal_window(e.window)
+                    && !self.windows.iter().any(|w| w.window == e.window)
+                {
+                    if let Some((wx, wy, ww, wh, depth, or_flag, viewable)) =
+                        self.x.get_window_info(e.window)
+                    {
+                        if (or_flag || e.override_redirect) && viewable && ww > 0 && wh > 0 {
+                            self.track_override_window(
+                                e.window,
+                                Rect::new(i32::from(wx), i32::from(wy), i32::from(ww), i32::from(wh)),
+                                depth,
+                            );
+                        }
+                    }
+                }
+            }
             Event::ConfigureRequest(e) => {
                 let mask = u16::from(e.value_mask);
                 let mut aux = ConfigureWindowAux::new();
@@ -2062,6 +2311,7 @@ impl Shell {
                         .iter()
                         .any(|w| w.window == e.event && !w.minimized)
                 {
+                    let prev_active = self.active;
                     if self.config.wm_auto_raise {
                         self.x.raise(e.event)?;
                         self.raise_z(e.event);
@@ -2069,6 +2319,12 @@ impl Shell {
                     }
                     self.x.focus(e.event)?;
                     self.active = Some(e.event);
+                    if self.comp.active {
+                        if let Some(prev) = prev_active {
+                            self.mark_window_dirty(prev);
+                        }
+                        self.mark_window_dirty(e.event);
+                    }
                     self.publish_active()?;
                     self.draw_taskbar();
                     self.present_taskbar()?;
@@ -2106,7 +2362,7 @@ impl Shell {
                     if self.menu_open {
                         self.close_menu()?;
                     }
-                } else {
+                } else if !self.remove_override_window(e.window) {
                     let is_minimized = self
                         .windows
                         .iter()
@@ -2119,6 +2375,7 @@ impl Shell {
                 }
             }
             Event::DestroyNotify(e) => {
+                self.remove_override_window(e.window);
                 if self.remove_window(e.window) {
                     self.draw_taskbar();
                     self.present_taskbar()?;
@@ -2130,6 +2387,7 @@ impl Shell {
                     let top_desync =
                         active.is_some_and(|w| self.z_stack.last().copied() != Some(w));
                     if active != self.active || top_desync {
+                        let prev_active = self.active;
                         self.active = active;
                         if active.is_some() && self.vol_open {
                             self.close_vol_popup()?;
@@ -2148,18 +2406,52 @@ impl Shell {
                             self.raise_chrome_above_clients()?;
                             self.x.focus(window)?;
                             self.x.flush()?;
+                            if self.comp.active {
+                                self.mark_window_dirty(window);
+                            }
+                        }
+                        if self.comp.active {
+                            if let Some(prev) = prev_active {
+                                self.mark_window_dirty(prev);
+                            }
                         }
                         self.draw_taskbar();
                         self.present_taskbar()?;
+                    }
+                } else if e.window == self.x.root && e.atom == self.x.atoms.spime_status {
+                    if let Some((cn, en)) = self.x.get_spime_status() {
+                        if self.ime_chinese != cn || self.ime_active != en {
+                            self.ime_chinese = cn;
+                            self.ime_active = en;
+                            self.draw_taskbar();
+                            self.present_taskbar()?;
+                        }
+                    }
+                } else if let Some(ov) =
+                    self.override_wins.iter_mut().find(|o| o.window == e.window)
+                {
+                    if e.atom == self.x.atoms.spui_glass_extents {
+                        ov.cw.glass_extents = self.x.get_glass_extents(e.window);
+                        let dirty = ov.rect.expand(20);
+                        self.comp.mark_dirty(dirty);
                     }
                 } else if self.windows.iter().any(|w| w.window == e.window) {
                     let title = self.window_title(e.window);
                     let icon = self.window_icon(e.window, &title);
                     if e.atom == self.x.atoms.spui_glass_extents {
                         let ext = self.x.get_glass_extents(e.window);
+                        let is_vortex = self.theme.is_vortexglass();
+                        let win_rect = self
+                            .windows
+                            .iter()
+                            .find(|w| w.window == e.window)
+                            .map(|m| self.window_rect_for(m));
                         if let Some(cw) = self.comps.get_mut(&e.window) {
                             cw.glass_extents = ext;
-                            self.comp.mark_full_dirty();
+                        }
+                        if let Some((rect, is_max)) = win_rect {
+                            self.comp
+                                .mark_dirty(window_damage_bounds(rect, is_vortex, is_max));
                         }
                     }
                     if let Some(managed) = self.windows.iter_mut().find(|w| w.window == e.window) {
@@ -2249,6 +2541,7 @@ impl Shell {
                         Hit::Start
                             | Hit::Pinned(_)
                             | Hit::Window(_)
+                            | Hit::ImeTray
                             | Hit::Network
                             | Hit::Volume
                             | Hit::Bell
@@ -2354,6 +2647,13 @@ impl Shell {
                         self.taskbar_click(x, y)?;
                         self.draw_taskbar();
                         self.present_taskbar()?;
+                    } else if e.detail == 3 && self.taskbar_hit(x, y) == Hit::ImeTray {
+                        let py = if self.config.panel_position == PanelPosition::Top {
+                            self.panel_height() + 4
+                        } else {
+                            i32::from(self.x.height) - self.panel_height() - CTX_HEIGHT - 4
+                        };
+                        self.open_ctx_mode(e.root_x as i32 - CTX_WIDTH / 2, py, true)?;
                     } else {
                         self.close_ctx()?;
                         self.close_vol_popup()?;
@@ -2476,6 +2776,10 @@ impl Shell {
             }
             Event::ButtonRelease(e) => {
                 ui::notify_pointer_button(e.event_x as i32, e.event_y as i32, e.detail, false);
+                if e.detail == 1 && self.wm_drag.is_some() {
+                    self.finish_wm_drag()?;
+                    return Ok(());
+                }
                 if e.detail == 1 && self.vol_dragging {
                     self.vol_dragging = false;
                     self.stage_sound_persist();
@@ -2503,6 +2807,14 @@ impl Shell {
                 let (x, y) = (e.event_x as i32, e.event_y as i32);
                 let btn1_held = u16::from(e.state) & (1 << 8) != 0;
                 ui::notify_pointer_motion(x, y, btn1_held);
+                if self.wm_drag.is_some() {
+                    if btn1_held {
+                        self.update_wm_drag_motion(i32::from(e.root_x), i32::from(e.root_y));
+                    } else {
+                        self.finish_wm_drag()?;
+                    }
+                    return Ok(());
+                }
                 if e.event == self.desktop {
                     let hit = self.desktop_hit(x, y);
                     if hit != self.hover {
@@ -2523,7 +2835,7 @@ impl Shell {
                 } else if e.event == self.taskbar {
                     self.comp.taskbar_mouse_x = Some(x);
                     let hit = self.taskbar_hit(x, y);
-                    let need_redraw = hit != self.hover || matches!(hit, Hit::Window(_));
+                    let need_redraw = hit != self.hover;
                     self.hover = hit;
                     if self.comp.active {
                         self.comp.show_desktop_peek = hit == Hit::ShowDesktop;
@@ -2641,11 +2953,32 @@ impl Shell {
                 }
             }
             Event::KeyPress(e) => {
+                let state: u16 = e.state.into();
                 let key = Key {
                     code: e.detail,
-                    state: e.state.into(),
-                    sym: self.x.key_symbol(e.detail, e.state.into()),
+                    state,
+                    sym: self.x.key_symbol(e.detail, state),
                 };
+                if self.menu_open && self.menu_confirm_power.is_none() {
+                    let wants_ime = !self.config.panel_start_fullscreen
+                        || self.start_screen.wants_ime();
+                    self.menu_ime_focused = wants_ime;
+                    if wants_ime {
+                        if let Some(reply) = self.ime_client.key_event(
+                            self.menu,
+                            true,
+                            key.sym,
+                            state,
+                            u16::from(e.detail),
+                        ) {
+                            let consumed = reply.consumed;
+                            self.apply_menu_ime_reply(reply)?;
+                            if consumed {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 let is_tab = matches!(key.sym, 0xff09 | 0xfe20);
                 let alt_held = (key.state & 0x0008) != 0;
                 let win_held = (key.state & 0x0040) != 0;
@@ -2717,6 +3050,16 @@ impl Shell {
                 }
             }
             Event::KeyRelease(e) => {
+                if self.menu_open && self.menu_ime_focused {
+                    let state: u16 = e.state.into();
+                    let sym = self.x.key_symbol(e.detail, state);
+                    if let Some(reply) =
+                        self.ime_client
+                            .key_event(self.menu, false, sym, state, u16::from(e.detail))
+                    {
+                        self.apply_menu_ime_reply(reply)?;
+                    }
+                }
                 let sym = self.x.key_symbol(e.detail, e.state.into());
                 if self.comp.alt_tab.is_some() && matches!(sym, 0xffe9 | 0xffea) {
                     self.commit_switcher()?;
@@ -2725,7 +3068,18 @@ impl Shell {
                 }
             }
             Event::ClientMessage(e) => {
-                if e.type_ == self.x.atoms.net_active_window {
+                if e.type_ == self.x.atoms.spime_notify && self.menu_open {
+                    for _ in 0..8 {
+                        let Some(reply) = self.ime_client.poll_pending() else {
+                            break;
+                        };
+                        let more = reply.consumed;
+                        self.apply_menu_ime_reply(reply)?;
+                        if !more {
+                            break;
+                        }
+                    }
+                } else if e.type_ == self.x.atoms.net_active_window {
                     let window = e.data.as_data32()[0];
                     self.activate(window)?;
                 } else if e.type_ == self.x.atoms.spui_window_cmd {
@@ -2734,6 +3088,7 @@ impl Shell {
                         1 => self.minimize_window(e.window)?,
                         10 => {
                             let sn = SnapZone::from_u32(data[1]);
+                            let prev_sr = self.comp.snap_rect;
                             self.comp.snap_zone = sn;
                             if sn != SnapZone::None {
                                 let ph = self.panel_height();
@@ -2746,7 +3101,60 @@ impl Shell {
                                 self.comp.snap_rect =
                                     sn.target_rect(i32::from(self.x.width), wt, wh);
                             }
-                            self.comp.mark_full_dirty();
+                            if let Some(sr) = prev_sr.or(self.comp.snap_rect) {
+                                let merged = self
+                                    .comp
+                                    .snap_rect
+                                    .map_or(sr, |nr| sr.union(nr))
+                                    .expand(20);
+                                self.comp.mark_dirty(merged);
+                            } else {
+                                self.comp.mark_full_dirty();
+                            }
+                        }
+                        20 => {
+                            let mode = data[1];
+                            let press_rx = i32::from((data[2] as u16) as i16);
+                            let press_ry = i32::from((data[3] as u16) as i16);
+                            self.start_wm_drag(e.window, mode, press_rx, press_ry, data[4])?;
+                        }
+                        22 => {
+                            if self.comp.active {
+                                let mut commit_rect = None;
+                                if let Some(cw) = self.comps.get_mut(&e.window) {
+                                    if data[1] == 0
+                                        || (cw.pixmap_w == data[1] as usize
+                                            && cw.pixmap_h == data[2] as usize)
+                                    {
+                                        cw.confirm_sync_commit();
+                                        if let Some((r, is_max)) = self
+                                            .windows
+                                            .iter()
+                                            .find(|m| m.window == e.window)
+                                            .map(|m| self.window_rect_for(m))
+                                        {
+                                            commit_rect = Some(window_damage_bounds(
+                                                r,
+                                                self.theme.is_vortexglass(),
+                                                is_max,
+                                            ));
+                                        }
+                                    }
+                                } else if let Some(ov) =
+                                    self.override_wins.iter_mut().find(|o| o.window == e.window)
+                                {
+                                    if data[1] == 0
+                                        || (ov.cw.pixmap_w == data[1] as usize
+                                            && ov.cw.pixmap_h == data[2] as usize)
+                                    {
+                                        ov.cw.confirm_sync_commit();
+                                        commit_rect = Some(ov.rect.expand(20));
+                                    }
+                                }
+                                if let Some(cr) = commit_rect {
+                                    self.comp.mark_dirty(cr);
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -2878,7 +3286,15 @@ impl Shell {
             });
             attach_window_pixmap(&self.x, &mut cw, geometry.width, geometry.height, geometry.depth);
             self.comps.insert(window, cw);
-            self.comp.mark_full_dirty();
+            let open_rect = Rect::new(
+                wx,
+                wy,
+                i32::from(geometry.width),
+                i32::from(geometry.height),
+            );
+            self.comp.mark_dirty(
+                window_damage_bounds(open_rect, self.theme.is_vortexglass(), false).expand(24),
+            );
         }
         self.publish_client_list()?;
         self.publish_active()?;
@@ -2888,6 +3304,9 @@ impl Shell {
     }
 
     fn minimize_window(&mut self, window: Window) -> Result<()> {
+        if self.wm_drag.is_some_and(|d| d.window == window) {
+            self.cancel_wm_drag();
+        }
         let Some(win_idx) = self.windows.iter().position(|w| w.window == window) else {
             return Ok(());
         };
@@ -2918,7 +3337,7 @@ impl Shell {
                 }
                 cw.anim = None;
             }
-            self.comp.mark_full_dirty();
+            self.comp.mark_dirty(m_rect.union(btn_screen).expand(28));
         }
         self.windows[win_idx].minimized = true;
         self.x.unmap(window)?;
@@ -2958,6 +3377,9 @@ impl Shell {
     }
 
     fn remove_window(&mut self, window: Window) -> bool {
+        if self.wm_drag.is_some_and(|d| d.window == window) {
+            self.cancel_wm_drag();
+        }
         let pos = self.windows.iter().position(|w| w.window == window);
         let Some(idx) = pos else {
             return false;
@@ -2992,7 +3414,15 @@ impl Shell {
                 });
             }
             detach_window_resources(&self.x, &mut cw);
-            self.comp.mark_full_dirty();
+            let close_rect = Rect::new(
+                i32::from(m.x),
+                i32::from(m.y),
+                i32::from(m.width),
+                i32::from(m.height),
+            );
+            self.comp.mark_dirty(
+                window_damage_bounds(close_rect, self.theme.is_vortexglass(), false).expand(24),
+            );
         }
         if self.active == Some(window) {
             self.active = self
@@ -3018,6 +3448,351 @@ impl Shell {
         }
         let _ = self.publish_client_list();
         true
+    }
+
+    fn work_area_vertical(&self) -> (i32, i32) {
+        let ph = self.panel_height();
+        let work_top = if self.config.panel_position == PanelPosition::Top {
+            ph
+        } else {
+            0
+        };
+        let work_h = (i32::from(self.x.height) - ph).max(200);
+        (work_top, work_h)
+    }
+
+    fn start_wm_drag(
+        &mut self,
+        window: Window,
+        mode: u32,
+        press_rx: i32,
+        press_ry: i32,
+        packed_min: u32,
+    ) -> Result<()> {
+        let Some((orig_x, orig_y, orig_w, orig_h)) = self
+            .windows
+            .iter()
+            .find(|w| w.window == window && !w.minimized)
+            .map(|w| (i32::from(w.x), i32::from(w.y), i32::from(w.width), i32::from(w.height)))
+        else {
+            return Ok(());
+        };
+        let Some((cur_rx, cur_ry, mask)) = self.x.query_pointer_root() else {
+            return Ok(());
+        };
+        if mask & (1 << 8) == 0 {
+            return Ok(());
+        }
+        self.close_menu()?;
+        self.close_ctx()?;
+        self.close_vol_popup()?;
+        let _ = self.close_thumb();
+        if self.active != Some(window) || self.z_stack.last().copied() != Some(window) {
+            self.activate(window)?;
+        }
+        let cursor = match mode {
+            1 | 5 => CursorKind::ResizeDiagF,
+            3 | 7 => CursorKind::ResizeDiagB,
+            2 | 6 => CursorKind::ResizeV,
+            4 | 8 => CursorKind::ResizeH,
+            _ => CursorKind::Default,
+        };
+        if self.pointer_grab.is_some() {
+            self.release_popup_grab();
+        }
+        if !self.x.grab_pointer_cursor(self.x.root, cursor) {
+            return Ok(());
+        }
+        self.pointer_grab = Some(self.x.root);
+        let min_w = ((packed_min >> 16) as i32).max(160);
+        let min_h = ((packed_min & 0xffff) as i32).max(120);
+        self.wm_drag = Some(WmDrag {
+            window,
+            mode,
+            orig_x,
+            orig_y,
+            orig_w,
+            orig_h,
+            press_rx,
+            press_ry,
+            min_w,
+            min_h,
+            pending_x: orig_x,
+            pending_y: orig_y,
+            pending_w: orig_w,
+            pending_h: orig_h,
+            has_pending: false,
+        });
+        if i32::from(cur_rx) != press_rx || i32::from(cur_ry) != press_ry {
+            self.update_wm_drag_motion(i32::from(cur_rx), i32::from(cur_ry));
+        }
+        Ok(())
+    }
+
+    fn update_wm_drag_motion(&mut self, rx: i32, ry: i32) {
+        let Some(mut drag) = self.wm_drag else {
+            return;
+        };
+        let scr_w = i32::from(self.x.width);
+        let (work_top, work_h) = self.work_area_vertical();
+        let dx = rx - drag.press_rx;
+        let dy = ry - drag.press_ry;
+
+        if drag.mode == 0 {
+            drag.pending_x = drag.orig_x + dx;
+            drag.pending_y = (drag.orig_y + dy).max(work_top);
+            drag.has_pending = true;
+            let zone = if ry <= work_top + 6 {
+                SnapZone::Maximize
+            } else if rx <= 10 {
+                SnapZone::Left
+            } else if rx >= scr_w - 11 {
+                SnapZone::Right
+            } else {
+                SnapZone::None
+            };
+            if zone != self.comp.snap_zone {
+                let prev_sr = self.comp.snap_rect;
+                self.comp.snap_zone = zone;
+                if zone != SnapZone::None {
+                    self.comp.snap_rect = zone.target_rect(scr_w, work_top, work_h);
+                }
+                if let Some(sr) = prev_sr.or(self.comp.snap_rect) {
+                    let merged = self
+                        .comp
+                        .snap_rect
+                        .map_or(sr, |nr| sr.union(nr))
+                        .expand(20);
+                    self.comp.mark_dirty(merged);
+                }
+            }
+        } else {
+            let min_w = drag.min_w;
+            let min_h = drag.min_h;
+            let (mut nx, mut ny, mut nw, mut nh) =
+                (drag.orig_x, drag.orig_y, drag.orig_w, drag.orig_h);
+            match drag.mode {
+                4 => nw = (drag.orig_w + dx).max(min_w),
+                6 => nh = (drag.orig_h + dy).max(min_h),
+                8 => {
+                    nw = (drag.orig_w - dx).max(min_w);
+                    nx = drag.orig_x + (drag.orig_w - nw);
+                }
+                2 => {
+                    nh = (drag.orig_h - dy).max(min_h);
+                    ny = (drag.orig_y + (drag.orig_h - nh)).max(work_top);
+                }
+                5 => {
+                    nw = (drag.orig_w + dx).max(min_w);
+                    nh = (drag.orig_h + dy).max(min_h);
+                }
+                7 => {
+                    nw = (drag.orig_w - dx).max(min_w);
+                    nx = drag.orig_x + (drag.orig_w - nw);
+                    nh = (drag.orig_h + dy).max(min_h);
+                }
+                3 => {
+                    nw = (drag.orig_w + dx).max(min_w);
+                    nh = (drag.orig_h - dy).max(min_h);
+                    ny = (drag.orig_y + (drag.orig_h - nh)).max(work_top);
+                }
+                1 => {
+                    nw = (drag.orig_w - dx).max(min_w);
+                    nx = drag.orig_x + (drag.orig_w - nw);
+                    nh = (drag.orig_h - dy).max(min_h);
+                    ny = (drag.orig_y + (drag.orig_h - nh)).max(work_top);
+                }
+                _ => {}
+            }
+            drag.pending_x = nx;
+            drag.pending_y = ny;
+            drag.pending_w = nw;
+            drag.pending_h = nh;
+            drag.has_pending = true;
+        }
+        self.wm_drag = Some(drag);
+    }
+
+    fn apply_pending_wm_drag(&mut self) -> Result<()> {
+        let Some(ref mut drag) = self.wm_drag else {
+            return Ok(());
+        };
+        if !drag.has_pending {
+            return Ok(());
+        }
+        drag.has_pending = false;
+        let (win, mode, nx, ny, nw, nh) = (
+            drag.window,
+            drag.mode,
+            drag.pending_x,
+            drag.pending_y,
+            drag.pending_w,
+            drag.pending_h,
+        );
+        let scr_w = i32::from(self.x.width);
+        let work_h = i32::from(self.x.height) - self.panel_height();
+        let is_vortex = self.theme.is_vortexglass();
+        let mut dirty_union = None;
+        let mut changed = false;
+
+        if let Some(m) = self.windows.iter_mut().find(|w| w.window == win) {
+            let old_rect = Rect::new(
+                i32::from(m.x),
+                i32::from(m.y),
+                i32::from(m.width),
+                i32::from(m.height),
+            );
+            let target_w = if mode == 0 {
+                i32::from(m.width)
+            } else {
+                nw.max(1)
+            };
+            let target_h = if mode == 0 {
+                i32::from(m.height)
+            } else {
+                nh.max(1)
+            };
+            let new_rect = Rect::new(nx, ny, target_w, target_h);
+            if old_rect != new_rect {
+                changed = true;
+                m.x = nx as i16;
+                m.y = ny as i16;
+                m.width = target_w as u16;
+                m.height = target_h as u16;
+                if self.comp.active {
+                    let old_max = old_rect.w >= scr_w - 2 && old_rect.h >= work_h - 2;
+                    let new_max = new_rect.w >= scr_w - 2 && new_rect.h >= work_h - 2;
+                    dirty_union = Some(
+                        window_damage_bounds(old_rect, is_vortex, old_max)
+                            .union(window_damage_bounds(new_rect, is_vortex, new_max)),
+                    );
+                }
+            }
+        }
+        if changed {
+            if mode == 0 {
+                self.x.move_window(win, nx as i16, ny as i16)?;
+            } else {
+                self.x
+                    .move_resize(win, nx as i16, ny as i16, nw as u16, nh as u16)?;
+            }
+            if let Some(d) = dirty_union {
+                self.comp.mark_dirty(d);
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_wm_drag(&mut self) {
+        if self.wm_drag.take().is_some() {
+            if self.pointer_grab == Some(self.x.root) {
+                self.release_popup_grab();
+            }
+            if self.comp.snap_zone != SnapZone::None {
+                self.comp.snap_zone = SnapZone::None;
+                if let Some(sr) = self.comp.snap_rect {
+                    self.comp.mark_dirty(sr.expand(20));
+                }
+            }
+        }
+    }
+
+    fn finish_wm_drag(&mut self) -> Result<()> {
+        self.apply_pending_wm_drag()?;
+        let Some(drag) = self.wm_drag.take() else {
+            return Ok(());
+        };
+        if self.pointer_grab == Some(self.x.root) {
+            self.release_popup_grab();
+        }
+
+        if drag.mode == 0 {
+            let zone = self.comp.snap_zone;
+            self.comp.snap_zone = SnapZone::None;
+            if let Some(sr) = self.comp.snap_rect {
+                self.comp.mark_dirty(sr.expand(20));
+            }
+            if zone != SnapZone::None {
+                let scr_w = i32::from(self.x.width);
+                let (work_top, work_h) = self.work_area_vertical();
+                let (sx, sy, sw, sh, zone_code) = match zone {
+                    SnapZone::Maximize => (0i16, work_top as i16, scr_w as u16, work_h as u16, 3u32),
+                    SnapZone::Left => {
+                        let half = (scr_w / 2).max(200);
+                        (0i16, work_top as i16, half as u16, work_h as u16, 1u32)
+                    }
+                    SnapZone::Right => {
+                        let half = (scr_w / 2).max(200);
+                        (
+                            half as i16,
+                            work_top as i16,
+                            (scr_w - half).max(200) as u16,
+                            work_h as u16,
+                            2u32,
+                        )
+                    }
+                    SnapZone::None => (0, 0, 0, 0, 0),
+                };
+                let packed_xy =
+                    (u32::from(drag.orig_x as i16 as u16) << 16) | u32::from(drag.orig_y as i16 as u16);
+                let packed_wh =
+                    (u32::from(drag.orig_w as u16) << 16) | u32::from(drag.orig_h as u16);
+                let _ = self.x.send_window_notify_data(
+                    drag.window,
+                    21,
+                    zone_code,
+                    packed_xy,
+                    packed_wh,
+                    0,
+                );
+                let is_vortex = self.theme.is_vortexglass();
+                let mut snap_dirty = None;
+                if let Some(m) = self.windows.iter_mut().find(|w| w.window == drag.window) {
+                    let old_rect = Rect::new(
+                        i32::from(m.x),
+                        i32::from(m.y),
+                        i32::from(m.width),
+                        i32::from(m.height),
+                    );
+                    m.x = sx;
+                    m.y = sy;
+                    m.width = sw;
+                    m.height = sh;
+                    let new_rect = Rect::new(i32::from(sx), i32::from(sy), i32::from(sw), i32::from(sh));
+                    if self.comp.active {
+                        snap_dirty = Some(
+                            window_damage_bounds(old_rect, is_vortex, false)
+                                .union(window_damage_bounds(new_rect, is_vortex, zone_code == 3)),
+                        );
+                    }
+                }
+                let _ = self.x.move_resize(drag.window, sx, sy, sw, sh);
+                if let Some(d) = snap_dirty {
+                    self.comp.mark_dirty(d);
+                }
+            }
+        }
+        if self.comp.active {
+            if matches!(
+                self.config.wm_compositor_quality,
+                CompositorQuality::Balanced | CompositorQuality::Quality
+            ) {
+                if let Some((r, is_max)) = self
+                    .windows
+                    .iter()
+                    .find(|m| m.window == drag.window)
+                    .map(|m| self.window_rect_for(m))
+                {
+                    self.comp.mark_dirty(window_damage_bounds(
+                        r,
+                        self.theme.is_vortexglass(),
+                        is_max,
+                    ));
+                }
+            }
+            self.composite_frame()?;
+        }
+        self.x.flush()
     }
 
     fn publish_client_list(&self) -> Result<()> {
@@ -3067,6 +3842,9 @@ impl Shell {
         }
         if self.toast.is_some() {
             let _ = self.x.raise(self.toast_window);
+        }
+        for ov in &self.override_wins {
+            let _ = self.x.raise(ov.window);
         }
         Ok(())
     }
@@ -3310,11 +4088,18 @@ impl Shell {
                 }
             }
         }
+        let prev_active = self.active;
         self.x.raise(window)?;
         self.raise_z(window);
         self.raise_chrome_above_clients()?;
         self.x.focus(window)?;
         self.active = Some(window);
+        if self.comp.active {
+            if let Some(prev) = prev_active.filter(|&p| p != window) {
+                self.mark_window_dirty(prev);
+            }
+            self.mark_window_dirty(window);
+        }
         self.publish_active()?;
         self.draw_taskbar();
         self.present_taskbar()?;
@@ -3336,6 +4121,10 @@ impl Shell {
     fn window_button_rect(&self, index: usize) -> Rect {
         self.taskbar_layout()
             .window_button_rect(self.panel_height(), self.windows.len(), index)
+    }
+
+    fn ime_rect(&self) -> Rect {
+        self.taskbar_layout().ime
     }
 
     fn net_rect(&self) -> Rect {
@@ -3365,6 +4154,9 @@ impl Shell {
             if self.window_button_rect(index).contains(x, y) {
                 return Hit::Window(index);
             }
+        }
+        if self.ime_rect().contains(x, y) {
+            return Hit::ImeTray;
         }
         if self.net_rect().contains(x, y) {
             return Hit::Network;
@@ -3417,6 +4209,13 @@ impl Shell {
             Hit::ShowDesktop => {
                 crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 self.toggle_show_desktop()
+            }
+            Hit::ImeTray => {
+                crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+                self.close_menu()?;
+                self.close_vol_popup()?;
+                self.toggle_ime_from_tray();
+                Ok(())
             }
             Hit::Network => {
                 self.close_menu()?;
@@ -3483,15 +4282,100 @@ impl Shell {
         }
     }
 
-    fn persist_sound_prop(&mut self, prop: &str, val: uxconf::Value) -> bool {
-        let _ = self.config.apply_property("sound", prop, &val);
+    fn persist_config_prop(&mut self, channel: &str, prop: &str, val: uxconf::Value) -> bool {
+        let _ = self.config.apply_property(channel, prop, &val);
         if self.ux_client.is_none() {
             self.ux_client = UxConfClient::connect().ok();
         }
         let Some(client) = self.ux_client.as_mut() else {
             return false;
         };
-        client.set("sound", prop, val).is_ok()
+        client.set(channel, prop, val).is_ok()
+    }
+
+    fn persist_sound_prop(&mut self, prop: &str, val: uxconf::Value) -> bool {
+        self.persist_config_prop("sound", prop, val)
+    }
+
+    fn toggle_ime_from_tray(&mut self) {
+        if !self.config.ime_enabled {
+            self.persist_config_prop("input", "/ime/enabled", uxconf::Value::Bool(true));
+            self.ime_active = true;
+            self.ime_chinese = self.ime_client.set_chinese_mode(true).unwrap_or(true);
+            return;
+        }
+        let next = self.ime_client.toggle_mode().unwrap_or(!self.ime_chinese);
+        self.ime_chinese = next;
+    }
+
+    fn sync_menu_ime_spot(&mut self, caret: Rect) {
+        if !self.menu_open {
+            return;
+        }
+        let (mx, my) = if self.config.panel_start_fullscreen {
+            (0, 0)
+        } else {
+            (6, self.menu_y())
+        };
+        let rx = mx + caret.x;
+        let ry = my + caret.y;
+        let h = caret.h.max(1);
+        if self.menu_ime_spot == Some((rx, ry, h)) {
+            return;
+        }
+        self.menu_ime_spot = Some((rx, ry, h));
+        self.ime_client.set_spot(rx, ry, h);
+    }
+
+    fn apply_menu_ime_reply(&mut self, reply: DaemonReply) -> Result<()> {
+        if self.ime_chinese != reply.chinese_mode {
+            self.ime_chinese = reply.chinese_mode;
+            self.draw_taskbar();
+            self.present_taskbar()?;
+        }
+        if !self.menu_open {
+            return Ok(());
+        }
+        if self.config.panel_start_fullscreen {
+            let mut dirty = self.start_screen.on_preedit(&reply.preedit.text);
+            if !reply.commit_text.is_empty() {
+                let action = self.start_screen.on_commit(&reply.commit_text);
+                if matches!(action, StartAction::Redraw) {
+                    dirty = true;
+                }
+            }
+            if dirty {
+                self.draw_menu();
+                self.present_menu()?;
+            }
+        } else {
+            let mut dirty = false;
+            if reply.preedit.text != self.menu_ime_preedit {
+                self.menu_ime_preedit = reply.preedit.text;
+                dirty = true;
+            }
+            if !reply.commit_text.is_empty() {
+                for ch in reply.commit_text.chars() {
+                    if !ch.is_control() && self.menu_query.chars().count() < 24 {
+                        self.menu_query.push(ch);
+                        dirty = true;
+                    }
+                }
+            }
+            if dirty {
+                if !self.menu_ime_preedit.is_empty() {
+                    if self.pointer_grab == Some(self.menu) {
+                        self.release_popup_grab();
+                    }
+                } else if self.menu_open && !self.config.panel_start_fullscreen {
+                    let _ = self.acquire_popup_grab(self.menu);
+                }
+                self.hover = Hit::None;
+                self.draw_menu();
+                self.present_menu()?;
+            }
+        }
+        Ok(())
     }
 
     fn stage_sound_persist(&mut self) {
@@ -3800,6 +4684,10 @@ impl Shell {
     }
 
     fn open_ctx(&mut self, root_x: i32, root_y: i32) -> Result<()> {
+        self.open_ctx_mode(root_x, root_y, false)
+    }
+
+    fn open_ctx_mode(&mut self, root_x: i32, root_y: i32, is_ime: bool) -> Result<()> {
         self.close_menu()?;
         self.close_vol_popup()?;
         let ph = self.panel_height();
@@ -3816,6 +4704,7 @@ impl Shell {
         let max_x = (i32::from(self.x.width) - CTX_WIDTH - 4).max(4);
         let cx = root_x.clamp(4, max_x) as i16;
         let cy = root_y.clamp(min_y, max_y) as i16;
+        self.ctx_is_ime = is_ime;
         self.ctx_open = true;
         self.ctx_pos = (cx, cy);
         self.hover = Hit::None;
@@ -3855,9 +4744,42 @@ impl Shell {
 
     fn ctx_click(&mut self, x: i32, y: i32) -> Result<()> {
         let hit = self.ctx_hit(x, y);
+        let is_ime = self.ctx_is_ime;
         self.close_ctx()?;
         if hit != Hit::None {
             crate::sound::play(&self.config, crate::sound::SystemSound::Click);
+        }
+        if is_ime {
+            match hit {
+                Hit::ContextRow(0) => {
+                    self.toggle_ime_from_tray();
+                    self.draw_taskbar();
+                    self.present_taskbar()?;
+                }
+                Hit::ContextRow(1) => {
+                    let next = next_ime_scheme(&self.config.ime_scheme);
+                    self.persist_config_prop(
+                        "input",
+                        "/ime/scheme",
+                        uxconf::Value::String(next.to_string()),
+                    );
+                }
+                Hit::ContextRow(2) => {
+                    let next = if self.config.ime_layout == "vertical" {
+                        "horizontal"
+                    } else {
+                        "vertical"
+                    };
+                    self.persist_config_prop(
+                        "input",
+                        "/ime/layout",
+                        uxconf::Value::String(next.to_string()),
+                    );
+                }
+                Hit::ContextRow(3) => self.launch_arg("settings", "input"),
+                _ => {}
+            }
+            return Ok(());
         }
         match hit {
             Hit::ContextRow(0) => self.launch("term"),
@@ -3881,6 +4803,8 @@ impl Shell {
             self.close_vol_popup()?;
             self.menu_open = true;
             self.menu_query.clear();
+            self.menu_ime_preedit.clear();
+            self.menu_ime_spot = None;
             self.hover = Hit::None;
             self.sync_menu_window()?;
             if self.config.panel_start_fullscreen {
@@ -3893,6 +4817,13 @@ impl Shell {
             self.present_menu()?;
             self.present_taskbar()?;
             self.x.focus(self.menu)?;
+            self.menu_ime_focused = !self.config.panel_start_fullscreen || self.start_screen.wants_ime();
+            if self.menu_ime_focused {
+                self.ime_client.focus_in(self.menu);
+                if let Some((rx, ry, h)) = self.menu_ime_spot {
+                    self.ime_client.set_spot(rx, ry, h);
+                }
+            }
             if !self.config.panel_start_fullscreen {
                 let _ = self.acquire_popup_grab(self.menu);
             }
@@ -3903,6 +4834,12 @@ impl Shell {
 
     fn close_menu(&mut self) -> Result<()> {
         if self.menu_open {
+            if self.menu_ime_focused {
+                self.menu_ime_focused = false;
+                self.ime_client.focus_out(self.menu);
+            }
+            self.menu_ime_preedit.clear();
+            self.menu_ime_spot = None;
             if self.pointer_grab == Some(self.menu) {
                 self.release_popup_grab();
             }
@@ -4091,6 +5028,7 @@ impl Shell {
         let win_rects: Vec<Rect> = (0..win_count)
             .map(|i| layout.window_button_rect(h, win_count, i))
             .collect();
+        let ime = layout.ime;
         let net = layout.net;
         let vol = layout.volume;
         let bell = layout.bell;
@@ -4446,11 +5384,96 @@ impl Shell {
             self.text.draw(canvas, &label, label_x, label_y, 12.0, fg, face);
         }
 
-        // Right tray: wired network status, speaker volume icon, notification bell & clock.
+        // Right tray: IME toggle, wired network status, speaker volume icon, bell & clock.
         if is_win98 {
-            let well = Rect::new(net.x - 4, 4, w - (net.x - 4) - 4, h - 8);
+            let well = Rect::new(ime.x - 4, 4, w - (ime.x - 4) - 4, h - 8);
             canvas.bevel_1px(well, self.theme.bevel_shadow, self.theme.bevel_hi);
         }
+        let ime_pressed = (self.ctx_open && self.ctx_is_ime) || ui::is_rect_pressed(ime);
+        let ime_shift = i32::from(is_win98 && ime_pressed);
+        let ime_hov = ui::animate_bool(ime, self.hover == Hit::ImeTray, ui::MOTION_HOVER);
+        let ime_on = self.config.ime_enabled && self.ime_active;
+        let ime_lbl = if !ime_on {
+            "--"
+        } else if self.ime_chinese {
+            "中"
+        } else {
+            "英"
+        };
+        if is_win98 {
+            if ime_pressed {
+                canvas.bevel_1px(ime, self.theme.bevel_shadow, self.theme.bevel_light);
+            } else if self.hover == Hit::ImeTray {
+                canvas.bevel_1px(ime, self.theme.bevel_hi, self.theme.bevel_shadow);
+            }
+        } else {
+            if ime_on && self.ime_chinese {
+                canvas.rounded_rect(
+                    ime,
+                    ctrl_r,
+                    if is_vortex { 0xffffff } else { self.theme.accent },
+                    if is_vortex {
+                        0.22 + 0.16 * ime_hov
+                    } else {
+                        0.16 + 0.10 * ime_hov
+                    },
+                );
+            } else if ime_hov > 0.001 {
+                canvas.rounded_rect(
+                    ime,
+                    ctrl_r,
+                    if is_vortex {
+                        0xffffff
+                    } else {
+                        self.theme.panel_hover
+                    },
+                    if is_vortex { 0.30 * ime_hov } else { ime_hov },
+                );
+            }
+            if is_vortex && (ime_hov > 0.001 || (ime_on && self.ime_chinese)) {
+                canvas.rounded_border(ime, ctrl_r, 0xffffff, 0.35, 1);
+            }
+        }
+        let ime_fg = if !ime_on {
+            self.theme.text_muted
+        } else if is_vortex {
+            if self.theme.is_dark() {
+                0xf5f9fd
+            } else {
+                0x0e1d30
+            }
+        } else if self.ime_chinese {
+            self.theme.accent
+        } else {
+            self.theme.text_dim
+        };
+        if is_vortex {
+            let glow = TextGlow::aero_compact(self.theme.is_dark(), self.ime_chinese);
+            canvas.with_clip(ime.inset(1), |c| {
+                self.text.draw_glow(
+                    c,
+                    ime_lbl,
+                    (ime.x + ime.w / 2) as f32,
+                    ime.y as f32 + ime.h as f32 * 0.5 + 4.5 + ime_shift as f32,
+                    12.0,
+                    Face::Bold,
+                    glow,
+                );
+            });
+        }
+        self.text.draw_centered(
+            canvas,
+            ime_lbl,
+            (ime.x + ime.w / 2 + ime_shift) as f32,
+            ime.y as f32 + ime.h as f32 * 0.5 + 4.5 + ime_shift as f32,
+            12.0,
+            ime_fg,
+            if self.ime_chinese {
+                Face::Bold
+            } else {
+                Face::Ui
+            },
+        );
         let net_pressed = ui::is_rect_pressed(net);
         let net_shift = i32::from(is_win98 && net_pressed);
         let net_hov = ui::animate_bool(net, self.hover == Hit::Network, ui::MOTION_HOVER);
@@ -4742,12 +5765,13 @@ impl Shell {
         }
 
         let search_r = vortex_menu_search_rect();
-        ui::text_input(
+        let search_caret = ui::text_input_ime(
             canvas,
             &mut self.text,
             &self.theme,
             search_r,
             &self.menu_query,
+            &self.menu_ime_preedit,
             "搜索程序和文件...",
             true,
             Some(Icon::Search),
@@ -4880,6 +5904,7 @@ impl Shell {
         if canvas.is_argb() {
             canvas.mask_rounded_corners(r);
         }
+        self.sync_menu_ime_spot(search_caret);
     }
 
     fn draw_menu(&mut self) {
@@ -4894,6 +5919,10 @@ impl Shell {
                 &self.wallpaper_scaled,
                 self.windows.len(),
             );
+            let caret = self
+                .start_screen
+                .ime_spot(i32::from(self.x.width), i32::from(self.x.height));
+            self.sync_menu_ime_spot(caret);
             return;
         }
         if self.theme.is_vortexglass() {
@@ -4911,12 +5940,13 @@ impl Shell {
             self.theme.radius_popup(),
         );
 
-        ui::text_input(
+        let search_caret = ui::text_input_ime(
             canvas,
             &mut self.text,
             &self.theme,
             Rect::new(14, 14, w - 28, 34),
             &self.menu_query,
+            &self.menu_ime_preedit,
             "搜索应用...",
             true,
             Some(Icon::Search),
@@ -5050,6 +6080,7 @@ impl Shell {
                 self.hover == Hit::PowerOff,
             );
         }
+        self.sync_menu_ime_spot(search_caret);
     }
 
     fn draw_ctx(&mut self) {
@@ -5058,12 +6089,41 @@ impl Shell {
         let r = self.theme.radius_popup();
         draw_vortex_popup_shell(canvas, &self.theme, full, r, true);
 
-        let items = [
-            ("在此打开终端", Icon::Terminal),
-            ("打开文件管理器", Icon::Files),
-            ("刷新桌面", Icon::Refresh),
-            ("桌面与外观设置", Icon::Settings),
-        ];
+        let items = if self.ctx_is_ime {
+            let mode_lbl = if !self.config.ime_enabled {
+                "启用中文输入法"
+            } else if self.ime_chinese {
+                "切换为 英文模式"
+            } else {
+                "切换为 中文模式"
+            };
+            let scheme_lbl = match self.config.ime_scheme.as_str() {
+                "xiaohe" => "方案: 小鹤双拼",
+                "ziranma" => "方案: 自然码",
+                "microsoft" => "方案: 微软双拼",
+                "sogou" => "方案: 搜狗双拼",
+                "abc" => "方案: 智能ABC",
+                _ => "方案: 全拼",
+            };
+            let layout_lbl = if self.config.ime_layout == "vertical" {
+                "候选栏: 竖排 -> 横排"
+            } else {
+                "候选栏: 横排 -> 竖排"
+            };
+            [
+                (mode_lbl, Icon::InputDevices),
+                (scheme_lbl, Icon::Editor),
+                (layout_lbl, Icon::Panel),
+                ("输入法设置...", Icon::Settings),
+            ]
+        } else {
+            [
+                ("在此打开终端", Icon::Terminal),
+                ("打开文件管理器", Icon::Files),
+                ("刷新桌面", Icon::Refresh),
+                ("桌面与外观设置", Icon::Settings),
+            ]
+        };
         draw_etched_hsep(canvas, &self.theme, 10, 104, CTX_WIDTH - 20);
         for (idx, (label, ic)) in items.iter().enumerate() {
             let row = ctx_row_rect(idx);
@@ -5502,40 +6562,77 @@ impl Shell {
         (rect, is_max)
     }
 
-    fn find_occluding_window_idx(&self, region: Rect, max_idx_excl: usize) -> Option<usize> {
-        if region.is_empty() || self.comp.flip3d.is_some() || self.comp.peek_factor > 0.01 {
-            return None;
+    fn is_internal_window(&self, w: Window) -> bool {
+        w == self.x.root
+            || w == self.desktop
+            || w == self.taskbar
+            || w == self.thumb_window
+            || w == self.menu
+            || w == self.ctx_menu
+            || w == self.vol_popup
+            || w == self.toast_window
+            || self.comp.overlay == Some(w)
+    }
+
+    fn mark_window_dirty(&mut self, window: Window) {
+        if !self.comp.active {
+            return;
         }
-        let end = max_idx_excl.min(self.z_stack.len());
-        for idx in (0..end).rev() {
-            let w = self.z_stack[idx];
-            let Some(m) = self.windows.iter().find(|m| m.window == w && !m.minimized) else {
-                continue;
-            };
-            let Some(cw) = self
-                .comps
-                .get(&w)
-                .filter(|c| c.has_pixels && c.anim.is_none())
-            else {
-                continue;
-            };
-            let glass_top = self.window_glass_top(cw, i32::from(m.height));
-            let opaque_rect = Rect::new(
-                i32::from(m.x),
-                i32::from(m.y) + glass_top,
-                i32::from(m.width),
-                (i32::from(m.height) - glass_top).max(0),
+        if let Some((rect, is_max)) = self
+            .windows
+            .iter()
+            .find(|m| m.window == window && !m.minimized)
+            .map(|m| self.window_rect_for(m))
+        {
+            self.comp.mark_dirty(
+                window_damage_bounds(rect, self.theme.is_vortexglass(), is_max).expand(4),
             );
-            if !opaque_rect.is_empty()
-                && opaque_rect.x <= region.x
-                && opaque_rect.y <= region.y
-                && opaque_rect.right() >= region.right()
-                && opaque_rect.bottom() >= region.bottom()
-            {
-                return Some(idx);
-            }
         }
-        None
+    }
+
+    fn track_override_window(&mut self, window: Window, rect: Rect, depth: u8) {
+        if !self.comp.active
+            || self.is_internal_window(window)
+            || self.windows.iter().any(|w| w.window == window)
+            || rect.is_empty()
+        {
+            return;
+        }
+        self.remove_override_window(window);
+        let _ = self.x.conn.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        );
+        let glass_extents = self.x.get_glass_extents(window);
+        let mut cw = CompWindow::new(window, depth, glass_extents);
+        attach_window_pixmap(&self.x, &mut cw, rect.w as u16, rect.h as u16, depth);
+        self.override_wins.push(OverrideWin { window, rect, cw });
+        self.comp.mark_dirty(rect.expand(24));
+    }
+
+    fn remove_override_window(&mut self, window: Window) -> bool {
+        let Some(pos) = self.override_wins.iter().position(|o| o.window == window) else {
+            return false;
+        };
+        let mut ov = self.override_wins.remove(pos);
+        detach_window_resources(&self.x, &mut ov.cw);
+        if self.comp.active {
+            self.comp.mark_dirty(ov.rect.expand(24));
+        }
+        true
+    }
+
+    fn sync_initial_override_windows(&mut self) {
+        if !self.comp.active {
+            return;
+        }
+        for (w, wx, wy, ww, wh, depth) in self.x.query_override_children() {
+            self.track_override_window(
+                w,
+                Rect::new(i32::from(wx), i32::from(wy), i32::from(ww), i32::from(wh)),
+                depth,
+            );
+        }
     }
 
     fn composite_frame(&mut self) -> Result<()> {
@@ -5545,9 +6642,70 @@ impl Shell {
         let Some(overlay) = self.comp.overlay else {
             return Ok(());
         };
+        let now = Instant::now();
         let is_vortex = self.theme.is_vortexglass();
-        let captured =
-            capture_dirty_windows(&self.x, self.comp.shm_read.as_ref(), self.comps.values_mut());
+        let scr = Rect::new(0, 0, i32::from(self.x.width), i32::from(self.x.height));
+
+        // Only capture occluded background windows when actually exposed or previewed.
+        let capture_all = self.comp.alt_tab.is_some()
+            || self.comp.flip3d.is_some()
+            || self.comp.peek_factor > 0.01;
+        self.capture_keep_buf.clear();
+        if !capture_all {
+            let mut exposed = std::mem::take(&mut self.comp.need_region);
+            exposed.reset_to_slice(&[scr]);
+            for &w in self.z_stack.iter().rev() {
+                let Some(m) = self.windows.iter().find(|m| m.window == w && !m.minimized) else {
+                    continue;
+                };
+                let Some(cw) = self.comps.get(&w) else {
+                    continue;
+                };
+                let is_thumb = self
+                    .comp
+                    .thumb
+                    .as_ref()
+                    .is_some_and(|t| t.target_window == w);
+                let (rect, is_max) = self.window_rect_for(m);
+                let bounds = if cw.anim.is_some() {
+                    rect.expand(24)
+                } else {
+                    window_damage_bounds(rect, is_vortex, is_max)
+                };
+                if !cw.has_pixels || is_thumb || exposed.intersects_rect(bounds.expand(AERO_BLUR_RADIUS)) {
+                    self.capture_keep_buf.push(w);
+                }
+                if cw.has_pixels
+                    && cw.anim.is_none()
+                    && cw.pw == usize::from(m.width)
+                    && cw.ph == usize::from(m.height)
+                {
+                    let glass_top = self.window_glass_top(cw, i32::from(m.height));
+                    let is_popup = cw.glass_extents.is_some_and(|e| e[1] == -1);
+                    if !is_popup && (cw.depth != 32 || (is_vortex && glass_top > 0)) {
+                        let opaque_rect = Rect::new(
+                            i32::from(m.x),
+                            i32::from(m.y) + glass_top,
+                            i32::from(m.width),
+                            (i32::from(m.height) - glass_top).max(0),
+                        );
+                        exposed.subtract_rect(opaque_rect);
+                    }
+                }
+            }
+            self.comp.need_region = exposed;
+        }
+
+        let captured = {
+            let keep = &self.capture_keep_buf;
+            capture_dirty_windows(
+                &self.x,
+                self.comp.shm_read.as_ref(),
+                self.comps.values_mut(),
+                now,
+                |cw| capture_all || keep.contains(&cw.window),
+            )
+        };
         for (win, local_area, first_capture) in captured {
             if let Some((rect, is_max)) = self
                 .windows
@@ -5555,116 +6713,142 @@ impl Shell {
                 .find(|m| m.window == win)
                 .map(|m| self.window_rect_for(m))
             {
-                if first_capture {
-                    self.comp
-                        .mark_dirty(window_damage_bounds(rect, is_vortex, is_max));
+                let dmg = if first_capture {
+                    window_damage_bounds(rect, is_vortex, is_max)
                 } else {
-                    self.comp.mark_dirty(Rect::new(
-                        rect.x + local_area.x - 4,
-                        rect.y + local_area.y - 4,
-                        local_area.w + 8,
-                        local_area.h + 8,
-                    ));
-                }
+                    Rect::new(
+                        rect.x + local_area.x - AERO_BLUR_RADIUS,
+                        rect.y + local_area.y - AERO_BLUR_RADIUS,
+                        local_area.w + AERO_BLUR_RADIUS * 2,
+                        local_area.h + AERO_BLUR_RADIUS * 2,
+                    )
+                };
+                self.comp.mark_dirty(dmg);
             }
         }
-        if !self.comp.is_dirty() {
+
+        for ov in &mut self.override_wins {
+            if let Some((local_area, first_capture)) =
+                capture_one_window(&self.x, self.comp.shm_read.as_ref(), &mut ov.cw, now)
+            {
+                let dmg = if first_capture {
+                    ov.rect.expand(24)
+                } else {
+                    Rect::new(
+                        ov.rect.x + local_area.x - AERO_BLUR_RADIUS,
+                        ov.rect.y + local_area.y - AERO_BLUR_RADIUS,
+                        local_area.w + AERO_BLUR_RADIUS * 2,
+                        local_area.h + AERO_BLUR_RADIUS * 2,
+                    )
+                };
+                self.comp.mark_dirty(dmg);
+            }
+        }
+
+        if !self.comp.is_dirty() || scr.is_empty() {
             return Ok(());
         }
 
-        let scr = Rect::new(0, 0, i32::from(self.x.width), i32::from(self.x.height));
-        if scr.is_empty() {
+        let mut dirty_rects = std::mem::take(&mut self.dirty_rects_buf);
+        self.comp.dirty.take_into(scr, &mut dirty_rects);
+        if dirty_rects.is_empty() {
+            self.dirty_rects_buf = dirty_rects;
             return Ok(());
         }
-        let dirty_area = if self.comp.force_full {
-            scr
-        } else {
-            self.comp.dirty.unwrap_or(scr).intersect(scr)
-        };
-        if dirty_area.is_empty() {
-            self.comp.dirty = None;
-            return Ok(());
-        }
-
         let Some(mut dst) = self.comp.canvas.take() else {
+            self.dirty_rects_buf = dirty_rects;
             return Ok(());
         };
-        let now = Instant::now();
-        let upload_area = if self.try_fast_top_opaque_blit(&mut dst, dirty_area) {
-            dirty_area
-        } else {
-            if is_vortex || self.comp.flip3d.is_some() {
-                self.comp.ensure_desktop_blur(&self.desktop_canvas);
+
+        let (live_blur, with_sheen) = match self.config.wm_compositor_quality {
+            CompositorQuality::Quality => (true, true),
+            CompositorQuality::Balanced => (self.wm_drag.is_none(), true),
+            CompositorQuality::Fast => (false, false),
+        };
+        if is_vortex || self.comp.flip3d.is_some() {
+            self.comp.ensure_desktop_blur(&self.desktop_canvas);
+        }
+        if self.comp_shm_pending_sync {
+            if let Err(err) = self.x.sync() {
+                self.comp.canvas = Some(dst);
+                dirty_rects.clear();
+                self.dirty_rects_buf = dirty_rects;
+                return Err(err);
             }
-            if self.comp.flip3d.is_some() {
-                dst.with_clip(dirty_area, |d| {
-                    d.copy_rect_from(
-                        self.desktop_canvas.pixels(),
-                        self.desktop_canvas.width,
-                        dirty_area,
-                    );
-                    let entries = build_switcher_entries(&self.windows, &self.comps);
-                    if let Some(ref flip) = self.comp.flip3d {
-                        draw_flip3d_scene(
-                            d,
-                            &self.comp.desktop_blur_cache,
-                            &mut self.text,
-                            &self.theme,
-                            &entries,
-                            flip,
-                            now,
-                        );
-                    }
-                });
-                self.composite_taskbar(&mut dst, dirty_area, now);
-            } else {
-                let start_idx = self.find_occluding_window_idx(dirty_area, self.z_stack.len());
-                if start_idx.is_none() {
+            self.comp_shm_pending_sync = false;
+        }
+
+        for &dirty_area in &dirty_rects {
+            if !self.try_fast_top_opaque_blit(&mut dst, dirty_area) {
+                if self.comp.flip3d.is_some() {
                     dst.with_clip(dirty_area, |d| {
                         d.copy_rect_from(
                             self.desktop_canvas.pixels(),
                             self.desktop_canvas.width,
                             dirty_area,
                         );
+                        let entries = build_switcher_entries(&self.windows, &self.comps);
+                        if let Some(ref flip) = self.comp.flip3d {
+                            draw_flip3d_scene(
+                                d,
+                                &self.comp.desktop_blur_cache,
+                                &mut self.text,
+                                &self.theme,
+                                &entries,
+                                flip,
+                                now,
+                            );
+                        }
                     });
-                }
-                self.composite_windows_range(
-                    &mut dst,
-                    dirty_area,
-                    start_idx.unwrap_or(0),
-                    self.z_stack.len(),
-                    now,
-                    true,
-                );
-                dst.with_clip(dirty_area, |d| {
-                    self.composite_ghosts(d, now);
-                    self.composite_snap_preview(d);
-                });
-                self.composite_taskbar(&mut dst, dirty_area, now);
-                self.composite_popups(&mut dst, dirty_area);
-                if let Some(selected) = self.comp.alt_tab.as_ref().map(|a| a.selected) {
-                    let entries = build_switcher_entries(&self.windows, &self.comps);
+                    self.composite_taskbar(&mut dst, dirty_area, live_blur, with_sheen);
+                    self.composite_override_windows(&mut dst, dirty_area, live_blur);
+                } else {
+                    self.composite_scene_occlusion_culled(
+                        &mut dst,
+                        dirty_area,
+                        now,
+                        live_blur,
+                        with_sheen,
+                    );
                     dst.with_clip(dirty_area, |d| {
-                        draw_alt_tab_hud(
-                            d,
-                            &mut self.text,
-                            &self.theme,
-                            &mut self.comp.blur_scratch,
-                            &entries,
-                            selected,
-                        );
+                        self.composite_ghosts(d, now);
+                        self.composite_snap_preview(d);
                     });
+                    self.composite_taskbar(&mut dst, dirty_area, live_blur, with_sheen);
+                    self.composite_popups(&mut dst, dirty_area);
+                    self.composite_override_windows(&mut dst, dirty_area, live_blur);
+                    if let Some(selected) = self.comp.alt_tab.as_ref().map(|a| a.selected) {
+                        let entries = build_switcher_entries(&self.windows, &self.comps);
+                        dst.with_clip(dirty_area, |d| {
+                            draw_alt_tab_hud(
+                                d,
+                                &mut self.text,
+                                &self.theme,
+                                &mut self.comp.blur_scratch,
+                                &entries,
+                                selected,
+                            );
+                        });
+                    }
                 }
             }
-            dirty_area
-        };
+            if let Err(err) = self.x.put_canvas_unsynced(overlay, &dst, dirty_area) {
+                self.comp.canvas = Some(dst);
+                dirty_rects.clear();
+                self.dirty_rects_buf = dirty_rects;
+                return Err(err);
+            }
+        }
 
-        self.comp.dirty = None;
-        self.comp.force_full = false;
-        let put_res = self.x.put_canvas(overlay, &dst, upload_area);
+        if dst.shm_seg().is_some() {
+            self.comp_shm_pending_sync = true;
+        }
+        let flush_res = self.x.flush();
         self.comp.canvas = Some(dst);
-        put_res?;
-        self.x.flush()
+        dirty_rects.clear();
+        self.dirty_rects_buf = dirty_rects;
+        self.last_composite = Instant::now();
+        flush_res
     }
 
     fn try_fast_top_opaque_blit(&self, dst: &mut Canvas, dirty: Rect) -> bool {
@@ -5681,6 +6865,10 @@ impl Shell {
             || self.comp.ctx_anim > 0.01
             || self.comp.vol_anim > 0.01
             || self.comp.toast_anim > 0.01
+            || self
+                .override_wins
+                .iter()
+                .any(|o| o.cw.has_pixels && !o.rect.expand(20).intersect(dirty).is_empty())
         {
             return false;
         }
@@ -5690,11 +6878,13 @@ impl Shell {
         let Some(m) = self.windows.iter().find(|w| w.window == top_w && !w.minimized) else {
             return false;
         };
-        let Some(cw) = self
-            .comps
-            .get(&top_w)
-            .filter(|c| c.has_pixels && c.anim.is_none())
-        else {
+        let Some(cw) = self.comps.get(&top_w).filter(|c| {
+            c.has_pixels
+                && c.anim.is_none()
+                && c.pw == usize::from(m.width)
+                && c.ph == usize::from(m.height)
+                && c.glass_extents.is_none_or(|e| e[1] != -1)
+        }) else {
             return false;
         };
         let tb = Rect::new(
@@ -5707,6 +6897,9 @@ impl Shell {
             return false;
         }
         let glass_top = self.window_glass_top(cw, i32::from(m.height));
+        if cw.depth == 32 && glass_top == 0 {
+            return false;
+        }
         let opaque_rect = Rect::new(
             i32::from(m.x),
             i32::from(m.y) + glass_top,
@@ -5722,7 +6915,7 @@ impl Shell {
             return false;
         }
         dst.with_clip(dirty, |c| {
-            blit_window_pixels(
+            blit_window_pixels_split(
                 c,
                 &cw.pixels,
                 cw.pw,
@@ -5731,82 +6924,20 @@ impl Shell {
                 i32::from(m.y),
                 255,
                 0,
-                false,
+                cw.depth == 32,
+                glass_top,
             );
         });
         true
     }
 
-    fn frost_glass_strip(
-        &mut self,
-        dst: &mut Canvas,
-        target_idx: usize,
-        strip: Rect,
-        dirty_area: Rect,
-        now: Instant,
-    ) {
-        let clip = strip.intersect(dirty_area).intersect(dst.bounds());
-        if clip.is_empty() {
-            return;
-        }
-        let ex = clip.expand(AERO_BLUR_RADIUS).intersect(dst.bounds());
-        let is_vortex = self.theme.is_vortexglass();
-        let end = target_idx.min(self.z_stack.len());
-        let has_lower_overlap = (0..end).any(|i| {
-            let w = self.z_stack[i];
-            let Some(m) = self.windows.iter().find(|m| m.window == w && !m.minimized) else {
-                return false;
-            };
-            let Some(cw) = self.comps.get(&w).filter(|c| c.has_pixels) else {
-                return false;
-            };
-            let (rect, is_max) = self.window_rect_for(m);
-            let bounds = if cw.anim.is_some() {
-                rect.expand(24)
-            } else {
-                window_damage_bounds(rect, is_vortex, is_max)
-            };
-            !bounds.intersect(ex).is_empty()
-        });
-
-        if !has_lower_overlap {
-            dst.with_clip(clip, |d| {
-                d.copy_rect_from(
-                    &self.comp.desktop_blur_cache,
-                    self.desktop_canvas.width,
-                    clip,
-                );
-            });
-            return;
-        }
-
-        let Some(mut ft) = self.comp.frost_tmp.take() else {
-            return;
-        };
-        let sub_occ = self.find_occluding_window_idx(ex, end);
-        if sub_occ.is_none() {
-            ft.with_clip(ex, |f| {
-                f.copy_rect_from(self.desktop_canvas.pixels(), self.desktop_canvas.width, ex);
-            });
-        }
-        self.composite_windows_range(&mut ft, ex, sub_occ.unwrap_or(0), end, now, false);
-        ft.with_clip(ex, |f| {
-            f.blur_rect(ex, AERO_BLUR_RADIUS, &mut self.comp.blur_scratch);
-        });
-        dst.with_clip(clip, |d| {
-            d.copy_rect_from(ft.pixels(), ft.width, clip);
-        });
-        self.comp.frost_tmp = Some(ft);
-    }
-
-    fn composite_windows_range(
+    fn composite_scene_occlusion_culled(
         &mut self,
         dst: &mut Canvas,
         dirty_area: Rect,
-        start_idx: usize,
-        end_idx: usize,
         now: Instant,
-        frost: bool,
+        live_blur: bool,
+        with_sheen: bool,
     ) {
         let peek_factor = self.comp.peek_factor;
         let peek_target = self
@@ -5816,10 +6947,12 @@ impl Shell {
             .filter(|t| t.pointer_inside)
             .map(|t| t.target_window);
         let is_vortex = self.theme.is_vortexglass();
-        let end = end_idx.min(self.z_stack.len());
+        let scr_w = i32::from(self.x.width);
 
-        for idx in start_idx..end {
-            let w = self.z_stack[idx];
+        // Reuse plan slots without per-frame allocation.
+        let mut plans = std::mem::take(&mut self.comp_plan_buf);
+        let mut used = 0usize;
+        for &w in &self.z_stack {
             let Some((base_rect, is_max)) = self
                 .windows
                 .iter()
@@ -5828,13 +6961,10 @@ impl Shell {
             else {
                 continue;
             };
-            let (anim_kind, cw_pw, cw_ph, cw_depth, cw_glass_ext) = {
-                let Some(cw) = self.comps.get(&w).filter(|c| c.has_pixels) else {
-                    continue;
-                };
-                (cw.anim, cw.pw, cw.ph, cw.depth, cw.glass_extents)
+            let Some(cw) = self.comps.get(&w).filter(|c| c.has_pixels) else {
+                continue;
             };
-            let (draw_rect, opacity, is_anim) = match anim_kind {
+            let (draw_rect, base_op, is_anim) = match cw.anim {
                 Some(a) => {
                     let t = smootherstep(a.progress(now));
                     match a.kind {
@@ -5852,123 +6982,217 @@ impl Shell {
                 }
                 None => (base_rect, 255, false),
             };
-
             let cull_bounds = if is_anim {
                 draw_rect.expand(16)
             } else {
                 window_damage_bounds(draw_rect, is_vortex, is_max)
             };
-            if cull_bounds.intersect(dirty_area).is_empty() {
-                continue;
-            }
-
-            let peeking_out = frost && peek_factor > 0.01 && peek_target != Some(w);
-            if peeking_out {
-                dst.with_clip(dirty_area, |d| {
-                    draw_aero_peek_sheet(d, draw_rect, self.theme.accent, peek_factor);
-                });
-                if peek_factor >= 0.96 {
-                    continue;
-                }
-            }
+            let peeking_out = peek_factor > 0.01 && peek_target != Some(w);
             let eff_op = if peeking_out {
-                ((opacity as f32) * (1.0 - peek_factor))
+                ((base_op as f32) * (1.0 - peek_factor))
                     .round()
                     .clamp(0.0, 255.0) as u8
             } else {
-                opacity
+                base_op
             };
-            if eff_op == 0 {
-                continue;
-            }
-
-            let active = self.active == Some(w);
-            let glass_top = if is_vortex && cw_depth == 32 {
-                cw_glass_ext
+            let glass_top = if is_vortex && cw.depth == 32 {
+                cw.glass_extents
                     .map(|e| e[0])
                     .unwrap_or(VORTEX_TITLEBAR_HEIGHT)
                     .clamp(1, draw_rect.h)
             } else {
                 0
             };
+            let has_vortex_glass = is_vortex && !is_anim && cw.depth == 32 && eff_op == 255;
+            let same_size = draw_rect.w == cw.pw as i32 && draw_rect.h == cw.ph as i32;
+            let is_frameless_popup = cw.glass_extents.is_some_and(|e| e[1] == -1);
+            let is_opaque = !is_anim
+                && !peeking_out
+                && same_size
+                && eff_op == 255
+                && !is_frameless_popup
+                && (cw.depth != 32 || (is_vortex && glass_top > 0));
+            let opaque_rect = if is_opaque {
+                Rect::new(
+                    draw_rect.x,
+                    draw_rect.y + glass_top,
+                    draw_rect.w,
+                    (draw_rect.h - glass_top).max(0),
+                )
+            } else {
+                Rect::default()
+            };
 
-            if is_vortex && !is_anim && cw_depth == 32 && eff_op == 255 {
-                let scr_w = i32::from(self.x.width);
+            if used >= plans.len() {
+                plans.push(WinCompPlan::default());
+            }
+            let p = &mut plans[used];
+            p.reset();
+            p.window = w;
+            p.draw_rect = draw_rect;
+            p.cull_bounds = cull_bounds;
+            p.opaque_rect = opaque_rect;
+            p.is_max = is_max;
+            p.is_anim = is_anim;
+            p.peeking_out = peeking_out;
+            p.has_vortex_glass = has_vortex_glass;
+            p.active = self.active == Some(w);
+            p.glass_top = glass_top;
+            p.eff_op = eff_op;
+            p.cw_pw = cw.pw;
+            p.cw_ph = cw.ph;
+            p.cw_depth = cw.depth;
+            if has_vortex_glass {
                 let glass_x = if is_max { 0 } else { draw_rect.x - 4 };
                 let glass_w = if is_max { scr_w } else { draw_rect.w + 8 };
-                if frost {
-                    if glass_top > 1 {
-                        self.frost_glass_strip(
-                            dst,
-                            idx,
-                            Rect::new(glass_x, draw_rect.y + 1, glass_w, glass_top - 1),
-                            dirty_area,
-                            now,
-                        );
-                    }
-                    if !is_max {
-                        let client_y = draw_rect.y + glass_top;
-                        let client_h = (draw_rect.h - glass_top).max(0);
-                        if client_h > 0 {
-                            self.frost_glass_strip(
-                                dst,
-                                idx,
-                                Rect::new(draw_rect.x - 4, client_y, 3, client_h),
-                                dirty_area,
-                                now,
-                            );
-                            self.frost_glass_strip(
-                                dst,
-                                idx,
-                                Rect::new(draw_rect.right() + 1, client_y, 3, client_h),
-                                dirty_area,
-                                now,
-                            );
-                        }
-                        self.frost_glass_strip(
-                            dst,
-                            idx,
-                            Rect::new(glass_x, draw_rect.bottom(), glass_w, 4),
-                            dirty_area,
-                            now,
-                        );
-                    }
+                if glass_top > 1 {
+                    p.glass_strips[p.glass_count] =
+                        Rect::new(glass_x, draw_rect.y + 1, glass_w, glass_top - 1);
+                    p.glass_count += 1;
                 }
-                dst.with_clip(dirty_area, |d| {
-                    draw_vortex_frame_chrome(d, draw_rect, glass_top, &self.theme, active, is_max);
-                });
-            } else if !is_anim && !is_max && eff_op > 128 {
-                dst.with_clip(dirty_area, |d| {
-                    d.rounded_drop_shadow(
-                        draw_rect,
-                        self.theme.radius_window(),
-                        if active { 10 } else { 6 },
-                        2,
-                        if active { 0.28 } else { 0.15 },
-                    );
-                });
+                if !is_max {
+                    let client_y = draw_rect.y + glass_top;
+                    let client_h = (draw_rect.h - glass_top).max(0);
+                    if client_h > 0 {
+                        p.glass_strips[p.glass_count] =
+                            Rect::new(draw_rect.x - 4, client_y, 3, client_h);
+                        p.glass_count += 1;
+                        p.glass_strips[p.glass_count] =
+                            Rect::new(draw_rect.right() + 1, client_y, 3, client_h);
+                        p.glass_count += 1;
+                    }
+                    p.glass_strips[p.glass_count] =
+                        Rect::new(glass_x, draw_rect.bottom(), glass_w, 4);
+                    p.glass_count += 1;
+                }
+            }
+            used += 1;
+        }
+
+        // Single-pass front-to-back exact occlusion culling + blur-halo preservation.
+        plan_window_occlusion(
+            dirty_area,
+            live_blur,
+            self.wm_drag.is_some(),
+            &mut plans[..used],
+            &mut self.comp.desktop_need,
+            &mut self.comp.strip_scratch,
+        );
+
+        // Step 1: Copy ONLY exposed desktop wallpaper regions into `dst`.
+        for &dr in &self.comp.desktop_need.rects {
+            dst.with_clip(dr, |d| {
+                d.copy_rect_from(
+                    self.desktop_canvas.pixels(),
+                    self.desktop_canvas.width,
+                    dr,
+                );
+            });
+        }
+
+        // Step 2: Back-to-front draw of only visible window regions + non-recursive local glass blur.
+        let mut ft = self.comp.frost_tmp.take();
+        for p in &plans[..used] {
+            if p.win_vis.is_empty() {
+                continue;
+            }
+            if p.peeking_out {
+                for &vr in &p.win_vis {
+                    dst.with_clip(vr, |d| {
+                        draw_aero_peek_sheet(d, p.draw_rect, self.theme.accent, peek_factor);
+                    });
+                }
+                if p.eff_op == 0 {
+                    continue;
+                }
             }
 
-            if let Some(cw) = self.comps.get(&w) {
-                dst.with_clip(dirty_area, |d| {
-                    if is_anim || draw_rect.w != cw_pw as i32 || draw_rect.h != cw_ph as i32 {
-                        blit_scaled_window(d, &cw.pixels, cw_pw, cw_ph, draw_rect, eff_op);
-                    } else {
-                        blit_window_pixels(
+            if p.has_vortex_glass {
+                for &(gr, has_lower) in &p.glass_vis {
+                    frost_clip_from_dst(
+                        dst,
+                        ft.as_mut(),
+                        &mut self.comp.blur_scratch,
+                        &self.comp.desktop_blur_cache,
+                        self.desktop_canvas.width,
+                        gr,
+                        dirty_area,
+                        has_lower,
+                        0,
+                    );
+                }
+                let mut fc = self.comps.get_mut(&p.window).and_then(|c| c.frame_cache.take());
+                for &vr in &p.win_vis {
+                    dst.with_clip(vr, |d| {
+                        draw_vortex_frame_chrome_cached(
                             d,
-                            &cw.pixels,
-                            cw_pw,
-                            cw_ph,
-                            draw_rect.x,
-                            draw_rect.y,
-                            eff_op,
-                            0,
-                            cw_depth == 32,
+                            p.draw_rect,
+                            p.glass_top,
+                            &self.theme,
+                            p.active,
+                            p.is_max,
+                            with_sheen,
+                            &mut fc,
                         );
-                    }
-                });
+                    });
+                }
+                if let Some(cw) = self.comps.get_mut(&p.window) {
+                    cw.frame_cache = fc;
+                }
+            } else if !p.is_anim && !p.is_max && p.eff_op > 128 {
+                for &vr in &p.win_vis {
+                    dst.with_clip(vr, |d| {
+                        d.rounded_drop_shadow(
+                            p.draw_rect,
+                            self.theme.radius_window(),
+                            if p.active { 10 } else { 6 },
+                            2,
+                            if p.active { 0.28 } else { 0.15 },
+                        );
+                    });
+                }
+            }
+
+            if let Some(cw) = self.comps.get(&p.window) {
+                let split_y = if is_vortex && !p.is_anim && p.cw_depth == 32 {
+                    p.glass_top
+                } else {
+                    0
+                };
+                for &vr in &p.win_vis {
+                    dst.with_clip(vr, |d| {
+                        if p.is_anim
+                            || p.draw_rect.w != p.cw_pw as i32
+                            || p.draw_rect.h != p.cw_ph as i32
+                        {
+                            blit_scaled_window(
+                                d,
+                                &cw.pixels,
+                                p.cw_pw,
+                                p.cw_ph,
+                                p.draw_rect,
+                                p.eff_op,
+                            );
+                        } else {
+                            blit_window_pixels_split(
+                                d,
+                                &cw.pixels,
+                                p.cw_pw,
+                                p.cw_ph,
+                                p.draw_rect.x,
+                                p.draw_rect.y,
+                                p.eff_op,
+                                0,
+                                p.cw_depth == 32,
+                                split_y,
+                            );
+                        }
+                    });
+                }
             }
         }
+        self.comp.frost_tmp = ft;
+        self.comp_plan_buf = plans;
     }
 
     fn composite_ghosts(&self, dst: &mut Canvas, now: Instant) {
@@ -6003,35 +7227,70 @@ impl Shell {
         }
     }
 
-    fn composite_taskbar(&mut self, dst: &mut Canvas, dirty_area: Rect, now: Instant) {
+    fn composite_taskbar(
+        &mut self,
+        dst: &mut Canvas,
+        dirty_area: Rect,
+        live_blur: bool,
+        with_sheen: bool,
+    ) {
         let tb = Rect::new(
             0,
             self.taskbar_y(),
             i32::from(self.x.width),
             self.panel_height(),
         );
-        if tb.intersect(dirty_area).is_empty() {
+        let tb_dirty = tb.intersect(dirty_area);
+        if tb_dirty.is_empty() {
             return;
         }
         if self.theme.is_vortexglass() {
-            if self.comp.flip3d.is_some() {
-                dst.with_clip(dirty_area, |d| {
-                    paint_shell_glass_region(
-                        d,
-                        tb,
-                        &self.theme,
-                        &mut self.comp.blur_scratch,
-                        130,
-                    );
-                });
+            let has_overlap = if self.comp.flip3d.is_some() {
+                true
+            } else if !live_blur {
+                false
             } else {
-                self.frost_glass_strip(dst, self.z_stack.len(), tb, dirty_area, now);
-                dst.with_clip(dirty_area.intersect(tb), |d| {
+                let tb_ex = tb_dirty
+                    .expand(AERO_BLUR_RADIUS)
+                    .intersect(dirty_area)
+                    .intersect(dst.bounds());
+                self.comp.snap_alpha > 0.01
+                    || !self.comp.ghosts.is_empty()
+                    || self.z_stack.iter().any(|&w| {
+                        let Some(m) = self.windows.iter().find(|m| m.window == w && !m.minimized)
+                        else {
+                            return false;
+                        };
+                        if !self.comps.get(&w).is_some_and(|c| c.has_pixels) {
+                            return false;
+                        }
+                        let (r, is_max) = self.window_rect_for(m);
+                        !window_damage_bounds(r, true, is_max).intersect(tb_ex).is_empty()
+                    })
+            };
+            let mut ft = self.comp.frost_tmp.take();
+            frost_clip_from_dst(
+                dst,
+                ft.as_mut(),
+                &mut self.comp.blur_scratch,
+                &self.comp.desktop_blur_cache,
+                self.desktop_canvas.width,
+                tb_dirty,
+                dirty_area,
+                has_overlap,
+                0,
+            );
+            self.comp.frost_tmp = ft;
+            dst.with_clip(tb_dirty, |d| {
+                if with_sheen {
                     crate::compositor::finish_shell_glass_overlay(d, tb, &self.theme, 130);
-                });
-            }
+                } else {
+                    let (tint, tint_a) = self.theme.glass_tint(true);
+                    d.fill_u8(tb, tint, tint_a);
+                }
+            });
         }
-        dst.with_clip(dirty_area, |d| {
+        dst.with_clip(tb_dirty, |d| {
             composite_shell_layer(
                 d,
                 &self.taskbar_canvas,
@@ -6041,6 +7300,90 @@ impl Shell {
                 self.taskbar_canvas.is_argb(),
             );
         });
+    }
+
+    fn composite_override_windows(
+        &mut self,
+        dst: &mut Canvas,
+        dirty_area: Rect,
+        live_blur: bool,
+    ) {
+        if self.override_wins.is_empty() {
+            return;
+        }
+        let is_vortex = self.theme.is_vortexglass();
+        let mut ft = self.comp.frost_tmp.take();
+        for ov in &self.override_wins {
+            if !ov.cw.has_pixels || ov.cw.pixels.is_empty() {
+                continue;
+            }
+            let r = Rect::new(
+                ov.rect.x,
+                ov.rect.y,
+                (ov.cw.pw as i32).min(ov.rect.w),
+                (ov.cw.ph as i32).min(ov.rect.h),
+            );
+            if r.is_empty() || r.expand(20).intersect(dirty_area).is_empty() {
+                continue;
+            }
+            let glass_popup =
+                is_vortex && ov.cw.depth == 32 && ov.cw.glass_extents.is_some_and(|e| e[1] == -1);
+            if glass_popup {
+                let corner_r = ov.cw.glass_extents.map_or(6, |e| e[4].clamp(0, 16));
+                let clip = r.intersect(dirty_area).intersect(dst.bounds());
+                if !clip.is_empty() {
+                    if live_blur {
+                        let ex = clip
+                            .expand(AERO_BLUR_RADIUS)
+                            .intersect(dirty_area)
+                            .intersect(dst.bounds());
+                        if let Some(ft_ref) = ft.as_mut() {
+                            ft_ref.with_clip(ex, |f| {
+                                f.copy_rect_from(dst.pixels(), dst.width, ex);
+                                f.blur_rect(ex, AERO_BLUR_RADIUS, &mut self.comp.blur_scratch);
+                            });
+                            dst.with_clip(dirty_area, |d| {
+                                d.rounded_drop_shadow(r, corner_r, 10, 3, 0.34);
+                            });
+                            copy_rounded_from_buf(dst, ft_ref.pixels(), ft_ref.width, r, clip, corner_r);
+                        }
+                    } else {
+                        dst.with_clip(dirty_area, |d| {
+                            d.rounded_drop_shadow(r, corner_r, 10, 3, 0.34);
+                        });
+                        if self.comp.desktop_blur_cache.len() >= dst.width * dst.height {
+                            copy_rounded_from_buf(
+                                dst,
+                                &self.comp.desktop_blur_cache,
+                                self.desktop_canvas.width,
+                                r,
+                                clip,
+                                corner_r,
+                            );
+                        }
+                    }
+                }
+            } else if ov.cw.depth != 32 {
+                dst.with_clip(dirty_area, |d| {
+                    d.rounded_drop_shadow(r, 0, 8, 2, 0.25);
+                });
+            }
+            dst.with_clip(dirty_area, |d| {
+                blit_window_pixels_split(
+                    d,
+                    &ov.cw.pixels,
+                    ov.cw.pw,
+                    ov.cw.ph,
+                    r.x,
+                    r.y,
+                    255,
+                    0,
+                    ov.cw.depth == 32,
+                    0,
+                );
+            });
+        }
+        self.comp.frost_tmp = ft;
     }
 
     fn composite_popups(&mut self, dst: &mut Canvas, dirty_area: Rect) {
@@ -6236,6 +7579,149 @@ fn build_switcher_entries<'a>(
         .collect()
 }
 
+/// Front-to-back single-pass occlusion subtraction preserving blur halos under glass strips.
+fn plan_window_occlusion(
+    dirty_area: Rect,
+    live_blur: bool,
+    drag_active: bool,
+    plans: &mut [WinCompPlan],
+    need: &mut RectRegion,
+    strip_scratch: &mut Vec<Rect>,
+) {
+    need.reset_to_slice(&[dirty_area]);
+    for i in (0..plans.len()).rev() {
+        plans[i].win_vis.clear();
+        plans[i].glass_vis.clear();
+        if need.is_empty() || !need.intersects_rect(plans[i].cull_bounds) {
+            continue;
+        }
+        need.intersect_rect_into(plans[i].cull_bounds, &mut plans[i].win_vis);
+        if plans[i].has_vortex_glass {
+            for s_idx in 0..plans[i].glass_count {
+                let strip = plans[i].glass_strips[s_idx];
+                need.intersect_rect_into(strip, strip_scratch);
+                for &gr in strip_scratch.iter() {
+                    let ex = gr.expand(AERO_BLUR_RADIUS).intersect(dirty_area);
+                    // During active drags, keep live blur on the main titlebar strip (s_idx == 0)
+                    // and reuse static desktop blur on thin side/bottom frame borders until drop.
+                    let has_lower = live_blur
+                        && !(drag_active && s_idx > 0)
+                        && (0..i).any(|j| !plans[j].cull_bounds.intersect(ex).is_empty());
+                    plans[i].glass_vis.push((gr, has_lower));
+                }
+            }
+        }
+        let opaque = plans[i].opaque_rect;
+        if !opaque.is_empty() {
+            need.subtract_rect(opaque);
+        }
+        for &(gr, has_lower) in &plans[i].glass_vis {
+            if has_lower {
+                let ex = gr.expand(AERO_BLUR_RADIUS).intersect(dirty_area);
+                need.add_rect(ex);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frost_clip_from_dst(
+    dst: &mut Canvas,
+    ft: Option<&mut Canvas>,
+    blur_scratch: &mut BlurScratch,
+    desktop_blur_cache: &[u32],
+    desktop_stride: usize,
+    clip: Rect,
+    dirty_area: Rect,
+    has_lower_overlap: bool,
+    corner_r: i32,
+) {
+    let clip = clip.intersect(dirty_area).intersect(dst.bounds());
+    if clip.is_empty() {
+        return;
+    }
+    if !has_lower_overlap && desktop_blur_cache.len() >= dst.width * dst.height {
+        if corner_r <= 1 {
+            dst.with_clip(clip, |d| {
+                d.copy_rect_from(desktop_blur_cache, desktop_stride, clip);
+            });
+        } else {
+            copy_rounded_from_buf(dst, desktop_blur_cache, desktop_stride, clip, clip, corner_r);
+        }
+        return;
+    }
+    let Some(ft) = ft else {
+        return;
+    };
+    let ex = clip
+        .expand(AERO_BLUR_RADIUS)
+        .intersect(dirty_area)
+        .intersect(dst.bounds());
+    if ex.is_empty() {
+        return;
+    }
+    ft.with_clip(ex, |f| {
+        f.copy_rect_from(dst.pixels(), dst.width, ex);
+        f.blur_rect(ex, AERO_BLUR_RADIUS, blur_scratch);
+    });
+    if corner_r <= 1 {
+        dst.with_clip(clip, |d| {
+            d.copy_rect_from(ft.pixels(), ft.width, clip);
+        });
+    } else {
+        copy_rounded_from_buf(dst, ft.pixels(), ft.width, clip, clip, corner_r);
+    }
+}
+
+fn copy_rounded_from_buf(
+    dst: &mut Canvas,
+    src: &[u32],
+    src_stride: usize,
+    round_rect: Rect,
+    clip: Rect,
+    corner_r: i32,
+) {
+    let clip = clip.intersect(round_rect).intersect(dst.bounds());
+    if clip.is_empty() {
+        return;
+    }
+    let rad = corner_r.min(round_rect.w / 2).min(round_rect.h / 2);
+    if rad <= 1 {
+        dst.with_clip(clip, |d| {
+            d.copy_rect_from(src, src_stride, clip);
+        });
+        return;
+    }
+    dst.mark_dirty(clip);
+    let dst_stride = dst.width;
+    let out = dst.pixels_mut();
+    let r2 = (rad * rad) as f32;
+    for py in clip.y..clip.bottom() {
+        let dy = if py < round_rect.y + rad {
+            (round_rect.y + rad) - py
+        } else if py >= round_rect.bottom() - rad {
+            py - (round_rect.bottom() - rad - 1)
+        } else {
+            0
+        };
+        let inset = if dy > 0 {
+            let d2 = (dy * dy) as f32;
+            let dx = (r2 - d2).max(0.0).sqrt().floor() as i32;
+            (rad - dx).max(0)
+        } else {
+            0
+        };
+        let rx0 = (round_rect.x + inset).max(clip.x);
+        let rx1 = (round_rect.right() - inset).min(clip.right());
+        if rx1 > rx0 {
+            let d_off = py as usize * dst_stride + rx0 as usize;
+            let s_off = py as usize * src_stride + rx0 as usize;
+            let n = (rx1 - rx0) as usize;
+            out[d_off..d_off + n].copy_from_slice(&src[s_off..s_off + n]);
+        }
+    }
+}
+
 fn draw_vortex_popup_shell(
     canvas: &mut Canvas,
     theme: &Theme,
@@ -6325,6 +7811,7 @@ mod tests {
                             assert!(layout.win_start_x > layout.start_sep_x);
                         }
 
+                        assert!(layout.ime.right() < layout.net.x);
                         assert!(layout.net.right() < layout.volume.x);
                         assert!(layout.volume.right() < layout.bell.x);
                         assert!(layout.bell.right() < layout.clock_sep_x);
@@ -6333,7 +7820,7 @@ mod tests {
                             for idx in 0..count {
                                 let wr = layout.window_button_rect(panel_h, count, idx);
                                 assert!(wr.x >= layout.win_start_x);
-                                assert!(wr.right() <= layout.net.x);
+                                assert!(wr.right() <= layout.ime.x);
                                 if idx + 1 < count {
                                     let next = layout.window_button_rect(panel_h, count, idx + 1);
                                     assert!(wr.right() < next.x);
@@ -6500,7 +7987,7 @@ mod tests {
                     assert!(layout.clock_sep_x < layout.show_desktop.x);
                     assert!(layout.start.right() < layout.start_sep_x);
                     let last_win = layout.window_button_rect(panel_h, 4, 3);
-                    assert!(last_win.right() <= layout.net.x);
+                    assert!(last_win.right() <= layout.ime.x);
                 }
             }
         }
@@ -6526,5 +8013,115 @@ mod tests {
         assert!(logout.right() <= VORTEX_MENU_WIDTH);
         assert!(confirm_cancel.right() < confirm_ok.x);
         assert!(confirm_ok.right() <= VORTEX_MENU_WIDTH);
+    }
+
+    #[test]
+    fn occlusion_plan_skips_buried_body_and_preserves_glass_blur_halo() {
+        let dirty = Rect::new(0, 0, 1280, 800);
+        // Bottom window at (100, 100, 600, 400), top window overlapping at (200, 180, 600, 400).
+        let w0_rect = Rect::new(100, 100, 600, 400);
+        let w1_rect = Rect::new(200, 180, 600, 400);
+        let glass_top = 30;
+
+        let mut p0 = WinCompPlan {
+            window: 1,
+            draw_rect: w0_rect,
+            cull_bounds: window_damage_bounds(w0_rect, true, false),
+            opaque_rect: Rect::new(100, 130, 600, 370),
+            has_vortex_glass: true,
+            glass_top,
+            glass_count: 1,
+            glass_strips: [
+                Rect::new(96, 101, 608, 29),
+                Rect::default(),
+                Rect::default(),
+                Rect::default(),
+            ],
+            ..WinCompPlan::default()
+        };
+        let mut p1 = WinCompPlan {
+            window: 2,
+            draw_rect: w1_rect,
+            cull_bounds: window_damage_bounds(w1_rect, true, false),
+            opaque_rect: Rect::new(200, 210, 600, 370),
+            has_vortex_glass: true,
+            glass_top,
+            glass_count: 1,
+            glass_strips: [
+                Rect::new(196, 181, 608, 29),
+                Rect::default(),
+                Rect::default(),
+                Rect::default(),
+            ],
+            ..WinCompPlan::default()
+        };
+
+        let mut plans = [p0, p1];
+        let mut desktop_need = RectRegion::new();
+        let mut scratch = Vec::new();
+        plan_window_occlusion(dirty, true, false, &mut plans, &mut desktop_need, &mut scratch);
+
+        // Top window glass overlaps bottom window -> needs live dynamic blur (`has_lower = true`).
+        assert_eq!(plans[1].glass_vis.len(), 1);
+        assert!(plans[1].glass_vis[0].1);
+
+        // Bottom window has NO lower window -> fast desktop_blur_cache (`has_lower = false`).
+        assert_eq!(plans[0].glass_vis.len(), 1);
+        assert!(!plans[0].glass_vis[0].1);
+
+        // Bottom window's deeply buried interior (e.g. (350, 350)) is NOT in win_vis.
+        let buried = Rect::new(350, 350, 100, 100);
+        assert!(plans[0]
+            .win_vis
+            .iter()
+            .all(|r| r.intersect(buried).is_empty()));
+
+        // Wait: the 8px halo band right under w1's glass strip (y=210..218) IS kept in w0.win_vis
+        // so w1's blur kernel gets valid lower-window pixels without overdrawing (350, 350)!
+        let halo_probe = Rect::new(300, 212, 20, 4);
+        assert!(plans[0]
+            .win_vis
+            .iter()
+            .any(|r| !r.intersect(halo_probe).is_empty()));
+
+        // Buried desktop wallpaper pixels behind w0/w1 are skipped cleanly.
+        assert!(desktop_need
+            .rects
+            .iter()
+            .all(|r| r.intersect(buried).is_empty()));
+
+        // When top window maximizes to full screen work area, bottom window is completely skipped!
+        p0 = WinCompPlan {
+            opaque_rect: Rect::new(100, 130, 600, 370),
+            cull_bounds: w0_rect,
+            ..WinCompPlan::default()
+        };
+        p1 = WinCompPlan {
+            opaque_rect: Rect::new(0, 0, 1280, 756),
+            cull_bounds: Rect::new(0, 0, 1280, 756),
+            ..WinCompPlan::default()
+        };
+        let mut max_plans = [p0, p1];
+        plan_window_occlusion(
+            Rect::new(0, 0, 1280, 756),
+            true,
+            false,
+            &mut max_plans,
+            &mut desktop_need,
+            &mut scratch,
+        );
+        assert!(max_plans[0].win_vis.is_empty());
+        assert!(desktop_need.is_empty());
+    }
+
+    #[test]
+    fn copy_rounded_from_buf_clips_corners_cleanly() {
+        let mut dst = Canvas::new(40, 40, 0x111111);
+        let src = vec![0xabcdefu32; 40 * 40];
+        let r = Rect::new(5, 5, 30, 30);
+        copy_rounded_from_buf(&mut dst, &src, 40, r, r, 8);
+        // Very top-left corner pixel of bounding rect stays untouched background; center copied.
+        assert_eq!(dst.pixels()[5 * 40 + 5], 0x111111);
+        assert_eq!(dst.pixels()[20 * 40 + 20], 0xabcdef);
     }
 }
