@@ -4,6 +4,7 @@
 > 来源：本文件由 Uinxed-Kernel 会话整理，供 SpaceKernel 会话继续执行。
 > 目标仓库：`~/Project/SpaceKernel`。
 > 托管：FadeHost Standard（app `goutoustdio`，域名 `https://goutoustdio.top`）。
+> 新增软件包的操作手册见 [ADDING_PACKAGES.md](ADDING_PACKAGES.md)。
 
 ## 0. 定位与原则
 
