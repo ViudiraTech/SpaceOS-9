@@ -903,7 +903,7 @@ fn run_p3_script_tests() -> Result<(), String> {
         "--repo",
         "/repo/base",
         "--noconfirm",
-        "sudo=0.1.0-1",
+        "sudo=0.1.0-2",
     ])?;
     expect_ok("sudo downgrade", &output)?;
     expect_contains("sudo downgrade", &output, "正在降级 sudo")?;

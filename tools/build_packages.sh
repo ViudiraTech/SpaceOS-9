@@ -86,7 +86,7 @@ pack_one() {
 
 pack_one hello 0.1.0-1 "$ROOT/packages/hello/manifest.toml" "$BUILD/packages/hello-0.1.0"
 pack_one hello 0.2.0-1 "$ROOT/packages/hello/manifest-0.2.0.toml" "$BUILD/packages/hello-0.2.0"
-pack_one sudo 0.1.0-1 "$ROOT/packages/sudo/manifest.toml" "$BUILD/packages/sudo"
-pack_one base 1.0.0-3 "$ROOT/packages/base/manifest.toml" "$BUILD/packages/base"
+pack_one sudo 0.1.0-2 "$ROOT/packages/sudo/manifest.toml" "$BUILD/packages/sudo"
+pack_one base 1.0.0-4 "$ROOT/packages/base/manifest.toml" "$BUILD/packages/base"
 
 printf 'reproducible packages in %s\n' "$REPO"
