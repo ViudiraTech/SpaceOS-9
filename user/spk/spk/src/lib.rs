@@ -1,0 +1,22 @@
+//
+//       user/spk/spk/src/lib.rs
+//       Target-side spk library
+//
+//       2026/11/20 By JiTianYu391
+//       Copyright (C) 2026 ViudiraTech.
+//
+
+pub mod check;
+pub mod crash;
+pub mod error;
+pub mod i18n;
+pub mod journal;
+pub mod ops;
+pub mod query;
+pub mod repair;
+pub mod repo;
+pub mod rootfs;
+pub mod solver;
+pub mod state;
+pub mod transaction;
+pub mod util;

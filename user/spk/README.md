@@ -1,25 +1,31 @@
 # spk — SpaceOS-9 native package manager
 
-P0 status: schema frozen, build-host tool and local repository pipeline working.
-The target-side `spk` crate arrives in P1. Design baseline:
-`docs/PACKAGE_MANAGER_PLAN.md`.
+P1 status: target-side `spk` can install, upgrade, downgrade, reinstall and
+remove from a signed local repository, with a backtracking dependency solver,
+file/transaction journal and crash recovery. P0's build-host tool and schema
+remain the baseline. Design: `docs/PACKAGE_MANAGER_PLAN.md`.
 
 ## Layout
 
 ```
 user/spk/
 ├── Cargo.toml        virtual workspace
-├── spk-core/         shared schemas, versions, keys, tar verification
-└── spk-host/         host CLI: keygen / pack / index / sign / verify
-packages/hello/       P0 smoke-test package (splibc hello)
+├── spk-core/         schemas, alpm version comparison, keys, tar safety,
+│                     zstd decode (ruzstd) and safe extraction
+├── spk-host/         host CLI: keygen / pack / index / sign / verify
+└── spk/              target CLI and library: install / upgrade / downgrade /
+                      reinstall / remove / list / info / files / owns /
+                      check / repair / trust
+packages/hello/       hello 0.1.0 and 0.2.0 upgrade fixtures
+packages/spk-tests/   solver and conflict fixtures (dep-a/dep-b, file-c/d, app/lib)
 tools/build_local_repo.sh
+tools/spk_qemu_test.py
 repo/                 generated artifacts, gitignored
 ```
 
-`spk-core` has no C dependencies: it decodes zstd with `ruzstd` and links the
-same way on the build host and on SpaceOS. `spk-host` uses the bundled C zstd
-encoder for package creation because `ruzstd` 0.9 is decode-only (plan §19
-anticipated this split).
+`spk-core` and the target `spk` have no C dependencies: zstd is decoded with
+`ruzstd`. `spk-host` uses the bundled C zstd encoder for package creation
+because `ruzstd` 0.9 is decode-only (plan §19).
 
 ## Build and test
 
@@ -29,16 +35,32 @@ nightly.
 
 ```sh
 REPO=$(git rev-parse --show-toplevel)
+
+# Host tool
 cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 \
   cargo build --manifest-path "$REPO/user/spk/Cargo.toml" \
   -p spk-host --release --target-dir "$REPO/target"
 
+# Target tool (static musl)
+cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 \
+  cargo build --manifest-path "$REPO/user/spk/Cargo.toml" \
+  -p spk --bins --release --target x86_64-unknown-linux-musl \
+  --target-dir "$REPO/target"
+
+# All unit and integration tests
 cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 \
   cargo test --manifest-path "$REPO/user/spk/Cargo.toml" \
   --target-dir "$REPO/target"
+
+# QEMU matrix (installs the kernel ISO, ext4 rootfs and three boots)
+# needs qemu-system-x86_64, OVMF, fakeroot, e2fsprogs, xorriso and KVM
+# (falls back to TCG when KVM is unavailable)
+tools/spk_qemu_test.py
 ```
 
-The target binary is `target/release/spk-host`.
+Binaries: `target/release/spk-host`,
+`target/x86_64-unknown-linux-musl/release/spk` and `spk-qemu-test`
+(static-pie, the same musl ELF form as the SPUI/browser userland).
 
 ## Repository workflow
 
@@ -48,47 +70,106 @@ target/release/spk-host keygen --name spaceos-main \
   --out ~/.config/spaceos/spk/keys \
   --comment "SpaceOS Build <build@spaceos>"
 
-# 2. Stage and pack
-packages/hello/build.sh
-target/release/spk-host pack \
-  --manifest packages/hello/manifest.toml \
-  --root build/packages/hello \
+# 2. Stage and pack hello 0.1 and 0.2
+packages/hello/build.sh 0.1.0
+packages/hello/build.sh 0.2.0
+target/release/spk-host pack --manifest packages/hello/manifest.toml \
+  --root build/packages/hello-0.1.0 \
   --output repo/x86_64/hello-0.1.0-1-x86_64.spk
+target/release/spk-host pack --manifest packages/hello/manifest-0.2.0.toml \
+  --root build/packages/hello-0.2.0 \
+  --output repo/x86_64/hello-0.2.0-1-x86_64.spk
 
-# 3. Index and sign (private key)
+# 3. Index and sign
 target/release/spk-host index \
   --repo-dir repo/x86_64 --repo spaceos-main --arch x86_64 \
   --key ~/.config/spaceos/spk/keys/spaceos-main.key
 
-# 4. Verify everything
+# 4. Verify
 target/release/spk-host verify \
   --repo-dir repo/x86_64 --key ~/.config/spaceos/spk/keys/spaceos-main.pub
 ```
 
-`tools/build_local_repo.sh` runs steps 2–4 and also publishes a copy of the
-public key as `repo/keys/<key_id>.pub`, ready to be embedded into
-`/etc/spk/trusted.d/`. The copy is for out-of-band trust distribution; clients
+`tools/build_local_repo.sh` runs steps 2–4 for both hello versions and
+publishes `repo/keys/<key_id>.pub` for out-of-band trust distribution. Clients
 must never auto-trust a key fetched from the repository itself.
 
-`spk-host keyid --key <file>` prints the key id for either key file form.
+## Target usage
 
-## Frozen P0 schemas
+```sh
+spk install --repo /repo/x86_64 hello            # latest version
+spk install --repo /repo/x86_64 hello=0.1.0-1    # exact version
+spk upgrade --repo /repo/update                  # full system upgrade
+spk downgrade --repo /repo/update hello=0.1.0-1
+spk reinstall --repo /repo/x86_64 hello
+spk remove hello
+spk remove -Rs app                               # orphan dependency cleanup
+spk list / info hello / files hello / owns /usr/bin/hello
+spk check                                        # DB + filesystem consistency
+spk repair                                       # recover an interrupted transaction
+spk trust add <public-key.pub> / trust list
+```
+
+Global options: `--root <dir>` (default `/`), `--noconfirm`, `--lang en|zh_CN`.
+Local paths and `file://` repositories are supported in P1; HTTP(S), mirrors
+and priorities arrive in P4.
+
+Exit codes follow plan §9.2: 0 OK, 1 general, 2 usage, 3 signature, 4
+dependency, 5 file conflict, 6 rolled back.
+
+## Transaction model
+
+- `/var/lib/spk/{installed,files,world,repos}.json`, `lock`, `journal`,
+  `backup/<txid>`, `staging/<txid>`.
+- `files.json` tracks non-directory paths only; directories are derived from
+  each package's file list, so shared directories are never removed while
+  non-empty.
+- Before touching the filesystem, the transaction writes an append-only JSONL
+  journal and `fsync`s each intent. Existing files are copied to
+  `backup/<txid>` and verified before overwrite/removal.
+- Files are installed through a same-directory temporary file and an atomic
+  rename; database files use temp + rename after the file phase. A crash at
+  any point is rolled back (or rolled forward after `DbDone`) by `spk repair`.
+- `SPK_TEST_CRASH=<point>` is a test-only hook that SIGKILLs `spk` at a named
+  commit point; the QEMU and host tests use it for crash recovery.
+- Conffiles: first install records the hash; upgrade keeps user edits and
+  writes new upstream content as `.spksave`; removal renames the conffile to
+  a free `.spksave[.N]` unless `--purge`.
+
+### Solver
+
+Backtracking over installed and repository candidates. Supports versioned
+depends, versioned `provides`, `conflicts`, `replaces`, dependency providers,
+cycles (the SCC is installed together), full upgrades, exact downgrades and
+reinstalls. Partial upgrades (`upgrade <pkg>` without `--allow-partial`) are
+refused. Failures print pacman-style chains, e.g.:
+
+```
+error: 无法准备事务（无法满足依赖关系）
+:: 安装 dep-b (2.0.0-1) 会破坏由 dep-a 要求的依赖 'dep-b<2'
+```
+
+## Frozen schemas
 
 All state files carry `"schema": 1`.
 
 ### manifest.toml
 
-Fields follow plan §3.2. Two additions are required for real packages and are
-now part of the schema:
+Fields follow plan §3.2. Required additions:
 
-- `[[files]]` entries have optional `type = "file" | "dir" | "symlink"`
-  (default `file`) and `target` for symlinks.
+- `[[files]]` has optional `type = "file" | "dir" | "symlink"` (default
+  `file`) and `target` for symlinks.
 - Directory entries carry `sha256 = ""` and `size = 0`; symlink entries hash
   the target string.
-
-`release` is a positive integer. `files` is generated by `spk-host pack` when
-omitted; if present it is verified against the staging tree, not trusted.
-Paths are absolute in the manifest and relative inside the tar.
+- `release` is a positive integer. `files` is generated by `spk build/pack`
+  when omitted; if present it is verified against staging, not trusted.
+- Source manifests may list `conffiles` before `files` exists; validation is
+  repeated after the generated table is filled.
+- Filename: `name-version-release-arch.spk`, or
+  `name-epoch:version-release-arch.spk` when `epoch != 0`.
+- Paths are absolute in the manifest and relative inside the payload tar.
+  The target-side limit is 511 bytes and `/var/lib/spk` plus
+  `/etc/spk/trusted.d` are reserved.
 
 Package symlinks may use absolute targets (interpreted inside the install
 root) or relative targets that do not climb above `/`. Entries nested below a
@@ -96,49 +177,41 @@ file or symlink entry are rejected, as are devices, FIFOs, sparse entries and
 duplicate paths. Hard links are stored as regular files with a warning; full
 hard-link support is P2.
 
-### index.json
+### index.json and signatures
 
-Exactly plan §4.2; packages are sorted by name and version. `index.json` is
-pretty JSON with a trailing newline and is signed byte-for-byte.
-`generated_at` is wall clock time unless `--generated-at` or
-`SOURCE_DATE_EPOCH` is given.
-
-### Keys and signatures
-
-- `key_id = ed25519:<first 16 hex chars of SHA-256(public key)>`.
-- Private key file: JSON, `schema`/`algorithm`/`key_id`/`comment`/
-  `secret_key` (base64 32-byte seed)/`public_key`; mode must be 0600.
-- Public key file: same JSON minus `secret_key`; also accepted by every
-  command that takes `--key`.
-- Trust-store file name: `<key_id>.pub` (plan §8).
-- `index.json.sig`: JSON with `schema`, `algorithm`, `key_id`, `sha256`
-  (digest of the signed bytes) and base64 `signature` (64 bytes). The
-  signature covers raw file bytes, never a re-serialization.
-
-### State databases (`/var/lib/spk`, P1 writer)
-
-`installed.json` (name → record), `files.json` (path → owner), `world.json`
-(sorted explicit set), `repos.json` (name/urls/priority/key_id/last_sync).
-Shapes live in `spk-core/src/db.rs` and round-trip tested.
+Exactly plan §4.2; packages are sorted by name and version. Pretty JSON with a
+trailing newline, signed byte-for-byte. `key_id = ed25519:<first 16 hex chars
+of SHA-256(public key)>`; trust files are `<key_id>.pub`. `index.json.sig`
+contains `schema`/`algorithm`/`key_id`/`sha256`/`signature` (base64 ed25519).
 
 ### Reproducibility
 
 Tar entries are sorted, owned by 0:0, and stamped from `SOURCE_DATE_EPOCH`
-(falling back to `manifest.build_date`). zstd level defaults to 19.
-Packing the same staging twice yields the same sha256.
+(falling back to `manifest.build_date`). zstd level defaults to 19. Packing the
+same staging twice yields the same sha256.
+
+## Kernel notes
+
+- The target uses `openat`/`mkdirat`/`unlinkat`/`symlinkat`/`flock`/`fsync`/
+  `renameat2`; all are implemented by SpaceOS. VFS does not yet honor
+  `O_NOFOLLOW` for ancestors, so `spk` resolves components with `lstat` and
+  stays inside `--root`; a TOCTOU window remains until the kernel catches up.
+- Path syscalls use a 512-byte buffer (511-byte paths).
+- ext4 `extent_truncate()` now frees directory data blocks as metadata and
+  writes a jbd2 revoke; without it, replay after power loss could clobber a
+  reused block (found by the QEMU phase-3 test).
+- The QEMU harness leaves the ext4 journal for the next boot to replay between
+  phases 1↔2, which is the regression for the directory-block revoke fix
+  (boot 2/3 replay 6/28 revokes). The final phase calls `sync()` so the host
+  can inspect the image offline. The explicit SIGKILL recovery is the separate
+  spk process crash in phase 2.
+- SpaceOS does not implement `copy_file_range` (syscall 326). `spk` copies
+  package data and database backups with read/write loops so std's fallback
+  never has to log an unimplemented syscall.
 
 ## Output style
 
-Plan §10.0/§10.5/§10.7: `::` only for stage headers, `(n/m)` for per-package
+Plan §10.0/§10.5/§10.7: `::` only for stage headers, `(n/m)` for package
 progress, `error:`/`warning:` for transaction diagnostics, `ERROR:`/`WARNING:`
-for index/constraint diagnostics. Chinese output follows pacman zh_CN
-(including `今日无事可做`). `spk-host` is English-only; user-facing target-side
-text is localized in P6.
-
-## Open schema notes
-
-- The filename format omits the epoch per plan §3.2. Two packages that differ
-  only in epoch would collide; the solver/index retention work in P2 must
-  either include the epoch on disk or reject the collision.
-- `release` is numeric. pacman compares string releases; the SpaceOS schema
-  intentionally keeps the plan's integer form.
+for index/constraint diagnostics. zh_CN follows pacman zh_CN, including
+`今日无事可做` for a no-op install/upgrade. `spk-host` is English-only.

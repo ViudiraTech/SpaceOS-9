@@ -1,0 +1,39 @@
+#
+#       user/spk/spk/Cargo.toml
+#       SpaceOS-9 target-side package manager
+#
+#       2026/11/20 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+[package]
+name = "spk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SpaceOS-9 package manager (target side)"
+
+[lib]
+name = "spk_ops"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spk"
+path = "src/main.rs"
+
+[[bin]]
+name = "spk-qemu-test"
+path = "src/bin/spk_qemu_test.rs"
+
+[dependencies]
+spk-core = { path = "../spk-core" }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+spk-host = { path = "../spk-host" }

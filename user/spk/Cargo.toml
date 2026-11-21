@@ -8,7 +8,7 @@
 
 [workspace]
 resolver = "2"
-members = ["spk-core", "spk-host"]
+members = ["spk-core", "spk-host", "spk"]
 
 [workspace.package]
 version = "0.1.0"
@@ -29,4 +29,5 @@ tar = { version = "0.4", default-features = false }
 ruzstd = { version = "0.9", default-features = false, features = ["std", "hash"] }
 zstd = { version = "0.14", default-features = false }
 clap = { version = "4.5", features = ["derive"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 tempfile = "3.13"

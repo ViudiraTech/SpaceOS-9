@@ -1,0 +1,29 @@
+#
+#       packages/hello/manifest-0.2.0.toml
+#       hello 0.2 upgrade fixture
+#
+#       2026/11/20 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "hello"
+epoch = 0
+version = "0.2.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "Hello world for SpaceOS-9 (v2)"
+description = "Second hello version used by the spk upgrade, downgrade and crash-recovery tests."
+license = "LicenseRef-Proprietary"
+url = "https://github.com/ViudiraTech/SpaceKernel"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = []
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false

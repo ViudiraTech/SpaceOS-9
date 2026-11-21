@@ -560,6 +560,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spk"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rustix",
+ "serde",
+ "serde_json",
+ "spk-core",
+ "spk-host",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "spk-core"
 version = "0.1.0"
 dependencies = [
