@@ -158,8 +158,13 @@ export SPK_REPO_KEY
 export SPK_REPO_PUBLIC
 export SPK_SECURITY
 
-.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
-all: release-try
+.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all all-packages kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
+all: release-try image
+
+# Packaging needs the musl target, BusyBox/musl sources and a CA bundle.
+# Use `make desktop`, `make iso`, `make kernel` or `make packages` for narrower
+# builds; `make all` is the full build.
+all-packages: packages repo
 
 defconfig:
 	kconfig-conf --alldefconfig Kconfig
@@ -369,10 +374,14 @@ help:
 	@printf '%s\n' \
 	  'make menuconfig   Configure architecture, drivers, modules and QEMU' \
 	  'make defconfig    Restore checked-in Kconfig defaults' \
-	  'make             Build bootable ISO' \
+	  'make             Full build: desktop, packages, repo and image' \
+	  'make desktop     Build desktop ISO and rootfs only' \
 	  'make run         Boot ISO in QEMU' \
 	  'make debug       Start QEMU paused with GDB port 1234' \
 	  'make test        Host model checks + x86_64/aarch64/riscv64 boot matrix' \
 	  'make test ARCH=  Single-architecture boot smoke test' \
 	  'make check       Format and check all target architectures' \
+	  'make packages    Build reproducible .spk packages' \
+	  'make repo        Build and sign the local repository' \
+	  'make image       Build the P5 base rootfs and image' \
 	  'make release-try Build release desktop ISO at build/spacekernel-release-try.iso'
