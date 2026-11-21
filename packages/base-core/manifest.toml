@@ -1,0 +1,29 @@
+#
+#       packages/base/manifest.toml
+#       SpaceOS-9 base runtime package
+#
+#       2026/11/23 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "base-core"
+epoch = 0
+version = "1.0.0"
+release = 6
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "SpaceOS-9 base runtime core"
+description = "spk, spk-sandbox, BusyBox, musl runtime, systemg and CA certificates."
+license = "LicenseRef-Proprietary AND GPL-2.0-only AND MIT AND MPL-2.0"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = ["base-core"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false

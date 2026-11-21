@@ -9,7 +9,7 @@
 name = "spk-runtime"
 epoch = 0
 version = "1.0.0"
-release = 1
+release = 2
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "spk package manager runtime for desktop images"
@@ -20,8 +20,8 @@ packager = "SpaceOS Build <build@spaceos>"
 build_date = 0
 
 depends = []
-provides = ["spk-runtime"]
-conflicts = ["base"]
+provides = ["spk-runtime", "base-core"]
+conflicts = []
 replaces = []
 
 conffiles = []

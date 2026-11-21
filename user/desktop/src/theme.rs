@@ -25,7 +25,10 @@ use std::time::SystemTime;
 
 use crate::draw::{mix, Canvas, Rect, Sprite};
 use crate::icons;
-use uxconf::{DesktopConfig, PanelPosition, ThemeMode, ThemeStyle, THEME_PRESETS, WALLPAPERS, WALLPAPER_DIR};
+use uxconf::{
+    ButtonLayout, DesktopConfig, PanelPosition, ThemeMode, ThemeStyle, THEME_PRESETS, WALLPAPERS,
+    WALLPAPER_DIR,
+};
 
 pub const TITLEBAR_HEIGHT: i32 = 34;
 pub const VORTEX_TITLEBAR_HEIGHT: i32 = 30;
@@ -59,6 +62,8 @@ pub struct ThemePreviewSpec {
     pub titlebar_left: u32,
     pub titlebar_right: u32,
     pub close_btn: u32,
+    pub min_btn: u32,
+    pub max_btn: u32,
     pub taskbar_top: u32,
     pub taskbar_bottom: u32,
     pub start_btn: u32,
@@ -79,6 +84,7 @@ pub struct InstalledThemeInfo {
     pub panel_position: Option<PanelPosition>,
     pub panel_size: Option<i32>,
     pub start_fullscreen: Option<bool>,
+    pub button_layout: Option<ButtonLayout>,
     pub preview: ThemePreviewSpec,
 }
 
@@ -362,9 +368,17 @@ pub struct WindowSkin {
     pub inactive_frame: CssSurface,
 }
 
+/// Title text alignment inside custom theme titlebars.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitleAlign {
+    Left,
+    Center,
+}
+
 #[derive(Clone, Debug)]
 pub struct TitlebarSkin {
     pub height: i32,
+    pub title_align: TitleAlign,
     pub active: CssSurface,
     pub inactive: CssSurface,
     pub edge_glow_left: Option<(u32, i32)>,
@@ -692,6 +706,10 @@ pub fn discover_installed_themes() -> Vec<InstalledThemeInfo> {
             let start_fullscreen = table
                 .get("start_fullscreen")
                 .and_then(toml::Value::as_bool);
+            let button_layout = table
+                .get("button_layout")
+                .and_then(toml::Value::as_str)
+                .map(ButtonLayout::parse);
             let preview = parse_preview_spec(table, accent);
 
             found.push(InstalledThemeInfo {
@@ -706,6 +724,7 @@ pub fn discover_installed_themes() -> Vec<InstalledThemeInfo> {
                 panel_position,
                 panel_size,
                 start_fullscreen,
+                button_layout,
                 preview,
             });
         }
@@ -748,7 +767,9 @@ pub fn discover_wallpapers() -> Vec<DiscoveredWallpaper> {
             continue;
         }
         let label = match fname {
-            "winxp-bliss.jpg" => "蓝天绿茵 (XP Bliss)".to_string(),
+            "winxp-bliss.jpg" | "xp-bliss.jpg" => "蓝天绿茵 (XP Bliss)".to_string(),
+            "aqua-wave.jpg" => "蔚蓝水波 (Aqua Wave)".to_string(),
+            "ambiance-wave.jpg" => "暖橙茄紫 (Ambiance)".to_string(),
             other => other
                 .rsplit_once('.')
                 .map_or(other, |(stem, _)| stem)
@@ -796,6 +817,8 @@ fn parse_preview_spec(table: &toml::value::Table, accent: u32) -> ThemePreviewSp
         titlebar_left,
         titlebar_right,
         close_btn: get_c("close_btn", "danger", 0xe0432e),
+        min_btn: get_c("min_btn", "titlebar_hi", titlebar_right),
+        max_btn: get_c("max_btn", "titlebar_hi", titlebar_right),
         taskbar_top: get_c("taskbar_top", "titlebar", 0x245edb),
         taskbar_bottom: get_c("taskbar_bottom", "window_border_active", 0x1941a5),
         start_btn: get_c("start_btn", "success", 0x3c9c24),
@@ -1398,6 +1421,17 @@ fn parse_custom_skin(
         .and_then(|t| t.get("height"))
         .and_then(toml::Value::as_integer)
         .unwrap_or(28) as i32;
+    let title_align = match tb_tbl
+        .and_then(|t| t.get("title_align"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("left")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "center" => TitleAlign::Center,
+        _ => TitleAlign::Left,
+    };
     let mut tb_active = parse_surface(tb_tbl, "active", theme_dir, None);
     if tb_active.is_empty() {
         tb_active.bg = parse_css_background(
@@ -1424,6 +1458,7 @@ fn parse_custom_skin(
         .map(|c| (c, glow_w));
     let titlebar = TitlebarSkin {
         height: tb_height.clamp(22, 44),
+        title_align,
         active: tb_active,
         inactive: tb_inactive,
         edge_glow_left,

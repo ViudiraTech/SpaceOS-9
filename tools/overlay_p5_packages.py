@@ -16,6 +16,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -34,36 +35,108 @@ def copy(src: pathlib.Path, dst: pathlib.Path, mode: int) -> None:
     dst.chmod(mode)
 
 
-def install_runtime(stage: pathlib.Path, local_repo: pathlib.Path, spk: pathlib.Path) -> None:
-    """Install spk-runtime from the build repository so the desktop image has
-    a real installed-package database entry instead of loose binaries."""
+def install_runtime(
+    stage: pathlib.Path,
+    local_repo: pathlib.Path,
+    spk: pathlib.Path,
+    spk_host: pathlib.Path,
+    repo_key: pathlib.Path,
+) -> None:
+    """Install base/sudo/spk-runtime from a filtered build repository so the
+    desktop image gets real package DB entries without pulling base-core."""
     if not spk.is_file():
         raise SystemExit(f"missing host spk binary: {spk}")
+    if not spk_host.is_file():
+        raise SystemExit(f"missing host spk-host binary: {spk_host}")
+    if not repo_key.is_file():
+        raise SystemExit(f"missing build signing key: {repo_key}")
+    runtime_repo = pathlib.Path(tempfile.mkdtemp(prefix="spk-runtime-repo-"))
     trusted = local_repo.parent / "trusted"
     trusted_dir = stage / "etc/spk/trusted.d"
-    shutil.rmtree(trusted_dir, ignore_errors=True)
-    trusted_dir.mkdir(parents=True)
-    for public in sorted(trusted.glob("*.pub")):
-        shutil.copy2(public, trusted_dir / public.name)
-        (trusted_dir / public.name).chmod(0o644)
-    command = [
-        str(spk),
-        "--root",
-        str(stage),
-        "--noconfirm",
-        "install",
-        "--repo",
-        str(local_repo),
-        "--overwrite",
-        "/usr/bin/spk",
-        "--overwrite",
-        "/usr/bin/spk-sandbox",
-        "spk-runtime",
-    ]
     try:
+        index = json.loads((local_repo / "index.json").read_text())
+        wanted = {"base", "spk-runtime", "sudo"}
+        selected = [pkg for pkg in index.get("packages", []) if pkg.get("name") in wanted]
+        if {pkg["name"] for pkg in selected} != wanted:
+            raise SystemExit(f"repository {local_repo} is missing base/spk-runtime/sudo")
+        for package in selected:
+            source = local_repo / package["filename"]
+            if not source.is_file():
+                raise SystemExit(f"missing package file: {source}")
+            shutil.copy2(source, runtime_repo / source.name)
+        subprocess.run(
+            [
+                str(spk_host),
+                "index",
+                "--repo-dir",
+                str(runtime_repo),
+                "--repo",
+                "local",
+                "--arch",
+                "x86_64",
+                "--key",
+                str(repo_key),
+            ],
+            check=True,
+        )
+
+        shutil.rmtree(trusted_dir, ignore_errors=True)
+        trusted_dir.mkdir(parents=True)
+        for public in sorted(trusted.glob("*.pub")):
+            shutil.copy2(public, trusted_dir / public.name)
+            (trusted_dir / public.name).chmod(0o644)
+        command = [
+            "unshare",
+            "-r",
+            "--",
+            str(spk),
+            "--root",
+            str(stage),
+            "--noconfirm",
+            "install",
+            "--repo",
+            str(runtime_repo),
+            "--overwrite",
+            "/usr/bin/spk",
+            "--overwrite",
+            "/usr/bin/spk-sandbox",
+            "--overwrite",
+            "/usr/bin/sudo",
+            "--overwrite",
+            "/usr/bin/doas",
+            "spk-runtime",
+            "base",
+            "sudo",
+        ]
+        # A stage reused from an earlier build may hold the previous runtime
+        # package whose old conflicts block the new transaction.
+        installed_path = stage / "var/lib/spk/installed.json"
+        if installed_path.is_file():
+            try:
+                installed = json.loads(installed_path.read_text())
+            except json.JSONDecodeError:
+                installed = {}
+            packages = installed.get("packages", {})
+            for name in ("base", "sudo", "spk-runtime"):
+                if name in packages:
+                    subprocess.run(
+                        [
+                            "unshare",
+                            "-r",
+                            "--",
+                            str(spk),
+                            "--root",
+                            str(stage),
+                            "--noconfirm",
+                            "remove",
+                            name,
+                        ],
+                        check=True,
+                    )
         subprocess.run(command, check=True)
     finally:
         shutil.rmtree(trusted_dir, ignore_errors=True)
+        shutil.rmtree(runtime_repo, ignore_errors=True)
 
 
 def main() -> int:
@@ -75,6 +148,10 @@ def main() -> int:
     parser.add_argument("--repo-url", default="https://goutoustdio.top/spaceos/repo/x86_64")
     parser.add_argument("--spk", type=pathlib.Path,
                         default=ROOT / "target/x86_64-unknown-linux-musl/release/spk")
+    parser.add_argument("--spk-host", type=pathlib.Path,
+                        default=ROOT / "target/release/spk-host")
+    parser.add_argument("--repo-key", type=pathlib.Path,
+                        default=ROOT / "build/keys/repo.key")
     parser.add_argument("--sandbox", type=pathlib.Path,
                         default=ROOT / "target/x86_64-unknown-linux-musl/release/spk-sandbox")
     parser.add_argument("--trust-key", type=pathlib.Path,
@@ -89,7 +166,13 @@ def main() -> int:
         raise SystemExit(f"local package repository missing: {arguments.local_repo}")
 
     if arguments.local_repo is not None:
-        install_runtime(stage, arguments.local_repo, arguments.spk)
+        install_runtime(
+            stage,
+            arguments.local_repo,
+            arguments.spk,
+            arguments.spk_host,
+            arguments.repo_key,
+        )
     else:
         copy(arguments.spk, stage / "usr/bin/spk", 0o755)
         copy(arguments.sandbox, stage / "usr/bin/spk-sandbox", 0o755)
