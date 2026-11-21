@@ -1,0 +1,29 @@
+#
+#       packages/spk-runtime/manifest.toml
+#       spk binaries for desktop images
+#
+#       2026/11/21 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "spk-runtime"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "spk package manager runtime for desktop images"
+description = "The static spk and spk-sandbox binaries used by desktop images that already provide musl, BusyBox and systemg from Alpine."
+license = "LicenseRef-Proprietary"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = ["spk-runtime"]
+conflicts = ["base"]
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false

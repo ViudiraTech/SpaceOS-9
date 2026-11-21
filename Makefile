@@ -296,9 +296,9 @@ desktop-run: release-try $(AUDIO_CONFIG)
 # boots the release kernel; the matching desktop rootfs is build/rootfs/ext4.img.
 RELEASE_TRY := build/spacekernel-release-try.iso
 
-release-try: packages
+release-try: repo
 	$(MAKE) desktop PROFILE=release ARCH=x86_64
-	SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" python3 -I tools/overlay_p5_packages.py 		--stage build/rootfs/stage 		--trust-key packages/keys/ed25519:b4280a08406a53c5.pub 		--epoch $(SOURCE_DATE_EPOCH)
+	SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" python3 -I tools/overlay_p5_packages.py 		--stage build/rootfs/stage 		--local-repo build/repo/x86_64 		--trust-key packages/keys/ed25519:b4280a08406a53c5.pub 		--epoch $(SOURCE_DATE_EPOCH)
 	python3 tools/build_desktop_rootfs.py --reuse-stage --image build/rootfs/ext4.img
 	cp build/x86_64/release/SpaceKernel-x86_64.iso $(RELEASE_TRY)
 	cp build/rootfs/ext4.img build/spacekernel-release-try-rootfs.img
