@@ -22,6 +22,8 @@ BUSYBOX_SRC="$TOOLCHAIN/busybox-$BUSYBOX_VERSION"
 OUTPUT="$ROOT/build/userland"
 JOBS=${JOBS:-$(nproc)}
 
+mkdir -p "$DOWNLOADS" "$TOOLCHAIN" "$OUTPUT/musl"
+
 fetch()
 {
     url=$1
@@ -37,8 +39,6 @@ fetch "https://musl.libc.org/releases/musl-$MUSL_VERSION.tar.gz" \
     "$MUSL_SHA256" "$DOWNLOADS/musl-$MUSL_VERSION.tar.gz"
 fetch "https://busybox.net/downloads/busybox-$BUSYBOX_VERSION.tar.bz2" \
     "$BUSYBOX_SHA256" "$DOWNLOADS/busybox-$BUSYBOX_VERSION.tar.bz2"
-
-mkdir -p "$TOOLCHAIN" "$OUTPUT/musl"
 
 if [ ! -x "$MUSL/bin/musl-gcc" ] || [ "${FORCE:-0}" = 1 ]; then
     rm -rf "$MUSL_SRC" "$MUSL"

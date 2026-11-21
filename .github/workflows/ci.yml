@@ -75,6 +75,7 @@ jobs:
           key: spk-p3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'user/spk/Cargo.lock') }}
       - name: Build static userland and BusyBox
         run: |
+          mkdir -p build/downloads
           tools/build_userland.sh
           tools/build_busybox.sh
       - name: spk and sudo host tests + clippy
