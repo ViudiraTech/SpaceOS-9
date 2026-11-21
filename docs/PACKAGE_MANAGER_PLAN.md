@@ -672,6 +672,16 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - `index.json.sig`：sha256 `58dc94507abdd8c0275d2bb86dc4c2fe5f8e87cba4fc8aee7ab56786c9e6489b`
   - 旧 `sudo-0.1.0-2` 已从生产仓库删除
 
+- 2026-11-21：`theme-winxp 1.0.0-2`：声明式 CSS/SVG 主题引擎；重建 base/hello/sudo。
+  - `theme-winxp-1.0.0-2-x86_64.spk`：sha256 `e8e9993adac9756b0e3360b411c138f59237cdaa7bbcf13b9b7e0b2b881b5e8e`
+  - `base-1.0.0-4-x86_64.spk`：sha256 `f966ac664c76ba5c9a446cdc9fbe2415a8cbb3cda0d40b4ab4cb954d2ab01258`
+  - `sudo-0.1.0-3-x86_64.spk`：sha256 `bbe79a1655d2f8a2328ed6f3606543aa1b46c6737e6f8f557e3c77c1120a2a1d`
+  - `hello-0.1.0-1-x86_64.spk`：sha256 `b65819aa91024fa8d8bb0a3391266a937ce3b04f95addde217293262a8549a4c`
+  - `hello-0.2.0-1-x86_64.spk`：sha256 `0cca48bee97486dc28f4676908b18bfe27cc7639958c0bbe7264fbf82ebbc69e`
+  - `index.json`：sha256 `d559a514c406c57a28bf920a6ea987533a987e7e738a7c9b7a1d363b96707d34`
+  - `index.json.sig`：sha256 `04d56076012dfa20b7aee0689bdcfbab789e1f669ed66a215025e3e2c25f8a57`
+  - 旧 `theme-winxp-1.0.0-1` 已从生产仓库删除
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
