@@ -47,6 +47,53 @@ jobs:
       - name: Host model and ABI tests
         run: make test-host
 
+  spk-p3:
+    name: spk P3 host + QEMU sandbox matrix
+    runs-on: ubuntu-24.04
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain and musl target
+        run: |
+          rustup component add rust-src rustfmt
+          rustup target add x86_64-unknown-linux-musl
+      - name: Install QEMU, OVMF, ext4, ISO, musl and userland tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf \
+            fakeroot e2fsprogs xorriso mtools dosfstools musl-tools \
+            clang lld make gcc curl xz-utils bzip2 llvm
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/downloads
+            build/toolchain
+            build/userland
+          key: spk-p3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'user/spk/Cargo.lock') }}
+      - name: Build static userland and BusyBox
+        run: |
+          tools/build_userland.sh
+          tools/build_busybox.sh
+      - name: spk and sudo host tests + clippy
+        run: |
+          cargo test --manifest-path user/spk/Cargo.toml
+          cargo test --manifest-path user/sudo/Cargo.toml
+          cargo clippy --manifest-path user/spk/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path user/sudo/Cargo.toml --all-targets -- -D warnings
+      - name: P3 QEMU matrix (KVM when available, TCG otherwise)
+        run: tools/spk_qemu_test.py --timeout 900
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spk-p3-qemu
+          path: |
+            build/spk-qemu/*.log
+            build/spk-qemu/result.json
+          if-no-files-found: ignore
+
   boot:
     name: boot ${{ matrix.arch }}
     runs-on: ubuntu-24.04

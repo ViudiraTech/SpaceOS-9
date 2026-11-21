@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use sudo_core::app::{self, Options};
+use sudo_core::config::{Doas, Sudoers};
 use sudo_core::Paths;
 
 #[derive(Parser)]
@@ -46,6 +47,12 @@ struct Cli {
     /// Edit files instead of running a command
     #[arg(short = 'e', long)]
     edit: bool,
+    /// Validate a sudoers file without running a command
+    #[arg(long = "check-config", value_name = "PATH")]
+    check_config: Option<std::path::PathBuf>,
+    /// Validate a doas.conf file without running a command
+    #[arg(long = "check-doas", value_name = "PATH")]
+    check_doas: Option<std::path::PathBuf>,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -64,8 +71,39 @@ fn options(cli: &Cli, doas: bool) -> Options {
     }
 }
 
+fn check_config(path: &std::path::Path, doas: bool) -> ExitCode {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("sudo: cannot read {}: {error}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let result = if doas {
+        Doas::parse(&text).map(|_| ())
+    } else {
+        Sudoers::parse(&text).map(|_| ())
+    };
+    match result {
+        Ok(()) => {
+            println!("{}: OK", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("sudo: {}: {error}", path.display());
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(path) = &cli.check_config {
+        return check_config(path, false);
+    }
+    if let Some(path) = &cli.check_doas {
+        return check_config(path, true);
+    }
     let paths = Paths::system();
     let uid = unsafe { libc::getuid() };
 

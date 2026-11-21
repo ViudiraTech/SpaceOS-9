@@ -124,8 +124,9 @@ deny :guest cmd /usr/bin/sh
 - sudo 包升级：spk 事务备份旧二进制；失败回滚保留旧 sudo。
 - 已实现：安装/升级包含 setuid 文件的包时，spk 要求 `/etc/spk/setuid.allow`
   为 root 所有、非组/其他可写，且每个 setuid 路径在名单内；否则拒绝并回滚。
-- P3 hooks：安装/升级前用 sudo 自身解析器校验 `/etc/sudoers`/`/etc/doas.conf`
-  （等价 `visudo -c`），失败中止事务。当前版本尚未接入该 hook。
+- 已实现：`sudo --check-config <path>` / `--check-doas <path>` 使用同一解析器
+  做无认证语法校验；spk 在安装/升级写 `/etc/sudoers` 或 `/etc/doas.conf` 前调用，
+  且在校验前移到文件冲突检查之前，失败即拒绝事务（fail closed）。
 
 ## 9. 测试矩阵
 
