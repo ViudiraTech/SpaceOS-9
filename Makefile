@@ -143,8 +143,22 @@ ROOTFS_IMG ?= build/rootfs/fat32.img
 # Set ROOTFS_BUILD=0 to package an image produced elsewhere (e.g. tools/bench.py).
 ROOTFS_BUILD ?= 1
 ROOTFS_MODULE := $(if $(filter 1,$(WITH_ROOTFS)),module_path: boot():/rootfs.img,)
+CMDLINE ?=
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || echo 0)
+export SOURCE_DATE_EPOCH
+P5_DIR := build/p5
+P5_ROOTFS := $(P5_DIR)/rootfs.img
+P5_FAT := $(P5_DIR)/rootfs.fat
+P5_ISO := $(P5_DIR)/SpaceOS9-p5.iso
+P5_CMDLINE ?= console=ttyS0 init=/sbin/systemg
+P5_PROFILE ?= release
+ISO_DATE := $(shell date -u -d @$(SOURCE_DATE_EPOCH) +%Y%m%d%H%M%S00 2>/dev/null || echo 1970010100000000)
+P5_TRUST_KEY ?= $(if $(SPK_REPO_PUBLIC),$(SPK_REPO_PUBLIC),$(if $(SPK_REPO_KEY),$(patsubst %.key,%.pub,$(SPK_REPO_KEY)),build/keys/repo.pub))
+export SPK_REPO_KEY
+export SPK_REPO_PUBLIC
+export SPK_SECURITY
 
-.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
+.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
 all: release-try
 
 defconfig:
@@ -207,7 +221,22 @@ rootfs-image: modules
 busybox:
 	tools/build_busybox.sh
 
-iso: kernel limine $(if $(and $(filter 1,$(WITH_ROOTFS)),$(filter 1,$(ROOTFS_BUILD))),rootfs-image)
+packages:
+	SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" tools/build_packages.sh
+
+repo: packages
+	SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" tools/build_repo.sh
+
+image: repo
+	SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" python3 -I tools/build_p5_image.py --repo build/repo/x86_64 --stage $(P5_DIR)/root --ext4 $(P5_ROOTFS) --fat $(P5_FAT) --trust-key $(P5_TRUST_KEY)
+	$(MAKE) iso ARCH=$(ARCH) PROFILE=$(P5_PROFILE) WITH_ROOTFS=1 ROOTFS_BUILD=0 ROOTFS_IMG=$(P5_FAT) ISO=$(P5_ISO) CMDLINE="$(P5_CMDLINE)"
+
+p5-isos: image
+	$(MAKE) iso ARCH=$(ARCH) PROFILE=$(P5_PROFILE) WITH_ROOTFS=0 ISO_NO_KERNEL=1 CMDLINE="console=ttyS0 root=/dev/nvme0n1 rootfstype=ext4 init=/sbin/spk-p5-test" ISO=$(P5_DIR)/p5-install.iso
+	$(MAKE) iso ARCH=$(ARCH) PROFILE=$(P5_PROFILE) WITH_ROOTFS=1 ISO_NO_KERNEL=1 ROOTFS_BUILD=0 ROOTFS_IMG=$(P5_FAT) CMDLINE="console=ttyS0 init=/sbin/spk-p5-test p5.mode=verify" ISO=$(P5_DIR)/p5-verify.iso
+
+ISO_NO_KERNEL ?= 0
+iso: $(if $(filter 1,$(ISO_NO_KERNEL)),limine,kernel limine) $(if $(and $(filter 1,$(WITH_ROOTFS)),$(filter 1,$(ROOTFS_BUILD))),rootfs-image)
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/EFI/BOOT $(ISO_ROOT)/boot/limine
 	cp $(KERNEL) $(ISO_ROOT)/kernel.elf
@@ -215,7 +244,8 @@ iso: kernel limine $(if $(and $(filter 1,$(WITH_ROOTFS)),$(filter 1,$(ROOTFS_BUI
 	$(if $(filter 1,$(WITH_ROOTFS)),cp $(ROOTFS_IMG) $(ISO_ROOT)/rootfs.img,)
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	$(DTB_CMD)
-	python3 tools/render_limine.py boot/limine.conf.in $(ISO_ROOT)/limine.conf $(if $(filter y,$(CONFIG_KASLR)),yes,no) '$(DTB_LINE)' '$(ROOTFS_MODULE)'
+	CMDLINE="$(CMDLINE)" python3 tools/render_limine.py boot/limine.conf.in $(ISO_ROOT)/limine.conf $(if $(filter y,$(CONFIG_KASLR)),yes,no) '$(DTB_LINE)' '$(ROOTFS_MODULE)'
+	find $(ISO_ROOT) -exec touch -h -d @$(SOURCE_DATE_EPOCH) {} +
 	xorriso -as mkisofs -R -r -J $(if $(filter x86_64,$(ARCH)),-b boot/limine/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table,) -hfsplus -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin -efi-boot-part --efi-boot-image --protective-msdos-label -o $(ISO) $(ISO_ROOT)
 	$(if $(filter x86_64,$(ARCH)),$(LIMINE_DIR)/limine bios-install $(ISO),true)
 	@printf 'ISO ready: %s\n' '$(ISO)'

@@ -189,24 +189,28 @@ impl PublicKey {
             Ok(public)
         } else {
             let public: PublicKeyFile = serde_json::from_value(value)?;
-            validate_key_file_header(public.schema, &public.algorithm, &public.key_id)?;
-            let bytes = decode_exact::<32>(&public.public_key, "public key")?;
-            let verifying = VerifyingKey::from_bytes(&bytes)
-                .map_err(|e| Error::Key(format!("invalid ed25519 public key: {e}")))?;
-            let derived = key_id_from_public(&bytes);
-            if derived != public.key_id {
-                return Err(Error::Key(format!(
-                    "key id mismatch: file says {}, derived {}",
-                    public.key_id, derived
-                )));
-            }
-            Ok(PublicKey {
-                key_id: public.key_id,
-                comment: public.comment,
-                bytes,
-                verifying,
-            })
+            Self::from_public_file(&public)
         }
+    }
+
+    pub fn from_public_file(public: &PublicKeyFile) -> Result<Self> {
+        validate_key_file_header(public.schema, &public.algorithm, &public.key_id)?;
+        let bytes = decode_exact::<32>(&public.public_key, "public key")?;
+        let verifying = VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| Error::Key(format!("invalid ed25519 public key: {e}")))?;
+        let derived = key_id_from_public(&bytes);
+        if derived != public.key_id {
+            return Err(Error::Key(format!(
+                "key id mismatch: file says {}, derived {}",
+                public.key_id, derived
+            )));
+        }
+        Ok(PublicKey {
+            key_id: public.key_id.clone(),
+            comment: public.comment.clone(),
+            bytes,
+            verifying,
+        })
     }
 
     pub fn verify(&self, data: &[u8], signature: &SignatureFile) -> Result<()> {

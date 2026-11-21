@@ -108,6 +108,8 @@ enum Command {
         print: bool,
         targets: Vec<String>,
     },
+    /// Show installed packages, holds, repositories and cache status
+    Status,
     /// List installed packages
     List,
     /// Show package information
@@ -120,6 +122,16 @@ enum Command {
     Check,
     /// Recover an interrupted transaction
     Repair,
+    /// Verify repository indexes and package files
+    Verify {
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+    },
+    /// Inspect or clean the package/repository cache
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     /// Synchronize configured repository indexes
     #[command(alias = "update")]
     Sync {
@@ -135,6 +147,19 @@ enum Command {
     Trust {
         #[command(subcommand)]
         command: TrustCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Show cache sizes and entry counts
+    Info,
+    /// Remove unreferenced packages and old partial downloads
+    Clean {
+        #[arg(long, default_value_t = 30)]
+        retention_days: u64,
+        #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
+        max_bytes: u64,
     },
 }
 
@@ -289,6 +314,26 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             },
             lang,
         ),
+        Command::Cache { command } => match command {
+            CacheCommand::Info => ops::cache_info(&paths, cli.json, lang),
+            CacheCommand::Clean {
+                retention_days,
+                max_bytes,
+            } => ops::cache_clean(&paths, retention_days, max_bytes, cli.json, lang),
+        },
+        Command::Verify { repos } => ops::verify(
+            &paths,
+            &repos,
+            ReportOptions {
+                json: cli.json,
+                print: false,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
+            },
+            lang,
+        ),
         Command::Sync { repos } => ops::sync(
             &paths,
             &repos,
@@ -326,6 +371,7 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             },
             lang,
         ),
+        Command::Status => ops::status(&paths, cli.json, lang),
         Command::List => ops::list(&paths),
         Command::Info { package } => ops::info(&paths, &package, lang),
         Command::Files { package } => ops::files(&paths, &package, lang),

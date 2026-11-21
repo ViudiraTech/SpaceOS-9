@@ -6,6 +6,7 @@
 //       Copyright (C) 2026 ViudiraTech.
 //
 
+pub mod audit;
 pub mod check;
 pub mod crash;
 pub mod error;

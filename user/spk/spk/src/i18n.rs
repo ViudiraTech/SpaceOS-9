@@ -613,3 +613,19 @@ pub fn repo_synced(lang: Lang, name: &str, packages: usize) -> String {
         format!(":: repository {name} synchronized ({packages} packages)")
     }
 }
+
+pub fn verifying_repo(lang: Lang, name: &str) -> String {
+    if lang.is_zh() {
+        format!("正在校验仓库 {name}")
+    } else {
+        format!("Verifying repository {name}")
+    }
+}
+
+pub fn verify_ok(lang: Lang) -> String {
+    if lang.is_zh() {
+        "仓库校验通过".to_string()
+    } else {
+        "repository verification passed".to_string()
+    }
+}
