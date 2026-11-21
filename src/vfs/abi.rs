@@ -87,7 +87,37 @@ pub const O_APPEND: u32 = 0o2000;
 pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_DIRECTORY_GENERIC: u32 = 0o200000;
 pub const O_DIRECTORY_ARM64: u32 = 0o40000;
+pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
+pub const O_PATH: u32 = 0o10000000;
+pub const OPENAT2_REGULAR: u64 = 1 << 32;
+
+pub const MS_RDONLY: u64 = 1;
+pub const MS_NOSUID: u64 = 2;
+pub const MS_NODEV: u64 = 4;
+pub const MS_NOEXEC: u64 = 8;
+pub const MS_REMOUNT: u64 = 32;
+pub const MS_BIND: u64 = 4096;
+pub const MS_REC: u64 = 16384;
+pub const MS_UNBINDABLE: u64 = 1 << 17;
+pub const MS_PRIVATE: u64 = 1 << 18;
+pub const MS_SLAVE: u64 = 1 << 19;
+pub const MS_SHARED: u64 = 1 << 20;
+pub const MNT_FORCE: u32 = 1;
+pub const MNT_DETACH: u32 = 2;
+
+pub const RESOLVE_NO_XDEV: u64 = 0x01;
+pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+pub const RESOLVE_BENEATH: u64 = 0x08;
+pub const RESOLVE_IN_ROOT: u64 = 0x10;
+pub const RESOLVE_CACHED: u64 = 0x20;
+pub const VALID_RESOLVE_FLAGS: u64 = RESOLVE_NO_XDEV
+    | RESOLVE_NO_MAGICLINKS
+    | RESOLVE_NO_SYMLINKS
+    | RESOLVE_BENEATH
+    | RESOLVE_IN_ROOT
+    | RESOLVE_CACHED;
 
 // *at() Flags
 pub const AT_FDCWD: i32 = -100;

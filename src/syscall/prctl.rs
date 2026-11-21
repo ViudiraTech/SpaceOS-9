@@ -91,7 +91,7 @@ pub fn prctl(option: u64, argument: u64, _third: u64, _fourth: u64, _fifth: u64)
         },
         PR_GET_SECCOMP => 0,
         // SECCOMP_MODE_STRICT/FILTER require a seccomp subsystem.
-        PR_SET_SECCOMP => -abi::EINVAL,
+        PR_SET_SECCOMP => crate::seccomp::legacy(argument, _third),
         PR_CAPBSET_READ => {
             if argument > CAP_LAST_CAP {
                 -abi::EINVAL

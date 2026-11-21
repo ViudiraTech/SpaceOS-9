@@ -468,12 +468,20 @@ impl OpenFile {
     }
 
     pub fn can_read(&self) -> bool {
-        let mode = self.flags() & abi::O_ACCMODE;
+        let flags = self.flags();
+        if flags & abi::O_PATH != 0 {
+            return false;
+        }
+        let mode = flags & abi::O_ACCMODE;
         mode == abi::O_RDONLY || mode == abi::O_RDWR
     }
 
     pub fn can_write(&self) -> bool {
-        let mode = self.flags() & abi::O_ACCMODE;
+        let flags = self.flags();
+        if flags & abi::O_PATH != 0 {
+            return false;
+        }
+        let mode = flags & abi::O_ACCMODE;
         mode == abi::O_WRONLY || mode == abi::O_RDWR
     }
 
@@ -500,6 +508,9 @@ impl OpenFile {
     pub fn write(&self, buf: &[u8]) -> Result<usize, VfsError> {
         if !self.can_write() {
             return Err(VfsError::BadFileDescriptor);
+        }
+        if crate::vfs::path_read_only(&self.abs_path) {
+            return Err(VfsError::ReadOnlyFs);
         }
         let meta = self.inode.metadata()?;
         if meta.kind == InodeKind::Directory {
@@ -538,6 +549,9 @@ impl OpenFile {
     pub fn pwrite(&self, pos: u64, buf: &[u8]) -> Result<usize, VfsError> {
         if !self.can_write() {
             return Err(VfsError::BadFileDescriptor);
+        }
+        if crate::vfs::path_read_only(&self.abs_path) {
+            return Err(VfsError::ReadOnlyFs);
         }
         let meta = self.inode.metadata()?;
         if meta.kind == InodeKind::Directory {

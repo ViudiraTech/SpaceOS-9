@@ -40,6 +40,7 @@ pub mod pci;
 pub mod printk;
 mod random;
 pub mod sched;
+pub mod seccomp;
 #[cfg(feature = "boot-self-test")]
 pub mod self_test;
 pub mod shell;

@@ -442,6 +442,10 @@ pub fn current_fs() -> Option<Arc<SpinLock<crate::vfs::FsContext>>> {
     current().map(|task| task.fs())
 }
 
+pub fn current_mount_namespace() -> Option<Arc<SpinLock<crate::vfs::MountNamespace>>> {
+    current().map(|task| task.mount_namespace())
+}
+
 /// Terminate every other thread and then the current one.
 pub fn exit_group(status: i32) -> ! {
     if let Some(current) = current() {

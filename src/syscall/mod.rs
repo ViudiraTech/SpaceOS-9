@@ -143,6 +143,10 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
     CURRENT_ARG[slot][0].store(arg0, core::sync::atomic::Ordering::Relaxed);
     CURRENT_ARG[slot][1].store(arg1, core::sync::atomic::Ordering::Relaxed);
     CURRENT_NR[slot].store(num, core::sync::atomic::Ordering::Relaxed);
+    if let Some(result) = crate::seccomp::pre_syscall(num, [arg0, arg1, arg2, arg3, arg4, arg5]) {
+        CURRENT_NR[slot].store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+        return result;
+    }
     let result = dispatch_inner(num, arg0, arg1, arg2, arg3, arg4, arg5);
     CURRENT_NR[slot].store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
     // Data transfer announces itself per object. These rarer calls change
@@ -177,6 +181,7 @@ fn dispatch_inner(
         SYS_READ => sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
         SYS_WRITE => sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
         SYS_OPENAT => sys_openat(arg0 as i32, arg1 as *const u8, arg2 as u32, arg3 as u32),
+        SYS_OPENAT2 => sys_openat2(arg0 as i32, arg1 as *const u8, arg2, arg3 as usize),
         SYS_CLOSE => sys_close(arg0 as i32),
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as u32),
         SYS_PREAD64 => sys_pread64(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3),
@@ -244,8 +249,10 @@ fn dispatch_inner(
             arg1 as *const u8,
             arg2 as *const u8,
             arg3,
+            arg4,
         ),
         SYS_UMOUNT2 => sys_umount2(arg0 as *const u8, arg1 as u32),
+        SYS_PIVOT_ROOT => sys_pivot_root(arg0 as *const u8, arg1 as *const u8),
 
         // Legacy x86_64 non-*at syscalls
         #[cfg(target_arch = "x86_64")]
@@ -355,6 +362,8 @@ fn dispatch_inner(
         SYS_WAITID => process::waitid(arg0 as u32, arg1 as u32, arg2, arg3 as u32, arg4),
         #[cfg(target_arch = "x86_64")]
         SYS_CLONE => process::clone(arg0, arg1, arg2, arg3, arg4),
+        SYS_UNSHARE => process::unshare(arg0),
+        SYS_SECCOMP => crate::seccomp::syscall(arg0, arg1, arg2),
         #[cfg(target_arch = "x86_64")]
         SYS_FORK => process::fork(),
         #[cfg(not(target_arch = "x86_64"))]
@@ -446,7 +455,7 @@ fn dispatch_inner(
         SYS_REMOVEXATTR | SYS_LREMOVEXATTR | SYS_FREMOVEXATTR => linux::xattr_unsupported(),
         SYS_GETXATTR | SYS_LGETXATTR | SYS_FGETXATTR => linux::xattr_get_missing(),
         SYS_LISTXATTR | SYS_LLISTXATTR | SYS_FLISTXATTR => linux::xattr_list_empty(),
-        SYS_CHROOT => -abi::EPERM,
+        SYS_CHROOT => sys_chroot(arg0 as *const u8),
         SYS_SETITIMER => process::setitimer(arg0 as u32, arg1, arg2),
         SYS_GETITIMER => process::getitimer(arg0 as u32, arg1),
         SYS_INOTIFY_INIT1 => crate::ipc::inotify_init1(arg0 as u32),
@@ -542,6 +551,132 @@ fn sys_openat(dirfd: i32, path_ptr: *const u8, flags: u32, mode: u32) -> i64 {
     match guard.alloc_fd(0, FdEntry { file, cloexec }) {
         Ok(fd) => fd as i64,
         Err(e) => e.to_errno(),
+    }
+}
+
+fn dirfd_anchor(table: &vfs::FileDescriptorTable, dirfd: i32) -> Result<String, VfsError> {
+    if dirfd == abi::AT_FDCWD {
+        return Ok(vfs::current_cwd());
+    }
+    if dirfd < 0 {
+        return Err(VfsError::BadFileDescriptor);
+    }
+    let entry = table
+        .get(dirfd as usize)
+        .ok_or(VfsError::BadFileDescriptor)?;
+    let meta = entry.file.inode.metadata()?;
+    if meta.kind != vfs::InodeKind::Directory {
+        return Err(VfsError::NotADirectory);
+    }
+    Ok(entry.file.abs_path.clone())
+}
+
+fn sys_openat2(dirfd: i32, path_ptr: *const u8, how_ptr: u64, size: usize) -> i64 {
+    if size < 24 {
+        return -abi::EINVAL;
+    }
+    if size > 4096 {
+        return -abi::E2BIG;
+    }
+    let mut raw = [0u8; 24];
+    if let Err(error) = uaccess::read(how_ptr, &mut raw) {
+        return error.to_errno();
+    }
+    let flags = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let mode = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let resolve = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+    let path = match read_c_string(path_ptr, 512) {
+        Ok(path) => path,
+        Err(error) => return error.to_errno(),
+    };
+    const VALID_FLAGS: u64 = (abi::O_ACCMODE
+        | abi::O_CREAT
+        | abi::O_EXCL
+        | abi::O_NOCTTY
+        | abi::O_TRUNC
+        | abi::O_APPEND
+        | abi::O_NONBLOCK
+        | abi::O_DIRECTORY_GENERIC
+        | abi::O_DIRECTORY_ARM64
+        | abi::O_NOFOLLOW
+        | abi::O_CLOEXEC
+        | abi::O_PATH) as u64
+        | abi::OPENAT2_REGULAR;
+    if flags & !VALID_FLAGS != 0 {
+        return -abi::EINVAL;
+    }
+    if resolve & !abi::VALID_RESOLVE_FLAGS != 0 {
+        return -abi::EINVAL;
+    }
+    if (resolve & abi::RESOLVE_BENEATH) != 0 && (resolve & abi::RESOLVE_IN_ROOT) != 0 {
+        return -abi::EINVAL;
+    }
+    let create = flags & abi::O_CREAT as u64 != 0;
+    if mode > 0o7777 || (mode != 0 && !create) {
+        return -abi::EINVAL;
+    }
+    let path_op = flags & abi::O_PATH as u64 != 0;
+    let nofollow = flags & abi::O_NOFOLLOW as u64 != 0;
+    let table = vfs::current_fd_table();
+    let anchor = {
+        let guard = table.lock();
+        match dirfd_anchor(&guard, dirfd) {
+            Ok(path) => path,
+            Err(error) => return error.to_errno(),
+        }
+    };
+    let opts = vfs::LookupOptions {
+        root: vfs::current_root(),
+        follow_final: !nofollow,
+        no_symlinks: resolve & abi::RESOLVE_NO_SYMLINKS != 0,
+        no_xdev: resolve & abi::RESOLVE_NO_XDEV != 0,
+        no_magiclinks: resolve & abi::RESOLVE_NO_MAGICLINKS != 0,
+        anchor: Some(anchor.clone()),
+        in_root: resolve & abi::RESOLVE_IN_ROOT != 0,
+        beneath: resolve & abi::RESOLVE_BENEATH != 0,
+        xdev_start: None,
+        allow_final_symlink: path_op && nofollow,
+    };
+    let result = if create {
+        let real = match vfs::normalize_scoped(&anchor, &path, &opts) {
+            Ok(real) => real,
+            Err(error) => return error.to_errno(),
+        };
+        let mut open_opts = opts.clone();
+        open_opts.follow_final = !nofollow && flags & abi::O_EXCL as u64 == 0;
+        open_opts.allow_final_symlink = false;
+        vfs::open_abs_opts(&real, flags as u32, mode as u32, &open_opts)
+    } else {
+        match vfs::lookup_at(&anchor, &path, &opts) {
+            Ok((inode, real)) => {
+                if flags & abi::OPENAT2_REGULAR != 0
+                    && inode
+                        .metadata()
+                        .map(|meta| meta.kind != vfs::InodeKind::Regular)
+                        .unwrap_or(true)
+                {
+                    return -134;
+                }
+                vfs::open_inode(inode, real, flags as u32)
+            }
+            Err(error) => Err(error),
+        }
+    };
+    match result {
+        Ok(file) => {
+            let mut guard = table.lock();
+            match guard.alloc_fd(
+                0,
+                FdEntry {
+                    file,
+                    cloexec: flags & abi::O_CLOEXEC as u64 != 0,
+                },
+            ) {
+                Ok(fd) => fd as i64,
+                Err(error) => error.to_errno(),
+            }
+        }
+        Err(error) => error.to_errno(),
     }
 }
 
@@ -1671,6 +1806,7 @@ fn sys_mount(
     target_ptr: *const u8,
     fstype_ptr: *const u8,
     flags: u64,
+    data_ptr: u64,
 ) -> i64 {
     let source = if source_ptr.is_null() {
         String::from("none")
@@ -1684,14 +1820,115 @@ fn sys_mount(
         Ok(s) => s,
         Err(e) => return e.to_errno(),
     };
-    let fstype = match read_c_string(fstype_ptr, 64) {
-        Ok(s) => s,
-        Err(e) => return e.to_errno(),
+    let fstype = if fstype_ptr.is_null() {
+        String::new()
+    } else {
+        match read_c_string(fstype_ptr, 64) {
+            Ok(s) => s,
+            Err(e) => return e.to_errno(),
+        }
     };
-    match vfs::mount_by_type_flags(&source, &target, &fstype, flags) {
+    let data = if data_ptr == 0 {
+        String::new()
+    } else {
+        match read_c_string(data_ptr as *const u8, 256) {
+            Ok(data) => data,
+            Err(error) => return error.to_errno(),
+        }
+    };
+    let bind = flags & vfs::abi::MS_BIND != 0;
+    let result = if bind && flags & vfs::abi::MS_REMOUNT != 0 {
+        vfs::remount_bind(&target, flags)
+    } else if bind {
+        vfs::bind_mount(&source, &target, flags)
+    } else if flags
+        & (vfs::abi::MS_PRIVATE
+            | vfs::abi::MS_SLAVE
+            | vfs::abi::MS_SHARED
+            | vfs::abi::MS_UNBINDABLE)
+        != 0
+    {
+        vfs::set_mount_propagation(&target, flags, flags & vfs::abi::MS_REC != 0)
+    } else {
+        vfs::mount_by_type_flags(&source, &target, &fstype, flags, &data)
+    };
+    match result {
         Ok(()) => 0,
         Err(e) => e.to_errno(),
     }
+}
+
+fn sys_pivot_root(new_root_ptr: *const u8, put_old_ptr: *const u8) -> i64 {
+    let task = match sched::current() {
+        Some(task) => task,
+        None => return -abi::ESRCH,
+    };
+    if task.credentials().euid != 0 {
+        return -abi::EPERM;
+    }
+    let new_root = match read_c_string(new_root_ptr, 512) {
+        Ok(path) => path,
+        Err(error) => return error.to_errno(),
+    };
+    let put_old = match read_c_string(put_old_ptr, 512) {
+        Ok(path) => path,
+        Err(error) => return error.to_errno(),
+    };
+    let table = vfs::current_fd_table();
+    let (new_root, put_old) = {
+        let guard = table.lock();
+        let new_root = match vfs::resolve_at_path(&guard, abi::AT_FDCWD, &new_root) {
+            Ok(path) => path,
+            Err(error) => return error.to_errno(),
+        };
+        let put_old = match vfs::resolve_at_path(&guard, abi::AT_FDCWD, &put_old) {
+            Ok(path) => path,
+            Err(error) => return error.to_errno(),
+        };
+        (new_root, put_old)
+    };
+    match vfs::pivot_root(&new_root, &put_old) {
+        Ok(()) => 0,
+        Err(error) => error.to_errno(),
+    }
+}
+
+fn sys_chroot(path_ptr: *const u8) -> i64 {
+    let task = match sched::current() {
+        Some(task) => task,
+        None => return -abi::ESRCH,
+    };
+    if task.credentials().euid != 0 {
+        return -abi::EPERM;
+    }
+    let path = match read_c_string(path_ptr, 512) {
+        Ok(path) => path,
+        Err(error) => return error.to_errno(),
+    };
+    let abs_path = {
+        let table = vfs::current_fd_table();
+        let guard = table.lock();
+        match vfs::resolve_at_path(&guard, abi::AT_FDCWD, &path) {
+            Ok(path) => path,
+            Err(error) => return error.to_errno(),
+        }
+    };
+    let (inode, resolved) = match vfs::lookup_abs(&abs_path, true) {
+        Ok(value) => value,
+        Err(error) => return error.to_errno(),
+    };
+    let meta = match inode.metadata() {
+        Ok(meta) => meta,
+        Err(error) => return error.to_errno(),
+    };
+    if meta.kind != vfs::InodeKind::Directory {
+        return -abi::ENOTDIR;
+    }
+    if meta.mode & 0o111 == 0 {
+        return -abi::EACCES;
+    }
+    vfs::current_fs().lock().root = resolved;
+    0
 }
 
 fn sys_umount2(target_ptr: *const u8, _flags: u32) -> i64 {
@@ -1947,6 +2184,127 @@ pub fn run_vfs_syscall_self_test() {
 
     assert_eq!(dispatch(SYS_FSYNC, fd as u64, 0, 0, 0, 0, 0), 0);
     assert_eq!(dispatch(SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0), 0);
+
+    // openat2(2): scoped resolution, O_NOFOLLOW/O_PATH and RESOLVE_* flags.
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let open2 = |dirfd: i32, path: &[u8], how: &OpenHow| {
+        dispatch(
+            SYS_OPENAT2,
+            dirfd as i64 as u64,
+            path.as_ptr() as u64,
+            (how as *const OpenHow) as u64,
+            core::mem::size_of::<OpenHow>() as u64,
+            0,
+            0,
+        )
+    };
+    assert!(vfs::mkdir_abs("/p3test", 0o755).is_ok());
+    assert!(vfs::write_file("/p3test/file", b"openat2").is_ok());
+    let mnt = b"/p3test\0";
+    let dir_fd = dispatch(
+        SYS_OPENAT,
+        abi::AT_FDCWD as i64 as u64,
+        mnt.as_ptr() as u64,
+        (abi::O_RDONLY | abi::O_DIRECTORY_GENERIC) as u64,
+        0,
+        0,
+        0,
+    );
+    assert!(dir_fd >= 3);
+    assert!(vfs::symlink_abs("/p3test/file", "/p3test/openat2-link").is_ok());
+
+    let mut how = OpenHow {
+        flags: abi::O_RDONLY as u64,
+        mode: 0,
+        resolve: 0,
+    };
+    let scoped = open2(dir_fd as i32, b"file\0", &how);
+    assert!(scoped >= 3, "openat2 BENEATH baseline failed: {scoped}");
+    assert_eq!(dispatch(SYS_CLOSE, scoped as u64, 0, 0, 0, 0, 0), 0);
+
+    how.resolve = abi::RESOLVE_BENEATH;
+    let escaped = open2(dir_fd as i32, b"../file\0", &how);
+    assert_eq!(escaped, -abi::EXDEV);
+    let absolute = open2(dir_fd as i32, b"/file\0", &how);
+    assert_eq!(absolute, -abi::EXDEV);
+
+    how.resolve = abi::RESOLVE_IN_ROOT;
+    let in_root = open2(dir_fd as i32, b"/file\0", &how);
+    assert!(in_root >= 3, "openat2 IN_ROOT failed: {in_root}");
+    assert_eq!(dispatch(SYS_CLOSE, in_root as u64, 0, 0, 0, 0, 0), 0);
+    let in_root_escape = open2(dir_fd as i32, b"/../file\0", &how);
+    assert!(
+        in_root_escape >= 3,
+        "IN_ROOT .. clamp failed: {in_root_escape}"
+    );
+    assert_eq!(dispatch(SYS_CLOSE, in_root_escape as u64, 0, 0, 0, 0, 0), 0);
+
+    how.resolve = abi::RESOLVE_NO_SYMLINKS;
+    let no_symlink = open2(dir_fd as i32, b"openat2-link\0", &how);
+    assert_eq!(no_symlink, -abi::ELOOP);
+
+    how.flags = (abi::O_PATH | abi::O_NOFOLLOW) as u64;
+    let path_link = open2(dir_fd as i32, b"openat2-link\0", &how);
+    assert!(path_link >= 3, "O_PATH symlink failed: {path_link}");
+    assert_eq!(
+        dispatch(
+            SYS_READ,
+            path_link as u64,
+            read_buf.as_mut_ptr() as u64,
+            1,
+            0,
+            0,
+            0
+        ),
+        -abi::EBADF
+    );
+    assert_eq!(dispatch(SYS_CLOSE, path_link as u64, 0, 0, 0, 0, 0), 0);
+
+    how.flags = abi::O_RDONLY as u64;
+    how.resolve = abi::RESOLVE_NO_SYMLINKS;
+    let path_link = open2(dir_fd as i32, b"openat2-link\0", &how);
+    assert_eq!(path_link, -abi::ELOOP);
+
+    how.flags = abi::O_RDONLY as u64;
+    how.resolve = 0;
+    let nofollow = open2(dir_fd as i32, b"openat2-link\0", &how);
+    assert!(nofollow >= 3);
+    assert_eq!(dispatch(SYS_CLOSE, nofollow as u64, 0, 0, 0, 0, 0), 0);
+    how.flags = (abi::O_RDONLY | abi::O_NOFOLLOW) as u64;
+    let nofollow = open2(dir_fd as i32, b"openat2-link\0", &how);
+    assert_eq!(nofollow, -abi::ELOOP);
+
+    how.flags = (abi::O_RDONLY | abi::O_NOFOLLOW) as u64;
+    how.resolve = abi::RESOLVE_NO_SYMLINKS;
+    let nofollow = open2(dir_fd as i32, b"openat2-link\0", &how);
+    assert_eq!(nofollow, -abi::ELOOP);
+
+    how.flags = (abi::O_RDONLY | abi::O_DIRECTORY_GENERIC | abi::OPENAT2_REGULAR as u32) as u64;
+    how.resolve = 0;
+    // OPENAT2_REGULAR lives in the upper 32 bits of open_how.flags.
+    how.flags = abi::O_RDONLY as u64 | abi::OPENAT2_REGULAR;
+    let regular = open2(dir_fd as i32, b"file\0", &how);
+    assert!(regular >= 3);
+    assert_eq!(dispatch(SYS_CLOSE, regular as u64, 0, 0, 0, 0, 0), 0);
+    let not_regular = open2(dir_fd as i32, b".\0", &how);
+    assert_eq!(not_regular, -134);
+
+    // NO_XDEV: /dev is a separate mount, so a path from / into /dev must fail.
+    how.flags = abi::O_RDONLY as u64;
+    how.resolve = abi::RESOLVE_NO_XDEV;
+    let xdev = open2(abi::AT_FDCWD, b"dev/null\0", &how);
+    assert_eq!(xdev, -abi::EXDEV);
+
+    assert_eq!(dispatch(SYS_CLOSE, dir_fd as u64, 0, 0, 0, 0, 0), 0);
+    assert!(vfs::unlink_abs("/p3test/openat2-link", false).is_ok());
+    assert!(vfs::unlink_abs("/p3test/file", false).is_ok());
+    assert!(vfs::unlink_abs("/p3test", true).is_ok());
+
     assert_eq!(
         dispatch(
             SYS_UNLINKAT,

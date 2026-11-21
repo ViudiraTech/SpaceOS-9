@@ -22,6 +22,7 @@ pub fn run_early() {
     crate::block::run_self_test();
     crate::vfs::run_self_test();
     crate::vfs::pseudo_test::devices();
+    crate::seccomp::self_test();
     // SAFETY: trusted static/stack test buffers, before scheduler/AP release.
     unsafe {
         crate::user::uaccess::kernel_test_scope(crate::syscall::run_vfs_syscall_self_test);
@@ -59,6 +60,9 @@ pub fn spawn_late() {
             #[cfg(target_arch = "x86_64")]
             crate::user::process_signal_self_test()
                 .expect("process/signal self-test failed");
+            #[cfg(target_arch = "x86_64")]
+            crate::user::p3_syscall_self_test()
+                .expect("P3 mount/chroot/seccomp self-test failed");
             #[cfg(feature = "modules")]
             crate::module::self_test::network_late();
             #[cfg(feature = "modules")]

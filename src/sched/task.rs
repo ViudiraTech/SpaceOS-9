@@ -271,6 +271,9 @@ impl TaskRef {
     pub fn files(&self) -> Arc<SpinLock<crate::vfs::FileDescriptorTable>> {
         self.lock().fd_table.clone()
     }
+    pub fn set_fd_table(&self, table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>) {
+        self.lock().fd_table = table;
+    }
     pub fn credentials(&self) -> Credentials {
         self.lock().creds
     }
@@ -341,6 +344,21 @@ impl TaskRef {
     }
     pub fn fs(&self) -> Arc<SpinLock<FsContext>> {
         self.lock().fs.clone()
+    }
+    pub fn set_fs(&self, fs: Arc<SpinLock<FsContext>>) {
+        self.lock().fs = fs;
+    }
+    pub fn mount_namespace(&self) -> Arc<SpinLock<crate::vfs::MountNamespace>> {
+        self.lock().mount_ns.clone()
+    }
+    pub fn set_mount_namespace(&self, ns: Arc<SpinLock<crate::vfs::MountNamespace>>) {
+        self.lock().mount_ns = ns;
+    }
+    pub fn seccomp_filters(&self) -> Vec<Arc<crate::seccomp::Filter>> {
+        self.lock().seccomp_filters.clone()
+    }
+    pub fn add_seccomp_filter(&self, filter: Arc<crate::seccomp::Filter>) {
+        self.lock().seccomp_filters.push(filter);
     }
     pub fn signals(&self) -> Arc<SignalState> {
         self.lock().signals.clone()
@@ -552,6 +570,8 @@ pub(crate) struct Task {
     pub(crate) address_space: Option<Arc<Mutex<crate::user::UserAddressSpace>>>,
     pub(crate) fd_table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>,
     pub(crate) fs: Arc<SpinLock<FsContext>>,
+    pub(crate) mount_ns: Arc<SpinLock<crate::vfs::MountNamespace>>,
+    pub(crate) seccomp_filters: Vec<Arc<crate::seccomp::Filter>>,
     pub(crate) signals: Arc<SignalState>,
     pub(crate) thread_signals: Arc<SpinLock<ThreadSignals>>,
 }
@@ -697,6 +717,8 @@ impl Task {
                 ))
             }),
             fs: crate::vfs::kernel_fs(),
+            mount_ns: crate::vfs::init_mount_namespace(),
+            seccomp_filters: Vec::new(),
             signals: Arc::new(SignalState::new()),
             thread_signals: Arc::new(SpinLock::new(ThreadSignals::new())),
         })));
@@ -776,6 +798,8 @@ impl Task {
             address_space: Some(spec.address_space),
             fd_table: spec.fd_table,
             fs: spec.fs,
+            mount_ns: spec.mount_ns,
+            seccomp_filters: spec.seccomp_filters,
             signals: spec.signals,
             thread_signals: spec.thread_signals,
         })));
@@ -802,6 +826,8 @@ pub(crate) struct UserTaskSpec {
     pub fd_table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>,
     pub files_shared: bool,
     pub fs: Arc<SpinLock<FsContext>>,
+    pub mount_ns: Arc<SpinLock<crate::vfs::MountNamespace>>,
+    pub seccomp_filters: Vec<Arc<crate::seccomp::Filter>>,
     pub signals: Arc<SignalState>,
     pub thread_signals: Arc<SpinLock<ThreadSignals>>,
     pub address_space: Arc<Mutex<crate::user::UserAddressSpace>>,

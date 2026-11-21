@@ -936,3 +936,27 @@ pub const SYS_DELETE_MODULE: u64 = 106;
 pub const SYS_FINIT_MODULE: u64 = 313;
 #[cfg(not(target_arch = "x86_64"))]
 pub const SYS_FINIT_MODULE: u64 = 273;
+
+// Linux openat2(2) is number 437 on all supported architectures.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+))]
+pub const SYS_OPENAT2: u64 = 437;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SECCOMP: u64 = 317;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const SYS_SECCOMP: u64 = 277;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_UNSHARE: u64 = 272;
+#[cfg(target_arch = "aarch64")]
+pub const SYS_UNSHARE: u64 = 97;
+#[cfg(target_arch = "riscv64")]
+pub const SYS_UNSHARE: u64 = 97;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_PIVOT_ROOT: u64 = 155;
+#[cfg(target_arch = "aarch64")]
+pub const SYS_PIVOT_ROOT: u64 = 41;
+#[cfg(target_arch = "riscv64")]
+pub const SYS_PIVOT_ROOT: u64 = 41;
