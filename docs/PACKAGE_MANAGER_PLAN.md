@@ -716,9 +716,15 @@ CI：
 
 ### P5 构建、镜像与运维
 
-- `make packages/repo/image`、可复现、ISO 内置仓库、base 包（含 spk/spk-sandbox/BusyBox、`/etc/spk/setuid.allow`）。
-- 增量/delta（可选）、缓存保留、审计、`--json`、本地化、GUI 接口、CI 并行/性能。
-- 验收：从零构建的 ISO 内 `spk verify` 全绿；仓库规模/并发/磁盘配额测试通过。
+- P5 实现记录（2026-11-23，构建/镜像/运维）：
+  - `tools/build_packages.sh`：统一 `SOURCE_DATE_EPOCH`，排序 staging、0:0、固定 mtime，生成 `.BUILDINFO`，产出 hello 0.1/0.2、sudo 0.1 和 `base` 1.0；相同 `SOURCE_DATE_EPOCH` 重建 sha256 一致。
+  - `packages/base`：`spk`、`spk-sandbox`、BusyBox/`/bin/sh`、musl loader/libc、systemg、CA bundle；保留路径 `/etc/spk/setuid.allow`、`trusted.d` 不入包，由镜像写入。
+  - `tools/build_repo.sh`：`spk-host index` 签名、可选 `SPK_SECURITY`、生产 key 通过 `SPK_REPO_KEY`/`SPK_REPO_PUBLIC` 注入；本地默认 key 只放 `build/keys`。
+  - `tools/build_p5_image.py`：以 host `spk` 把 base 装进镜像，写 `/etc/spk/setuid.allow`（root:root 0644）、trusted bundle、`/var/lib/spk/repos.json`、内嵌 `var/lib/spk/repo/x86_64`；生成确定性 ext4（固定 UUID/hash seed）和 FAT32（固定 volume id）；`tools/build_p5_image.py` 复制 P5 init 驱动。
+  - `make packages`、`make repo`、`make image`、`make p5-isos`；ISO 通过 Limine 内嵌 FAT32 rootfs，rootfs 也作为 QEMU 可写 ext4 盘。
+  - 运维：`spk cache info|clean`（保留当前索引引用、`.part`、年龄/容量策略）；`spk status --json` 稳定 GUI JSON；事务成功写 `/var/log/spk/audit.log` JSONL；`spk verify` 校验索引和全部包，新增中文输出；P5 host 测试 90 项（含 2000 包索引、并发审计、缓存保留）。
+  - `tools/spk_p5_qemu_test.py`：ISO 内 `p5.mode=verify` 校验 + ext4 rootfs 离线 install/upgrade/remove；CI `spk-p5` job 构建镜像并跑离线矩阵。
+- 验收：从零 `make image` 后 ISO 内 `spk verify` 全绿；QEMU 离线仓库安装/升级/卸载；现有 86 host + 71 QEMU 不回归。
 
 ## 18. 目录结构建议
 

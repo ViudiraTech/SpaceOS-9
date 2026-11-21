@@ -99,6 +99,51 @@ jobs:
             build/spk-qemu/result.json
           if-no-files-found: ignore
 
+  spk-p5:
+    name: spk P5 image + offline QEMU matrix
+    runs-on: ubuntu-24.04
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain, musl and clippy
+        run: |
+          rustup component add rust-src rustfmt clippy
+          rustup target add x86_64-unknown-linux-musl
+      - name: Install image and QEMU tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf \
+            fakeroot e2fsprogs xorriso mtools dosfstools musl-tools \
+            clang lld make gcc curl xz-utils bzip2 llvm ca-certificates
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            build/downloads
+            build/toolchain
+            build/userland
+          key: spk-p5-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'user/spk/Cargo.lock') }}
+      - name: Build P5 packages, signed repo, rootfs and ISOs
+        env:
+          CC_x86_64_unknown_linux_musl: clang
+          AR_x86_64_unknown_linux_musl: ar
+        run: make p5-isos
+      - name: P5 QEMU offline repository matrix
+        env:
+          CC_x86_64_unknown_linux_musl: clang
+          AR_x86_64_unknown_linux_musl: ar
+        run: tools/spk_p5_qemu_test.py --no-build
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spk-p5-image
+          path: |
+            build/p5/*.log
+            build/p5/*.iso
+          if-no-files-found: ignore
+
   boot:
     name: boot ${{ matrix.arch }}
     runs-on: ubuntu-24.04

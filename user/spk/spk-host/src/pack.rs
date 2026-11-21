@@ -119,7 +119,9 @@ fn read_meta_files(
 ) -> Result<BTreeMap<&'static str, Vec<u8>>> {
     let mut meta = BTreeMap::new();
     for name in [META_BUILDINFO, META_CHANGELOG] {
-        if let Some(data) = read_optional_regular(&meta_dir.join(name), name)? {
+        let data = read_optional_regular(&meta_dir.join(name), name)?
+            .or(read_optional_regular(&staging.join(name), name)?);
+        if let Some(data) = data {
             meta.insert(name, data);
         }
     }
