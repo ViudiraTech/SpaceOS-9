@@ -475,7 +475,7 @@ fn download_one(
         }
         match client.download_file(
             &http::join_url(mirror, &package.filename),
-            &[("Cache-Control", "no-cache".to_string())],
+            &[],
             part,
             resume,
             package.size,
