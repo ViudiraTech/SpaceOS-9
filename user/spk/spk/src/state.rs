@@ -36,6 +36,7 @@ pub struct Paths {
     pub repo_cache: PathBuf,
     pub package_cache: PathBuf,
     pub revoked: PathBuf,
+    pub trusted_bundle: PathBuf,
 }
 
 impl Paths {
@@ -61,6 +62,7 @@ impl Paths {
             repo_cache: root.join("var/cache/spk/repos"),
             package_cache: root.join("var/cache/spk/packages"),
             revoked: root.join("etc/spk/revoked.d"),
+            trusted_bundle: root.join("etc/spk/trusted.json"),
             trusted: root.join(TRUST_DIR),
             state,
             root,

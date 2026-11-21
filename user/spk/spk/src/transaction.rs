@@ -328,6 +328,12 @@ pub fn execute(
     let _ = fs::remove_dir_all(paths.scripts.join(&txid));
     let keep = crate::remote::package_cache_keep(repos);
     let _ = crate::remote::prune_package_cache(paths, &keep);
+    let changed: Vec<String> = solution
+        .actions
+        .iter()
+        .map(|action| format!("{} {}", action.to.name, action.to.version))
+        .collect();
+    let _ = crate::audit::record(paths, options.operation, &changed, "ok");
     println!(
         "{}",
         i18n::ok_summary(

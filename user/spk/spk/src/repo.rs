@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use spk_core::fsutil::atomic_write;
 use spk_core::index::Index;
-use spk_core::keys::{read_signature, verify_any, PublicKey, SignatureFile};
+use spk_core::keys::{read_signature, verify_any, PublicKey, PublicKeyFile, SignatureFile};
 
 use crate::error::{Result, SpkError};
 use crate::security::SecurityState;
@@ -399,10 +399,17 @@ pub fn load_repo(
     })
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustBundle {
+    schema: u32,
+    keys: Vec<PublicKeyFile>,
+}
+
 pub fn trust_keys(paths: &Paths) -> Result<Vec<PublicKey>> {
     let entries = match fs::read_dir(&paths.trusted) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return trust_bundle(paths),
         Err(error) => return Err(error.into()),
     };
     let mut paths_found: Vec<PathBuf> = Vec::new();
@@ -433,6 +440,30 @@ pub fn trust_keys(paths: &Paths) -> Result<Vec<PublicKey>> {
             )));
         }
         keys.push(key);
+    }
+    if keys.is_empty() {
+        return trust_bundle(paths);
+    }
+    Ok(keys)
+}
+
+fn trust_bundle(paths: &Paths) -> Result<Vec<PublicKey>> {
+    let bytes = match fs::read(&paths.trusted_bundle) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let bundle: TrustBundle = serde_json::from_slice(&bytes)?;
+    if bundle.schema != 1 {
+        return Err(SpkError::General(format!(
+            "{}: unsupported trust bundle schema {}",
+            paths.trusted_bundle.display(),
+            bundle.schema
+        )));
+    }
+    let mut keys = Vec::with_capacity(bundle.keys.len());
+    for file in bundle.keys {
+        keys.push(PublicKey::from_public_file(&file)?);
     }
     Ok(keys)
 }

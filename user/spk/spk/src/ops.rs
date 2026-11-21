@@ -23,6 +23,7 @@ use crate::repo;
 use crate::solver::{self, Operation, PkgSpec, Solution};
 use crate::state::{lock_exclusive, Paths, State, StateLock};
 use crate::transaction::{self, OperationKind, Options};
+use crate::util::human_size;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReportOptions {
@@ -627,6 +628,168 @@ fn write_holds(paths: &Paths, holds: &spk_core::db::HoldsDb) -> Result<()> {
     Ok(())
 }
 
+pub fn cache_info(paths: &Paths, json: bool, lang: Lang) -> Result<()> {
+    let info = crate::remote::cache_info(paths)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "repository_bytes": info.repository_bytes,
+                "package_bytes": info.package_bytes,
+                "part_bytes": info.part_bytes,
+                "package_count": info.package_count,
+                "part_count": info.part_count,
+                "snapshot_count": info.snapshot_count,
+            }))?
+        );
+        return Ok(());
+    }
+    if lang.is_zh() {
+        println!(
+            "仓库缓存：{}（{} 个快照）",
+            human_size(info.repository_bytes),
+            info.snapshot_count
+        );
+        println!(
+            "软件包缓存：{}（{} 个文件）",
+            human_size(info.package_bytes),
+            info.package_count
+        );
+        println!(
+            "未完成下载：{}（{} 个文件）",
+            human_size(info.part_bytes),
+            info.part_count
+        );
+    } else {
+        println!(
+            "repositories: {} ({} snapshots)",
+            human_size(info.repository_bytes),
+            info.snapshot_count
+        );
+        println!(
+            "packages:     {} ({} files)",
+            human_size(info.package_bytes),
+            info.package_count
+        );
+        println!(
+            "partial:      {} ({} files)",
+            human_size(info.part_bytes),
+            info.part_count
+        );
+    }
+    Ok(())
+}
+
+pub fn cache_clean(
+    paths: &Paths,
+    retention_days: u64,
+    limit_bytes: u64,
+    json: bool,
+    lang: Lang,
+) -> Result<()> {
+    let keep = crate::remote::cached_package_shas(paths)?;
+    crate::remote::prune_package_cache_with(paths, &keep, retention_days, limit_bytes)?;
+    let info = crate::remote::cache_info(paths)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "ok": true,
+                "retention_days": retention_days,
+                "limit_bytes": limit_bytes,
+                "package_bytes": info.package_bytes,
+                "part_bytes": info.part_bytes,
+            }))?
+        );
+    } else if lang.is_zh() {
+        println!(
+            "缓存清理完成：{} 个软件包，{} 个未完成下载",
+            info.package_count, info.part_count
+        );
+    } else {
+        println!(
+            "cache cleaned: {} packages, {} partial",
+            info.package_count, info.part_count
+        );
+    }
+    Ok(())
+}
+
+pub fn verify(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang) -> Result<()> {
+    let repos = repo::load_repos(
+        paths,
+        urls,
+        lang,
+        crate::remote::RemoteOptions {
+            offline: report.offline,
+            allow_unsigned: report.allow_unsigned,
+        },
+    )?;
+    if repos.is_empty() {
+        return Err(SpkError::General("no usable repositories to verify".into()));
+    }
+    let mut results = Vec::new();
+    for loaded in &repos {
+        if !report.json {
+            println!(":: {}", i18n::verifying_repo(lang, &loaded.name));
+        }
+        for package in &loaded.index.packages {
+            let path = loaded.ensure_package(package)?;
+            let metadata = std::fs::metadata(&path)?;
+            if metadata.len() != package.size {
+                return Err(SpkError::Check {
+                    message: format!("{}: size mismatch", package.name),
+                    lines: vec![format!(
+                        "{}: index {}, file {}",
+                        path.display(),
+                        package.size,
+                        metadata.len()
+                    )],
+                });
+            }
+            let digest = spk_core::fsutil::sha256_file(&path)?;
+            if digest != package.sha256 {
+                return Err(SpkError::Check {
+                    message: format!("{}: sha256 mismatch", package.name),
+                    lines: vec![format!(
+                        "{}: index {}, file {}",
+                        path.display(),
+                        package.sha256,
+                        digest
+                    )],
+                });
+            }
+            spk_core::archive::inspect_spk(&path)?;
+            if !report.json {
+                println!("   {} {} ... OK", package.name, package.version());
+            }
+            results.push(serde_json::json!({
+                "repository": loaded.name,
+                "name": package.name,
+                "version": package.version().to_string(),
+                "sha256": package.sha256,
+                "size": package.size,
+                "ok": true,
+            }));
+        }
+    }
+    if report.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "repositories": repos.iter().map(|repo| repo.name.clone()).collect::<Vec<_>>(),
+                "packages": results,
+            }))?
+        );
+    } else {
+        println!("{}", i18n::verify_ok(lang));
+    }
+    Ok(())
+}
+
 pub fn sync(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang) -> Result<()> {
     let (_lock, _state) = prepare(paths, lang)?;
     let repos = repo::load_repos(
@@ -725,6 +888,79 @@ pub fn hold_list(paths: &Paths) -> Result<()> {
     let state = State::load(paths)?;
     for (name, held) in &state.holds.packages {
         println!("{} {}", name, held.version());
+    }
+    Ok(())
+}
+
+pub fn status(paths: &Paths, json: bool, lang: Lang) -> Result<()> {
+    let state = State::load(paths)?;
+    let cache = crate::remote::cache_info(paths)?;
+    let installed: Vec<_> = state
+        .installed
+        .packages
+        .values()
+        .map(|package| {
+            serde_json::json!({
+                "name": package.name,
+                "epoch": package.epoch,
+                "version": package.version,
+                "release": package.release,
+                "arch": package.arch,
+                "abi": package.abi,
+            })
+        })
+        .collect();
+    let holds: Vec<_> = state.holds.packages.keys().cloned().collect();
+    let repos: Vec<_> = state
+        .repos
+        .repos
+        .iter()
+        .map(|repo| {
+            serde_json::json!({
+                "name": repo.name,
+                "arch": repo.arch,
+                "urls": repo.urls,
+                "priority": repo.priority,
+                "key_id": repo.key_id,
+                "last_sync": repo.last_sync,
+                "enabled": repo.enabled,
+            })
+        })
+        .collect();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "installed": installed,
+                "holds": holds,
+                "repositories": repos,
+                "cache": {
+                    "repository_bytes": cache.repository_bytes,
+                    "package_bytes": cache.package_bytes,
+                    "part_bytes": cache.part_bytes,
+                    "package_count": cache.package_count,
+                    "snapshot_count": cache.snapshot_count,
+                },
+                "audit_log": paths.root.join("var/log/spk/audit.log").display().to_string(),
+            }))?
+        );
+    } else if lang.is_zh() {
+        println!("已安装：{}", installed.len());
+        println!("已锁定：{}", holds.len());
+        println!("仓库：{}", repos.len());
+        println!(
+            "缓存：{} 个软件包，{} 个快照",
+            cache.package_count, cache.snapshot_count
+        );
+    } else {
+        println!("installed: {}", installed.len());
+        println!("holds: {}", holds.len());
+        println!("repositories: {}", repos.len());
+        println!(
+            "cache: {} packages, {} snapshots",
+            cache.package_count, cache.snapshot_count
+        );
     }
     Ok(())
 }

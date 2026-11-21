@@ -30,6 +30,10 @@ path = "src/bin/spk_qemu_test.rs"
 name = "spk-sandbox"
 path = "src/bin/spk_sandbox.rs"
 
+[[bin]]
+name = "spk-p5-test"
+path = "src/bin/spk_p5_test.rs"
+
 [dependencies]
 spk-core = { path = "../spk-core" }
 serde.workspace = true

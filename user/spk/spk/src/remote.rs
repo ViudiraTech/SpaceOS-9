@@ -559,8 +559,13 @@ fn sync_dir(path: &Path) {
     }
 }
 
-/// Remove old `.part` files and enforce a simple size/age retention policy.
-pub fn prune_package_cache(paths: &Paths, keep: &BTreeSet<String>) -> Result<()> {
+/// Remove old `.part` files and enforce a configurable size/age policy.
+pub fn prune_package_cache_with(
+    paths: &Paths,
+    keep: &BTreeSet<String>,
+    retention_days: u64,
+    limit_bytes: u64,
+) -> Result<()> {
     let entries = match fs::read_dir(&paths.package_cache) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
@@ -599,13 +604,98 @@ pub fn prune_package_cache(paths: &Paths, keep: &BTreeSet<String>) -> Result<()>
         let age = modified
             .and_then(|time| now.duration_since(time).ok())
             .unwrap_or_default();
-        if (age > Duration::from_secs(RETENTION_DAYS * 24 * 60 * 60) || total > CACHE_LIMIT_BYTES)
+        if ((retention_days > 0 && age > Duration::from_secs(retention_days * 24 * 60 * 60))
+            || (limit_bytes > 0 && total > limit_bytes))
             && fs::remove_file(&path).is_ok()
         {
             total = total.saturating_sub(length);
         }
     }
     Ok(())
+}
+
+pub fn prune_package_cache(paths: &Paths, keep: &BTreeSet<String>) -> Result<()> {
+    prune_package_cache_with(paths, keep, RETENTION_DAYS, CACHE_LIMIT_BYTES)
+}
+
+/// Package hashes referenced by the currently cached repository snapshots.
+pub fn cached_package_shas(paths: &Paths) -> Result<BTreeSet<String>> {
+    let mut shas = BTreeSet::new();
+    let entries = match fs::read_dir(&paths.repo_cache) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(shas),
+    };
+    for entry in entries.flatten() {
+        let root = entry.path();
+        let pointer = match fs::read_to_string(root.join("current")) {
+            Ok(pointer) => pointer.trim().to_string(),
+            Err(_) => continue,
+        };
+        if pointer.len() != 64 {
+            continue;
+        }
+        let index_path = root.join("snapshots").join(&pointer).join("index.json");
+        if let Ok(bytes) = fs::read(&index_path) {
+            if let Ok(index) = Index::from_slice(&bytes) {
+                for package in index.packages {
+                    shas.insert(package.sha256);
+                }
+            }
+        }
+    }
+    Ok(shas)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CacheInfo {
+    pub repository_bytes: u64,
+    pub package_bytes: u64,
+    pub part_bytes: u64,
+    pub package_count: usize,
+    pub part_count: usize,
+    pub snapshot_count: usize,
+}
+
+pub fn cache_info(paths: &Paths) -> Result<CacheInfo> {
+    let mut info = CacheInfo::default();
+    if let Ok(entries) = fs::read_dir(&paths.package_cache) {
+        for entry in entries.flatten() {
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".spk.part") {
+                info.part_bytes = info.part_bytes.saturating_add(metadata.len());
+                info.part_count += 1;
+            } else if name.ends_with(".spk") {
+                info.package_bytes = info.package_bytes.saturating_add(metadata.len());
+                info.package_count += 1;
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(&paths.repo_cache) {
+        for entry in entries.flatten() {
+            let root = entry.path();
+            if let Ok(entries) = fs::read_dir(root.join("snapshots")) {
+                for snapshot in entries.flatten() {
+                    info.snapshot_count += 1;
+                    let mut stack = vec![snapshot.path()];
+                    while let Some(path) = stack.pop() {
+                        if path.is_dir() {
+                            if let Ok(entries) = fs::read_dir(&path) {
+                                stack.extend(entries.flatten().map(|entry| entry.path()));
+                            }
+                        } else if let Ok(metadata) = path.metadata() {
+                            info.repository_bytes =
+                                info.repository_bytes.saturating_add(metadata.len());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(info)
 }
 
 pub fn package_cache_keep(repos: &[crate::repo::LoadedRepo]) -> BTreeSet<String> {
