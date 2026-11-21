@@ -56,7 +56,7 @@ pub fn setup_user_stack(
     loaded: &LoadedElf,
     name: &str,
 ) -> Result<u64, &'static str> {
-    setup(space, loaded, name, &[name], &[])
+    setup(space, loaded, name, &[name], &[], false)
 }
 pub fn setup(
     space: &mut UserAddressSpace,
@@ -64,6 +64,7 @@ pub fn setup(
     name: &str,
     argv: &[&str],
     env: &[&str],
+    secure: bool,
 ) -> Result<u64, &'static str> {
     let top = stack_top();
     let base = top - USER_STACK_PAGES as u64 * 4096;
@@ -100,7 +101,7 @@ pub fn setup(
             (14, 0),
             (15, platform),
             (17, 100),
-            (23, 0),
+            (23, u64::from(secure)),
             (31, execfn),
         ];
         let mut random = [0; 16];

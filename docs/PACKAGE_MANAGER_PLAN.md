@@ -611,6 +611,13 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - 站点已加入“SpaceOS 9 软件源”入口（下载页按钮、导航、页脚、首页卡片、介绍页）
   - `index.json`/`.sig` no-cache；`.spk` immutable；Range 206 已验证
 
+- 2026-11-21：P1 发布 `hello 0.2`，`index.json` 同时包含 0.1 / 0.2。
+  - `hello-0.2.0-1-x86_64.spk`：sha256 `d8d8ccf956c5b12e61554a69f6b56588f0167ff3c1f128a16ecaa4fa55524c6d`
+  - `index.json`：sha256 `ac9c15d90cb6b9a0684d02f8aa5a89bca6af794d1e0bf7cea3f9e8e4d0c1488c`
+  - `index.json.sig`：sha256 `c4bfb44c511949dc5511ae490633118af06fa4c6480f6b1acc84bfec7a8987cd`
+  - 线上 `spk-host verify`：hello 0.1.0-1 OK、hello 0.2.0-1 OK、index.json OK
+  - 公钥未变；0.1 保留，支持 downgrade
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
@@ -678,6 +685,7 @@ CI：
 - 复杂依赖图、循环依赖、虚拟包/提供者、hold/pin、部分升级策略、多仓库优先级下的求解。
 - 冲突诊断、求解性能、`--print`/`--json` 事务计划。
 - 验收：复杂图、冲突、循环、hold、多仓库测试全过；求解结果可复现。
+- 实现记录（2026-11-21）：hold/pin 与 held-back 警告、`--override-hold`；多仓库配置（priority、同一仓库多镜像 failover、跨仓库同版本一致性诊断、坏签名 fail-closed）；`--print`/`--json` 确定性事务计划与 JSON 错误；环/虚拟提供者/replaces/文件与 conffile 边界；proptest fuzz（版本、manifest、index、tar 路径）与 120 包链性能测试；`pkgver` 收紧为首尾字母数字，保证 alpm `rpmvercmp` 在合法域内为全序。host 测试 78 项、QEMU 46 步通过：hold 阻止升级→unhold→升级、base+update 多仓库、sudo/doas 全链路。
 
 ### P3 脚本、钩子、触发器
 
@@ -710,7 +718,10 @@ SpaceKernel/
 │   └── spk/                  # 目标端 CLI + 求解/事务/repair/check
 ├── packages/
 │   ├── hello/                # 0.1.0 / 0.2.0
-│   └── spk-tests/            # solver/file-conflict fixtures
+│   ├── sudo/                 # setuid sudo/doas 包
+│   └── spk-tests/            # solver/file-conflict/setuid fixtures
+├── user/sudo/                # sudo/doas（setuid 路线）
+├── docs/SUDO_DOAS_DESIGN.md
 ├── tools/
 │   ├── build_local_repo.sh
 │   └── spk_qemu_test.py
@@ -727,6 +738,9 @@ SpaceKernel/
 - VFS `openat` 尚未实现 `O_NOFOLLOW`，祖先符号链接会被跟随；`spk` 用 lstat 级联解析把写入限制在 `--root` 内，但仍存在 TOCTOU 窗口，待内核补齐后收紧。
 - `statvfs` 没有独立 syscall；`spk` 的磁盘空间检查使用 `statfs`。
 - `copy_file_range`（x86_64 syscall 326）未实现；std 会回退并打印 unimplemented 告警。`spk` 的备份/恢复改用 read/write 复制，目标端不再触发该路径。
+- 已实现（2026-11-21）：内核 setuid/setgid exec（euid/suid、egid/sgid、fsuid/fsgid 重置、`no_new_privs` 与 `MS_NOSUID` 抑制、`AT_SECURE`、dumpable=0、`MS_NOEXEC`/`MS_NOSUID` 挂载标志）。修复 `setgid`/`setregid`/`setresgid`/`setfsgid` 以 egid==0 判断特权、导致 4755 setuid-root sudo（egid 仍为调用者）无法切换主组的问题；按 Linux 语义改为 euid==0。QEMU sudo/doas 全链路（含 `-u` 非 root 目标）通过。
+- OOBE 空密码已支持：DDM 对空字符串生成 `$6$` 哈希并验证；sudo 接受空 shadow 哈希/空密码；首次授权成功提示包含空密码警告；OOBE 界面注明“空密码账户首次 sudo/doas 授权会收到一次性安全提示”。
+- `pkgver` 现要求首尾为字母数字；alpm `rpmvercmp` 对前导/尾随分隔符的字符串不满足传递性（与上游一致），fuzz 在合法 `pkgver` 域验证全序，避免求解器排序出现不一致。
 - 已修复（2026-11-21）：ext4 `extent_truncate()` 释放目录数据块时使用 `metadata=false`，没有写 revoke；掉电后 jbd2 回放会把旧目录块覆盖到复用该块的文件（QEMU 第三阶段复现 `files.json` 指向目录块）。修复为目录数据块按元数据释放并生成 revoke。QEMU 三阶段在阶段 1↔2 不调用 `sync`、强制日志回放：boot 2/3 分别回放 14/98 个事务、6/28 条 revoke，最终阶段 sync 供离线检查，矩阵全部通过。
 - TLS 根证书与离线信任链；`rustls` 在 SpaceOS 上的 ring 后端可用性。
 - FadeHost `/data` 在 redeploy/迁移/备份恢复后的持久性需实测。
@@ -736,6 +750,8 @@ SpaceKernel/
 - `optdepends` 的展示语义尚未定稿；`replaces` 已在 P1 求解器中实现（同事务移除被替换包）。
 
 ## 20. 特权工具：sudo / doas（与 spk 同期）
+
+实现状态（2026-11-21）：采用 setuid 路线。内核 setuid/setgid exec 已落地；`user/sudo` 实现 sudo/doas、sudoers/doas.conf 子集、sha512-crypt/yescrypt、ticket/faillock、10.6 lecture、首次授权提示、审计、sudoedit、环境清理；`packages/sudo` 通过 spk 的 `/etc/spk/setuid.allow` 白名单以 4755 安装。QEMU 全链路（密码、ticket、NOPASSWD、`-u empty`、sudoedit、`-l`、doas、空密码、`-k`）通过。
 
 目标：SpaceOS 提供原生特权提升工具，兼容 sudo 常用用法，同时支持 doas 式极简配置；与 spk 的 setuid 白名单、conffile、包事务集成。
 
@@ -777,6 +793,7 @@ sudo -e file...
 ### 20.6 安全
 
 - setuid 二进制的环境、文件描述符、信号处理；禁止 PATH/LD_* 注入。
+- 首次成功授权输出一次性 notice；空密码账户在同一 notice 中显示安全警告；marker `lectured/<uid>` 与 10.6 lecture 独立，`sudo -k` 不清除。
 - 命令使用绝对路径解析；`secure_path`。
 - 审计记录 user/tty/cwd/command/结果；可选日志后端。
 - 密码不回显；超时清理；Ctrl-C 不泄漏。
@@ -801,6 +818,13 @@ sudo -e file...
 - 与 spk P1/P3 同期：先落地 `sudod`（或 setuid 版本），再做 sudoers/doas 解析、lecture、ticket、审计。
 - 验收：普通用户按规则执行命令；未授权拒绝；审计完整；spk 事务可回滚。
 
+### 20.7 空密码与首次授权
+
+- OOBE/DDM 允许空密码：`hash_password(b"")` 生成 `$6$` 哈希，`verify_password(b"", hash)` 通过；登录与 sudo 共用该语义。
+- shadow 哈希为空（OOBE 空密码）或为 `$6$`/`$5$`/`$y$` 时，sudo 只接受空密码；`!`/`*` 锁定始终拒绝。
+- 首次成功授权（密码或 NOPASSWD 规则）输出“First successful authorization...”一次性提示；空密码账户追加警告；lecture 10.6 仍按 `lecture=once|always|never` 独立控制。
+- 失败计数/锁定与首次授权 marker 分离，避免认证失败被当成“首次成功”。
+
 ## 21. 任务清单
 
 - [x] 定稿 manifest/index/DB schema（第 3、4、6 节）。
@@ -811,11 +835,16 @@ sudo -e file...
 - [x] 实现完整 `upgrade`（求解/替换/回滚）并 QEMU 验证。
 - [x] 实现版本比较与依赖求解器、冲突链输出。
 - [ ] 实现 `.INSTALL`、hooks.d、triggers、脚本沙箱。
-- [ ] 实现多仓库/镜像/签名信任/防降级。
+- [x] 实现多仓库/镜像优先级/故障切换/签名信任。
+- [ ] 实现防降级、密钥轮换/吊销（P4）。
 - [x] 给 `goutoustdio-site` 提 `/spaceos/repo` 路由 PR，部署 `hello` 测试仓库。
 - [ ] 接入 `make packages/repo/image`，ISO 用包构建。
-- [ ] 接入 QEMU 测试矩阵与 CI。
+- [x] 接入 QEMU 三阶段测试矩阵（含 P2 hold/多仓库与 sudo/doas）。
+- [ ] 接入 CI。
 - [ ] 多架构与 R2 备份/大文件后端。
-- [ ] 实现 sudo/doas（认证、ticket、sudoers/doas.conf、lecture、审计）。
-- [ ] spk 支持 setuid 白名单与 sudoers 校验钩子。
-- [ ] sudo 安装/升级/回滚的 QEMU 测试。
+- [x] 实现 sudo/doas（认证、ticket、sudoers/doas.conf、lecture、审计、sudoedit）。
+- [x] spk 支持 setuid 白名单（`/etc/spk/setuid.allow`，root 所有、非组/其他可写）。
+- [ ] sudoers/doas.conf 校验钩子（随 P3 hooks）。
+- [x] sudo setuid 安装/卸载与凭据矩阵的 QEMU 测试。
+- [ ] sudo 包升级/事务回滚的 QEMU 测试（P3）。
+- [x] P2 hold/pin、多仓库、`--print`/`--json`、复杂图/环/provides/replaces、fuzz 与性能测试。

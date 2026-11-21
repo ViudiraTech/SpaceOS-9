@@ -113,6 +113,8 @@ pub struct MountEntry {
     pub mount_point: String,
     pub fs_type: &'static str,
     pub fs: Arc<dyn FileSystem>,
+    /// Linux `MS_*` flags supplied to mount(2).
+    pub flags: u64,
 }
 
 static MOUNTS: SpinLock<Vec<MountEntry>> = SpinLock::new(Vec::new());
@@ -138,8 +140,18 @@ pub fn list_mounts() -> Vec<MountEntry> {
     MOUNTS.lock().clone()
 }
 
-/// Mount a filesystem instance at `mount_point`.
+/// Mount a filesystem instance at `mount_point` with no special flags.
 pub fn mount_fs(device: &str, mount_point: &str, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
+    mount_fs_flags(device, mount_point, fs, 0)
+}
+
+/// Mount a filesystem instance at `mount_point` with Linux `MS_*` flags.
+pub fn mount_fs_flags(
+    device: &str,
+    mount_point: &str,
+    fs: Arc<dyn FileSystem>,
+    flags: u64,
+) -> Result<(), VfsError> {
     let mp = normalize_path("/", mount_point);
     let mut mounts = MOUNTS.lock();
     if let Some(existing) = mounts.iter_mut().find(|m| m.mount_point == mp) {
@@ -147,6 +159,7 @@ pub fn mount_fs(device: &str, mount_point: &str, fs: Arc<dyn FileSystem>) -> Res
         existing.device = String::from(device);
         existing.fs_type = fs.fs_type();
         existing.fs = fs;
+        existing.flags = flags;
         return Ok(());
     }
     mounts.push(MountEntry {
@@ -155,6 +168,7 @@ pub fn mount_fs(device: &str, mount_point: &str, fs: Arc<dyn FileSystem>) -> Res
         mount_point: mp,
         fs_type: fs.fs_type(),
         fs,
+        flags,
     });
     // Sort by descending mount_point length so longest prefix always matches first
     mounts.sort_by(|a, b| b.mount_point.len().cmp(&a.mount_point.len()));
@@ -163,6 +177,15 @@ pub fn mount_fs(device: &str, mount_point: &str, fs: Arc<dyn FileSystem>) -> Res
 
 /// Mount by filesystem type name (`ramfs`, `devfs`, `proc`, `vfat` / `fat32`).
 pub fn mount_by_type(source: &str, target: &str, fstype: &str) -> Result<(), VfsError> {
+    mount_by_type_flags(source, target, fstype, 0)
+}
+
+pub fn mount_by_type_flags(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: u64,
+) -> Result<(), VfsError> {
     let mp = normalize_path("/", target);
     if mp != "/" {
         let _ = mkdir_abs(&mp, 0o755);
@@ -185,7 +208,7 @@ pub fn mount_by_type(source: &str, target: &str, fstype: &str) -> Result<(), Vfs
         }
         _ => return Err(VfsError::NotSupported),
     };
-    mount_fs(source, &mp, fs)
+    mount_fs_flags(source, &mp, fs, flags)
 }
 
 /// Unmount a filesystem mounted at `target`.

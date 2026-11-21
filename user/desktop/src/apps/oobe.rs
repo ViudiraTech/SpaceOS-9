@@ -1214,7 +1214,7 @@ impl Oobe {
         );
         self.screen.text.draw(
             &mut self.screen.canvas,
-            "密码使用 SHA-512 crypt 哈希保存，DDM 不会以明文记录密码。",
+            "密码使用 SHA-512 crypt 哈希保存；空密码账户首次 sudo/doas 授权会收到一次性安全提示。",
             layout.content_x as f32,
             (layout.card.y + 486) as f32,
             10.0,

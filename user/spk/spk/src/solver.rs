@@ -210,11 +210,20 @@ pub struct Action {
 }
 
 #[derive(Clone, Debug)]
+pub struct HeldBack {
+    pub name: String,
+    pub installed: Version,
+    pub available: Version,
+}
+
+#[derive(Clone, Debug)]
 pub struct Solution {
     pub assignment: BTreeMap<String, Candidate>,
     pub actions: Vec<Action>,
     pub removals: Vec<InstalledPackage>,
     pub explicit: BTreeSet<String>,
+    pub held_back: Vec<HeldBack>,
+    pub cleared_holds: BTreeSet<String>,
 }
 
 impl Solution {
@@ -238,6 +247,10 @@ struct Solver<'a> {
     steps: u64,
     path: BTreeSet<String>,
     lang: Lang,
+    holds: BTreeMap<String, Version>,
+    override_hold: bool,
+    override_names: BTreeSet<String>,
+    held_back: Vec<HeldBack>,
     _repos: &'a [LoadedRepo],
 }
 
@@ -246,15 +259,21 @@ pub fn solve(
     repos: &[LoadedRepo],
     operation: Operation,
     lang: Lang,
+    override_hold: bool,
 ) -> Result<Solution> {
     let request = operation.into_request();
-    let mut solver = Solver::new(state, repos, lang)?;
+    let mut solver = Solver::new(state, repos, lang, override_hold)?;
     solver.plan(&request)?;
     solver.finish()
 }
 
 impl<'a> Solver<'a> {
-    fn new(state: &'a State, repos: &'a [LoadedRepo], lang: Lang) -> Result<Self> {
+    fn new(
+        state: &'a State,
+        repos: &'a [LoadedRepo],
+        lang: Lang,
+        override_hold: bool,
+    ) -> Result<Self> {
         let mut by_name: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
         let mut installed = BTreeMap::new();
         for package in state.installed.packages.values() {
@@ -288,6 +307,22 @@ impl<'a> Solver<'a> {
                     .then_with(|| origin_rank(&a.origin).cmp(&origin_rank(&b.origin)))
             });
         }
+        let mut holds = BTreeMap::new();
+        for (name, held) in &state.holds.packages {
+            let held = held.version();
+            let Some(package) = installed.get(name) else {
+                return Err(SpkError::General(format!(
+                    "held package '{name}' is not installed"
+                )));
+            };
+            let current = Version::new(package.epoch, package.version.clone(), package.release);
+            if current != held {
+                return Err(SpkError::General(format!(
+                    "held package '{name}' is at {held}, installed version is {current}; run spk check or repair"
+                )));
+            }
+            holds.insert(name.clone(), held);
+        }
         Ok(Self {
             by_name,
             assignment: BTreeMap::new(),
@@ -296,11 +331,28 @@ impl<'a> Solver<'a> {
             steps: 0,
             path: BTreeSet::new(),
             lang,
+            holds,
+            override_hold,
+            override_names: BTreeSet::new(),
+            held_back: Vec::new(),
             _repos: repos,
         })
     }
 
     fn plan(&mut self, request: &Request) -> Result<()> {
+        self.override_names = if self.override_hold {
+            match request {
+                Request::Install { specs, .. } => {
+                    specs.iter().map(|spec| spec.name.clone()).collect()
+                }
+                Request::UpgradeAll => self.holds.keys().cloned().collect(),
+                Request::UpgradeSome(names) => names.iter().cloned().collect(),
+                Request::Downgrade(specs) => specs.iter().map(|spec| spec.name.clone()).collect(),
+                Request::Reinstall(names) => names.iter().cloned().collect(),
+            }
+        } else {
+            BTreeSet::new()
+        };
         match request {
             Request::Install { specs, needed } => self.plan_install(specs, *needed)?,
             Request::UpgradeAll => self.plan_upgrade(None)?,
@@ -360,6 +412,15 @@ impl<'a> Solver<'a> {
                     )));
                 }
             };
+            if let Some(held) = self.holds.get(&spec.name) {
+                if !self.override_names.contains(&spec.name) && candidate.version != *held {
+                    return Err(self.failure(Failure::Held {
+                        name: spec.name.clone(),
+                        held: held.to_string(),
+                        attempted: candidate.version.to_string(),
+                    }));
+                }
+            }
             self.pin(&spec.name, &candidate, kind)?;
         }
         self.seed_assignment()
@@ -384,6 +445,20 @@ impl<'a> Solver<'a> {
                 installed.version.clone(),
                 installed.release,
             );
+            if let Some(held) = self.holds.get(&name) {
+                if !self.override_names.contains(&name) {
+                    if let Some(candidate) = self.newest_repo_candidate(&name) {
+                        if candidate.version > *held {
+                            self.held_back.push(HeldBack {
+                                name: name.clone(),
+                                installed: installed_version,
+                                available: candidate.version,
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
             if let Some(candidate) = self.newest_repo_candidate(&name) {
                 if candidate.version > installed_version {
                     self.pin(&name, &candidate, TargetKind::Upgrade)?;
@@ -418,6 +493,15 @@ impl<'a> Solver<'a> {
                     "{} {} is not older than the installed {}",
                     spec.name, candidate.version, installed_version
                 )));
+            }
+            if let Some(held) = self.holds.get(&spec.name) {
+                if !self.override_names.contains(&spec.name) && candidate.version != *held {
+                    return Err(self.failure(Failure::Held {
+                        name: spec.name.clone(),
+                        held: held.to_string(),
+                        attempted: candidate.version.to_string(),
+                    }));
+                }
             }
             self.pin(&spec.name, &candidate, TargetKind::Downgrade)?;
         }
@@ -520,6 +604,15 @@ impl<'a> Solver<'a> {
     }
 
     fn try_assign(&mut self, candidate: Candidate) -> Result<()> {
+        if let Some(held) = self.holds.get(&candidate.name) {
+            if !self.override_names.contains(&candidate.name) && candidate.version != *held {
+                return Err(self.failure(Failure::Held {
+                    name: candidate.name.clone(),
+                    held: held.to_string(),
+                    attempted: candidate.version.to_string(),
+                }));
+            }
+        }
         if let Some(pinned) = self.pinned.get(&candidate.name) {
             if pinned.version != candidate.version {
                 return Err(self.failure(Failure::Pinned(candidate.name.clone())));
@@ -764,6 +857,14 @@ impl<'a> Solver<'a> {
                 message: i18n::solver_header_dependencies(self.lang).to_string(),
                 lines: vec![i18n::target_requires(self.lang, &name, &name)],
             },
+            Failure::Held {
+                name,
+                held,
+                attempted,
+            } => SpkError::Dependency {
+                message: i18n::solver_header_dependencies(self.lang).to_string(),
+                lines: vec![i18n::solver_held(self.lang, &name, &held, &attempted)],
+            },
             Failure::Budget => SpkError::Dependency {
                 message: i18n::solver_header_dependencies(self.lang).to_string(),
                 lines: vec![i18n::solver_budget(self.lang).to_string()],
@@ -828,11 +929,18 @@ impl<'a> Solver<'a> {
         }
         order_actions(&mut actions, &self.assignment);
         let explicit = self.pinned.keys().cloned().collect();
+        let cleared_holds = self
+            .override_names
+            .intersection(&self.holds.keys().cloned().collect())
+            .cloned()
+            .collect();
         Ok(Solution {
             assignment: self.assignment,
             actions,
             removals,
             explicit,
+            held_back: self.held_back,
+            cleared_holds,
         })
     }
 
@@ -887,6 +995,11 @@ enum Failure {
         bv: String,
     },
     Pinned(String),
+    Held {
+        name: String,
+        held: String,
+        attempted: String,
+    },
     Budget,
 }
 
@@ -999,6 +1112,8 @@ mod tests {
             key_id: index.key_id.clone(),
             dir: std::path::PathBuf::from("/repo"),
             index,
+            priority: 0,
+            order: 0,
         }
     }
 
@@ -1008,6 +1123,7 @@ mod tests {
             files: FileDb::default(),
             world: WorldDb::default(),
             repos: ReposDb::default(),
+            holds: Default::default(),
         }
     }
 
@@ -1042,6 +1158,7 @@ depends = {depends:?}
                 needed: false,
             },
             Lang::En,
+            false,
         )
         .unwrap();
         assert_eq!(solution.actions.len(), 2);
@@ -1061,6 +1178,7 @@ depends = {depends:?}
                 needed: false,
             },
             Lang::En,
+            false,
         )
         .unwrap_err();
         assert_eq!(error.exit_code(), 4);
@@ -1082,6 +1200,7 @@ depends = {depends:?}
                 needed: false,
             },
             Lang::En,
+            false,
         )
         .unwrap_err();
         let text = format!("{:?}", error);
@@ -1103,6 +1222,7 @@ depends = {depends:?}
                 needed: false,
             },
             Lang::En,
+            false,
         )
         .unwrap();
         assert!(solution.assignment.contains_key("provider"));
@@ -1147,6 +1267,7 @@ depends = {depends:?}
                 needed: false,
             },
             Lang::En,
+            false,
         )
         .unwrap();
         assert_eq!(solution.removals.len(), 1);
@@ -1169,6 +1290,7 @@ depends = {depends:?}
                 needed: false,
             },
             Lang::En,
+            false,
         )
         .unwrap();
         assert_eq!(solution.actions.len(), 2);
@@ -1201,7 +1323,7 @@ depends = {depends:?}
             package("hello", "0.1.0", &[], &[]),
             package("hello", "0.2.0", &[], &[]),
         ])];
-        let solution = solve(&state, &repos, Operation::UpgradeAll, Lang::En).unwrap();
+        let solution = solve(&state, &repos, Operation::UpgradeAll, Lang::En, false).unwrap();
         assert_eq!(solution.actions.len(), 1);
         assert_eq!(solution.actions[0].kind, TargetKind::Upgrade);
         assert_eq!(solution.actions[0].to.version.to_string(), "0.2.0-1");
@@ -1212,6 +1334,7 @@ depends = {depends:?}
             &repos,
             Operation::Downgrade(vec![parse_spec("hello=0.1.0-1").unwrap()]),
             Lang::En,
+            false,
         )
         .unwrap();
         assert_eq!(solution.actions.len(), 1);

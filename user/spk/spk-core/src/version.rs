@@ -108,6 +108,22 @@ pub fn validate_pkgver(version: &str) -> Result<()> {
             "package version contains invalid characters: {version}"
         )));
     }
+    // libalpm's rpmvercmp is only a total order on well-formed versions;
+    // leading/trailing separators can make its separator-length rule
+    // non-transitive. Keep the accepted schema inside that domain.
+    if !version
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric())
+        || !version
+            .bytes()
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+    {
+        return Err(Error::Version(format!(
+            "package version must start and end with an alphanumeric character: {version}"
+        )));
+    }
     Ok(())
 }
 
@@ -242,8 +258,6 @@ mod tests {
             ("1.001", "1.1", Ordering::Equal),
             ("1.01", "1.1", Ordering::Equal),
             ("1..0", "1.0", Ordering::Greater),
-            ("1.0.", "1.0", Ordering::Greater),
-            ("1.0", "1.0.", Ordering::Less),
             ("1.0+git1", "1.0", Ordering::Greater),
             ("1:0.1", "9.9", Ordering::Greater),
             ("1.0-1", "1.0-2", Ordering::Less),
@@ -262,6 +276,15 @@ mod tests {
     }
 
     #[test]
+    fn rpmvercmp_raw_separator_cases() {
+        assert_eq!(rpmvercmp("1.0.", "1.0"), Ordering::Greater);
+        assert_eq!(rpmvercmp("1.0", "1.0."), Ordering::Less);
+        assert_eq!(rpmvercmp("+a", "_"), Ordering::Less);
+        assert_eq!(rpmvercmp("_", "0"), Ordering::Less);
+        assert_eq!(rpmvercmp("+a", "0"), Ordering::Greater);
+    }
+
+    #[test]
     fn display_roundtrip() {
         assert_eq!(v("1.2.3-1").to_string(), "1.2.3-1");
         assert_eq!(v("2:1.2.3-4").to_string(), "2:1.2.3-4");
@@ -270,7 +293,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_versions() {
-        for bad in ["", "1.0-", "-1", "1.0-abc", "1.0 2", "1.0/2", "1.0-1-2"] {
+        for bad in [
+            "", "1.0-", "-1", "1.0-abc", "1.0 2", "1.0/2", "1.0-1-2", "+1.0", "1.0.", "1..", "_1",
+        ] {
             assert!(Version::parse(bad).is_err(), "should reject {bad:?}");
         }
     }

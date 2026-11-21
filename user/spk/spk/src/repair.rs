@@ -249,7 +249,10 @@ fn restore_database(paths: &Paths, events: &[Event]) -> Result<()> {
             .logical
             .strip_prefix("/var/lib/spk/")
             .ok_or_else(|| SpkError::General(format!("invalid DB path '{}'", backup.logical)))?;
-        if !matches!(name, "installed.json" | "files.json" | "world.json") {
+        if !matches!(
+            name,
+            "installed.json" | "files.json" | "world.json" | "holds.json"
+        ) {
             return Err(SpkError::General(format!(
                 "invalid DB backup name '{name}'"
             )));

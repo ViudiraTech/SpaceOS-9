@@ -239,7 +239,12 @@ fn dispatch_inner(
         }
         SYS_STATFS => sys_statfs(arg0 as *const u8, arg1 as *mut LinuxStatFs),
         SYS_FSTATFS => sys_fstatfs(arg0 as i32, arg1 as *mut LinuxStatFs),
-        SYS_MOUNT => sys_mount(arg0 as *const u8, arg1 as *const u8, arg2 as *const u8),
+        SYS_MOUNT => sys_mount(
+            arg0 as *const u8,
+            arg1 as *const u8,
+            arg2 as *const u8,
+            arg3,
+        ),
         SYS_UMOUNT2 => sys_umount2(arg0 as *const u8, arg1 as u32),
 
         // Legacy x86_64 non-*at syscalls
@@ -1661,7 +1666,12 @@ fn sys_fstatfs(fd: i32, buf_ptr: *mut LinuxStatFs) -> i64 {
     }
 }
 
-fn sys_mount(source_ptr: *const u8, target_ptr: *const u8, fstype_ptr: *const u8) -> i64 {
+fn sys_mount(
+    source_ptr: *const u8,
+    target_ptr: *const u8,
+    fstype_ptr: *const u8,
+    flags: u64,
+) -> i64 {
     let source = if source_ptr.is_null() {
         String::from("none")
     } else {
@@ -1678,7 +1688,7 @@ fn sys_mount(source_ptr: *const u8, target_ptr: *const u8, fstype_ptr: *const u8
         Ok(s) => s,
         Err(e) => return e.to_errno(),
     };
-    match vfs::mount_by_type(&source, &target, &fstype) {
+    match vfs::mount_by_type_flags(&source, &target, &fstype, flags) {
         Ok(()) => 0,
         Err(e) => e.to_errno(),
     }

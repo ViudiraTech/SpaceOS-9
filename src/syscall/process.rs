@@ -32,6 +32,39 @@ fn strings(pointer: u64) -> Result<Vec<String>, VfsError> {
     }
     Err(VfsError::NoSpace)
 }
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
+const MS_NOSUID: u64 = 2;
+const MS_NOEXEC: u64 = 8;
+
+/// Apply Linux set-user-ID / set-group-ID exec semantics. The real IDs stay
+/// unchanged; effective and saved IDs take the file owner's IDs for the bits
+/// present. `no_new_privs` and a `nosuid` mount suppress both bits.
+fn exec_credentials(
+    mut creds: sched::Credentials,
+    meta: &vfs::Stat,
+    no_new_privs: bool,
+    nosuid: bool,
+) -> (sched::Credentials, bool) {
+    let old_euid = creds.euid;
+    let old_egid = creds.egid;
+    if !no_new_privs && !nosuid {
+        if meta.mode & S_ISUID != 0 {
+            creds.euid = meta.uid;
+            creds.suid = meta.uid;
+        }
+        if meta.mode & S_ISGID != 0 {
+            creds.egid = meta.gid;
+            creds.sgid = meta.gid;
+        }
+    }
+    // execve resets the filesystem IDs to the effective IDs.
+    creds.fsuid = creds.euid;
+    creds.fsgid = creds.egid;
+    let secure = creds.euid != old_euid || creds.egid != old_egid;
+    (creds, secure)
+}
+
 pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
     let prepared = (|| -> Result<_, VfsError> {
         let path = uaccess::string(path, 4096)?;
@@ -45,11 +78,23 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
         let argv = strings(argv)?;
         let env = strings(envp)?;
         let resolved = crate::user::exec::resolve(&path, &argv)?;
+        let task = sched::current().ok_or(VfsError::InvalidArgument)?;
+        let (original_mount, _) = vfs::find_mount(&path)?;
+        let (exec_mount, _) = vfs::find_mount(&resolved.exec_path)?;
+        if original_mount.flags & MS_NOEXEC != 0 || exec_mount.flags & MS_NOEXEC != 0 {
+            return Err(VfsError::PermissionDenied);
+        }
+        let (new_creds, secure) = exec_credentials(
+            task.credentials(),
+            &resolved.meta,
+            task.no_new_privs(),
+            exec_mount.flags & MS_NOSUID != 0,
+        );
         let mut space = UserAddressSpace::new().map_err(|_| VfsError::NoMemory)?;
         let loaded = elf::load_elf(&mut space, &resolved.data).map_err(|_| VfsError::ExecFormat)?;
         let args: Vec<_> = resolved.argv.iter().map(|s| s.as_str()).collect();
         let environment: Vec<_> = env.iter().map(|s| s.as_str()).collect();
-        let sp = stack::setup(&mut space, &loaded, &path, &args, &environment)
+        let sp = stack::setup(&mut space, &loaded, &path, &args, &environment, secure)
             .map_err(|_| VfsError::NoSpace)?;
         Ok((
             Arc::new(Mutex::new(space)),
@@ -57,9 +102,11 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
             sp,
             loaded.tls_tp,
             path,
+            new_creds,
+            secure,
         ))
     })();
-    let (space, pc, sp, tls_tp, path) = match prepared {
+    let (space, pc, sp, tls_tp, path, new_creds, secure) = match prepared {
         Ok(p) => p,
         Err(e) => return e.to_errno(),
     };
@@ -72,6 +119,12 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
     // No fallible operation remains after descriptor/image publication.
     if let Err(error) = crate::signal::prepare_exec(&task) {
         return error.to_errno();
+    }
+    if new_creds != task.credentials() {
+        task.set_credentials(new_creds);
+    }
+    if secure {
+        task.lock().dumpable = false;
     }
     if task.files_shared() {
         let replacement = Arc::new(SpinLock::new(task.files().lock().clone()));

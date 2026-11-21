@@ -8,7 +8,8 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -52,6 +53,30 @@ fn run() -> Result<(), String> {
 }
 
 fn phase_install() -> Result<(), String> {
+    // Kernel setuid/setgid exec: the probe is root-owned mode 6755, and the
+    // child starts as uid/gid 1000.
+    let probe = Command::new("/usr/bin/setuid-probe")
+        .uid(1000)
+        .gid(1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run setuid-probe: {error}"))?;
+    expect_ok("setuid probe", &probe)?;
+    expect_contains("setuid probe", &probe, "UID=1000")?;
+    expect_contains("setuid probe", &probe, "EUID=0")?;
+    expect_contains("setuid probe", &probe, "EGID=0")?;
+    print_output("setuid probe", &probe);
+
+    let plain = Command::new("/usr/bin/nosetuid-probe")
+        .uid(1000)
+        .gid(1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run nosetuid-probe: {error}"))?;
+    expect_ok("nosuid probe", &plain)?;
+    expect_contains("nosuid probe", &plain, "EUID=1000")?;
+    expect_contains("nosuid probe", &plain, "EGID=1000")?;
+
     let output = spk_zh(&[
         "install",
         "--repo",
@@ -98,6 +123,38 @@ fn phase_install() -> Result<(), String> {
     expect_ok("install --needed", &output)?;
     expect_contains("install --needed", &output, "今日无事可做")?;
 
+    let hold = spk_zh(&["hold", "hello"])?;
+    expect_ok("hold hello", &hold)?;
+    expect_contains("hold hello", &hold, "0.1.0-1")?;
+    let hold_list = spk(&["hold"])?;
+    expect_contains("hold list", &hold_list, "hello 0.1.0-1")?;
+    expect_ok("check after hold", &spk(&["check"])?)?;
+
+    // sudo is installed by spk as a setuid package; the whitelist lives in
+    // /etc/spk/setuid.allow on the rootfs.
+    let output = spk_zh(&["install", "--repo", "/repo/base", "--noconfirm", "sudo"])?;
+    expect_ok("install sudo", &output)?;
+    expect_contains("install sudo", &output, "正在安装 sudo")?;
+    let mode = fs::metadata("/usr/bin/sudo")
+        .map_err(|error| format!("sudo is missing: {error}"))?
+        .permissions()
+        .mode();
+    if mode & 0o4000 == 0 {
+        return Err(format!("/usr/bin/sudo is not setuid (mode {mode:04o})"));
+    }
+    expect_ok("check after sudo", &spk(&["check"])?)?;
+
+    run_sudo_tests()?;
+
+    // Exercise setuid package removal before the reboot matrix continues.
+    let output = spk_zh(&["remove", "--noconfirm", "sudo"])?;
+    expect_ok("remove sudo", &output)?;
+    expect_contains("remove sudo", &output, "正在删除 sudo")?;
+    if fs::metadata("/usr/bin/sudo").is_ok() {
+        return Err("remove sudo left /usr/bin/sudo behind".into());
+    }
+    expect_ok("check after remove sudo", &spk(&["check"])?)?;
+
     set_phase("1")?;
     finish_phase("SPK_QEMU_REBOOT 1");
     Ok(())
@@ -108,7 +165,36 @@ fn phase_upgrade_and_repair() -> Result<(), String> {
     let list = spk(&["list"])?;
     expect_contains("list after reboot", &list, "hello 0.1.0-1")?;
 
-    let output = spk_zh(&["upgrade", "--repo", "/repo/update", "--noconfirm"])?;
+    let held = spk_zh(&[
+        "upgrade",
+        "--repo",
+        "/repo/base",
+        "--repo",
+        "/repo/update",
+        "--noconfirm",
+    ])?;
+    expect_ok("held upgrade", &held)?;
+    expect_contains("held upgrade", &held, "被锁定")?;
+    expect_contains("held upgrade", &held, "0.1.0-1")?;
+    print_output("held upgrade", &held);
+    let list = spk(&["list"])?;
+    expect_contains("list after held upgrade", &list, "hello 0.1.0-1")?;
+    expect_ok("check after held upgrade", &spk(&["check"])?)?;
+
+    let unhold = spk_zh(&["unhold", "hello"])?;
+    expect_ok("unhold hello", &unhold)?;
+    if !text(&spk(&["hold"])?).trim().is_empty() {
+        return Err("unhold left a hold behind".into());
+    }
+
+    let output = spk_zh(&[
+        "upgrade",
+        "--repo",
+        "/repo/base",
+        "--repo",
+        "/repo/update",
+        "--noconfirm",
+    ])?;
     expect_ok("upgrade", &output)?;
     expect_contains("upgrade", &output, "正在升级 hello")?;
     print_output("upgrade to 0.2", &output);
@@ -264,6 +350,154 @@ fn phase_conflicts_and_cleanup() -> Result<(), String> {
     Ok(())
 }
 
+fn expect_code(label: &str, output: &Output, code: i32) -> Result<(), String> {
+    if output.status.code() == Some(code) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} exited with {:?}, expected {code}\n{}",
+            output.status,
+            text(output)
+        ))
+    }
+}
+
+fn sudo_command(args: &[&str], uid: u32) -> Command {
+    let mut command = Command::new("/usr/bin/sudo");
+    command
+        .args(args)
+        .uid(uid)
+        .gid(uid)
+        .env("LANG", "en")
+        .env("TERM", "dumb");
+    command
+}
+
+fn sudo_password(args: &[&str], uid: u32, password: &[u8]) -> Result<Output, String> {
+    let mut child = sudo_command(args, uid)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot run sudo {}: {error}", args.join(" ")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(password)
+            .map_err(|error| format!("cannot write sudo password: {error}"))?;
+    }
+    child
+        .wait_with_output()
+        .map_err(|error| format!("sudo wait failed: {error}"))
+}
+
+fn run_sudo_tests() -> Result<(), String> {
+    // First authorization: password rule, first-auth notice, SHA-512 auth.
+    let output = sudo_password(
+        &["-S", "-u", "root", "/usr/bin/sudo-probe-pw"],
+        1000,
+        b"testpass\n",
+    )?;
+    expect_ok("sudo password auth", &output)?;
+    expect_contains("sudo password auth", &output, "UID=0 EUID=0")?;
+    expect_contains(
+        "sudo password auth",
+        &output,
+        "First successful authorization",
+    )?;
+    print_output("sudo password auth", &output);
+
+    // Ticket is global in the test sudoers; no TTY is required.
+    let output = sudo_command(&["-n", "-u", "root", "/usr/bin/sudo-probe-pw"], 1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run sudo ticket: {error}"))?;
+    expect_ok("sudo ticket", &output)?;
+    expect_contains("sudo ticket", &output, "UID=0 EUID=0")?;
+
+    // Target a non-root user: exercises setgroups/setgid/setuid order.
+    let output = sudo_command(&["-n", "-u", "empty", "/usr/bin/sudo-probe"], 1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run sudo -u empty: {error}"))?;
+    expect_ok("sudo -u empty", &output)?;
+    expect_contains("sudo -u empty", &output, "UID=1001")?;
+    expect_contains("sudo -u empty", &output, "EUID=1001")?;
+    expect_contains("sudo -u empty", &output, "GID=1001")?;
+    expect_contains("sudo -u empty", &output, "EGID=1001")?;
+
+    // NOPASSWD rule.
+    let output = sudo_command(&["-n", "-u", "root", "/usr/bin/sudo-probe"], 1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run sudo nopass: {error}"))?;
+    expect_ok("sudo nopass", &output)?;
+    expect_contains("sudo nopass", &output, "UID=0 EUID=0")?;
+
+    // sudoedit keeps a valid ticket and runs the editor as the invoking user.
+    let output = sudo_command(&["-n", "-e", "/etc/test-edit"], 1000)
+        .env("SUDO_EDITOR", "/usr/bin/sudo-edit-probe")
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run sudoedit: {error}"))?;
+    expect_ok("sudoedit", &output)?;
+    let edited = fs::read_to_string("/etc/test-edit").map_err(|error| error.to_string())?;
+    if !edited.contains("edited") {
+        return Err(format!(
+            "sudoedit did not update /etc/test-edit: {edited:?}"
+        ));
+    }
+
+    // sudo -l and a denied command.
+    let output = sudo_command(&["-l"], 1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run sudo -l: {error}"))?;
+    expect_ok("sudo -l", &output)?;
+    expect_contains("sudo -l", &output, "NOPASSWD")?;
+    let output = sudo_command(&["-n", "-u", "root", "/usr/bin/nosetuid-probe"], 1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run denied sudo: {error}"))?;
+    expect_code("denied sudo", &output, 1)?;
+
+    // doas uses doas.conf and has no ticket.
+    let output = Command::new("/usr/bin/doas")
+        .args(["-u", "root", "/usr/bin/sudo-probe"])
+        .uid(1000)
+        .gid(1000)
+        .env("LANG", "en")
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run doas: {error}"))?;
+    expect_ok("doas", &output)?;
+    expect_contains("doas", &output, "UID=0 EUID=0")?;
+
+    // OOBE-style empty password: the empty shadow field accepts an empty
+    // password and the first-auth notice carries the security warning.
+    let output = sudo_password(&["-S", "-u", "root", "/usr/bin/sudo-probe-pw"], 1001, b"\n")?;
+    expect_ok("empty password sudo", &output)?;
+    expect_contains("empty password sudo", &output, "UID=0 EUID=0")?;
+    expect_contains("empty password sudo", &output, "empty password")?;
+
+    // Clearing the ticket forces a password; non-interactive must fail.
+    let output = sudo_command(&["-k"], 1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run sudo -k: {error}"))?;
+    expect_ok("sudo -k", &output)?;
+    let output = sudo_command(&["-n", "-u", "root", "/usr/bin/sudo-probe-pw"], 1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run sudo after -k: {error}"))?;
+    expect_code("sudo after -k", &output, 1)?;
+
+    let audit = fs::read_to_string("/var/log/sudo.log").map_err(|error| error.to_string())?;
+    if !audit.contains("result=executed") || !audit.contains("sudoedit-changed") {
+        return Err(format!("sudo audit log is incomplete:\n{audit}"));
+    }
+    Ok(())
+}
+
 fn spk(args: &[&str]) -> Result<Output, String> {
     spk_env(args, &[])
 }
@@ -347,7 +581,8 @@ fn set_phase(phase: &str) -> Result<(), String> {
 }
 
 fn fail(message: &str) {
-    println!("SPK_QEMU_FAIL {message}");
+    println!("{message}");
+    println!("SPK_QEMU_FAIL");
     io::stdout().flush().ok();
     loop {
         thread::sleep(Duration::from_secs(3600));

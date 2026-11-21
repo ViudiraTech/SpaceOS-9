@@ -30,15 +30,20 @@ pub struct ResolvedExec {
     pub argv: Vec<String>,
     /// Script path as supplied to execve, used for comm and AT_EXECFN.
     pub path: String,
+    /// Metadata of the ELF image that actually runs (the final interpreter
+    /// for scripts). Setuid/setgid bits are taken from this file.
+    pub meta: vfs::Stat,
+    /// Absolute path of that final ELF image, used for mount flag checks.
+    pub exec_path: String,
 }
 
-fn check_executable(path: &str) -> Result<(), VfsError> {
-    let (inode, _) = vfs::lookup_abs(path, true)?;
+fn check_executable(path: &str) -> Result<(vfs::Stat, String), VfsError> {
+    let (inode, resolved) = vfs::lookup_abs(path, true)?;
     let meta = inode.metadata()?;
     if meta.kind != vfs::InodeKind::Regular || meta.mode & 0o111 == 0 {
         return Err(VfsError::PermissionDenied);
     }
-    Ok(())
+    Ok((meta, resolved))
 }
 
 fn shebang_fields(data: &[u8]) -> Option<(String, Option<String>)> {
@@ -82,13 +87,15 @@ fn shebang_fields(data: &[u8]) -> Option<(String, Option<String>)> {
 }
 
 fn resolve_inner(path: &str, argv: &[String], depth: u32) -> Result<ResolvedExec, VfsError> {
-    check_executable(path)?;
+    let (meta, exec_path) = check_executable(path)?;
     let data = vfs::read_file(path)?;
     let Some((interpreter, argument)) = shebang_fields(&data) else {
         return Ok(ResolvedExec {
             data,
             argv: argv.to_vec(),
             path: path.to_string(),
+            meta,
+            exec_path,
         });
     };
     if depth == 0 {
