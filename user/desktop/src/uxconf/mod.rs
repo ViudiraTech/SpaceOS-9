@@ -1181,8 +1181,19 @@ impl DesktopConfig {
         match (channel, property) {
             ("appearance", "/theme/id") => {
                 if let Some(s) = value.as_str() {
-                    let parsed = ThemePreset::parse(s);
-                    self.theme_id = parsed.id().to_string();
+                    let lower = s.trim().to_ascii_lowercase();
+                    if matches!(
+                        lower.as_str(),
+                        "vortexglass" | "spui" | "spui-4" | "spui4" | "win98" | "windows98"
+                    ) {
+                        let parsed = ThemePreset::parse(&lower);
+                        self.theme_id = parsed.id().to_string();
+                        self.theme_style = parsed.style();
+                    } else {
+                        // External theme packs keep their own id; the loader
+                        // resolves /usr/share/spui/themes/<id>/theme.toml.
+                        self.theme_id = lower;
+                    }
                 }
             }
             ("appearance", "/theme/style") => {

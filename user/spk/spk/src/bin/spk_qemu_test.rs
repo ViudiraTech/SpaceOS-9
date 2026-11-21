@@ -957,6 +957,15 @@ fn run_sudo_tests() -> Result<(), String> {
     expect_ok("sudo ticket", &output)?;
     expect_contains("sudo ticket", &output, "UID=0 EUID=0")?;
 
+    // BusyBox dispatches /bin/su from argv[0]; sudo must not rewrite it to
+    // bbsuid when canonicalizing the symlink.
+    let output = sudo_command(&["-n", "su", "-c", "id"], 1000)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run sudo su: {error}"))?;
+    expect_ok("sudo su", &output)?;
+    expect_contains("sudo su", &output, "uid=0")?;
+
     // Target a non-root user: exercises setgroups/setgid/setuid order.
     let output = sudo_command(&["-n", "-u", "empty", "/usr/bin/sudo-probe"], 1000)
         .stdin(Stdio::inherit())

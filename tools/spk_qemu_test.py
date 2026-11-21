@@ -384,6 +384,14 @@ def build_rootfs(key_id: str, http_base: str) -> None:
     (stage / "bin" / "busybox").chmod(0o755)
     shutil.copy2(busybox, stage / "bin" / "sh")
     (stage / "bin" / "sh").chmod(0o755)
+    # Setuid BusyBox applet, mirroring the desktop rootfs.  sudo must preserve
+    # argv[0]="su" instead of canonicalizing the symlink to "bbsuid".
+    shutil.copy2(busybox, stage / "bin" / "bbsuid")
+    (stage / "bin" / "bbsuid").chmod(0o4755)
+    su = stage / "bin" / "su"
+    if su.exists() or su.is_symlink():
+        su.unlink()
+    su.symlink_to("bbsuid")
     loader = next(
         (
             candidate

@@ -1,0 +1,29 @@
+#
+#       packages/theme-winxp/manifest.toml
+#       Windows XP Luna-inspired SPUI theme
+#
+#       2026/11/21 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "theme-winxp"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "Windows XP Luna-inspired SPUI theme"
+description = "Original XP-inspired SPUI theme with Luna-blue chrome, silver controls and a generated landscape wallpaper; no Microsoft assets."
+license = "CC-BY-4.0"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = ["spui-theme"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false
