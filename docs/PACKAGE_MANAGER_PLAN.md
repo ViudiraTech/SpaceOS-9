@@ -641,6 +641,14 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - license：`LicenseRef-Proprietary AND GPL-2.0-only AND MIT AND MPL-2.0`；包内新增 `/usr/share/doc/base/THIRD_PARTY_NOTICES.md`
   - 旧 `base-1.0.0-1` 已从生产仓库删除；`SOURCE_DATE_EPOCH=1764000000`
 
+- 2026-11-21：`base 1.0.0-3` 修正 spk 属主/setuid 安装；生产索引替换 1.0.0-2。
+  - `base-1.0.0-3-x86_64.spk`：sha256 `d2c9b88ec64c3ab5b578c4f9b9086212d54ed04328bd38644ce00de1993c4e96`
+  - `index.json`：sha256 `99d9a06bae58539af92e8271231c4d5242a566db322c8295be277f169e1ed87b`
+  - `index.json.sig`：sha256 `ce81af6ec07290b8805033ba9942f1a950f0b24fd115bc9509e2e9a2ecb9f764`
+  - spk 现在要求 live 事务 euid 0，按 manifest uid/gid chown 文件/目录/符号链接，并校验 setuid 文件必须是 root 所有
+  - `spk check` 校验磁盘属主/权限，`spk repair` 修正；QEMU 覆盖非 root 拒绝、sudo root:root 4755、repair
+  - 旧 `base-1.0.0-2` 已从生产仓库删除；`SOURCE_DATE_EPOCH=1795255334`
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。

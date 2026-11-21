@@ -8,7 +8,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{chown, lchown, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{renameat_with, RenameFlags, CWD};
@@ -30,6 +30,8 @@ pub enum OnDiskKind {
 pub struct OnDisk {
     pub kind: OnDiskKind,
     pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub size: u64,
     pub sha256: String,
     pub target: Option<String>,
@@ -45,6 +47,10 @@ impl Fs {
         Ok(Self {
             root: fs::canonicalize(root)?,
         })
+    }
+
+    fn privileged(&self) -> bool {
+        (unsafe { libc::geteuid() }) == 0
     }
 
     /// Resolve every component of an absolute path, following symlinks but
@@ -156,6 +162,8 @@ impl Fs {
             Ok(Some(OnDisk {
                 kind: OnDiskKind::Symlink,
                 mode,
+                uid: metadata.uid(),
+                gid: metadata.gid(),
                 size: target.len() as u64,
                 sha256: hash_bytes(target.as_bytes()),
                 target: Some(target),
@@ -164,6 +172,8 @@ impl Fs {
             Ok(Some(OnDisk {
                 kind: OnDiskKind::File,
                 mode,
+                uid: metadata.uid(),
+                gid: metadata.gid(),
                 size: metadata.len(),
                 sha256: sha256_file(&path)?,
                 target: None,
@@ -172,6 +182,8 @@ impl Fs {
             Ok(Some(OnDisk {
                 kind: OnDiskKind::Dir,
                 mode,
+                uid: metadata.uid(),
+                gid: metadata.gid(),
                 size: 0,
                 sha256: String::new(),
                 target: None,
@@ -202,6 +214,8 @@ impl Fs {
         &self,
         logical: &str,
         mode: u32,
+        uid: u32,
+        gid: u32,
         created: &mut Vec<(String, u32)>,
     ) -> Result<()> {
         validate_absolute_path(logical)?;
@@ -267,7 +281,15 @@ impl Fs {
                     } else {
                         0o755
                     };
+                    let (file_uid, file_gid) = if index + 1 == pending.len() {
+                        (uid, gid)
+                    } else {
+                        (0, 0)
+                    };
                     fs::create_dir(&candidate)?;
+                    if self.privileged() {
+                        chown(&candidate, Some(file_uid), Some(file_gid))?;
+                    }
                     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))?;
                     if file_mode != 0o700 {
                         fs::set_permissions(&candidate, fs::Permissions::from_mode(file_mode))?;
@@ -286,7 +308,15 @@ impl Fs {
         Ok(())
     }
 
-    pub fn write_from(&self, source: &Path, logical: &str, mode: u32, txid: &str) -> Result<()> {
+    pub fn write_from(
+        &self,
+        source: &Path,
+        logical: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        txid: &str,
+    ) -> Result<()> {
         let (parent, name) = self.resolve_parent(logical)?;
         let destination = parent.join(&name);
         let existed = fs::symlink_metadata(&destination).is_ok();
@@ -306,13 +336,24 @@ impl Fs {
             output.write_all(&buffer[..read])?;
         }
         output.sync_all()?;
+        if self.privileged() {
+            chown(&temp, Some(uid), Some(gid))?;
+        }
         fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
         place(&temp, &destination, existed)?;
         sync_parent(&parent)?;
         Ok(())
     }
 
-    pub fn write_bytes(&self, data: &[u8], logical: &str, mode: u32, txid: &str) -> Result<()> {
+    pub fn write_bytes(
+        &self,
+        data: &[u8],
+        logical: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        txid: &str,
+    ) -> Result<()> {
         let (parent, name) = self.resolve_parent(logical)?;
         let destination = parent.join(&name);
         let existed = fs::symlink_metadata(&destination).is_ok();
@@ -324,20 +365,56 @@ impl Fs {
             .open(&temp)?;
         output.write_all(data)?;
         output.sync_all()?;
+        if self.privileged() {
+            chown(&temp, Some(uid), Some(gid))?;
+        }
         fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
         place(&temp, &destination, existed)?;
         sync_parent(&parent)?;
         Ok(())
     }
 
-    pub fn write_symlink(&self, target: &str, logical: &str, txid: &str) -> Result<()> {
+    pub fn write_symlink(
+        &self,
+        target: &str,
+        logical: &str,
+        uid: u32,
+        gid: u32,
+        txid: &str,
+    ) -> Result<()> {
         let (parent, name) = self.resolve_parent(logical)?;
         let destination = parent.join(&name);
         let existed = fs::symlink_metadata(&destination).is_ok();
         let temp = temp_name(&parent, txid, "l");
         std::os::unix::fs::symlink(target, &temp)?;
+        if self.privileged() {
+            lchown(&temp, Some(uid), Some(gid))?;
+        }
         place(&temp, &destination, existed)?;
         sync_parent(&parent)?;
+        Ok(())
+    }
+
+    pub fn set_metadata(
+        &self,
+        logical: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        symlink: bool,
+    ) -> Result<()> {
+        let (parent, name) = self.resolve_parent(logical)?;
+        let path = parent.join(&name);
+        if self.privileged() {
+            if symlink {
+                lchown(&path, Some(uid), Some(gid))?;
+            } else {
+                chown(&path, Some(uid), Some(gid))?;
+            }
+        }
+        if !symlink {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode & 0o7777))?;
+        }
         Ok(())
     }
 
@@ -438,12 +515,14 @@ impl Fs {
 
     pub fn restore(&self, backup_path: &Path, logical: &str, mode: u32) -> Result<()> {
         let metadata = fs::symlink_metadata(backup_path)?;
+        let uid = metadata.uid();
+        let gid = metadata.gid();
         if metadata.file_type().is_symlink() {
             let target = fs::read_link(backup_path)?;
             let target = target.to_string_lossy();
-            self.write_symlink(&target, logical, "restore")?;
+            self.write_symlink(&target, logical, uid, gid, "restore")?;
         } else {
-            self.write_from(backup_path, logical, mode, "restore")?;
+            self.write_from(backup_path, logical, mode, uid, gid, "restore")?;
         }
         Ok(())
     }

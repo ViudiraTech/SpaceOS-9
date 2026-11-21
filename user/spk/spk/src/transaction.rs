@@ -124,6 +124,8 @@ struct WriteOp {
     logical: String,
     source: WriteSource,
     mode: u32,
+    uid: u32,
+    gid: u32,
     sha256: String,
     kind: &'static str,
 }
@@ -133,6 +135,8 @@ struct SaveOp {
     logical: String,
     source: PathBuf,
     mode: u32,
+    uid: u32,
+    gid: u32,
     sha256: String,
 }
 
@@ -145,7 +149,7 @@ struct RemoveOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
-    dirs: Vec<(String, u32)>,
+    dirs: Vec<(String, u32, u32, u32)>,
     writes: Vec<WriteOp>,
     saves: Vec<SaveOp>,
     removes: Vec<RemoveOp>,
@@ -796,7 +800,7 @@ fn build_plan(
         }
     }
 
-    let mut dirs: BTreeMap<String, u32> = BTreeMap::new();
+    let mut dirs: BTreeMap<String, (u32, u32, u32)> = BTreeMap::new();
     let mut kept_dirs: BTreeSet<String> = BTreeSet::new();
     for (name, package) in &state.installed.packages {
         if affected.contains(name) {
@@ -814,7 +818,7 @@ fn build_plan(
             .ok_or_else(|| SpkError::General(format!("{} was not staged", action.to.name)))?;
         for file in &staged.manifest.files {
             if file.file_type == FileType::Dir {
-                dirs.insert(file.path.clone(), file.mode_bits()?);
+                dirs.insert(file.path.clone(), (file.mode_bits()?, file.uid, file.gid));
                 continue;
             }
             let (sha256, size) = staged_digest(staged, file)?;
@@ -848,7 +852,7 @@ fn build_plan(
             if parent.is_empty() {
                 break;
             }
-            dirs.entry(parent.to_string()).or_insert(0o755);
+            dirs.entry(parent.to_string()).or_insert((0o755, 0, 0));
             ancestor = parent;
         }
     }
@@ -924,6 +928,8 @@ fn build_plan(
                                 logical: saved.clone(),
                                 source: staged.dir.join(file.path.trim_start_matches('/')),
                                 mode: file.mode_bits()?,
+                                uid: file.uid,
+                                gid: file.gid,
                                 sha256: actual_sha256.clone(),
                             });
                             warnings.push(i18n::warning_conffile(options.lang, &file.path, &saved));
@@ -942,6 +948,8 @@ fn build_plan(
                     logical: file.path.clone(),
                     source: WriteSource::File(source),
                     mode: file.mode_bits()?,
+                    uid: file.uid,
+                    gid: file.gid,
                     sha256: actual_sha256.clone(),
                     kind: "file",
                 },
@@ -951,6 +959,8 @@ fn build_plan(
                         SpkError::General(format!("{}: symlink without target", file.path))
                     })?),
                     mode: file.mode_bits()?,
+                    uid: file.uid,
+                    gid: file.gid,
                     sha256: actual_sha256.clone(),
                     kind: "symlink",
                 },
@@ -1083,7 +1093,10 @@ fn build_plan(
         .sum();
 
     dirs.retain(|path, _| !fs.exists(path).unwrap_or(false));
-    let mut dirs: Vec<(String, u32)> = dirs.into_iter().collect();
+    let mut dirs: Vec<(String, u32, u32, u32)> = dirs
+        .into_iter()
+        .map(|(path, (mode, uid, gid))| (path, mode, uid, gid))
+        .collect();
     dirs.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
 
     Ok(Plan {
@@ -1181,9 +1194,9 @@ fn apply(
     let backup_root = paths.backup.join(txid).join("fs");
 
     let mut created = Vec::new();
-    for (path, mode) in &plan.dirs {
+    for (path, mode, uid, gid) in &plan.dirs {
         let mut new_dirs = Vec::new();
-        fs.ensure_dir(path, *mode, &mut new_dirs)?;
+        fs.ensure_dir(path, *mode, *uid, *gid, &mut new_dirs)?;
         for (created_path, created_mode) in new_dirs {
             journal.append(&Event::MkDir {
                 path: created_path.clone(),
@@ -1257,8 +1270,17 @@ fn apply(
             kind: write.kind.to_string(),
         })?;
         match &write.source {
-            WriteSource::File(source) => fs.write_from(source, &write.logical, write.mode, txid)?,
-            WriteSource::Symlink(target) => fs.write_symlink(target, &write.logical, txid)?,
+            WriteSource::File(source) => fs.write_from(
+                source,
+                &write.logical,
+                write.mode,
+                write.uid,
+                write.gid,
+                txid,
+            )?,
+            WriteSource::Symlink(target) => {
+                fs.write_symlink(target, &write.logical, write.uid, write.gid, txid)?
+            }
         }
         if first_write {
             first_write = false;
@@ -1272,8 +1294,17 @@ fn apply(
             new_sha256: Some(save.sha256.clone()),
             kind: "file".into(),
         })?;
-        fs.write_from(&save.source, &save.logical, save.mode, txid)?;
+        fs.write_from(
+            &save.source,
+            &save.logical,
+            save.mode,
+            save.uid,
+            save.gid,
+            txid,
+        )?;
     }
+
+    verify_written(fs, plan, lang)?;
 
     for remove in &plan.removes {
         if let Some(rename_to) = &remove.rename_to {
@@ -1373,6 +1404,64 @@ fn commit_db(
     fs::File::open(&paths.state)?.sync_all()?;
     journal.append(&Event::DbDone)?;
     crash::point("after-db-done");
+    Ok(())
+}
+
+fn verify_written(fs: &Fs, plan: &Plan, lang: Lang) -> Result<()> {
+    let privileged = unsafe { libc::geteuid() } == 0;
+    for write in &plan.writes {
+        let entry = fs.on_disk(&write.logical)?.ok_or_else(|| {
+            SpkError::General(format!("{} is missing after install", write.logical))
+        })?;
+        if write.mode & 0o6000 != 0 && entry.uid != 0 {
+            return Err(SpkError::Security(i18n::setuid_not_root(
+                lang,
+                &write.logical,
+                entry.uid,
+            )));
+        }
+        if privileged && (entry.uid != write.uid || entry.gid != write.gid) {
+            return Err(SpkError::Security(i18n::owner_mismatch(
+                lang,
+                &write.logical,
+                write.uid,
+                write.gid,
+                entry.uid,
+                entry.gid,
+            )));
+        }
+        if write.kind == "file" && entry.mode & 0o7777 != write.mode & 0o7777 {
+            return Err(SpkError::Security(i18n::mode_mismatch(
+                lang,
+                &write.logical,
+                write.mode & 0o7777,
+                entry.mode & 0o7777,
+            )));
+        }
+    }
+    for save in &plan.saves {
+        let entry = fs.on_disk(&save.logical)?.ok_or_else(|| {
+            SpkError::General(format!("{} is missing after install", save.logical))
+        })?;
+        if privileged && (entry.uid != save.uid || entry.gid != save.gid) {
+            return Err(SpkError::Security(i18n::owner_mismatch(
+                lang,
+                &save.logical,
+                save.uid,
+                save.gid,
+                entry.uid,
+                entry.gid,
+            )));
+        }
+        if entry.mode & 0o7777 != save.mode & 0o7777 {
+            return Err(SpkError::Security(i18n::mode_mismatch(
+                lang,
+                &save.logical,
+                save.mode & 0o7777,
+                entry.mode & 0o7777,
+            )));
+        }
+    }
     Ok(())
 }
 
