@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -31,6 +32,38 @@ def copy(src: pathlib.Path, dst: pathlib.Path, mode: int) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
     dst.chmod(mode)
+
+
+def install_runtime(stage: pathlib.Path, local_repo: pathlib.Path, spk: pathlib.Path) -> None:
+    """Install spk-runtime from the build repository so the desktop image has
+    a real installed-package database entry instead of loose binaries."""
+    if not spk.is_file():
+        raise SystemExit(f"missing host spk binary: {spk}")
+    trusted = local_repo.parent / "trusted"
+    trusted_dir = stage / "etc/spk/trusted.d"
+    shutil.rmtree(trusted_dir, ignore_errors=True)
+    trusted_dir.mkdir(parents=True)
+    for public in sorted(trusted.glob("*.pub")):
+        shutil.copy2(public, trusted_dir / public.name)
+        (trusted_dir / public.name).chmod(0o644)
+    command = [
+        str(spk),
+        "--root",
+        str(stage),
+        "--noconfirm",
+        "install",
+        "--repo",
+        str(local_repo),
+        "--overwrite",
+        "/usr/bin/spk",
+        "--overwrite",
+        "/usr/bin/spk-sandbox",
+        "spk-runtime",
+    ]
+    try:
+        subprocess.run(command, check=True)
+    finally:
+        shutil.rmtree(trusted_dir, ignore_errors=True)
 
 
 def main() -> int:
@@ -55,8 +88,11 @@ def main() -> int:
     if arguments.local_repo is not None and not arguments.local_repo.is_dir():
         raise SystemExit(f"local package repository missing: {arguments.local_repo}")
 
-    copy(arguments.spk, stage / "usr/bin/spk", 0o755)
-    copy(arguments.sandbox, stage / "usr/bin/spk-sandbox", 0o755)
+    if arguments.local_repo is not None:
+        install_runtime(stage, arguments.local_repo, arguments.spk)
+    else:
+        copy(arguments.spk, stage / "usr/bin/spk", 0o755)
+        copy(arguments.sandbox, stage / "usr/bin/spk-sandbox", 0o755)
     if arguments.ca_bundle.is_file():
         copy(arguments.ca_bundle, stage / "etc/ssl/certs/ca-certificates.crt", 0o644)
 

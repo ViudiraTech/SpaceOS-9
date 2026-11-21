@@ -49,6 +49,7 @@ fi
 "$ROOT/packages/sudo/build.sh" "$BUILD/packages/sudo"
 "$ROOT/packages/theme-winxp/build.sh" "$BUILD/packages/theme-winxp"
 "$ROOT/packages/base/build.sh" "$BUILD/packages/base"
+"$ROOT/packages/spk-runtime/build.sh" "$BUILD/packages/spk-runtime"
 
 rm -rf "$BUILD/packages/meta" "$REPO"
 install -d -m 0755 "$BUILD/packages/meta" "$REPO"
@@ -90,5 +91,6 @@ pack_one hello 0.2.0-1 "$ROOT/packages/hello/manifest-0.2.0.toml" "$BUILD/packag
 pack_one sudo 0.1.0-3 "$ROOT/packages/sudo/manifest.toml" "$BUILD/packages/sudo"
 pack_one base 1.0.0-5 "$ROOT/packages/base/manifest.toml" "$BUILD/packages/base"
 pack_one theme-winxp 1.0.0-4 "$ROOT/packages/theme-winxp/manifest.toml" "$BUILD/packages/theme-winxp"
+pack_one spk-runtime 1.0.0-1 "$ROOT/packages/spk-runtime/manifest.toml" "$BUILD/packages/spk-runtime"
 
 printf 'reproducible packages in %s\n' "$REPO"

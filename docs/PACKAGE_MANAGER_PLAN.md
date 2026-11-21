@@ -701,6 +701,13 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - 系统 hook `90-spui-theme-reload.hook` 监听主题/壁纸路径的 install/upgrade/remove，执行 `spui-theme-kick` 刷新 `/run/spui-theme.stamp`
   - SPUI 主循环检测 stamp mtime 变化并热重载主题；旧 `base-1.0.0-4` 已删除
 
+- 2026-11-21：`spk-runtime 1.0.0-1`：桌面镜像通过 `spk install` 安装运行时包。
+  - `spk-runtime-1.0.0-1-x86_64.spk`：sha256 `bf767709efebdd78b9180ede7fc85e7c1e6ec7a4a09bbe91ac5dfd2a3845a7bc`
+  - `index.json`：sha256 `38f368bbeaf3fb539b1c319617cd90e17e66966fb79e4defbaae9a1350278df6`
+  - `index.json.sig`：sha256 `6f319a6928550be87bff5c0f73b0b609aef263a7054d77f812123d382f7f6713`
+  - 包含 `/usr/bin/spk`、`/usr/bin/spk-sandbox`；overlay 安装后 `spk list` 有记录
+  - `base` 仍只用于 P5 最小 rootfs；桌面不覆盖 Alpine musl/BusyBox/systemg
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
