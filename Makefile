@@ -158,8 +158,13 @@ export SPK_REPO_KEY
 export SPK_REPO_PUBLIC
 export SPK_SECURITY
 
-.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
+.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all all-packages world kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
 all: release-try
+
+# Packaging needs the musl target, BusyBox/musl sources and a CA bundle, so it
+# is kept out of the default kernel build.  `make world` builds both.
+all-packages: packages repo
+world: all all-packages
 
 defconfig:
 	kconfig-conf --alldefconfig Kconfig
@@ -375,4 +380,8 @@ help:
 	  'make test        Host model checks + x86_64/aarch64/riscv64 boot matrix' \
 	  'make test ARCH=  Single-architecture boot smoke test' \
 	  'make check       Format and check all target architectures' \
+	  'make packages    Build reproducible .spk packages' \
+	  'make repo        Build and sign the local repository' \
+	  'make image       Build the P5 base rootfs and image' \
+	  'make world       Release image plus packages and repository' \
 	  'make release-try Build release desktop ISO at build/spacekernel-release-try.iso'

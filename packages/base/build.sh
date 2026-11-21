@@ -37,10 +37,12 @@ install -d -m 0755 \
 install -m 0755 "$SPK_BIN" "$STAGE/usr/bin/spk"
 install -m 0755 "$SANDBOX_BIN" "$STAGE/usr/bin/spk-sandbox"
 install -m 0755 "$BUSYBOX" "$STAGE/bin/busybox"
-install -m 0755 "$BUSYBOX" "$STAGE/bin/sh"
+ln -s busybox "$STAGE/bin/sh"
 install -m 0755 "$MUSL/ld-musl-x86_64.so.1" "$STAGE/lib/ld-musl-x86_64.so.1"
-install -m 0755 "$MUSL/libc.so" "$STAGE/lib/libc.musl-x86_64.so.1"
+ln -s ld-musl-x86_64.so.1 "$STAGE/lib/libc.musl-x86_64.so.1"
 install -m 0644 "$CA_BUNDLE" "$STAGE/etc/ssl/certs/ca-certificates.crt"
+install -d -m 0755 "$STAGE/usr/share/doc/base"
+install -m 0644 "$ROOT/packages/base/THIRD_PARTY_NOTICES.md" "$STAGE/usr/share/doc/base/THIRD_PARTY_NOTICES.md"
 if [ -f "$SYSTEMG" ]; then
     install -m 0755 "$SYSTEMG" "$STAGE/sbin/systemg"
 fi

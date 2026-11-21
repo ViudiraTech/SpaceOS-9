@@ -625,6 +625,22 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - 线上 `spk-host verify`：hello 0.1/0.2、sudo 0.1、index.json 全部 OK
   - sudo 安装前置：镜像需提供 root:root、0644 的 `/etc/spk/setuid.allow`，包含 `/usr/bin/sudo`、`/usr/bin/doas`
 
+- 2026-11-21：P5 发布 `base 1.0.0`，生产索引加入 base，hello 0.1/0.2 与 sudo 0.1 保持不变。
+  - `base-1.0.0-1-x86_64.spk`：sha256 `0768cab88e0ddfe9f05f64575b0fe0efc9b533545501d5f087a497a54ad0368c`
+  - `index.json`：sha256 `6e24cbae45f857153ae7ba32936c42ba51db7db8e18e2c6ee68e2a23ea615ff5`
+  - `index.json.sig`：sha256 `07520436d2aad7d144d5afdd626406ad1a53f8ad2d120fd217103a2193204e9b`
+  - 线上 `spk-host verify`：base 1.0、hello 0.1/0.2、sudo 0.1、index.json 全部 OK
+  - base 包含 spk、spk-sandbox、BusyBox、musl、systemg、CA bundle；安装前置 `/etc/spk/setuid.allow`
+  - P0–P5 已全部合并到 master，HEAD `1059e74bb6457d1df6c091ad23142e1f13f2bf72`
+
+- 2026-11-21：`base 1.0.0-2` 修正 license metadata 与重复文件；生产索引替换 1.0.0-1。
+  - `base-1.0.0-2-x86_64.spk`：sha256 `f1e429fa6c75d113c83164a3a07198507e81d5089e7081efe84bf14c36d04a7f`
+  - `index.json`：sha256 `22771ac7c32ec83eecbe5a0ee7d0bb9647b553f734d5a78563a28868e8385d07`
+  - `index.json.sig`：sha256 `94c70a9bc082eddf2c1384a2db2cb407e0d3be6216a0833436b44a93cbd05b2e`
+  - `/bin/sh`、`/lib/libc.musl-x86_64.so.1` 改为符号链接；解包体积 10.20 MiB → 8.48 MiB
+  - license：`LicenseRef-Proprietary AND GPL-2.0-only AND MIT AND MPL-2.0`；包内新增 `/usr/share/doc/base/THIRD_PARTY_NOTICES.md`
+  - 旧 `base-1.0.0-1` 已从生产仓库删除；`SOURCE_DATE_EPOCH=1764000000`
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
