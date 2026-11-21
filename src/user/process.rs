@@ -56,7 +56,7 @@ pub fn spawn_init(path: &str) -> Result<u64, &'static str> {
     let mut space = UserAddressSpace::new()?;
     let loaded = elf::load_elf(&mut space, &resolved.data)?;
     let args: alloc::vec::Vec<&str> = resolved.argv.iter().map(|s| s.as_str()).collect();
-    let user_sp = stack::setup(&mut space, &loaded, path, &args, &[])?;
+    let user_sp = stack::setup(&mut space, &loaded, path, &args, &[], false)?;
     if sched::alloc_pid() != 1 {
         return Err("PID 1 was already allocated");
     }

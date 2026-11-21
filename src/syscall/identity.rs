@@ -99,7 +99,10 @@ pub fn setgid(gid: u32) -> i64 {
         return error;
     }
     with_creds(|creds| {
-        if creds.egid == 0 {
+        // Linux grants setgid privilege from CAP_SETGID (euid 0 here), not
+        // from the effective group itself. A setuid-root sudo therefore may
+        // setgid even though it carries the caller's egid.
+        if creds.euid == 0 {
             creds.gid = gid;
             creds.egid = gid;
             creds.sgid = gid;
@@ -166,7 +169,7 @@ pub fn setregid(rgid: u32, egid: u32) -> i64 {
     }
     with_creds(|creds| {
         let old_gid = creds.gid;
-        let privileged = creds.egid == 0;
+        let privileged = creds.euid == 0;
         let new_rgid = if rgid == INVALID_ID { old_gid } else { rgid };
         let new_egid = if egid == INVALID_ID { creds.egid } else { egid };
         if rgid != INVALID_ID
@@ -240,7 +243,7 @@ pub fn setresgid(rgid: u32, egid: u32, sgid: u32) -> i64 {
         }
     }
     with_creds(|creds| {
-        let privileged = creds.egid == 0;
+        let privileged = creds.euid == 0;
         for id in [rgid, egid, sgid] {
             if id != INVALID_ID
                 && !privileged
@@ -326,7 +329,7 @@ pub fn setfsgid(gid: u32) -> i64 {
     };
     let mut creds = task.credentials();
     let old = creds.fsgid;
-    if creds.egid == 0
+    if creds.euid == 0
         || gid == creds.gid
         || gid == creds.egid
         || gid == creds.sgid
