@@ -731,7 +731,7 @@ def configure() -> None:
     if (ddm_dir / "ddm.conf").is_file():
         install_binary(ddm_dir / "ddm.conf", "/etc/ddm/ddm.conf", 0o644)
     if (ddm_dir / "doas.conf").is_file():
-        install_binary(ddm_dir / "doas.conf", "/etc/doas.conf", 0o640)
+        install_binary(ddm_dir / "doas.conf", "/etc/doas.conf", 0o440)
     xsessions = ROOT / "user" / "desktop" / "assets" / "xsessions"
     if xsessions.is_dir():
         for path in sorted(xsessions.iterdir()):

@@ -262,6 +262,54 @@ ln -s foo "$STAGE/usr/bin/foo-alias"
 
 ---
 
+### 4.5 数据-only 包（主题、字体、文档）
+
+`spk` 不要求包内必须有可执行文件。主题、图标、字体、文档、桌面配置等纯数据包只需要普通的 `file` 条目；`spk-host pack` 会按 staging 内容生成 `files`，不会检查“有没有二进制”。
+
+例如主题包 `packages/theme-foo/manifest.toml`：
+
+```toml
+name = "theme-foo"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "Foo desktop theme"
+description = "GTK/SPUI theme assets, no executables."
+license = "CC-BY-4.0"
+url = "https://example.invalid/theme-foo"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = []
+conflicts = []
+replaces = []
+conffiles = []
+scripts = false
+allow_setuid = false
+```
+
+`packages/theme-foo/build.sh`：
+
+```sh
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+STAGE=${1:-$ROOT/build/packages/theme-foo}
+
+rm -rf "$STAGE"
+install -d -m 0755 "$STAGE/usr/share/themes/foo"
+install -m 0644 "$ROOT/packages/theme-foo/theme.css" \
+    "$STAGE/usr/share/themes/foo/theme.css"
+install -m 0644 "$ROOT/packages/theme-foo/index.theme" \
+    "$STAGE/usr/share/themes/foo/index.theme"
+```
+
+打包、签名、安装流程与带二进制的包完全一样。只要不设 `scripts = true`，就不需要 `.INSTALL`；不需要 `allow_setuid`，也不会有 root 属主/权限校验之外的特殊要求。
+
 ## 5. 安装脚本 `.INSTALL`
 
 放在 staging 根，`scripts = true`。
