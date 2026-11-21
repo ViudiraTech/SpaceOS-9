@@ -442,6 +442,19 @@ fn requested_help(arguments: &[String]) -> Option<String> {
     })
 }
 
+fn has_command_argument(arguments: &[String]) -> bool {
+    let mut index = 1usize;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        match argument.as_str() {
+            "--root" | "--lang" | "--script-failure" => index += 2,
+            value if value.starts_with('-') => index += 1,
+            _ => return true,
+        }
+    }
+    false
+}
+
 fn localize_clap_error(lang: Lang, error: clap::Error) -> ! {
     if !lang.is_zh() {
         error.exit();
@@ -486,6 +499,10 @@ fn main() -> ExitCode {
         if let Some(help) = requested_help(&arguments) {
             print!("{help}");
             return ExitCode::SUCCESS;
+        }
+        if !has_command_argument(&arguments) {
+            eprintln!("错误：需要子命令\n\n{ZH_ROOT_HELP}");
+            return ExitCode::from(2);
         }
     }
     let cli = match Cli::try_parse_from(&arguments) {
