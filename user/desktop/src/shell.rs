@@ -1294,7 +1294,12 @@ impl Shell {
     fn menu_dims(&self) -> (i32, i32) {
         if self.config.panel_start_fullscreen {
             (i32::from(self.x.width), i32::from(self.x.height))
-        } else if let Some(ref sm) = self.theme.skin().and_then(|s| s.start_menu.as_ref()) {
+        } else if let Some(ref sm) = self
+            .theme
+            .skin()
+            .and_then(|s| s.start_menu.as_ref())
+            .filter(|sm| sm.layout == crate::theme::StartMenuLayoutKind::TwoColumn)
+        {
             (sm.width, sm.height)
         } else if self.theme.is_vortexglass() {
             (VORTEX_MENU_WIDTH, VORTEX_MENU_HEIGHT)
@@ -1306,7 +1311,12 @@ impl Shell {
     fn menu_x(&self) -> i32 {
         if self.config.panel_start_fullscreen {
             0
-        } else if let Some(ref sm) = self.theme.skin().and_then(|s| s.start_menu.as_ref()) {
+        } else if let Some(ref sm) = self
+            .theme
+            .skin()
+            .and_then(|s| s.start_menu.as_ref())
+            .filter(|sm| sm.layout == crate::theme::StartMenuLayoutKind::TwoColumn)
+        {
             sm.offset_x
         } else {
             6

@@ -456,6 +456,13 @@ enum HitTarget {
     ResetPage,
     ThemePreset(usize),
     ExternalTheme(usize),
+    ThemeFilter(ThemeFilter),
+    ThemeSearchInput,
+    ThemeSearchClear,
+    ThemeRefresh,
+    ThemePagePrev,
+    ThemePageNext,
+    ThemeExpandToggle,
     ThemeMode(ThemeMode),
     Accent(usize),
     FontScale(usize),
@@ -1158,6 +1165,82 @@ fn commit_master_volume(host: &mut impl SettingsHost) {
     host.set_config_property("sound", "/muted", Value::Bool(muted));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ThemeFilter {
+    All,
+    Builtin,
+    External,
+}
+
+impl ThemeFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部",
+            Self::Builtin => "内置",
+            Self::External => "扩展包",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GalleryThemeItem {
+    Builtin(usize),
+    External(usize),
+}
+
+fn filter_theme_gallery(
+    external_themes: &[crate::theme::InstalledThemeInfo],
+    filter: ThemeFilter,
+    query: &str,
+) -> Vec<GalleryThemeItem> {
+    let q = query.trim().to_ascii_lowercase();
+    let matches_query = |id: &str, name: &str, sub: &str| -> bool {
+        if q.is_empty() {
+            return true;
+        }
+        id.to_ascii_lowercase().contains(&q)
+            || name.to_ascii_lowercase().contains(&q)
+            || sub.to_ascii_lowercase().contains(&q)
+    };
+    let mut out = Vec::new();
+    if matches!(filter, ThemeFilter::All | ThemeFilter::Builtin) {
+        for (idx, preset) in THEME_PRESETS.iter().enumerate() {
+            if matches_query(preset.id(), preset.name(), preset.subtitle()) {
+                out.push(GalleryThemeItem::Builtin(idx));
+            }
+        }
+    }
+    if matches!(filter, ThemeFilter::All | ThemeFilter::External) {
+        for (idx, pack) in external_themes.iter().enumerate() {
+            if matches_query(&pack.id, &pack.name, &pack.subtitle) {
+                out.push(GalleryThemeItem::External(idx));
+            }
+        }
+    }
+    out
+}
+
+fn paginate_theme_gallery(
+    total: usize,
+    page: usize,
+    per_page: usize,
+    expanded: bool,
+) -> (usize, usize, std::ops::Range<usize>) {
+    let per_page = per_page.max(1);
+    let total_pages = (total.max(1) + per_page - 1) / per_page;
+    let clamped_page = page.min(total_pages.saturating_sub(1));
+    if expanded || total <= per_page {
+        return (0, total_pages, 0..total);
+    }
+    let start = clamped_page * per_page;
+    let end = (start + per_page).min(total);
+    (clamped_page, total_pages, start..end)
+}
+
+fn gallery_cols_for_card_w(card_w: i32) -> i32 {
+    if card_w >= 620 { 3 } else { 2 }
+}
+
 /// Reusable System Settings UI state shared between `spui settings` and Start Screen `设置中心`.
 pub struct SettingsState {
     pub page: Page,
@@ -1171,6 +1254,11 @@ pub struct SettingsState {
     sound_card: String,
     last_clock_preview: String,
     external_themes: Vec<crate::theme::InstalledThemeInfo>,
+    theme_filter: ThemeFilter,
+    theme_search: String,
+    theme_search_focused: bool,
+    theme_page: usize,
+    theme_expanded: bool,
     wallpapers: Vec<crate::theme::DiscoveredWallpaper>,
     thumbnails: Vec<Option<Sprite>>,
     thumbnails_loaded: bool,
@@ -1207,6 +1295,11 @@ impl SettingsState {
             sound_card: crate::sound::detected_card_name(),
             last_clock_preview: String::new(),
             external_themes,
+            theme_filter: ThemeFilter::All,
+            theme_search: String::new(),
+            theme_search_focused: false,
+            theme_page: 0,
+            theme_expanded: false,
             wallpapers,
             thumbnails,
             thumbnails_loaded,
@@ -1225,6 +1318,7 @@ impl SettingsState {
             self.scroll.snap_to(0.0);
         }
         self.net_state.focused = None;
+        self.theme_search_focused = false;
         match next_page {
             Page::Appearance => {
                 self.external_themes = crate::theme::discover_installed_themes();
@@ -1251,11 +1345,34 @@ impl SettingsState {
     }
 
     pub fn is_text_input_focused(&self) -> bool {
-        self.page == Page::Network && self.net_state.focused.is_some()
+        (self.page == Page::Network && self.net_state.focused.is_some())
+            || (self.page == Page::Appearance && self.theme_search_focused)
+    }
+
+    pub fn is_theme_search_focused(&self) -> bool {
+        self.page == Page::Appearance && self.theme_search_focused
     }
 
     pub fn clear_text_focus(&mut self) {
         self.net_state.focused = None;
+        self.theme_search_focused = false;
+    }
+
+    pub fn on_commit_text(&mut self, committed: &str) -> bool {
+        if !self.is_theme_search_focused() || committed.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for ch in committed.chars() {
+            if !ch.is_control() && self.theme_search.chars().count() < 32 {
+                self.theme_search.push(ch);
+                changed = true;
+            }
+        }
+        if changed {
+            self.theme_page = 0;
+        }
+        changed
     }
 
     pub fn refresh_net_now(&mut self) -> bool {
@@ -1326,7 +1443,9 @@ impl SettingsState {
             CursorKind::Pointer
         } else {
             match next {
-                Some(HitTarget::NetInput(_)) => CursorKind::Text,
+                Some(HitTarget::NetInput(_)) | Some(HitTarget::ThemeSearchInput) => {
+                    CursorKind::Text
+                }
                 Some(_) => CursorKind::Pointer,
                 None => CursorKind::Default,
             }
@@ -1369,6 +1488,10 @@ impl SettingsState {
                 self.net_state.focused = None;
                 action.redraw = true;
             }
+            if !matches!(hit, Some(HitTarget::ThemeSearchInput)) && self.theme_search_focused {
+                self.theme_search_focused = false;
+                action.redraw = true;
+            }
             if matches!(hit, Some(HitTarget::SoundMasterSlider)) {
                 if let Some(sr) = self.vol_slider_rect {
                     self.dragging_volume = true;
@@ -1384,6 +1507,34 @@ impl SettingsState {
     }
 
     pub fn on_key(&mut self, host: &mut impl SettingsHost, key: Key) -> bool {
+        if self.page == Page::Appearance && self.theme_search_focused {
+            if key.is_escape() {
+                self.theme_search_focused = false;
+                return true;
+            } else if key.is_backspace() {
+                if self.theme_search.pop().is_some() {
+                    self.theme_page = 0;
+                    return true;
+                }
+                return false;
+            } else if key.ctrl_byte() == Some(21) {
+                if !self.theme_search.is_empty() {
+                    self.theme_search.clear();
+                    self.theme_page = 0;
+                    return true;
+                }
+                return false;
+            } else if !key.control() && !key.alt() {
+                if let Some(ch) = key.text().filter(|c| !c.is_control()) {
+                    if self.theme_search.chars().count() < 32 {
+                        self.theme_search.push(ch);
+                        self.theme_page = 0;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
         if self.page != Page::Network {
             return false;
         }
@@ -1499,7 +1650,12 @@ pub fn run(initial_page: Option<&str>) -> Result<()> {
                     state.on_config_changed(&app);
                     app.needs_redraw = true;
                 }
-                UiEvent::CommitText(_) | UiEvent::Preedit(_) => {}
+                UiEvent::CommitText(s) => {
+                    if state.on_commit_text(&s) {
+                        app.needs_redraw = true;
+                    }
+                }
+                UiEvent::Preedit(_) => {}
                 UiEvent::Key(key) => {
                     if state.on_key(&mut app, key) {
                         app.needs_redraw = true;
@@ -1650,13 +1806,16 @@ impl SettingsState {
                             Value::String(format_hex_rgb(sc)),
                         );
                     }
-                    if let Some(pos) = pack.panel_position {
-                        host.set_config_property(
-                            "panel",
-                            "/position",
-                            Value::String(pos.as_str().to_string()),
-                        );
-                    }
+                    host.set_config_property(
+                        "panel",
+                        "/position",
+                        Value::String(
+                            pack.panel_position
+                                .unwrap_or(PanelPosition::Bottom)
+                                .as_str()
+                                .to_string(),
+                        ),
+                    );
                     if let Some(sz) = pack.panel_size {
                         host.set_config_property(
                             "panel",
@@ -1671,7 +1830,62 @@ impl SettingsState {
                             Value::Bool(fs),
                         );
                     }
+                    host.set_config_property(
+                        "wm",
+                        "/titlebar/button-layout",
+                        Value::String(
+                            pack.button_layout
+                                .unwrap_or(ButtonLayout::Right)
+                                .as_str()
+                                .to_string(),
+                        ),
+                    );
                     self.status = format!("已切换为「{}」扩展主题", pack.name);
+                }
+            }
+            HitTarget::ThemeFilter(filter) => {
+                self.theme_filter = filter;
+                self.theme_page = 0;
+            }
+            HitTarget::ThemeSearchInput => {
+                self.theme_search_focused = true;
+            }
+            HitTarget::ThemeSearchClear => {
+                self.theme_search.clear();
+                self.theme_page = 0;
+            }
+            HitTarget::ThemeRefresh => {
+                self.external_themes = crate::theme::discover_installed_themes();
+                self.theme_page = 0;
+                self.status = format!("已刷新，共发现 {} 套扩展主题", self.external_themes.len());
+            }
+            HitTarget::ThemePagePrev => {
+                self.theme_page = self.theme_page.saturating_sub(1);
+            }
+            HitTarget::ThemePageNext => {
+                let filtered = filter_theme_gallery(
+                    &self.external_themes,
+                    self.theme_filter,
+                    &self.theme_search,
+                );
+                let sidebar_w = sidebar_width_for(self.last_bounds, self.last_style);
+                let pane_w = (self.last_bounds.w - sidebar_w).max(320);
+                let max_card_w = if self.last_style == SettingsRenderStyle::Xj380 {
+                    920
+                } else {
+                    pane_w - 48
+                };
+                let card_w = (pane_w - 48).clamp(320, max_card_w.max(320));
+                let per_page = (gallery_cols_for_card_w(card_w) as usize) * 2;
+                let total_pages = (filtered.len().max(1) + per_page - 1) / per_page;
+                if self.theme_page + 1 < total_pages {
+                    self.theme_page += 1;
+                }
+            }
+            HitTarget::ThemeExpandToggle => {
+                self.theme_expanded = !self.theme_expanded;
+                if self.theme_expanded {
+                    self.theme_page = 0;
                 }
             }
             HitTarget::ThemeMode(mode) => {
@@ -2377,6 +2591,159 @@ fn draw_sound_event_row(
     push_clipped_hit(hits, viewport, sw_rect, toggle_target);
 }
 
+fn draw_theme_mini_preview(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    mini: Rect,
+    item: GalleryThemeItem,
+    external_themes: &[crate::theme::InstalledThemeInfo],
+) {
+    match item {
+        GalleryThemeItem::Builtin(idx) => match THEME_PRESETS[idx] {
+            ThemePreset::VortexGlass => {
+                canvas.vertical_gradient(mini, 0x103b66, 0x2f88ca);
+                canvas.line(
+                    mini.x + 8,
+                    mini.y + 4,
+                    mini.right() - 24,
+                    mini.bottom() - 10,
+                    0xbbe4ff,
+                    0.26,
+                );
+                let win_m = Rect::new(mini.x + 11, mini.y + 7, mini.w - 22, mini.h - 22);
+                canvas.rounded_drop_shadow(win_m, 4, 4, 1, 0.45);
+                canvas.rounded_rect(win_m, 4, 0x8cc6f2, 0.88);
+                canvas.rounded_border(win_m, 4, 0xffffff, 0.65, 1);
+                canvas.fill(
+                    Rect::new(win_m.x + 3, win_m.y + 9, win_m.w - 6, (win_m.h - 12).max(4)),
+                    0xf4f8fc,
+                );
+                canvas.fill(
+                    Rect::new(win_m.right() - 12, win_m.y + 2, 9, 4),
+                    0xd94336,
+                );
+                canvas.fill_gradient_v(
+                    Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
+                    0x2d6699,
+                    0x183d62,
+                    0.92,
+                    0.92,
+                );
+                canvas.circle(
+                    (mini.x + 8) as f32,
+                    (mini.bottom() - 5) as f32,
+                    4.0,
+                    0x5ecfff,
+                    1.0,
+                );
+                canvas.rounded_border(mini, 4, 0xffffff, 0.55, 1);
+            }
+            ThemePreset::Spui4 => {
+                canvas.rounded_rect(mini, 4, 0x0f172a, 1.0);
+                let win_m = Rect::new(mini.x + 10, mini.y + 8, mini.w - 20, mini.h - 24);
+                canvas.rounded_rect(win_m, 3, 0x1e293b, 1.0);
+                canvas.fill(
+                    Rect::new(win_m.x + 1, win_m.y + 1, win_m.w - 2, 7),
+                    0x2563eb,
+                );
+                canvas.fill(
+                    Rect::new(mini.x + 2, mini.bottom() - 9, mini.w - 4, 7),
+                    0x111827,
+                );
+                canvas.rounded_border(mini, 4, theme.panel_border, 1.0, 1);
+            }
+            ThemePreset::Win98 => {
+                canvas.fill(mini, 0x008080);
+                let win_m = Rect::new(mini.x + 8, mini.y + 7, mini.w - 16, mini.h - 23);
+                canvas.fill(win_m, 0xc0c0c0);
+                canvas.bevel_1px(win_m, 0xffffff, 0x404040);
+                canvas.horizontal_gradient(
+                    Rect::new(win_m.x + 2, win_m.y + 2, win_m.w - 4, 8),
+                    0x000080,
+                    0x1084d0,
+                );
+                canvas.fill(
+                    Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
+                    0xc0c0c0,
+                );
+                canvas.fill(
+                    Rect::new(mini.x + 3, mini.bottom() - 7, 16, 5),
+                    0xdfdfdf,
+                );
+                canvas.bevel_1px(mini, 0x808080, 0xffffff);
+            }
+        },
+        GalleryThemeItem::External(ext_idx) => {
+            let pack = &external_themes[ext_idx];
+            let pv = &pack.preview;
+            let top_panel = pack.panel_position == Some(PanelPosition::Top);
+            let left_btns = pack.button_layout == Some(ButtonLayout::Left);
+            canvas.vertical_gradient(mini, pv.desktop_top, pv.desktop_bottom);
+
+            let win_y = if top_panel { mini.y + 12 } else { mini.y + 6 };
+            let win_m = Rect::new(mini.x + 9, win_y, mini.w - 18, (mini.h - 22).max(20));
+            let wr = pv.window_top_radius.clamp(0, 6);
+            canvas.rounded_rect_corners(win_m, [wr, wr, 0, 0], pv.window_border, 1.0);
+            canvas.fill(
+                Rect::new(win_m.x + 2, win_m.y + 9, win_m.w - 4, (win_m.h - 11).max(6)),
+                pv.window_bg,
+            );
+            canvas.horizontal_gradient(
+                Rect::new(win_m.x + 2, win_m.y + 2, win_m.w - 4, 7),
+                pv.titlebar_left,
+                pv.titlebar_right,
+            );
+            canvas.fill_alpha(
+                Rect::new(win_m.x + 2, win_m.y + 1, win_m.w - 4, 1),
+                0xffffff,
+                0.55,
+            );
+            if left_btns {
+                for (di, col) in [pv.close_btn, pv.min_btn, pv.max_btn].into_iter().enumerate() {
+                    canvas.rounded_rect(
+                        Rect::new(win_m.x + 4 + di as i32 * 6, win_m.y + 3, 4, 4),
+                        2,
+                        col,
+                        1.0,
+                    );
+                }
+            } else {
+                canvas.rounded_rect(
+                    Rect::new(win_m.right() - 9, win_m.y + 2, 6, 6),
+                    1,
+                    pv.close_btn,
+                    1.0,
+                );
+            }
+
+            let tb_y = if top_panel { mini.y + 1 } else { mini.bottom() - 9 };
+            let tb_m = Rect::new(mini.x + 1, tb_y, mini.w - 2, 8);
+            canvas.vertical_gradient(tb_m, pv.taskbar_top, pv.taskbar_bottom);
+            canvas.fill_alpha(
+                Rect::new(
+                    tb_m.x,
+                    if top_panel { tb_m.bottom() - 1 } else { tb_m.y },
+                    tb_m.w,
+                    1,
+                ),
+                if top_panel { pv.window_border } else { 0xffffff },
+                0.40,
+            );
+            canvas.rounded_rect_corners(
+                Rect::new(tb_m.x, tb_m.y, 20, tb_m.h),
+                if top_panel { [0, 0, 0, 0] } else { [0, 4, 4, 0] },
+                pv.start_btn,
+                1.0,
+            );
+            canvas.fill(
+                Rect::new(tb_m.right() - 16, tb_m.y, 16, tb_m.h),
+                pv.tray_bg,
+            );
+            canvas.rounded_border(mini, 4, theme.panel_border, 1.0, 1);
+        }
+    }
+}
+
 impl SettingsState {
     #[allow(clippy::too_many_arguments)]
     fn draw_pass(
@@ -2617,6 +2984,11 @@ impl SettingsState {
         }
         let dragging_volume = self.dragging_volume;
         let external_themes = &self.external_themes;
+        let theme_filter = self.theme_filter;
+        let theme_search = self.theme_search.as_str();
+        let theme_search_focused = self.theme_search_focused;
+        let theme_page = self.theme_page;
+        let theme_expanded = self.theme_expanded;
         let wallpapers = &self.wallpapers;
         let thumbnails = &self.thumbnails;
         let screen_size = self.screen_size;
@@ -2684,317 +3056,505 @@ impl SettingsState {
             }
             match page {
                 Page::Appearance => {
-                    y = draw_section_heading(canvas, text, theme, content_x, y, "系统主题方案");
-                    let n_builtin = THEME_PRESETS.len() as i32;
-                    let n_ext = external_themes.len() as i32;
-                    let n_total = n_builtin + n_ext;
-                    let cols = if card_w >= 620 { 3 } else { 2 };
-                    let rows = (n_total + cols - 1) / cols;
-                    let preset_gap = 12;
-                    let card_item_h = if cols == 3 { 126 } else { 86 };
-                    let c_theme_h = 14 + rows * card_item_h + (rows - 1).max(0) * 10 + 30;
-                    let c_theme = Rect::new(content_x, y, card_w, c_theme_h);
-                    ui::card(canvas, theme, c_theme);
-                    let active_ext_id = external_themes
-                        .iter()
-                        .find(|p| p.id == cfg.theme_id)
-                        .map(|p| p.id.as_str());
-                    let active_preset = if active_ext_id.is_some() {
+                    let active_ext_idx = external_themes.iter().position(|p| p.id == cfg.theme_id);
+                    let active_builtin_idx = if active_ext_idx.is_some() {
                         None
                     } else {
                         Some(
                             THEME_PRESETS
                                 .iter()
-                                .copied()
-                                .find(|p| p.id() == cfg.theme_id)
-                                .unwrap_or_else(|| ThemePreset::from_style(cfg.theme_style)),
+                                .position(|p| p.id() == cfg.theme_id)
+                                .unwrap_or_else(|| {
+                                    let fallback = ThemePreset::from_style(cfg.theme_style);
+                                    THEME_PRESETS
+                                        .iter()
+                                        .position(|p| *p == fallback)
+                                        .unwrap_or(0)
+                                }),
                         )
                     };
-                    let preset_w = (card_w - 32 - preset_gap * (cols - 1)) / cols;
-                    for item_idx in 0..n_total as usize {
-                        let col_i = item_idx as i32 % cols;
-                        let row_i = item_idx as i32 / cols;
-                        let card_r = Rect::new(
-                            content_x + 16 + col_i * (preset_w + preset_gap),
-                            y + 14 + row_i * (card_item_h + 10),
-                            preset_w,
-                            card_item_h,
+                    let active_item = if let Some(ext_i) = active_ext_idx {
+                        GalleryThemeItem::External(ext_i)
+                    } else {
+                        GalleryThemeItem::Builtin(active_builtin_idx.unwrap_or(0))
+                    };
+                    let (active_name, active_sub, active_source) = match active_item {
+                        GalleryThemeItem::Builtin(i) => (
+                            THEME_PRESETS[i].name(),
+                            THEME_PRESETS[i].subtitle(),
+                            "内置主题".to_string(),
+                        ),
+                        GalleryThemeItem::External(i) => (
+                            external_themes[i].name.as_str(),
+                            external_themes[i].subtitle.as_str(),
+                            format!("扩展包 · {}", external_themes[i].id),
+                        ),
+                    };
+
+                    // Section A: Current Theme Hero Card
+                    y = draw_section_heading(canvas, text, theme, content_x, y, "当前正在使用");
+                    let c_hero = Rect::new(content_x, y, card_w, 88);
+                    ui::card(canvas, theme, c_hero);
+                    let hero_mini = Rect::new(c_hero.x + 14, c_hero.y + 12, 118, 64);
+                    draw_theme_mini_preview(canvas, theme, hero_mini, active_item, external_themes);
+
+                    let hx = hero_mini.right() + 14;
+                    let refresh_btn = Rect::new(c_hero.right() - 102, c_hero.y + 28, 86, 32);
+                    let info_max_w = (refresh_btn.x - hx - 12).max(80) as f32;
+                    let hero_title = text.truncate(active_name, (info_max_w - 92.0).max(40.0), 15.0, Face::Bold);
+                    text.draw(
+                        canvas,
+                        &hero_title,
+                        hx as f32,
+                        (c_hero.y + 30) as f32,
+                        15.0,
+                        theme.text,
+                        Face::Bold,
+                    );
+                    let name_w = text.measure(&hero_title, 15.0, Face::Bold);
+                    let pill_w = (text.measure(&active_source, 10.0, Face::Bold) + 14.0).round() as i32;
+                    let pill_r = Rect::new((hx as f32 + name_w + 10.0).round() as i32, c_hero.y + 14, pill_w, 20);
+                    if pill_r.right() < refresh_btn.x - 6 {
+                        canvas.rounded_rect(pill_r, if is_win98 { 0 } else { 4 }, theme.accent_soft, 1.0);
+                        text.draw_centered(
+                            canvas,
+                            &active_source,
+                            pill_r.x as f32 + pill_r.w as f32 * 0.5,
+                            (pill_r.y + 14) as f32,
+                            10.0,
+                            theme.accent,
+                            Face::Bold,
                         );
-                        let is_builtin = (item_idx as i32) < n_builtin;
-                        let (selected, target, item_name, item_subtitle) = if is_builtin {
-                            let preset = THEME_PRESETS[item_idx];
-                            (
-                                active_preset == Some(preset),
-                                HitTarget::ThemePreset(item_idx),
-                                preset.name(),
-                                preset.subtitle(),
-                            )
-                        } else {
-                            let ext_idx = item_idx - n_builtin as usize;
-                            let pack = &external_themes[ext_idx];
-                            (
-                                active_ext_id == Some(pack.id.as_str()),
-                                HitTarget::ExternalTheme(ext_idx),
-                                pack.name.as_str(),
-                                pack.subtitle.as_str(),
-                            )
-                        };
-                        let hovered = hover == Some(target);
+                    }
+                    let hero_sub = text.truncate(active_sub, info_max_w, 11.5, Face::Ui);
+                    text.draw(
+                        canvas,
+                        &hero_sub,
+                        hx as f32,
+                        (c_hero.y + 51) as f32,
+                        11.5,
+                        theme.text_dim,
+                        Face::Ui,
+                    );
+                    let meta_str = format!(
+                        "{}模式  ·  面板{}  ·  窗口按钮{}",
+                        if cfg.mode == ThemeMode::Dark { "深色" } else { "浅色" },
+                        if cfg.panel_position == PanelPosition::Top { "置顶" } else { "置底" },
+                        if cfg.wm_button_layout == ButtonLayout::Left { "居左" } else { "居右" },
+                    );
+                    let meta_shown = text.truncate(&meta_str, info_max_w, 10.5, Face::Ui);
+                    text.draw(
+                        canvas,
+                        &meta_shown,
+                        hx as f32,
+                        (c_hero.y + 70) as f32,
+                        10.5,
+                        theme.text_muted,
+                        Face::Ui,
+                    );
+                    ui::button(
+                        canvas,
+                        text,
+                        theme,
+                        refresh_btn,
+                        "刷新列表",
+                        None,
+                        false,
+                        hover == Some(HitTarget::ThemeRefresh),
+                    );
+                    push_clipped_hit(hits, viewport, refresh_btn, HitTarget::ThemeRefresh);
+                    y += c_hero.h + 14;
+
+                    // Section B: Scalable Theme Gallery Card (filter + search + 2-row paginated grid)
+                    y = draw_section_heading(canvas, text, theme, content_x, y, "主题库");
+                    let filtered_items =
+                        filter_theme_gallery(external_themes, theme_filter, theme_search);
+                    let cols = gallery_cols_for_card_w(card_w);
+                    let per_page = (cols as usize) * 2;
+                    let (cur_page, total_pages, page_range) = paginate_theme_gallery(
+                        filtered_items.len(),
+                        theme_page,
+                        per_page,
+                        theme_expanded,
+                    );
+                    let shown_items = &filtered_items[page_range.clone()];
+                    let rows = if shown_items.is_empty() {
+                        0
+                    } else {
+                        ((shown_items.len() as i32) + cols - 1) / cols
+                    };
+                    let toolbar_h = 46;
+                    let card_item_h = if cols == 3 { 126 } else { 86 };
+                    let preset_gap = 12;
+                    let grid_area_h = if shown_items.is_empty() {
+                        84
+                    } else {
+                        12 + rows * card_item_h + (rows - 1).max(0) * 10 + 12
+                    };
+                    let show_pager = filtered_items.len() > per_page || theme_expanded;
+                    let footer_h = if show_pager { 42 } else { 28 };
+                    let c_theme_h = toolbar_h + grid_area_h + footer_h;
+                    let c_theme = Rect::new(content_x, y, card_w, c_theme_h);
+                    ui::card(canvas, theme, c_theme);
+
+                    // Toolbar: Filter pills on left + search box on right
+                    let mut fx = c_theme.x + 14;
+                    let counts = [
+                        (ThemeFilter::All, THEME_PRESETS.len() + external_themes.len()),
+                        (ThemeFilter::Builtin, THEME_PRESETS.len()),
+                        (ThemeFilter::External, external_themes.len()),
+                    ];
+                    for (flt, cnt) in counts {
+                        let lbl = format!("{} ({cnt})", flt.label());
+                        let fw = (text.measure(&lbl, 11.5, Face::Ui) + 20.0).round() as i32;
+                        let fr = Rect::new(fx, c_theme.y + 9, fw, 28);
+                        let is_act = theme_filter == flt;
+                        let tgt = HitTarget::ThemeFilter(flt);
+                        let is_hov = hover == Some(tgt);
                         if is_win98 {
-                            canvas.fill(
-                                card_r,
-                                if selected {
-                                    theme.window_alt
-                                } else if hovered {
-                                    theme.panel_hover
-                                } else {
-                                    theme.panel
-                                },
-                            );
-                            if selected {
-                                ui::sunken_bevel(canvas, theme, card_r);
+                            canvas.fill(fr, if is_act { theme.window_alt } else { theme.panel });
+                            if is_act {
+                                ui::sunken_bevel(canvas, theme, fr);
                             } else {
-                                ui::raised_bevel(canvas, theme, card_r);
+                                ui::raised_bevel(canvas, theme, fr);
                             }
                         } else {
-                            let fill = if selected {
-                                theme.accent_soft
-                            } else if hovered {
+                            let bg = if is_act {
+                                theme.accent
+                            } else if is_hov {
                                 theme.panel_hover
                             } else {
                                 theme.window_alt
                             };
-                            canvas.rounded_rect(card_r, ctrl_r, fill, 1.0);
-                            canvas.rounded_border(
-                                card_r,
-                                ctrl_r,
-                                if selected {
-                                    theme.accent
-                                } else {
-                                    theme.window_border
-                                },
-                                1.0,
-                                if selected { 2 } else { 1 },
-                            );
+                            canvas.rounded_rect(fr, ctrl_r, bg, 1.0);
+                            if !is_act {
+                                canvas.rounded_border(fr, ctrl_r, theme.window_border, 1.0, 1);
+                            }
                         }
-
-                        // Mini desktop + window preview.
-                        let stacked = cols == 3;
-                        let mini = if stacked {
-                            Rect::new(card_r.x + (card_r.w - 110) / 2, card_r.y + 10, 110, 56)
+                        let fg = if is_act && !is_win98 {
+                            theme.selection_text
+                        } else if is_act {
+                            theme.text
                         } else {
-                            Rect::new(card_r.x + 12, card_r.y + 15, 82, 56)
+                            theme.text_dim
                         };
-                        if is_builtin {
-                            match THEME_PRESETS[item_idx] {
-                                ThemePreset::VortexGlass => {
-                                    canvas.vertical_gradient(mini, 0x103b66, 0x2f88ca);
-                                    canvas.line(
-                                        mini.x + 8,
-                                        mini.y + 4,
-                                        mini.right() - 24,
-                                        mini.bottom() - 10,
-                                        0xbbe4ff,
-                                        0.26,
-                                    );
-                                    let win_m = Rect::new(mini.x + 11, mini.y + 7, mini.w - 22, 34);
-                                    canvas.rounded_drop_shadow(win_m, 4, 4, 1, 0.45);
-                                    canvas.rounded_rect(win_m, 4, 0x8cc6f2, 0.88);
-                                    canvas.rounded_border(win_m, 4, 0xffffff, 0.65, 1);
-                                    canvas.fill(
-                                        Rect::new(
-                                            win_m.x + 3,
-                                            win_m.y + 9,
-                                            win_m.w - 6,
-                                            win_m.h - 12,
-                                        ),
-                                        0xf4f8fc,
-                                    );
-                                    canvas.fill(
-                                        Rect::new(win_m.right() - 12, win_m.y + 2, 9, 4),
-                                        0xd94336,
-                                    );
-                                    canvas.fill_gradient_v(
-                                        Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
-                                        0x2d6699,
-                                        0x183d62,
-                                        0.92,
-                                        0.92,
-                                    );
-                                    canvas.circle(
-                                        (mini.x + 8) as f32,
-                                        (mini.bottom() - 5) as f32,
-                                        4.0,
-                                        0x5ecfff,
-                                        1.0,
-                                    );
-                                    canvas.rounded_border(mini, 4, 0xffffff, 0.55, 1);
-                                }
-                                ThemePreset::Spui4 => {
-                                    canvas.rounded_rect(mini, 4, 0x0f172a, 1.0);
-                                    let win_m = Rect::new(mini.x + 10, mini.y + 8, mini.w - 20, 32);
-                                    canvas.rounded_rect(win_m, 3, 0x1e293b, 1.0);
-                                    canvas.fill(
-                                        Rect::new(win_m.x + 1, win_m.y + 1, win_m.w - 2, 7),
-                                        0x2563eb,
-                                    );
-                                    canvas.fill(
-                                        Rect::new(mini.x + 2, mini.bottom() - 9, mini.w - 4, 7),
-                                        0x111827,
-                                    );
-                                    canvas.rounded_border(mini, 4, theme.panel_border, 1.0, 1);
-                                }
-                                ThemePreset::Win98 => {
-                                    canvas.fill(mini, 0x008080);
-                                    let win_m = Rect::new(mini.x + 8, mini.y + 7, mini.w - 16, 33);
-                                    canvas.fill(win_m, 0xc0c0c0);
-                                    canvas.bevel_1px(win_m, 0xffffff, 0x404040);
-                                    canvas.horizontal_gradient(
-                                        Rect::new(win_m.x + 2, win_m.y + 2, win_m.w - 4, 8),
-                                        0x000080,
-                                        0x1084d0,
-                                    );
-                                    canvas.fill(
-                                        Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
-                                        0xc0c0c0,
-                                    );
-                                    canvas.fill(
-                                        Rect::new(mini.x + 3, mini.bottom() - 7, 16, 5),
-                                        0xdfdfdf,
-                                    );
-                                    canvas.bevel_1px(mini, 0x808080, 0xffffff);
-                                }
-                            }
-                        } else {
-                            let ext_idx = item_idx - n_builtin as usize;
-                            let pv = &external_themes[ext_idx].preview;
-                            canvas.vertical_gradient(mini, pv.desktop_top, pv.desktop_bottom);
-                            let win_m = Rect::new(mini.x + 9, mini.y + 6, mini.w - 18, 34);
-                            let wr = pv.window_top_radius.clamp(0, 6);
-                            canvas.rounded_rect_corners(
-                                win_m,
-                                [wr, wr, 0, 0],
-                                pv.window_border,
-                                1.0,
-                            );
-                            canvas.fill(
-                                Rect::new(win_m.x + 2, win_m.y + 9, win_m.w - 4, win_m.h - 11),
-                                pv.window_bg,
-                            );
-                            canvas.horizontal_gradient(
-                                Rect::new(win_m.x + 2, win_m.y + 2, win_m.w - 4, 7),
-                                pv.titlebar_left,
-                                pv.titlebar_right,
-                            );
-                            canvas.fill_alpha(
-                                Rect::new(win_m.x + 2, win_m.y + 1, win_m.w - 4, 1),
-                                0xffffff,
-                                0.55,
-                            );
-                            canvas.rounded_rect(
-                                Rect::new(win_m.right() - 9, win_m.y + 2, 6, 6),
-                                1,
-                                pv.close_btn,
-                                1.0,
-                            );
-                            let tb_m = Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8);
-                            canvas.vertical_gradient(tb_m, pv.taskbar_top, pv.taskbar_bottom);
-                            canvas.fill_alpha(
-                                Rect::new(tb_m.x, tb_m.y, tb_m.w, 1),
-                                0xffffff,
-                                0.40,
-                            );
-                            canvas.rounded_rect_corners(
-                                Rect::new(tb_m.x, tb_m.y, 20, tb_m.h),
-                                [0, 4, 4, 0],
-                                pv.start_btn,
-                                1.0,
-                            );
-                            canvas.fill(
-                                Rect::new(tb_m.right() - 16, tb_m.y, 16, tb_m.h),
-                                pv.tray_bg,
-                            );
-                            canvas.rounded_border(mini, 4, theme.panel_border, 1.0, 1);
-                        }
-
-                        if stacked {
-                            let tx = card_r.x + 10;
-                            text.draw(
-                                canvas,
-                                item_name,
-                                tx as f32,
-                                (mini.bottom() + 18) as f32,
-                                13.0,
-                                if selected { theme.accent } else { theme.text },
-                                Face::Bold,
-                            );
-                            let sub_max = (card_r.w - 20).max(40) as f32;
-                            let sub_shown = text.truncate(item_subtitle, sub_max, 10.5, Face::Ui);
-                            text.draw(
-                                canvas,
-                                &sub_shown,
-                                tx as f32,
-                                (mini.bottom() + 36) as f32,
-                                10.5,
-                                theme.text_dim,
-                                Face::Ui,
-                            );
-                            if selected {
-                                text.draw(
-                                    canvas,
-                                    "● 当前启用",
-                                    (card_r.right() - 74) as f32,
-                                    (mini.bottom() + 18) as f32,
-                                    10.5,
-                                    theme.accent,
-                                    Face::Bold,
-                                );
-                            }
-                        } else {
-                            let tx = mini.right() + 12;
-                            text.draw(
-                                canvas,
-                                item_name,
-                                tx as f32,
-                                (card_r.y + 28) as f32,
-                                13.5,
-                                if selected { theme.accent } else { theme.text },
-                                Face::Bold,
-                            );
-                            let sub_max = (card_r.right() - tx - 10).max(40) as f32;
-                            let sub_shown = text.truncate(item_subtitle, sub_max, 11.0, Face::Ui);
-                            text.draw(
-                                canvas,
-                                &sub_shown,
-                                tx as f32,
-                                (card_r.y + 47) as f32,
-                                11.0,
-                                theme.text_dim,
-                                Face::Ui,
-                            );
-                            if selected {
-                                text.draw(
-                                    canvas,
-                                    "● 当前启用",
-                                    tx as f32,
-                                    (card_r.y + 66) as f32,
-                                    10.5,
-                                    theme.accent,
-                                    Face::Bold,
-                                );
-                            }
-                        }
-                        push_clipped_hit(hits, viewport, card_r, target);
+                        text.draw_centered(
+                            canvas,
+                            &lbl,
+                            fr.x as f32 + fr.w as f32 * 0.5,
+                            (fr.y + 18) as f32,
+                            11.5,
+                            fg,
+                            if is_act { Face::Bold } else { Face::Ui },
+                        );
+                        push_clipped_hit(hits, viewport, fr, tgt);
+                        fx += fw + 6;
                     }
-                    text.draw(
+
+                    let search_w = (c_theme.right() - 14 - fx - 12).clamp(130, 210);
+                    let search_r = Rect::new(c_theme.right() - 14 - search_w, c_theme.y + 9, search_w, 28);
+                    ui::text_input(
                         canvas,
-                        "切换主题将立即更新桌面、任务栏、开始菜单、全部应用、登录及关机界面；深浅/强调色仍可微调",
-                        (content_x + 16) as f32,
-                        (y + c_theme_h - 14) as f32,
-                        11.0,
-                        theme.text_muted,
-                        Face::Ui,
+                        text,
+                        theme,
+                        search_r,
+                        theme_search,
+                        "搜索主题名 / 特性...",
+                        theme_search_focused,
+                        Some(Icon::Search),
                     );
+                    if !theme_search.is_empty() {
+                        let clear_r = Rect::new(search_r.right() - 24, search_r.y + 3, 20, 22);
+                        let c_hov = hover == Some(HitTarget::ThemeSearchClear);
+                        if c_hov {
+                            canvas.rounded_rect(clear_r, 3, theme.panel_hover, 1.0);
+                        }
+                        text.draw_centered(
+                            canvas,
+                            "×",
+                            clear_r.x as f32 + clear_r.w as f32 * 0.5,
+                            (clear_r.y + 15) as f32,
+                            13.0,
+                            theme.text_muted,
+                            Face::Bold,
+                        );
+                        push_clipped_hit(hits, viewport, clear_r, HitTarget::ThemeSearchClear);
+                        push_clipped_hit(
+                            hits,
+                            viewport,
+                            Rect::new(search_r.x, search_r.y, (search_r.w - 26).max(20), search_r.h),
+                            HitTarget::ThemeSearchInput,
+                        );
+                    } else {
+                        push_clipped_hit(hits, viewport, search_r, HitTarget::ThemeSearchInput);
+                    }
+
+                    draw_row_divider(canvas, theme, content_x, card_w, y + toolbar_h);
+
+                    let grid_y = y + toolbar_h;
+                    if shown_items.is_empty() {
+                        text.draw_centered(
+                            canvas,
+                            "未找到匹配的主题，请清空搜索词或点击上方「刷新列表」",
+                            c_theme.x as f32 + c_theme.w as f32 * 0.5,
+                            (grid_y + 46) as f32,
+                            12.0,
+                            theme.text_muted,
+                            Face::Ui,
+                        );
+                    } else {
+                        let preset_w = (card_w - 32 - preset_gap * (cols - 1)) / cols;
+                        for (slot_idx, &item) in shown_items.iter().enumerate() {
+                            let col_i = slot_idx as i32 % cols;
+                            let row_i = slot_idx as i32 / cols;
+                            let card_r = Rect::new(
+                                content_x + 16 + col_i * (preset_w + preset_gap),
+                                grid_y + 12 + row_i * (card_item_h + 10),
+                                preset_w,
+                                card_item_h,
+                            );
+                            let (selected, target, item_name, item_subtitle, badge_lbl) = match item {
+                                GalleryThemeItem::Builtin(idx) => {
+                                    let preset = THEME_PRESETS[idx];
+                                    (
+                                        active_builtin_idx == Some(idx),
+                                        HitTarget::ThemePreset(idx),
+                                        preset.name(),
+                                        preset.subtitle(),
+                                        None,
+                                    )
+                                }
+                                GalleryThemeItem::External(ext_idx) => {
+                                    let pack = &external_themes[ext_idx];
+                                    (
+                                        active_ext_idx == Some(ext_idx),
+                                        HitTarget::ExternalTheme(ext_idx),
+                                        pack.name.as_str(),
+                                        pack.subtitle.as_str(),
+                                        Some("扩展"),
+                                    )
+                                }
+                            };
+                            let hovered = hover == Some(target);
+                            if is_win98 {
+                                canvas.fill(
+                                    card_r,
+                                    if selected {
+                                        theme.window_alt
+                                    } else if hovered {
+                                        theme.panel_hover
+                                    } else {
+                                        theme.panel
+                                    },
+                                );
+                                if selected {
+                                    ui::sunken_bevel(canvas, theme, card_r);
+                                } else {
+                                    ui::raised_bevel(canvas, theme, card_r);
+                                }
+                            } else {
+                                let fill = if selected {
+                                    theme.accent_soft
+                                } else if hovered {
+                                    theme.panel_hover
+                                } else {
+                                    theme.window_alt
+                                };
+                                canvas.rounded_rect(card_r, ctrl_r, fill, 1.0);
+                                canvas.rounded_border(
+                                    card_r,
+                                    ctrl_r,
+                                    if selected {
+                                        theme.accent
+                                    } else {
+                                        theme.window_border
+                                    },
+                                    1.0,
+                                    if selected { 2 } else { 1 },
+                                );
+                            }
+
+                            let stacked = cols == 3;
+                            let mini = if stacked {
+                                Rect::new(card_r.x + (card_r.w - 110) / 2, card_r.y + 10, 110, 56)
+                            } else {
+                                Rect::new(card_r.x + 12, card_r.y + 15, 82, 56)
+                            };
+                            draw_theme_mini_preview(canvas, theme, mini, item, external_themes);
+
+                            if stacked {
+                                let tx = card_r.x + 10;
+                                let right_tag_w = if selected { 62.0 } else if badge_lbl.is_some() { 34.0 } else { 0.0 };
+                                let title_max = (card_r.w as f32 - 22.0 - right_tag_w).max(40.0);
+                                let title_shown = text.truncate(item_name, title_max, 13.0, Face::Bold);
+                                text.draw(
+                                    canvas,
+                                    &title_shown,
+                                    tx as f32,
+                                    (mini.bottom() + 18) as f32,
+                                    13.0,
+                                    if selected { theme.accent } else { theme.text },
+                                    Face::Bold,
+                                );
+                                let sub_max = (card_r.w - 20).max(40) as f32;
+                                let sub_shown = text.truncate(item_subtitle, sub_max, 10.5, Face::Ui);
+                                text.draw(
+                                    canvas,
+                                    &sub_shown,
+                                    tx as f32,
+                                    (mini.bottom() + 36) as f32,
+                                    10.5,
+                                    theme.text_dim,
+                                    Face::Ui,
+                                );
+                                if selected {
+                                    text.draw(
+                                        canvas,
+                                        "● 已启用",
+                                        (card_r.right() - 62) as f32,
+                                        (mini.bottom() + 18) as f32,
+                                        10.5,
+                                        theme.accent,
+                                        Face::Bold,
+                                    );
+                                } else if let Some(tag) = badge_lbl {
+                                    let tr = Rect::new(card_r.right() - 40, mini.bottom() + 6, 30, 15);
+                                    canvas.rounded_rect(tr, 3, theme.panel_hover, 1.0);
+                                    text.draw_centered(
+                                        canvas,
+                                        tag,
+                                        tr.x as f32 + tr.w as f32 * 0.5,
+                                        (tr.y + 11) as f32,
+                                        9.0,
+                                        theme.text_muted,
+                                        Face::Ui,
+                                    );
+                                }
+                            } else {
+                                let tx = mini.right() + 12;
+                                let title_max = (card_r.right() - tx - 12).max(40) as f32;
+                                let title_shown = text.truncate(item_name, title_max, 13.5, Face::Bold);
+                                text.draw(
+                                    canvas,
+                                    &title_shown,
+                                    tx as f32,
+                                    (card_r.y + 28) as f32,
+                                    13.5,
+                                    if selected { theme.accent } else { theme.text },
+                                    Face::Bold,
+                                );
+                                let sub_shown = text.truncate(item_subtitle, title_max, 11.0, Face::Ui);
+                                text.draw(
+                                    canvas,
+                                    &sub_shown,
+                                    tx as f32,
+                                    (card_r.y + 47) as f32,
+                                    11.0,
+                                    theme.text_dim,
+                                    Face::Ui,
+                                );
+                                if selected {
+                                    text.draw(
+                                        canvas,
+                                        "● 已启用",
+                                        tx as f32,
+                                        (card_r.y + 66) as f32,
+                                        10.5,
+                                        theme.accent,
+                                        Face::Bold,
+                                    );
+                                } else if let Some(tag) = badge_lbl {
+                                    text.draw(
+                                        canvas,
+                                        tag,
+                                        tx as f32,
+                                        (card_r.y + 66) as f32,
+                                        10.0,
+                                        theme.text_muted,
+                                        Face::Ui,
+                                    );
+                                }
+                            }
+                            push_clipped_hit(hits, viewport, card_r, target);
+                        }
+                    }
+
+                    let footer_y = y + toolbar_h + grid_area_h;
+                    if show_pager {
+                        draw_row_divider(canvas, theme, content_x, card_w, footer_y);
+                        let prev_r = Rect::new(c_theme.x + 14, footer_y + 7, 68, 28);
+                        let next_r = Rect::new(prev_r.right() + 6, footer_y + 7, 68, 28);
+                        ui::button(
+                            canvas,
+                            text,
+                            theme,
+                            prev_r,
+                            "上一页",
+                            None,
+                            false,
+                            !theme_expanded && cur_page > 0 && hover == Some(HitTarget::ThemePagePrev),
+                        );
+                        ui::button(
+                            canvas,
+                            text,
+                            theme,
+                            next_r,
+                            "下一页",
+                            None,
+                            false,
+                            !theme_expanded
+                                && cur_page + 1 < total_pages
+                                && hover == Some(HitTarget::ThemePageNext),
+                        );
+                        if !theme_expanded && cur_page > 0 {
+                            push_clipped_hit(hits, viewport, prev_r, HitTarget::ThemePagePrev);
+                        }
+                        if !theme_expanded && cur_page + 1 < total_pages {
+                            push_clipped_hit(hits, viewport, next_r, HitTarget::ThemePageNext);
+                        }
+                        let page_info = if theme_expanded {
+                            format!("已展开全部 {} 套匹配主题", filtered_items.len())
+                        } else {
+                            format!("第 {} / {} 页 · 共 {} 套", cur_page + 1, total_pages, filtered_items.len())
+                        };
+                        text.draw(
+                            canvas,
+                            &page_info,
+                            (next_r.right() + 12) as f32,
+                            (footer_y + 25) as f32,
+                            11.5,
+                            theme.text_muted,
+                            Face::Ui,
+                        );
+                        let exp_label = if theme_expanded {
+                            "收起分页".to_string()
+                        } else {
+                            format!("展开全部 ({})", filtered_items.len())
+                        };
+                        let exp_w = (text.measure(&exp_label, 11.5, Face::Ui) + 22.0).round() as i32;
+                        let exp_r = Rect::new(c_theme.right() - 14 - exp_w, footer_y + 7, exp_w, 28);
+                        ui::button(
+                            canvas,
+                            text,
+                            theme,
+                            exp_r,
+                            &exp_label,
+                            None,
+                            false,
+                            hover == Some(HitTarget::ThemeExpandToggle),
+                        );
+                        push_clipped_hit(hits, viewport, exp_r, HitTarget::ThemeExpandToggle);
+                    } else {
+                        text.draw(
+                            canvas,
+                            "切换主题将立即更新桌面、面板、开始菜单、控件外观与壁纸；深浅与强调色仍可微调",
+                            (content_x + 16) as f32,
+                            (footer_y + 16) as f32,
+                            11.0,
+                            theme.text_muted,
+                            Face::Ui,
+                        );
+                    }
                     y += c_theme.h + 16;
 
                     y = draw_section_heading(canvas, text, theme, content_x, y, "主题与色彩");
@@ -5357,5 +5917,64 @@ mod tests {
         assert_eq!(parse_initial_page(Some("logs")), Page::Logs);
         assert_eq!(parse_initial_page(Some("about")), Page::About);
         assert_eq!(parse_initial_page(None), Page::Appearance);
+    }
+
+    #[test]
+    fn theme_gallery_filters_searches_and_paginates_cleanly() {
+        let mk_ext = |idx: usize| crate::theme::InstalledThemeInfo {
+            id: format!("ext-{idx}"),
+            name: format!("Custom Pack {idx}"),
+            subtitle: if idx % 2 == 0 {
+                "顶栏 水晶".to_string()
+            } else {
+                "复古 暗色".to_string()
+            },
+            base_style: uxconf::ThemeStyle::Spui,
+            mode: ThemeMode::Light,
+            accent: 0x0054e3,
+            wallpaper: None,
+            solid_color: None,
+            panel_position: Some(PanelPosition::Top),
+            panel_size: Some(32),
+            start_fullscreen: Some(false),
+            button_layout: Some(ButtonLayout::Left),
+            preview: crate::theme::ThemePreviewSpec {
+                desktop_top: 0,
+                desktop_bottom: 0,
+                window_bg: 0,
+                window_border: 0,
+                window_top_radius: 4,
+                titlebar_left: 0,
+                titlebar_right: 0,
+                close_btn: 0,
+                min_btn: 0,
+                max_btn: 0,
+                taskbar_top: 0,
+                taskbar_bottom: 0,
+                start_btn: 0,
+                tray_bg: 0,
+            },
+        };
+        let exts: Vec<_> = (0..10).map(mk_ext).collect();
+        let all = filter_theme_gallery(&exts, ThemeFilter::All, "");
+        assert_eq!(all.len(), THEME_PRESETS.len() + 10);
+
+        let builtin_only = filter_theme_gallery(&exts, ThemeFilter::Builtin, "");
+        assert_eq!(builtin_only.len(), THEME_PRESETS.len());
+
+        let ext_only = filter_theme_gallery(&exts, ThemeFilter::External, "");
+        assert_eq!(ext_only.len(), 10);
+
+        let searched_all = filter_theme_gallery(&exts, ThemeFilter::All, "水晶");
+        assert_eq!(searched_all.len(), 6);
+        let searched_ext = filter_theme_gallery(&exts, ThemeFilter::External, "水晶");
+        assert_eq!(searched_ext.len(), 5);
+
+        let (p0, tp, r0) = paginate_theme_gallery(all.len(), 0, 6, false);
+        assert_eq!((p0, tp, r0), (0, 3, 0..6));
+        let (p2, _, r2) = paginate_theme_gallery(all.len(), 99, 6, false);
+        assert_eq!((p2, r2), (2, 12..13));
+        let (pe, _, re) = paginate_theme_gallery(all.len(), 1, 6, true);
+        assert_eq!((pe, re), (0, 0..13));
     }
 }

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Ambiance Theme
+Comment=Apply the Ambiance SPUI theme
+Exec=/usr/bin/spui-theme-ambiance
+Terminal=false
+Icon=preferences-desktop-theme
+Categories=Settings;DesktopSettings;
+StartupNotify=false
