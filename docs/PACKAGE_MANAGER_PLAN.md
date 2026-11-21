@@ -659,6 +659,13 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - sudo：修复 `command_for_shell` 重复传程序名（`sudo spk sync` 变成 `spk spk sync`）
   - 旧 `base-1.0.0-3`、`sudo-0.1.0-1` 已从生产仓库删除
 
+- 2026-11-21：`theme-winxp 1.0.0-1`：SPUI 外部主题自动加载 + XP Luna 风格主题包。
+  - `theme-winxp-1.0.0-1-x86_64.spk`：sha256 `21d92a89976a584ea128629c47a239bc82b25ff7cc719d1cc3b14cdcaf9533b6`
+  - `index.json`：sha256 `4efe38d9abe634d2aaf1935214a83dc721f90cc6cd4e46a7d38ee2aaa94fe745`
+  - `index.json.sig`：sha256 `be86205bae593776ff3d85ed2af47ce528568a655477e2625fd7f3f9babc3cb2`
+  - SPUI 启动扫描 `/usr/share/spui/themes/<id>/theme.toml`；主题包不改代码
+  - 主题包含原创 `winxp-bliss.jpg`、`theme.toml`、`spui-theme-winxp` 应用脚本
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
