@@ -1932,11 +1932,19 @@ fn sys_chroot(path_ptr: *const u8) -> i64 {
 }
 
 fn sys_umount2(target_ptr: *const u8, _flags: u32) -> i64 {
-    let target = match read_c_string(target_ptr, 256) {
+    let target = match read_c_string(target_ptr, 512) {
         Ok(s) => s,
         Err(e) => return e.to_errno(),
     };
-    match vfs::umount(&target) {
+    let table = vfs::current_fd_table();
+    let target = {
+        let guard = table.lock();
+        match vfs::resolve_at_path(&guard, abi::AT_FDCWD, &target) {
+            Ok(path) => path,
+            Err(error) => return error.to_errno(),
+        }
+    };
+    match vfs::umount_with_flags(&target, _flags & vfs::abi::MNT_DETACH != 0) {
         Ok(()) => 0,
         Err(e) => e.to_errno(),
     }

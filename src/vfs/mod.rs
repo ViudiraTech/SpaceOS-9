@@ -421,23 +421,40 @@ pub fn pivot_root(new_root: &str, put_old: &str) -> Result<(), VfsError> {
     Ok(())
 }
 
-/// Unmount a filesystem mounted at `target`./// Unmount a filesystem mounted at `target`.
+/// Unmount a filesystem mounted at `target`./// Unmount a filesystem mounted at `target`. With `detach`, remove the
+/// entire mount subtree (Linux MNT_DETACH), which is required after pivot_root
+/// so old-root device/proc mounts cannot remain visible at put_old.
 pub fn umount(target: &str) -> Result<(), VfsError> {
+    umount_with_flags(target, false)
+}
+
+pub fn umount_with_flags(target: &str, detach: bool) -> Result<(), VfsError> {
     let mp = normalize_path("/", target);
     if mp == "/" {
         return Err(VfsError::Busy);
     }
     let namespace = current_mount_namespace();
     let mut ns = namespace.lock();
-    let idx = ns
-        .mounts
-        .iter()
-        .position(|m| m.mount_point == mp)
-        .ok_or(VfsError::InvalidArgument)?;
-    let removed = ns.mounts.remove(idx);
+    if !ns.mounts.iter().any(|m| m.mount_point == mp) {
+        return Err(VfsError::InvalidArgument);
+    }
+    let prefix = format!("{mp}/");
+    let mut removed = Vec::new();
+    let mut index = 0;
+    while index < ns.mounts.len() {
+        let entry = &ns.mounts[index];
+        if entry.mount_point == mp || (detach && entry.mount_point.starts_with(&prefix)) {
+            removed.push(ns.mounts.remove(index));
+        } else {
+            index += 1;
+        }
+    }
     drop(ns);
-    dcache::invalidate_mount(removed.id);
-    removed.fs.sync()
+    for entry in &removed {
+        dcache::invalidate_mount(entry.id);
+        let _ = entry.fs.sync();
+    }
+    Ok(())
 }
 
 /// Find the best-matching mount entry for `abs_path` and return `(MountEntry, relative_subpath)`.
