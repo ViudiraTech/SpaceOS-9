@@ -159,11 +159,13 @@ export SPK_REPO_PUBLIC
 export SPK_SECURITY
 
 .PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all all-packages kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
-all: release-try image
+all: image
+	$(MAKE) release-try
 
 # Packaging needs the musl target, BusyBox/musl sources and a CA bundle.
-# Use `make desktop`, `make iso`, `make kernel` or `make packages` for narrower
-# builds; `make all` is the full build.
+# `image` runs first so the desktop rootfs can pick up the freshly built
+# spk/spk-sandbox binaries.  Use `make desktop`, `make iso`, `make kernel` or
+# `make packages` for narrower builds; `make all` is the full build.
 all-packages: packages repo
 
 defconfig:

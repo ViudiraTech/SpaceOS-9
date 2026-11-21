@@ -50,6 +50,8 @@ PACKAGES = [
     "musl",
     "busybox",
     "busybox-suid",
+    "ca-certificates",
+    "ca-certificates-bundle",
     "doas",
     "xorg-server",
     "xf86-input-libinput",
@@ -832,6 +834,73 @@ EndSection
                 if dest.is_symlink() or dest.exists():
                     dest.unlink()
                 dest.symlink_to(f"/bin/{name}")
+
+    # Native package manager.  `make all` builds packages before this script,
+    # so the static musl binaries are available; `make desktop` alone keeps
+    # working without them.
+    host_spk = ROOT / "target" / "x86_64-unknown-linux-musl" / "release"
+    for name in ("spk", "spk-sandbox"):
+        source = host_spk / name
+        if source.exists():
+            install_binary(source, f"/usr/bin/{name}")
+    write("/etc/spk/setuid.allow", "/usr/bin/sudo\n/usr/bin/doas\n")
+
+    # Repository configuration.  `make all` builds the signed local repo
+    # before this script; `make desktop` alone may not have it, so the remote
+    # production repo is configured independently.
+    trusted: list[dict] = []
+    repos: list[dict] = []
+    build_key = ROOT / "build/keys/repo.pub"
+    production_key = ROOT / "packages/base/keys/spaceos-main.pub"
+    for key_path in (build_key, production_key):
+        if not key_path.is_file():
+            continue
+        public = json.loads(key_path.read_text())
+        if "secret_key" in public:
+            raise SystemExit(f"refusing to embed a private key: {key_path}")
+        trusted.append(public)
+    local_repo = ROOT / "build/repo/x86_64"
+    if local_repo.is_dir() and build_key.is_file():
+        target = STAGE / "var/lib/spk/repo/x86_64"
+        target.mkdir(parents=True, exist_ok=True)
+        for item in local_repo.iterdir():
+            if item.is_file():
+                shutil.copy2(item, target / item.name)
+        build_public = json.loads(build_key.read_text())
+        repos.append(
+            {
+                "name": "local",
+                "arch": "x86_64",
+                "urls": ["/var/lib/spk/repo/x86_64"],
+                "priority": 10,
+                "key_id": build_public["key_id"],
+                "last_sync": 0,
+                "enabled": True,
+            }
+        )
+    if production_key.is_file():
+        production_public = json.loads(production_key.read_text())
+        repos.append(
+            {
+                "name": "spaceos-main",
+                "arch": "x86_64",
+                "urls": ["https://goutoustdio.top/spaceos/repo/x86_64"],
+                "priority": 20,
+                "key_id": production_public["key_id"],
+                "last_sync": 0,
+                "enabled": True,
+            }
+        )
+    if trusted:
+        write(
+            "/etc/spk/trusted.json",
+            json.dumps({"schema": 1, "keys": trusted}, indent=2) + "\n",
+        )
+    if repos:
+        write(
+            "/var/lib/spk/repos.json",
+            json.dumps({"schema": 1, "repos": repos}, indent=2) + "\n",
+        )
 
     for p in ("/bin/systemd-journald", "/usr/bin/systemd-journald"):
         dest = STAGE / p.lstrip("/")
