@@ -103,6 +103,9 @@ ifeq ($(CONFIG_SOUND_DUMMY),y)
 CARGO_FEATURE_LIST += sound-dummy
 endif
 CARGO_FEATURES = $(foreach feature,$(CARGO_FEATURE_LIST),--features $(feature))
+# Only the freestanding kernel targets request build-std. A global build-std
+# setting also applies to host workspace builds and breaks std/alloc linkage.
+BUILD_STD = -Z build-std=core,alloc,compiler_builtins
 
 MODULE_LIST := $(strip \
   $(if $(filter y,$(CONFIG_MODULE_E1000)),e1000) \
@@ -180,7 +183,7 @@ kernel: deps modules
 	SPK_BUILD_COMPILER="$$(rustc --version 2>/dev/null || echo rustc)" \
 	SPK_MODULE_DIR="$$(pwd)/$(MODULE_OUT)" \
 	SPK_KERNEL_ARCH="$(ARCH)" \
-	cargo build --target $(TARGET) $(CARGO_PROFILE) $(CARGO_FEATURES)
+	cargo build --target $(TARGET) $(CARGO_PROFILE) $(CARGO_FEATURES) $(BUILD_STD)
 	@if [ "$(CONFIG_KALLSYMS)" = "y" ]; then \
 	  python3 tools/gen_kallsyms.py "$(KERNEL)" $(if $(filter y,$(CONFIG_KALLSYMS_ALL)),--all,); \
 	fi
@@ -322,7 +325,7 @@ endif
 check:
 	cargo fmt --all -- --check
 	@for target in x86_64-unknown-none aarch64-unknown-none-softfloat riscv64imac-unknown-none-elf; do \
-	  rustup target add $$target && cargo check --target $$target --all-features || exit 1; \
+	  rustup target add $$target && cargo check --target $$target --all-features $(BUILD_STD) || exit 1; \
 	done
 
 fmt:

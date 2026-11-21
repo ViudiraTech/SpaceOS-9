@@ -26,6 +26,10 @@ path = "src/main.rs"
 name = "spk-qemu-test"
 path = "src/bin/spk_qemu_test.rs"
 
+[[bin]]
+name = "spk-sandbox"
+path = "src/bin/spk_sandbox.rs"
+
 [dependencies]
 spk-core = { path = "../spk-core" }
 serde.workspace = true
@@ -33,6 +37,7 @@ serde_json.workspace = true
 clap.workspace = true
 rustix.workspace = true
 thiserror.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

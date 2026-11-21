@@ -139,7 +139,11 @@ mod tests {
         assert!(!needs_first_auth(&paths, 1000));
         assert!(needs_lecture(&paths, 1000, LectureMode::Always));
         assert!(!needs_lecture(&paths, 1000, LectureMode::Never));
-        assert!(first_auth_text(true).contains("空密码"));
+        let text = first_auth_text(true);
+        // The host locale differs between developer machines and CI; accept
+        // either localized warning while still exercising the empty-password
+        // branch.
+        assert!(text.contains("空密码") || text.contains("empty password"));
         clear_first_auth(&paths, 1000).unwrap();
         assert!(needs_first_auth(&paths, 1000));
     }

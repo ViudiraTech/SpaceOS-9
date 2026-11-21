@@ -28,6 +28,8 @@ use crate::transaction::{self, OperationKind, Options};
 pub struct ReportOptions {
     pub json: bool,
     pub print: bool,
+    pub script_failure_keep: bool,
+    pub no_sandbox_scripts: bool,
 }
 
 impl ReportOptions {
@@ -70,7 +72,7 @@ pub fn install(
     }
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
-    let repos = repo::load_repos(paths, urls)?;
+    let repos = repo::load_repos(paths, urls, lang)?;
     if !report.json {
         println!("{}", i18n::resolving(lang));
         println!("{}", i18n::looking_for_conflicts(lang));
@@ -103,6 +105,8 @@ pub fn install(
             noconfirm,
             purge: false,
             operation: OperationKind::Install,
+            script_failure_keep: report.script_failure_keep,
+            no_sandbox_scripts: report.no_sandbox_scripts,
         },
     )
 }
@@ -122,7 +126,7 @@ pub fn upgrade(
     if !targets.is_empty() && !allow_partial {
         return Err(SpkError::General(i18n::partial_disabled(lang).to_string()));
     }
-    let repos = repo::load_repos(paths, urls)?;
+    let repos = repo::load_repos(paths, urls, lang)?;
     if !report.json {
         if targets.is_empty() {
             println!("{}", i18n::starting_full_upgrade(lang));
@@ -158,6 +162,8 @@ pub fn upgrade(
             noconfirm,
             purge: false,
             operation: OperationKind::Upgrade,
+            script_failure_keep: report.script_failure_keep,
+            no_sandbox_scripts: report.no_sandbox_scripts,
         },
     )
 }
@@ -178,7 +184,7 @@ pub fn downgrade(
     }
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
-    let repos = repo::load_repos(paths, urls)?;
+    let repos = repo::load_repos(paths, urls, lang)?;
     if !report.json {
         println!("{}", i18n::resolving(lang));
         println!("{}", i18n::looking_for_conflicts(lang));
@@ -211,6 +217,8 @@ pub fn downgrade(
             noconfirm,
             purge: false,
             operation: OperationKind::Install,
+            script_failure_keep: report.script_failure_keep,
+            no_sandbox_scripts: report.no_sandbox_scripts,
         },
     )
 }
@@ -230,7 +238,7 @@ pub fn reinstall(
         ));
     }
     let (_lock, state) = prepare(paths, lang)?;
-    let repos = repo::load_repos(paths, urls)?;
+    let repos = repo::load_repos(paths, urls, lang)?;
     if !report.json {
         println!("{}", i18n::resolving(lang));
         println!("{}", i18n::looking_for_conflicts(lang));
@@ -263,6 +271,8 @@ pub fn reinstall(
             noconfirm,
             purge: false,
             operation: OperationKind::Install,
+            script_failure_keep: report.script_failure_keep,
+            no_sandbox_scripts: report.no_sandbox_scripts,
         },
     )
 }
@@ -341,6 +351,8 @@ pub fn remove(
             noconfirm,
             purge,
             operation: OperationKind::Remove,
+            script_failure_keep: report.script_failure_keep,
+            no_sandbox_scripts: report.no_sandbox_scripts,
         },
     )
 }
@@ -624,7 +636,7 @@ pub fn unhold(paths: &Paths, targets: &[String], lang: Lang) -> Result<()> {
     let mut holds = state.holds.clone();
     for name in targets {
         if holds.packages.remove(name).is_none() {
-            eprintln!("warning: {} is not held", name);
+            eprintln!("{}", i18n::not_held(lang, name));
         } else {
             println!("{}", name);
         }

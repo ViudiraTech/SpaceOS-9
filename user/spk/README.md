@@ -1,10 +1,10 @@
 # spk — SpaceOS-9 native package manager
 
-P2 status: target-side `spk` can install, upgrade, downgrade, reinstall and
-remove from signed local repositories, with a backtracking dependency solver,
-holds/pins, multi-repository priority and mirror failover, deterministic
-`--print`/`--json` transaction plans, file/transaction journal and crash
-recovery. Design: `docs/PACKAGE_MANAGER_PLAN.md`; privileged tools:
+P3 status: target-side `spk` can install, upgrade, downgrade, reinstall and
+remove from signed local repositories, with holds/pins, multi-repository
+priority/failover, deterministic plans, `.INSTALL` scriptlets, hooks.d and
+file triggers, and a private mount-namespace script sandbox. Design:
+`docs/PACKAGE_MANAGER_PLAN.md`; privileged tools:
 `docs/SUDO_DOAS_DESIGN.md`.
 
 ## Layout
@@ -17,7 +17,8 @@ user/spk/
 ├── spk-host/         host CLI: keygen / pack / index / sign / verify
 └── spk/              target CLI and library: install / upgrade / downgrade /
                       reinstall / remove / list / info / files / owns /
-                      check / repair / trust / hold / repo
+                      check / repair / trust / hold / repo; scripts/hooks/
+                      triggers and the spk-sandbox helper
 user/sudo/            sudo + doas (setuid root, shadow auth, tickets, audit)
 packages/hello/       hello 0.1.0 and 0.2.0 upgrade fixtures
 packages/sudo/        setuid sudo/doas package fixtures
@@ -65,8 +66,8 @@ cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 \
   cargo test --manifest-path "$REPO/user/sudo/Cargo.toml" \
   --target-dir "$REPO/target"
 
-# QEMU matrix (kernel ISO, ext4 rootfs, three boots; includes spk P2,
-# sudo/doas, setuid probes and ext4 journal replay)
+# QEMU matrix (kernel ISO, ext4 rootfs, three boots; includes spk P2/P3,
+# scripts/hooks/triggers, sandbox escapes, sudo/doas and ext4 replay)
 # needs qemu-system-x86_64, OVMF, fakeroot, e2fsprogs, xorriso and KVM
 # (falls back to TCG when KVM is unavailable)
 tools/spk_qemu_test.py
@@ -127,6 +128,8 @@ spk remove -Rs app                               # orphan dependency cleanup
 spk list / info hello / files hello / owns /usr/bin/hello
 spk check                                        # DB + filesystem consistency
 spk repair                                       # recover an interrupted transaction
+spk --script-failure=keep install ...            # debug: continue after script failure
+spk --no-sandbox-scripts install ...             # debug: run .INSTALL unsandboxed
 spk trust add <public-key.pub> / trust list
 spk repo add main /repo/x86_64 --priority 10
 spk repo add main /repo/mirror --priority 10     # same repo, fallback mirror
@@ -146,6 +149,54 @@ and anti-downgrade arrive in P4.
 
 Exit codes follow plan §9.2: 0 OK, 1 general, 2 usage, 3 signature, 4
 dependency, 5 file conflict, 6 rolled back.
+
+## P3 scriptlets, hooks and triggers
+
+`.INSTALL` functions run in a private mount namespace with a BusyBox ash
+`/bin/sh`:
+
+- `pre_install`/`post_install`: `$1` = new `version-release`.
+- `pre_upgrade`/`post_upgrade`: `$1` = new, `$2` = old.
+- `pre_remove`/`post_remove`: `$1` = installed version.
+
+The sandbox layout is a ramfs root with `/stage` (package staging) writable,
+`/source` (real root) read-only, `/bin`, `/lib`, `/usr`, `/etc` read-only,
+`/dev` devfs and `/proc` with `hidepid=2`. It uses `pivot_root` with a chroot
+fallback, closes fds above stdio, sets rlimits/process group/timeout/output
+limit, clears the environment, drops to uid/gid 61111 with no supplementary
+groups or passwd entry, sets `no_new_privs`, and installs a seccomp denylist
+for networking, mounts, namespaces, device nodes, ptrace, BPF, keyrings and
+similar escape primitives. `clone(CLONE_NEW*)` and `clone3` are rejected;
+`execve` is allowed. Scripts may rewrite declared files but may not add,
+remove or change the type of undeclared staging paths. A failed script aborts
+before file commit (exit 6); `--script-failure=keep` is debug-only.
+
+Package hooks live under `/usr/lib/spk/hooks/<pkg>/*.hook`; system hooks are
+root-owned files in `/etc/spk/hooks.d/*.hook`. Both use:
+
+```ini
+[Trigger]
+Operation = Install
+Type = Path
+Target = usr/lib/firmware/*
+
+[Action]
+Description = 更新固件索引
+When = PostTransaction
+Exec = /usr/bin/update-fw
+```
+
+`PreTransaction` hooks run before scripts, `PostTransaction` after the DB
+commit; system hooks run as root, package hooks run in the sandbox. File
+triggers use manifest `triggers = ["/path/glob"]`, a package-owned
+`/usr/lib/spk/triggers/<pkg>.trigger`, and run once per package per
+transaction with output `Executing <pkg>-<version>.trigger`.
+
+`sudo --check-config`/`--check-doas` validate staged policy files; spk runs
+this before file-conflict checks and rejects the transaction on failure.
+`/etc/spk/setuid.allow` must be root:root mode 0644 and list `/usr/bin/sudo`
+and `/usr/bin/doas`; both the ext4 QEMU rootfs and the base rootfs builder
+ship it.
 
 ## Transaction model
 

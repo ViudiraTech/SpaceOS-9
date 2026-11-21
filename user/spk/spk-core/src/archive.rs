@@ -468,13 +468,33 @@ pub fn verify_scan(scan: RawScan) -> Result<ScannedPackage> {
         }
     }
 
-    let has_script = scan.meta.contains_key(META_INSTALL);
+    let has_install = scan.meta.contains_key(META_INSTALL);
+    let has_trigger = !manifest.triggers.is_empty()
+        || scan.entries.iter().any(|entry| {
+            entry
+                .path
+                .starts_with(crate::manifest::TRIGGER_PREFIX.trim_start_matches('/'))
+        });
+    let has_hook = scan.entries.iter().any(|entry| {
+        entry
+            .path
+            .starts_with(crate::manifest::HOOK_PREFIX.trim_start_matches('/'))
+    });
+    let has_script = has_install || has_trigger || has_hook;
     if manifest.scripts != has_script {
         return Err(Error::Package(format!(
-            "manifest declares scripts = {}, archive {} .INSTALL",
-            manifest.scripts,
-            if has_script { "contains" } else { "lacks" }
+            "manifest declares scripts = {}, archive has install/trigger/hook scripts = {}",
+            manifest.scripts, has_script
         )));
+    }
+    if has_trigger {
+        let path = crate::manifest::trigger_path(&manifest.name);
+        let entry = entries
+            .get(path.trim_start_matches('/'))
+            .ok_or_else(|| Error::Package(format!("trigger package is missing {path}")))?;
+        if entry.kind != EntryKind::File {
+            return Err(Error::Package(format!("{path} must be a regular file")));
+        }
     }
 
     Ok(ScannedPackage {

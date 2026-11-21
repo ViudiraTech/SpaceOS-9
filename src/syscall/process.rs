@@ -70,7 +70,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
         let path = uaccess::string(path, 4096)?;
         let cwd = vfs::current_cwd();
         let path = vfs::normalize_path(&cwd, &path);
-        let (inode, _) = vfs::lookup_abs(&path, true)?;
+        let (inode, resolved_path) = vfs::lookup_abs(&path, true)?;
         let meta = inode.metadata()?;
         if meta.kind != vfs::InodeKind::Regular || meta.mode & 0o111 == 0 {
             return Err(VfsError::PermissionDenied);
@@ -79,7 +79,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
         let env = strings(envp)?;
         let resolved = crate::user::exec::resolve(&path, &argv)?;
         let task = sched::current().ok_or(VfsError::InvalidArgument)?;
-        let (original_mount, _) = vfs::find_mount(&path)?;
+        let (original_mount, _) = vfs::find_mount(&resolved_path)?;
         let (exec_mount, _) = vfs::find_mount(&resolved.exec_path)?;
         if original_mount.flags & MS_NOEXEC != 0 || exec_mount.flags & MS_NOEXEC != 0 {
             return Err(VfsError::PermissionDenied);

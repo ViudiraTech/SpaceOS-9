@@ -30,6 +30,8 @@ pub struct Paths {
     pub backup: PathBuf,
     pub lock: PathBuf,
     pub journal: PathBuf,
+    pub sandbox: PathBuf,
+    pub scripts: PathBuf,
 }
 
 impl Paths {
@@ -49,6 +51,8 @@ impl Paths {
             backup: state.join("backup"),
             lock: state.join("lock"),
             journal: state.join("journal"),
+            sandbox: state.join("sandbox"),
+            scripts: state.join("scripts"),
             trusted: root.join(TRUST_DIR),
             state,
             root,
@@ -59,6 +63,8 @@ impl Paths {
         create_dir(&self.state)?;
         create_dir(&self.staging)?;
         create_dir(&self.backup)?;
+        create_dir(&self.sandbox)?;
+        create_dir(&self.scripts)?;
         create_dir(&self.root.join("var/cache/spk"))?;
         Ok(())
     }

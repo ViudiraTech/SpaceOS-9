@@ -60,7 +60,7 @@ pub fn pack(manifest_path: &Path, staging: &Path, output: &Path, level: i32) -> 
     }
     let mtime = source_date_epoch.unwrap_or(manifest.build_date);
 
-    let meta = read_meta_files(meta_dir, &manifest)?;
+    let meta = read_meta_files(meta_dir, staging, &manifest)?;
     let (mut sources, warnings) = walk_staging(staging, &manifest)?;
     sources.sort_by(|a, b| a.rel.cmp(&b.rel));
 
@@ -114,21 +114,27 @@ fn source_date_epoch() -> Result<Option<u64>> {
 
 fn read_meta_files(
     meta_dir: &Path,
+    staging: &Path,
     manifest: &Manifest,
 ) -> Result<BTreeMap<&'static str, Vec<u8>>> {
     let mut meta = BTreeMap::new();
-    for name in [META_BUILDINFO, META_CHANGELOG, META_INSTALL] {
+    for name in [META_BUILDINFO, META_CHANGELOG] {
         if let Some(data) = read_optional_regular(&meta_dir.join(name), name)? {
             meta.insert(name, data);
         }
     }
-    let has_script = meta.contains_key(META_INSTALL);
-    if manifest.scripts != has_script {
-        return Err(Error::Manifest(format!(
-            "manifest declares scripts = {}, but {} .INSTALL",
-            manifest.scripts,
-            if has_script { "found" } else { "is missing" }
-        )));
+    // .INSTALL lives at the package root (staging root); older layouts kept it
+    // beside the manifest, so accept that as a fallback.
+    let install = read_optional_regular(&staging.join(META_INSTALL), META_INSTALL)?.or(
+        read_optional_regular(&meta_dir.join(META_INSTALL), META_INSTALL)?,
+    );
+    if let Some(data) = install {
+        meta.insert(META_INSTALL, data);
+    }
+    if !manifest.scripts && meta.contains_key(META_INSTALL) {
+        return Err(Error::Manifest(
+            "manifest declares scripts = false but .INSTALL is present".into(),
+        ));
     }
     Ok(meta)
 }
@@ -189,6 +195,11 @@ fn walk_dir(
             Error::Package(format!("non-UTF-8 path in staging: {}", abs.display()))
         })?;
         let rel = rel.replace(std::path::MAIN_SEPARATOR, "/");
+        if !rel.contains('/')
+            && matches!(rel.as_str(), META_INSTALL | META_CHANGELOG | META_BUILDINFO)
+        {
+            continue;
+        }
         validate_relative_path(&rel)?;
 
         let file_type = metadata.file_type();

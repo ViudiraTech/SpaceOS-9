@@ -156,7 +156,24 @@ def prepare_repositories() -> str:
         ROOT / "build" / "packages" / "hello-0.1.0",
         base,
     )
-    for name in ("dep-a", "dep-b", "file-c", "file-d", "app", "lib"):
+    for name in (
+        "dep-a",
+        "dep-b",
+        "file-c",
+        "file-d",
+        "app",
+        "lib",
+        "script-ok",
+        "script-fail",
+        "script-post-fail",
+        "script-extra",
+        "script-source",
+        "sandbox-ok",
+        "trigger-pkg",
+        "trigger-other",
+        "hook-pkg",
+        "bad-sudoers",
+    ):
         pack(
             ROOT / "packages" / "spk-tests" / name / "manifest.toml",
             ROOT / "build" / "spk-tests" / name,
@@ -172,6 +189,16 @@ def prepare_repositories() -> str:
     pack(
         ROOT / "packages" / "hello" / "manifest-0.2.0.toml",
         ROOT / "build" / "packages" / "hello-0.2.0",
+        update,
+    )
+    pack(
+        ROOT / "packages" / "spk-tests" / "script-ok-0.2" / "manifest.toml",
+        ROOT / "build" / "spk-tests" / "script-ok-0.2",
+        update,
+    )
+    pack(
+        ROOT / "packages" / "sudo" / "manifest-0.2.0.toml",
+        ROOT / "build" / "packages" / "sudo",
         update,
     )
     for directory in (base, update):
@@ -199,6 +226,50 @@ def prepare_repositories() -> str:
                 str(keys / "spk-test.pub"),
             ]
         )
+    bad_keys = BUILD / "keys-bad"
+    run(
+        [
+            str(HOST_BIN),
+            "keygen",
+            "--name",
+            "spk-bad-test",
+            "--out",
+            str(bad_keys),
+            "--comment",
+            "SpaceOS QEMU bad signature <bad@spaceos>",
+        ]
+    )
+    bad = BUILD / "repo-bad"
+    bad.mkdir(parents=True)
+    shutil.copy2(
+        base / "script-ok-1.0.0-1-x86_64.spk",
+        bad / "script-ok-1.0.0-1-x86_64.spk",
+    )
+    for directory, key, name in ((bad, bad_keys, "spk-bad-test"),):
+        run(
+            [
+                str(HOST_BIN),
+                "index",
+                "--repo-dir",
+                str(directory),
+                "--repo",
+                name,
+                "--arch",
+                "x86_64",
+                "--key",
+                str(key / "spk-bad-test.key"),
+            ]
+        )
+        run(
+            [
+                str(HOST_BIN),
+                "verify",
+                "--repo-dir",
+                str(directory),
+                "--key",
+                str(key / "spk-bad-test.pub"),
+            ]
+        )
     return key_id
 
 
@@ -206,8 +277,12 @@ def build_rootfs(key_id: str) -> None:
     stage = BUILD / "root"
     for directory in (
         "sbin",
+        "bin",
+        "lib",
         "usr/bin",
+        "usr/share/spk-tests",
         "etc/spk/trusted.d",
+        "etc/spk/hooks.d",
         "var/log",
         "var/lib/sudo",
         "var/tmp",
@@ -215,6 +290,7 @@ def build_rootfs(key_id: str) -> None:
         "home/empty",
         "repo/base",
         "repo/update",
+        "repo/bad",
         "var/lib",
         "var/cache",
         "tmp",
@@ -226,13 +302,64 @@ def build_rootfs(key_id: str) -> None:
         (stage / directory).mkdir(parents=True, exist_ok=True)
     for source, destination in (
         (TARGET_BIN / "spk", stage / "usr/bin/spk"),
+        (TARGET_BIN / "spk-sandbox", stage / "usr/bin/spk-sandbox"),
         (TARGET_BIN / "spk-qemu-test", stage / "sbin/spk-qemu-test"),
     ):
         if not source.exists():
             raise SystemExit(f"missing {source}; run with --build")
         shutil.copy2(source, destination)
         destination.chmod(0o755)
-    for directory in ("base", "update"):
+    busybox = next(
+        (
+            candidate
+            for candidate in (
+                ROOT / "build" / "userland" / "busybox",
+                ROOT / "build" / "rootfs" / "stage" / "bin" / "busybox",
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    if busybox is None:
+        raise SystemExit("missing busybox; run tools/build_busybox.sh")
+    shutil.copy2(busybox, stage / "bin" / "busybox")
+    (stage / "bin" / "busybox").chmod(0o755)
+    shutil.copy2(busybox, stage / "bin" / "sh")
+    (stage / "bin" / "sh").chmod(0o755)
+    loader = next(
+        (
+            candidate
+            for candidate in (
+                ROOT / "build" / "userland" / "musl" / "ld-musl-x86_64.so.1",
+                ROOT / "build" / "rootfs" / "stage" / "lib" / "ld-musl-x86_64.so.1",
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    libc = next(
+        (
+            candidate
+            for candidate in (
+                ROOT / "build" / "userland" / "musl" / "libc.so",
+                ROOT / "build" / "rootfs" / "stage" / "lib" / "libc.musl-x86_64.so.1",
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    if loader is None or libc is None:
+        raise SystemExit("missing musl loader/libc; run tools/build_busybox.sh")
+    shutil.copy2(loader, stage / "lib" / "ld-musl-x86_64.so.1")
+    (stage / "lib" / "ld-musl-x86_64.so.1").chmod(0o755)
+    shutil.copy2(libc, stage / "lib" / "libc.musl-x86_64.so.1")
+    (stage / "lib" / "libc.musl-x86_64.so.1").chmod(0o755)
+    sandbox_probe = ROOT / "build" / "spk-tests" / "sandbox-probe"
+    if not sandbox_probe.is_file():
+        raise SystemExit(f"missing {sandbox_probe}; run packages/spk-tests/build.sh")
+    shutil.copy2(sandbox_probe, stage / "usr/bin/sandbox-probe")
+    (stage / "usr/bin/sandbox-probe").chmod(0o755)
+    for directory in ("base", "update", "bad"):
         for package in (BUILD / f"repo-{directory}").iterdir():
             shutil.copy2(package, stage / "repo" / directory / package.name)
     probe = ROOT / "build" / "spk-tests" / "setuid-probe"
@@ -284,6 +411,18 @@ def build_rootfs(key_id: str) -> None:
         "permit nopass test as root cmd /usr/bin/sudo-probe\n"
     )
     (stage / "etc/spk/setuid.allow").write_text("/usr/bin/sudo\n/usr/bin/doas\n")
+    (stage / "etc/spk/hooks.d/10-pre.hook").write_text(
+        "[Trigger]\nOperation = Install\nType = Package\nTarget = hook-pkg\n\n"
+        "[Action]\nDescription = 系统测试钩子（前）\nWhen = PreTransaction\n"
+        "Exec = printf 'SYSTEM_PRE_RAN\\n'\n"
+    )
+    (stage / "etc/spk/hooks.d/20-post.hook").write_text(
+        "[Trigger]\nOperation = Install\nType = Package\nTarget = hook-pkg\n\n"
+        "[Action]\nDescription = 系统测试钩子（后）\nWhen = PostTransaction\n"
+        "Exec = printf 'SYSTEM_POST_RAN\\n'\n"
+    )
+    (stage / "etc/spk/hooks.d/10-pre.hook").chmod(0o644)
+    (stage / "etc/spk/hooks.d/20-post.hook").chmod(0o644)
     (stage / "etc/test-edit").write_text("original\n")
     for name in ("etc/passwd", "etc/group"):
         (stage / name).chmod(0o644)

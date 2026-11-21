@@ -402,11 +402,87 @@ pub fn warning_conffile(lang: Lang, path: &str, saved: &str) -> String {
     }
 }
 
-pub fn warning_script_unsupported(lang: Lang, package: &str) -> String {
+pub fn running_script(lang: Lang, function: &str, package: &str) -> String {
     if lang.is_zh() {
-        format!("警告：{package} 包含安装脚本；P3 之前不会执行")
+        format!(":: 正在为 {package} 运行 {function} 脚本...")
     } else {
-        format!("warning: {package} contains install scripts; not running them before P3")
+        format!(":: Running {function} script for {package}...")
+    }
+}
+
+pub fn script_failed(lang: Lang, function: &str, code: i32) -> String {
+    if lang.is_zh() {
+        format!("{function} 脚本失败（退出码 {code}）")
+    } else {
+        format!("{function} script failed (exit code {code})")
+    }
+}
+
+pub fn script_timeout(lang: Lang, function: &str) -> String {
+    if lang.is_zh() {
+        format!("{function} 脚本在 60 秒后超时")
+    } else {
+        format!("{function} script timed out after 60 seconds")
+    }
+}
+
+pub fn script_failure_kept(lang: Lang, function: &str, error: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：{function} 脚本失败但已按 --script-failure=keep 继续：{error}")
+    } else {
+        format!("warning: {function} script failed but --script-failure=keep continues: {error}")
+    }
+}
+
+pub fn running_pre_hooks(lang: Lang) -> &'static str {
+    tr(
+        lang,
+        ":: Running pre-transaction hooks...",
+        ":: 正在运行事务前钩子...",
+    )
+}
+
+pub fn running_post_hooks(lang: Lang) -> &'static str {
+    tr(
+        lang,
+        ":: Running post-transaction hooks...",
+        ":: 正在运行事务后钩子...",
+    )
+}
+
+pub fn hook_progress(_lang: Lang, index: usize, total: usize, description: &str) -> String {
+    format!("({index}/{total}) {description}")
+}
+
+pub fn trigger_executing(lang: Lang, package: &str, version: &str) -> String {
+    if lang.is_zh() {
+        format!("正在执行 {package}-{version}.trigger")
+    } else {
+        format!("Executing {package}-{version}.trigger")
+    }
+}
+
+pub fn trigger_failed(lang: Lang, package: &str, error: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：{package} trigger 执行失败：{error}")
+    } else {
+        format!("warning: {package} trigger failed: {error}")
+    }
+}
+
+pub fn hook_failed(lang: Lang, description: &str, error: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：钩子“{description}”失败：{error}")
+    } else {
+        format!("warning: hook '{description}' failed: {error}")
+    }
+}
+
+pub fn staging_undeclared(lang: Lang, path: &str) -> String {
+    if lang.is_zh() {
+        format!("脚本新增了未声明的 staging 路径 {path}")
+    } else {
+        format!("scriptlet added undeclared staging path {path}")
     }
 }
 
@@ -443,5 +519,81 @@ pub fn held_back(lang: Lang, name: &str, installed: &str, available: &str) -> St
         format!("警告：{name} 被锁定在 {installed}（可升级到 {available}）")
     } else {
         format!("warning: {name} is held back ({installed} -> {available})")
+    }
+}
+
+pub fn error_label(lang: Lang) -> &'static str {
+    tr(lang, "error: ", "错误：")
+}
+
+pub fn repo_mirror_unavailable(lang: Lang, name: &str, url: &str, error: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：仓库“{name}”镜像 {url} 不可用：{error}")
+    } else {
+        format!("warning: repository '{name}' mirror {url} unavailable: {error}")
+    }
+}
+
+pub fn repo_unavailable(lang: Lang, url: &str, error: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：仓库 {url} 不可用：{error}")
+    } else {
+        format!("warning: repository {url} unavailable: {error}")
+    }
+}
+
+pub fn repo_no_mirror(lang: Lang, name: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：仓库“{name}”没有可用镜像")
+    } else {
+        format!("warning: repository '{name}' has no usable mirror")
+    }
+}
+
+pub fn not_held(lang: Lang, name: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：{name} 未被锁定")
+    } else {
+        format!("warning: {name} is not held")
+    }
+}
+
+pub fn setuid_preserved(lang: Lang, package: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：保留来自签名软件包 {package} 的 setuid/setgid 位")
+    } else {
+        format!("warning: preserving setuid/setgid bits from signed package {package}")
+    }
+}
+
+pub fn staging_removed(lang: Lang, path: &str) -> String {
+    if lang.is_zh() {
+        format!("脚本删除了已声明的 staging 路径 {path}")
+    } else {
+        format!("scriptlet removed declared staging path {path}")
+    }
+}
+
+pub fn staging_type_changed(lang: Lang, path: &str) -> String {
+    if lang.is_zh() {
+        format!("脚本改变了已声明 staging 路径 {path} 的类型")
+    } else {
+        format!("scriptlet changed the type of declared staging path {path}")
+    }
+}
+
+pub fn sandbox_disabled(lang: Lang, package: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：--no-sandbox-scripts 已启用，{package} 的安装脚本不受沙箱保护")
+    } else {
+        format!("warning: --no-sandbox-scripts is active; {package} install script is unsandboxed")
+    }
+}
+
+pub fn staging_symlink_changed(lang: Lang, path: &str) -> String {
+    if lang.is_zh() {
+        format!("脚本改变了已声明符号链接 {path} 的目标")
+    } else {
+        format!("scriptlet changed the target of declared symlink {path}")
     }
 }

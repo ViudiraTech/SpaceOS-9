@@ -22,12 +22,15 @@ use spk_core::manifest::{validate_absolute_path, FileType, Manifest, PackageFile
 
 use crate::crash;
 use crate::error::{Result, SpkError};
+use crate::hooks;
 use crate::i18n::{self, Lang};
 use crate::journal::{DbBackup, Event, Journal};
 use crate::repo::{target_arch, LoadedRepo};
 use crate::rootfs::{Fs, OnDiskKind};
+use crate::sandbox;
 use crate::solver::{Solution, TargetKind};
 use crate::state::{write_temp_json, Paths, State};
+use crate::triggers;
 use crate::util::{copy_file, human_size, now, txid as new_txid};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,12 +45,15 @@ pub struct Options {
     pub noconfirm: bool,
     pub purge: bool,
     pub operation: OperationKind,
+    pub script_failure_keep: bool,
+    pub no_sandbox_scripts: bool,
 }
 
 struct Staged {
     manifest: Manifest,
     dir: PathBuf,
     conffiles: BTreeSet<String>,
+    install_script: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -138,7 +144,7 @@ struct RemoveOp {
 }
 
 #[derive(Clone, Debug)]
-struct Plan {
+pub(crate) struct Plan {
     dirs: Vec<(String, u32)>,
     writes: Vec<WriteOp>,
     saves: Vec<SaveOp>,
@@ -157,6 +163,18 @@ struct Plan {
 }
 
 impl Plan {
+    pub(crate) fn changed_paths(&self) -> BTreeSet<String> {
+        let mut paths = BTreeSet::new();
+        paths.extend(self.writes.iter().map(|write| write.logical.clone()));
+        paths.extend(self.saves.iter().map(|save| save.logical.clone()));
+        paths.extend(self.removes.iter().map(|remove| remove.logical.clone()));
+        paths
+    }
+
+    pub(crate) fn installed(&self) -> &InstalledDb {
+        &self.installed
+    }
+
     fn net_size(&self) -> i64 {
         self.installed_size as i64 - self.removed_size as i64
     }
@@ -190,6 +208,10 @@ pub fn execute(
         staged
     };
 
+    if let Err(error) = check_sudo_configs(paths, &staged, &solution) {
+        cleanup_dir(&paths.staging.join(&txid));
+        return Err(error);
+    }
     let fs = Fs::new(&paths.root)?;
     let plan = match build_plan(paths, state, &solution, &staged, options, &txid) {
         Ok(plan) => plan,
@@ -214,9 +236,64 @@ pub fn execute(
     println!("({count}/{count}) {}", i18n::checking_disk(options.lang));
     check_disk(&fs, &plan)?;
 
+    let hook_packages: Vec<hooks::HookPackage> = solution
+        .actions
+        .iter()
+        .filter_map(|action| staged.get(&action.to.name))
+        .map(|staged| hooks::HookPackage {
+            name: staged.manifest.name.clone(),
+            manifest: staged.manifest.clone(),
+            dir: staged.dir.clone(),
+        })
+        .collect();
+    let hooks = hooks::load(paths, &state.installed, &hook_packages)?;
+    let mut hook_operations = BTreeSet::new();
+    let mut hook_packages_names = BTreeSet::new();
+    for action in &solution.actions {
+        hook_packages_names.insert(action.to.name.clone());
+        hook_operations.insert(match action.kind {
+            TargetKind::Install => hooks::Operation::Install,
+            _ => hooks::Operation::Upgrade,
+        });
+    }
+    for removal in &solution.removals {
+        hook_packages_names.insert(removal.name.clone());
+        hook_operations.insert(hooks::Operation::Remove);
+    }
+    let hook_context = hooks::Context {
+        packages: hook_packages_names,
+        paths: plan.changed_paths(),
+        operations: hook_operations,
+    };
+    if let Err(error) = hooks::run_pre(paths, &txid, &hooks, &hook_context, options.lang) {
+        cleanup_dir(&paths.staging.join(&txid));
+        cleanup_dir(&paths.backup.join(&txid));
+        return Err(error);
+    }
+
     for warning in &plan.warnings {
         eprintln!("{warning}");
     }
+
+    if let Err(error) = run_scripts(paths, state, &solution, &staged, options, &txid) {
+        cleanup_dir(&paths.staging.join(&txid));
+        cleanup_dir(&paths.backup.join(&txid));
+        let _ = fs::remove_dir_all(paths.sandbox.join(&txid));
+        let _ = fs::remove_dir_all(paths.scripts.join(&txid));
+        return Err(error);
+    }
+    // Scriptlets may rewrite declared files; rebuild the plan so file DB and
+    // journal hashes describe the contents that will actually be installed.
+    let plan = match build_plan(paths, state, &solution, &staged, options, &txid) {
+        Ok(plan) => plan,
+        Err(error) => {
+            cleanup_dir(&paths.staging.join(&txid));
+            cleanup_dir(&paths.backup.join(&txid));
+            return Err(error);
+        }
+    };
+    check_disk(&fs, &plan)?;
+
     println!("{}", i18n::processing(options.lang));
 
     let result = apply(paths, &fs, &plan, &solution, &txid, options.lang);
@@ -237,8 +314,18 @@ pub fn execute(
         }
     }
 
+    if let Err(error) = hooks::run_post(paths, &txid, &hooks, &hook_context, options.lang) {
+        eprintln!("{error}");
+    }
+    if let Err(error) = triggers::run(paths, &plan, &solution, &txid, options.lang) {
+        eprintln!("{error}");
+    }
     cleanup_dir(&paths.staging.join(&txid));
     cleanup_dir(&paths.backup.join(&txid));
+    let _ = fs::remove_dir_all(paths.state.join("hooks").join(&txid));
+    let _ = fs::remove_dir_all(paths.state.join("triggers").join(&txid));
+    let _ = fs::remove_dir_all(paths.sandbox.join(&txid));
+    let _ = fs::remove_dir_all(paths.scripts.join(&txid));
     println!(
         "{}",
         i18n::ok_summary(
@@ -328,6 +415,194 @@ fn confirm(lang: &Lang, noconfirm: bool, operation: OperationKind) -> Result<boo
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
 }
 
+fn check_sudo_configs(
+    paths: &Paths,
+    staged: &BTreeMap<String, Staged>,
+    solution: &Solution,
+) -> Result<()> {
+    let sudo = paths.root.join("usr/bin/sudo");
+    for action in &solution.actions {
+        let Some(package) = staged.get(&action.to.name) else {
+            continue;
+        };
+        for file in &package.manifest.files {
+            let doas = file.path == "/etc/doas.conf";
+            if file.path != "/etc/sudoers" && !doas {
+                continue;
+            }
+            if file.file_type != FileType::File {
+                return Err(SpkError::General(format!(
+                    "{}: sudo configuration must be a regular file",
+                    file.path
+                )));
+            }
+            if !sudo.is_file() {
+                return Err(SpkError::General(format!(
+                    "cannot validate {}: /usr/bin/sudo is not installed (fail closed)",
+                    file.path
+                )));
+            }
+            let staged_path = package.dir.join(file.path.trim_start_matches('/'));
+            let mut command = std::process::Command::new(&sudo);
+            command.arg(if doas {
+                "--check-doas"
+            } else {
+                "--check-config"
+            });
+            command.arg(&staged_path);
+            let output = command.output().map_err(|error| {
+                SpkError::General(format!("cannot run sudo configuration check: {error}"))
+            })?;
+            if !output.status.success() {
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return Err(SpkError::General(format!(
+                    "{}: sudo configuration rejected: {}",
+                    file.path,
+                    text.trim()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn version_string(epoch: u64, version: &str, release: u64) -> String {
+    if epoch == 0 {
+        format!("{version}-{release}")
+    } else {
+        format!("{epoch}:{version}-{release}")
+    }
+}
+
+fn script_function(kind: TargetKind, has_from: bool, pre: bool) -> &'static str {
+    match (kind, has_from, pre) {
+        (TargetKind::Install, _, true) => "pre_install",
+        (TargetKind::Install, _, false) => "post_install",
+        (_, true, true) => "pre_upgrade",
+        (_, true, false) => "post_upgrade",
+        (_, false, true) => "pre_install",
+        (_, false, false) => "post_install",
+    }
+}
+
+fn run_scripts(
+    paths: &Paths,
+    state: &State,
+    solution: &Solution,
+    staged: &BTreeMap<String, Staged>,
+    options: &Options,
+    txid: &str,
+) -> Result<()> {
+    for action in &solution.actions {
+        let Some(staged_package) = staged.get(&action.to.name) else {
+            continue;
+        };
+        let Some(script) = staged_package.install_script.as_deref() else {
+            continue;
+        };
+        let new = version_string(
+            staged_package.manifest.epoch,
+            &staged_package.manifest.version,
+            staged_package.manifest.release,
+        );
+        let old = action
+            .from
+            .as_ref()
+            .map(|old| version_string(old.epoch, &old.version, old.release));
+        let before = sandbox::snapshot_stage(&staged_package.dir)?;
+        let mut failed = None;
+        for pre in [true, false] {
+            let function = script_function(action.kind, old.is_some(), pre);
+            let args = if matches!(action.kind, TargetKind::Install) || old.is_none() {
+                vec![new.clone()]
+            } else {
+                vec![new.clone(), old.clone().unwrap_or_default()]
+            };
+            if let Err(error) = sandbox::run_install_script(
+                paths,
+                txid,
+                &action.to.name,
+                &staged_package.dir,
+                script,
+                function,
+                &args,
+                options.lang,
+                !options.no_sandbox_scripts,
+            ) {
+                failed = Some((function.to_string(), error));
+                break;
+            }
+        }
+        let after = sandbox::snapshot_stage(&staged_package.dir)?;
+        if let Err(error) =
+            sandbox::verify_stage(&staged_package.manifest, &before, &after, options.lang)
+        {
+            if !options.script_failure_keep {
+                return Err(error);
+            }
+            eprintln!(
+                "{}",
+                i18n::script_failure_kept(options.lang, "staging", &error.to_string())
+            );
+        }
+        if let Some((function, error)) = failed {
+            if options.script_failure_keep {
+                eprintln!(
+                    "{}",
+                    i18n::script_failure_kept(options.lang, &function, &error.to_string())
+                );
+            } else {
+                return Err(error);
+            }
+        }
+    }
+
+    for removal in &solution.removals {
+        let Some(installed) = state.installed.packages.get(&removal.name) else {
+            continue;
+        };
+        let Some(script) = installed.install_script.as_deref() else {
+            continue;
+        };
+        let old = version_string(removal.epoch, &removal.version, removal.release);
+        let empty = paths
+            .staging
+            .join(txid)
+            .join(format!(".remove-{}", removal.name));
+        if empty.exists() {
+            let _ = fs::remove_dir_all(&empty);
+        }
+        fs::create_dir_all(&empty)?;
+        for function in ["pre_remove", "post_remove"] {
+            if let Err(error) = sandbox::run_install_script(
+                paths,
+                txid,
+                &removal.name,
+                &empty,
+                script,
+                function,
+                std::slice::from_ref(&old),
+                options.lang,
+                !options.no_sandbox_scripts,
+            ) {
+                if options.script_failure_keep {
+                    eprintln!(
+                        "{}",
+                        i18n::script_failure_kept(options.lang, function, &error.to_string())
+                    );
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn stage_packages(
     paths: &Paths,
     solution: &Solution,
@@ -382,16 +657,14 @@ fn stage_packages(
                 target_arch()
             )));
         }
-        if scanned.manifest.scripts {
-            return Err(SpkError::General(format!(
-                "{}: install scripts are not supported until P3",
-                index.filename
-            )));
-        }
-        if scanned.install_script.is_some() {
-            eprintln!("{}", i18n::warning_script_unsupported(lang, &index.name));
-        }
-        check_setuid_policy(paths, &scanned.manifest)?;
+        let install_script = match scanned.install_script {
+            Some(bytes) => Some(String::from_utf8(bytes).map_err(|_| {
+                SpkError::General(format!("{}: .INSTALL is not valid UTF-8", index.filename))
+            })?),
+            None => None,
+        };
+        let _ = lang;
+        check_setuid_policy(paths, &scanned.manifest, lang)?;
         let conffiles = scanned.manifest.conffiles.iter().cloned().collect();
         staged.insert(
             index.name.clone(),
@@ -399,13 +672,14 @@ fn stage_packages(
                 manifest: scanned.manifest,
                 dir: stage_dir,
                 conffiles,
+                install_script,
             },
         );
     }
     Ok(staged)
 }
 
-fn check_setuid_policy(paths: &Paths, manifest: &Manifest) -> Result<()> {
+fn check_setuid_policy(paths: &Paths, manifest: &Manifest, lang: Lang) -> Result<()> {
     let setuid: Vec<&PackageFile> = manifest
         .files
         .iter()
@@ -431,9 +705,13 @@ fn check_setuid_policy(paths: &Paths, manifest: &Manifest) -> Result<()> {
             whitelist.display()
         ))
     })?;
-    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+    if !metadata.file_type().is_file()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.mode() & 0o777 != 0o644
+    {
         return Err(SpkError::General(format!(
-            "{} must be a root-owned file not writable by group/other",
+            "{} must be root:root mode 0644",
             whitelist.display()
         )));
     }
@@ -452,10 +730,7 @@ fn check_setuid_policy(paths: &Paths, manifest: &Manifest) -> Result<()> {
             )));
         }
     }
-    eprintln!(
-        "warning: preserving setuid/setgid bits from signed package {}",
-        manifest.name
-    );
+    eprintln!("{}", i18n::setuid_preserved(lang, &manifest.name));
     Ok(())
 }
 
@@ -470,6 +745,27 @@ fn index_matches(index: &IndexPackage, manifest: &Manifest) -> bool {
         && index.provides == manifest.provides
         && index.conflicts == manifest.conflicts
         && index.replaces == manifest.replaces
+}
+
+fn staged_digest(staged: &Staged, file: &PackageFile) -> Result<(String, u64)> {
+    match file.file_type {
+        FileType::Dir => Ok((String::new(), 0)),
+        FileType::Symlink => {
+            let target = file.target.as_deref().ok_or_else(|| {
+                SpkError::General(format!("{}: symlink without target", file.path))
+            })?;
+            Ok((
+                spk_core::fsutil::sha256_bytes(target.as_bytes()),
+                target.len() as u64,
+            ))
+        }
+        FileType::File => {
+            let path = staged.dir.join(file.path.trim_start_matches('/'));
+            let meta = fs::metadata(&path)
+                .map_err(|error| SpkError::General(format!("{}: {error}", path.display())))?;
+            Ok((sha256_file(&path)?, meta.len()))
+        }
+    }
 }
 
 fn build_plan(
@@ -513,11 +809,14 @@ fn build_plan(
                 dirs.insert(file.path.clone(), file.mode_bits()?);
                 continue;
             }
-            let owner = Owner::from_package_file(
+            let (sha256, size) = staged_digest(staged, file)?;
+            let mut owner = Owner::from_package_file(
                 &action.to.name,
                 file,
                 staged.conffiles.contains(&file.path),
             );
+            owner.sha256 = sha256;
+            owner.size = size;
             if let Some(existing) = owners.get(&file.path) {
                 if existing.package != owner.package {
                     return Err(SpkError::FileConflict {
@@ -570,7 +869,8 @@ fn build_plan(
             if file.file_type == FileType::Dir {
                 continue;
             }
-            installed_size += file.size;
+            let (actual_sha256, actual_size) = staged_digest(staged, file)?;
+            installed_size += actual_size;
             let old_record = state.files.files.get(&file.path);
             let on_disk = fs.on_disk(&file.path).map_err(|_| SpkError::FileConflict {
                 message: i18n::file_conflict_header(options.lang).to_string(),
@@ -609,14 +909,14 @@ fn build_plan(
                 if let (Some(record), Some(entry)) = (old_record, on_disk.as_ref()) {
                     if record.conffile && entry.kind == OnDiskKind::File {
                         let user_modified = entry.sha256 != record.sha256;
-                        let upstream_changed = file.sha256 != record.sha256;
+                        let upstream_changed = actual_sha256 != record.sha256;
                         if user_modified && upstream_changed {
                             let saved = unique_save_path(&fs, paths, state, &owners, &file.path)?;
                             saves.push(SaveOp {
                                 logical: saved.clone(),
                                 source: staged.dir.join(file.path.trim_start_matches('/')),
                                 mode: file.mode_bits()?,
-                                sha256: file.sha256.clone(),
+                                sha256: actual_sha256.clone(),
                             });
                             warnings.push(i18n::warning_conffile(options.lang, &file.path, &saved));
                             continue;
@@ -634,7 +934,7 @@ fn build_plan(
                     logical: file.path.clone(),
                     source: WriteSource::File(source),
                     mode: file.mode_bits()?,
-                    sha256: file.sha256.clone(),
+                    sha256: actual_sha256.clone(),
                     kind: "file",
                 },
                 FileType::Symlink => WriteOp {
@@ -643,7 +943,7 @@ fn build_plan(
                         SpkError::General(format!("{}: symlink without target", file.path))
                     })?),
                     mode: file.mode_bits()?,
-                    sha256: file.sha256.clone(),
+                    sha256: actual_sha256.clone(),
                     kind: "symlink",
                 },
                 FileType::Dir => unreachable!(),
@@ -712,6 +1012,14 @@ fn build_plan(
             None if solution.explicit.contains(&action.to.name) => InstallReason::Explicit,
             None => InstallReason::Dependency,
         };
+        let mut installed_files = staged.manifest.files.clone();
+        for file in &mut installed_files {
+            if file.file_type != FileType::Dir {
+                let (sha256, size) = staged_digest(staged, file)?;
+                file.sha256 = sha256;
+                file.size = size;
+            }
+        }
         let package = InstalledPackage {
             name: staged.manifest.name.clone(),
             epoch: staged.manifest.epoch,
@@ -719,13 +1027,15 @@ fn build_plan(
             release: staged.manifest.release,
             arch: staged.manifest.arch.clone(),
             abi: staged.manifest.abi.clone(),
-            files: staged.manifest.files.clone(),
+            files: installed_files,
             depends: staged.manifest.depends.clone(),
             provides: staged.manifest.provides.clone(),
             conflicts: staged.manifest.conflicts.clone(),
             replaces: staged.manifest.replaces.clone(),
             conffiles: staged.manifest.conffiles.clone(),
             scripts: staged.manifest.scripts,
+            triggers: staged.manifest.triggers.clone(),
+            install_script: staged.install_script.clone(),
             allow_setuid: staged.manifest.allow_setuid,
             install_date: now(),
             install_reason: reason,

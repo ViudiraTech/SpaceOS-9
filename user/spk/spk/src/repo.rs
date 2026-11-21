@@ -37,7 +37,11 @@ pub fn target_arch() -> &'static str {
     std::env::consts::ARCH
 }
 
-pub fn load_repos(paths: &Paths, urls: &[String]) -> Result<Vec<LoadedRepo>> {
+pub fn load_repos(
+    paths: &Paths,
+    urls: &[String],
+    lang: crate::i18n::Lang,
+) -> Result<Vec<LoadedRepo>> {
     let mut repos = Vec::new();
     if urls.is_empty() {
         let state = crate::state::State::load(paths)?;
@@ -71,15 +75,20 @@ pub fn load_repos(paths: &Paths, urls: &[String]) -> Result<Vec<LoadedRepo>> {
                     }
                     Err(error) => {
                         eprintln!(
-                            "warning: repository '{}' mirror {} unavailable: {error}",
-                            config.name, url
+                            "{}",
+                            crate::i18n::repo_mirror_unavailable(
+                                lang,
+                                &config.name,
+                                url,
+                                &error.to_string()
+                            )
                         );
                     }
                 }
             }
             match loaded {
                 Some(repo) => repos.push(repo),
-                None => eprintln!("warning: repository '{}' has no usable mirror", config.name),
+                None => eprintln!("{}", crate::i18n::repo_no_mirror(lang, &config.name)),
             }
         }
     } else {
@@ -88,7 +97,10 @@ pub fn load_repos(paths: &Paths, urls: &[String]) -> Result<Vec<LoadedRepo>> {
                 Ok(repo) => repos.push(repo),
                 Err(SpkError::Signature(error)) => return Err(SpkError::Signature(error)),
                 Err(error) => {
-                    eprintln!("warning: repository {} unavailable: {error}", url);
+                    eprintln!(
+                        "{}",
+                        crate::i18n::repo_unavailable(lang, url, &error.to_string())
+                    );
                 }
             }
         }

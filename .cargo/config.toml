@@ -6,9 +6,9 @@
 #       Copyright (C) 2026 ViudiraTech.
 #
 
-[unstable]
-build-std = ["core", "alloc", "compiler_builtins"]
-
+# Freestanding targets build core/alloc/compiler_builtins explicitly in the
+# Makefile. Keeping this out of the global config prevents host-side workspace
+# tests from rebuilding alloc against the host std (duplicate lang items).
 [target.x86_64-unknown-none]
 linker = "rust-lld"
 rustflags = [

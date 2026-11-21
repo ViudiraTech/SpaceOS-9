@@ -698,6 +698,7 @@ CI：
 
 - `.INSTALL`、hooks.d、文件 triggers、沙箱、幂等与失败策略。
 - 验收：busybox 式 trigger、升级脚本、沙箱逃逸测试。
+- P3b 实现记录（2026-11-22，spk/sudo/CI）：`spk-sandbox` 在 private mount namespace 中挂 ramfs 根，`/stage` 可写 bind、`/source` 只读 bind、`/bin`/`/lib`/`/usr` 只读 bind（BusyBox ash 固定为 `/bin/sh`）、`/dev` devfs、`/proc hidepid=2`；优先 `pivot_root`、失败回退 `chroot`，fd>2 关闭、rlimit、setsid/进程组、60s、输出上限、清空环境、`spk-script` uid/gid 61111 无附加组/无 passwd。seccomp 拒绝网络、mount/umount/pivot/chroot/setns/unshare、mknod、ptrace、bpf/perf/userfaultfd/io_uring、keyctl、process_vm、open_by_handle_at、reboot/kexec/module、clone 带 `CLONE_NEW*`（clone3 直接拒绝），允许 execve。`.INSTALL` 支持 pre/post install/upgrade/remove、staging 哈希与未声明路径拒绝、失败回滚、`--script-failure=keep` 与 `--no-sandbox-scripts` 调试；hooks.d Pre/PostTransaction、系统 hook root、包 hook 沙箱、描述与输出、marker 去重；文件 triggers glob、每包每事务一次、journal marker；sudo `--check-config`/`--check-doas` 在文件冲突前校验；`/etc/spk/setuid.allow` 进入 `build_rootfs.py` 与 QEMU rootfs 并收紧为 root:root 0644；QEMU 矩阵与 CI job 接入。
 - P3a 实现记录（2026-11-22，内核）：`openat2(437)`（`open_how`/RESOLVE_* /OPENAT2_REGULAR/O_NOFOLLOW/O_PATH）、`chroot(161)` 与 per-task root、private mount namespace（`clone(CLONE_NEWNS)`/`unshare(272)`）、`mount(2)` 5 参数/MS_BIND/MS_REC/MS_RDONLY/MS_REMOUNT、bind 子树、只读写拒绝、`pivot_root(155)`、procfs `hidepid=1|2`、`seccomp(317)` cBPF（ALLOW/ERRNO/KILL/TRAP/LOG、TSYNC/LOG、no_new_privs、fork/exec 继承）。新增用户态 P3 探针与 boot-self-test 通过；P3b 将在此之上实现脚本/hooks/triggers/sudo 校验。
 
 ### P4 仓库与信任
@@ -750,6 +751,8 @@ SpaceKernel/
 - OOBE 空密码已支持：DDM 对空字符串生成 `$6$` 哈希并验证；sudo 接受空 shadow 哈希/空密码；首次授权成功提示包含空密码警告；OOBE 界面注明“空密码账户首次 sudo/doas 授权会收到一次性安全提示”。
 - P3a 内核原语已落地：`openat2` + `O_NOFOLLOW/O_PATH` + `RESOLVE_BENEATH/IN_ROOT/NO_SYMLINKS/NO_XDEV/NO_MAGICLINKS`；`chroot` 使 `FsContext.root` 参与绝对路径/绝对符号链接/`..` 解析；private mount namespace 与 bind/只读挂载；procfs `hidepid`；seccomp cBPF。沙箱仍按 P3b 以非 root `spk-script` + 只读 source + staging 视图组合使用。
 - P3a 的 mount namespace 目前是 private 传播语义；shared/slave peer group 传播、seccomp `USER_NOTIF/NEW_LISTENER/TRACE` 未接入（沙箱不使用），列入 P4。
+- P3b 沙箱以非 root `spk-script` 运行 `.INSTALL`/包 hook/trigger，系统级动作由 root-owned `/etc/spk/hooks.d` 承担；`.INSTALL` 在文件提交前执行 pre/post，失败时无系统写入可回滚（等价回滚结果）；`--no-sandbox-scripts` 仅调试并打印警告。
+- `spk-sandbox` 及其脚本/沙箱依赖进入 P5 base 镜像；P3b 通过 QEMU rootfs 验证，生产 ISO 仍需打包 `spk`/`spk-sandbox` 与 BusyBox。
 - `pkgver` 现要求首尾为字母数字；alpm `rpmvercmp` 对前导/尾随分隔符的字符串不满足传递性（与上游一致），fuzz 在合法 `pkgver` 域验证全序，避免求解器排序出现不一致。
 - 已修复（2026-11-21）：ext4 `extent_truncate()` 释放目录数据块时使用 `metadata=false`，没有写 revoke；掉电后 jbd2 回放会把旧目录块覆盖到复用该块的文件（QEMU 第三阶段复现 `files.json` 指向目录块）。修复为目录数据块按元数据释放并生成 revoke。QEMU 三阶段在阶段 1↔2 不调用 `sync`、强制日志回放：boot 2/3 分别回放 14/98 个事务、6/28 条 revoke，最终阶段 sync 供离线检查，矩阵全部通过。
 - TLS 根证书与离线信任链；`rustls` 在 SpaceOS 上的 ring 后端可用性。
@@ -859,4 +862,5 @@ sudo -e file...
 - [ ] sudo 包升级/事务回滚的 QEMU 测试（P3）。
 - [x] P2 hold/pin、多仓库、`--print`/`--json`、复杂图/环/provides/replaces、fuzz 与性能测试。
 - [x] P3a 内核：openat2/O_NOFOLLOW/O_PATH、chroot、mount namespace/bind/RO/pivot_root、proc hidepid、seccomp cBPF 与内核/QEMU 测试。
-- [ ] P3b：.INSTALL/hooks.d/triggers、非 root 沙箱、sudoers 校验、setuid 包升级回滚与 CI。
+- [x] P3b：.INSTALL/hooks.d/triggers、非 root 沙箱、sudoers/doas 校验、setuid 包升级/降级、QEMU 矩阵与 CI。
+- [ ] P4：HTTP(S) 仓库、镜像优先级线上化、防降级、密钥轮换/吊销；seccomp USER_NOTIF/TRACE 与完整 shared mount propagation。

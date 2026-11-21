@@ -145,6 +145,7 @@ fn phase_install() -> Result<(), String> {
     expect_ok("check after sudo", &spk(&["check"])?)?;
 
     run_sudo_tests()?;
+    run_p3_script_tests()?;
 
     // Exercise setuid package removal before the reboot matrix continues.
     let output = spk_zh(&["remove", "--noconfirm", "sudo"])?;
@@ -388,6 +389,248 @@ fn sudo_password(args: &[&str], uid: u32, password: &[u8]) -> Result<Output, Str
     child
         .wait_with_output()
         .map_err(|error| format!("sudo wait failed: {error}"))
+}
+
+fn run_p3_script_tests() -> Result<(), String> {
+    // Declared file is modified by pre_install and post_install; the script
+    // arguments use version-release.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "script-ok",
+    ])?;
+    expect_ok("script-ok install", &output)?;
+    expect_contains("script-ok install", &output, "pre_install 脚本")?;
+    let content =
+        fs::read_to_string("/usr/share/spk-tests/script-ok").map_err(|error| error.to_string())?;
+    if !content.contains("pre_install 1.0.0-1") || !content.contains("post_install 1.0.0-1") {
+        return Err(format!(
+            "script-ok install scriptlet output is wrong:\n{content}"
+        ));
+    }
+
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/update",
+        "--noconfirm",
+        "script-ok=0.2.0-1",
+    ])?;
+    expect_ok("script-ok upgrade", &output)?;
+    expect_contains("script-ok upgrade", &output, "pre_upgrade 脚本")?;
+    let content =
+        fs::read_to_string("/usr/share/spk-tests/script-ok").map_err(|error| error.to_string())?;
+    if !content.contains("pre_upgrade 0.2.0-1 1.0.0-1")
+        || !content.contains("post_upgrade 0.2.0-1 1.0.0-1")
+    {
+        return Err(format!(
+            "script-ok upgrade scriptlet output is wrong:\n{content}"
+        ));
+    }
+    let output = spk_zh(&["remove", "--noconfirm", "script-ok"])?;
+    expect_ok("script-ok remove", &output)?;
+    expect_contains("script-ok remove", &output, "pre_remove")?;
+
+    // pre_install failure aborts before any files are written.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "script-fail",
+    ])?;
+    expect_code("script-fail rollback", &output, 6)?;
+    if fs::metadata("/usr/share/spk-tests/script-fail").is_ok() {
+        return Err("script-fail left its file behind".into());
+    }
+
+    // post_install failure rolls back the committed files as well.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "script-post-fail",
+    ])?;
+    expect_code("script-post-fail rollback", &output, 6)?;
+    if fs::metadata("/usr/share/spk-tests/script-post-fail").is_ok() {
+        return Err("script-post-fail left its file behind".into());
+    }
+
+    // Undeclared staging paths are rejected after the scriptlet.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "script-extra",
+    ])?;
+    expect_code("script-extra rollback", &output, 6)?;
+    if fs::metadata("/usr/share/spk-tests/undeclared-extra").is_ok() {
+        return Err("script-extra committed an undeclared file".into());
+    }
+
+    // /source is read-only; the script observes the failure and succeeds.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "script-source",
+    ])?;
+    expect_ok("script-source install", &output)?;
+    if fs::metadata("/etc/spk-script-write").is_ok() {
+        return Err("script wrote through /source".into());
+    }
+    let content = fs::read_to_string("/usr/share/spk-tests/source-blocked")
+        .map_err(|error| error.to_string())?;
+    if !content.contains("blocked") {
+        return Err("script-source did not reach its declared write".into());
+    }
+
+    // The sandbox probe checks network, mount, chroot, clone namespace,
+    // clone3, ptrace, mknod and /source writes from inside the scriptlet.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "sandbox-ok",
+    ])?;
+    expect_ok("sandbox probe", &output)?;
+    let probe = fs::read_to_string("/usr/share/spk-tests/sandbox-probe.txt")
+        .map_err(|error| error.to_string())?;
+    if !probe.contains("SANDBOX_OK") {
+        return Err(format!("sandbox probe was not fully denied:\n{probe}"));
+    }
+
+    // One trigger per package per transaction, even with two matching paths.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "trigger-pkg",
+    ])?;
+    expect_ok("trigger-pkg install", &output)?;
+    let body = text(&output);
+    if body.matches("正在执行 trigger-pkg-1.0.0-1.trigger").count() != 1
+        || !body.contains("TRIGGER_RAN trigger-pkg install")
+    {
+        return Err(format!("trigger-pkg did not run exactly once:\n{body}"));
+    }
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "trigger-other",
+    ])?;
+    expect_ok("trigger-other install", &output)?;
+    expect_contains(
+        "trigger-other install",
+        &output,
+        "正在执行 trigger-other-1.0.0-1.trigger",
+    )?;
+
+    // System pre/post hooks and the package hook. PreTransaction runs before
+    // the filesystem phase; PostTransaction after it.
+    let output = spk_zh(&["install", "--repo", "/repo/base", "--noconfirm", "hook-pkg"])?;
+    expect_ok("hooks install", &output)?;
+    let body = text(&output);
+    for needle in [
+        "正在运行事务前钩子",
+        "系统测试钩子（前）",
+        "SYSTEM_PRE_RAN",
+        "正在运行事务后钩子",
+        "系统测试钩子（后）",
+        "SYSTEM_POST_RAN",
+        "包内测试钩子",
+        "PACKAGE_HOOK_RAN",
+    ] {
+        if !body.contains(needle) {
+            return Err(format!("hook output is missing {needle}:\n{body}"));
+        }
+    }
+    let pre = body.find("SYSTEM_PRE_RAN").unwrap();
+    let processing = body.find("正在处理软件包的变化").unwrap_or(usize::MAX);
+    let post = body.find("SYSTEM_POST_RAN").unwrap();
+    if !(pre < processing && processing < post) {
+        return Err(format!("hook order is wrong:\n{body}"));
+    }
+
+    // A bad sudoers file is rejected before any file is committed.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "bad-sudoers",
+    ])?;
+    expect_code("bad sudoers", &output, 1)?;
+    let sudoers = fs::read_to_string("/etc/sudoers").map_err(|error| error.to_string())?;
+    if sudoers.contains("not a valid sudoers") {
+        return Err("bad sudoers was committed".into());
+    }
+
+    // scripts=true from an untrusted repository must fail signature checking.
+    let output = spk(&["install", "--repo", "/repo/bad", "--noconfirm", "script-ok"])?;
+    expect_code("bad signature scripts", &output, 3)?;
+
+    // sudo package upgrade and downgrade preserve the setuid bit.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/update",
+        "--noconfirm",
+        "sudo=0.2.0-1",
+    ])?;
+    expect_ok("sudo upgrade", &output)?;
+    expect_contains("sudo upgrade", &output, "正在升级 sudo")?;
+    if fs::metadata("/usr/bin/sudo")
+        .map_err(|error| error.to_string())?
+        .permissions()
+        .mode()
+        & 0o4000
+        == 0
+    {
+        return Err("sudo upgrade lost the setuid bit".into());
+    }
+    let output = spk_zh(&[
+        "downgrade",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "sudo=0.1.0-1",
+    ])?;
+    expect_ok("sudo downgrade", &output)?;
+    expect_contains("sudo downgrade", &output, "正在降级 sudo")?;
+    if fs::metadata("/usr/bin/sudo")
+        .map_err(|error| error.to_string())?
+        .permissions()
+        .mode()
+        & 0o4000
+        == 0
+    {
+        return Err("sudo downgrade lost the setuid bit".into());
+    }
+    expect_ok("check after p3 scripts", &spk(&["check"])?)?;
+
+    // Clean the script fixtures before the reboot matrix.
+    for package in [
+        "script-source",
+        "sandbox-ok",
+        "trigger-pkg",
+        "trigger-other",
+        "hook-pkg",
+    ] {
+        let output = spk_zh(&["remove", "--noconfirm", package])?;
+        expect_ok("remove p3 fixture", &output)?;
+    }
+    expect_ok("check after p3 cleanup", &spk(&["check"])?)?;
+    Ok(())
 }
 
 fn run_sudo_tests() -> Result<(), String> {

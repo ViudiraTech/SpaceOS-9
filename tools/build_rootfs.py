@@ -73,7 +73,7 @@ def main() -> int:
     with open(IMAGE, "wb") as image:
         image.truncate(64 * 1024 * 1024)
     run("mkfs.vfat", "-F", "32", "-n", "SPACEROOT", str(IMAGE))
-    for directory in ("/sbin", "/bin", "/lib", "/lib/modules", "/etc", "/etc/systemg",
+    for directory in ("/sbin", "/bin", "/lib", "/lib/modules", "/etc", "/etc/spk", "/etc/systemg",
                       "/tmp", "/dev", "/proc", "/sys", "/run", "/root", "/usr",
                       "/usr/share", "/usr/share/music"):
         run("mmd", "-i", str(IMAGE), f"::{directory}")
@@ -136,6 +136,10 @@ def main() -> int:
         path = staging / name
         path.write_text(content)
         run("mcopy", "-i", str(IMAGE), str(path), f"::/etc/{name}")
+
+    setuid_allow = staging / "setuid.allow"
+    setuid_allow.write_text("/usr/bin/sudo\n/usr/bin/doas\n")
+    run("mcopy", "-i", str(IMAGE), str(setuid_allow), "::/etc/spk/setuid.allow")
 
     print(f"rootfs image ready: {IMAGE}")
     return 0
