@@ -714,15 +714,11 @@ CI：
   - CLI：`spk sync`（别名 `update`）、HTTP(S) `--repo`、`repo add`、全局 `--offline`/`--allow-unsigned`；配置仓库名作为缓存 id，支持同一仓库多 URL 镜像。
   - 测试：host `http_remote` 13 项（200/304/404/500 重试/超时/重定向/Range/ETag/坏签名/坏索引/CA/多镜像/多签/CLI HTTP 安装/sync/offline/安全回退）；host 总计 86 项；QEMU 71 步（63 P3 + 8 P4）使用 `-nic user,model=e1000e`，加载 `e1000e.ko`，通过 rtnetlink 配置 `eth0`，本地 HTTP 仓库跑 install/upgrade/remove/offline。内核补 `RTM_NEWLINK` 路由请求（复用已有 `link_set`），不改 syscall 编号/结构。
 
-### P5 构建与镜像
+### P5 构建、镜像与运维
 
-- `make packages/repo/image`、可复现、ISO 内置仓库、base 包。
-- 验收：从零构建的 ISO 内 `spk verify` 全绿。
-
-### P6 运维与规模
-
-- 增量/delta（可选）、缓存保留、审计、`--json`、本地化、GUI 接口。
-- 验收：仓库规模/并发/磁盘配额测试通过。
+- `make packages/repo/image`、可复现、ISO 内置仓库、base 包（含 spk/spk-sandbox/BusyBox、`/etc/spk/setuid.allow`）。
+- 增量/delta（可选）、缓存保留、审计、`--json`、本地化、GUI 接口、CI 并行/性能。
+- 验收：从零构建的 ISO 内 `spk verify` 全绿；仓库规模/并发/磁盘配额测试通过。
 
 ## 18. 目录结构建议
 
