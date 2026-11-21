@@ -93,6 +93,10 @@ def main() -> int:
         )
         + "\n",
     )
+    # The desktop demo userland ships an unowned hello; a package install
+    # would otherwise be rejected as an unowned file conflict.
+    for path in ("usr/bin/hello", "bin/hello"):
+        (stage / path).unlink(missing_ok=True)
     target = stage / "var/lib/spk/repo/x86_64"
     if target.exists():
         shutil.rmtree(target)

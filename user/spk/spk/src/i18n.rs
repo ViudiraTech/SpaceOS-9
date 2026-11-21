@@ -173,7 +173,7 @@ pub fn checking_dependencies(lang: Lang) -> &'static str {
 
 pub fn ok_summary(lang: Lang, size: &str, count: usize) -> String {
     if lang.is_zh() {
-        format!("OK: {size} in {count} 个软件包")
+        format!("OK: {size}，共 {count} 个软件包")
     } else {
         format!(
             "OK: {size} in {count} package{}",
@@ -619,6 +619,54 @@ pub fn verifying_repo(lang: Lang, name: &str) -> String {
         format!("正在校验仓库 {name}")
     } else {
         format!("Verifying repository {name}")
+    }
+}
+
+pub fn no_sync_repositories(lang: Lang) -> &'static str {
+    tr(
+        lang,
+        "no usable repositories to synchronize",
+        "没有可用于同步的仓库",
+    )
+}
+
+pub fn no_verify_repositories(lang: Lang) -> &'static str {
+    tr(
+        lang,
+        "no usable repositories to verify",
+        "没有可用于校验的仓库",
+    )
+}
+
+pub fn offline_not_cached(lang: Lang, name: &str) -> String {
+    if lang.is_zh() {
+        format!("仓库 {name} 未缓存，且指定了 --offline")
+    } else {
+        format!("repository {name} is not cached and --offline was given")
+    }
+}
+
+pub fn no_usable_mirror(lang: Lang, name: &str) -> String {
+    if lang.is_zh() {
+        format!("仓库 {name} 没有可用镜像")
+    } else {
+        format!("repository {name} has no usable mirror")
+    }
+}
+
+pub fn verify_size_mismatch(lang: Lang, name: &str, indexed: u64, actual: u64) -> String {
+    if lang.is_zh() {
+        format!("{name}: 大小不匹配：索引 {indexed}，文件 {actual}")
+    } else {
+        format!("{name}: size mismatch: index {indexed}, file {actual}")
+    }
+}
+
+pub fn verify_hash_mismatch(lang: Lang, name: &str) -> String {
+    if lang.is_zh() {
+        format!("{name}: sha256 不匹配")
+    } else {
+        format!("{name}: sha256 mismatch")
     }
 }
 

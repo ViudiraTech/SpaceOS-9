@@ -728,7 +728,7 @@ pub fn verify(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang)
         },
     )?;
     if repos.is_empty() {
-        return Err(SpkError::General("no usable repositories to verify".into()));
+        return Err(SpkError::General(i18n::no_verify_repositories(lang).into()));
     }
     let mut results = Vec::new();
     for loaded in &repos {
@@ -740,21 +740,21 @@ pub fn verify(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang)
             let metadata = std::fs::metadata(&path)?;
             if metadata.len() != package.size {
                 return Err(SpkError::Check {
-                    message: format!("{}: size mismatch", package.name),
-                    lines: vec![format!(
-                        "{}: index {}, file {}",
-                        path.display(),
+                    message: i18n::verify_size_mismatch(
+                        lang,
+                        &package.name,
                         package.size,
-                        metadata.len()
-                    )],
+                        metadata.len(),
+                    ),
+                    lines: vec![format!("{}", path.display())],
                 });
             }
             let digest = spk_core::fsutil::sha256_file(&path)?;
             if digest != package.sha256 {
                 return Err(SpkError::Check {
-                    message: format!("{}: sha256 mismatch", package.name),
+                    message: i18n::verify_hash_mismatch(lang, &package.name),
                     lines: vec![format!(
-                        "{}: index {}, file {}",
+                        "{}: {} != {}",
                         path.display(),
                         package.sha256,
                         digest

@@ -385,9 +385,7 @@ pub fn sync_repo(
                 mirrors,
                 stale: true,
             }),
-            None => Err(SpkError::Network(format!(
-                "repository {name_hint} is not cached and --offline was given"
-            ))),
+            None => Err(SpkError::Network(i18n::offline_not_cached(lang, name_hint))),
         };
     }
     let mut last_error = None;
@@ -445,7 +443,7 @@ pub fn sync_repo(
         });
     }
     Err(last_error.unwrap_or_else(|| {
-        SpkError::Network(format!("repository {name_hint} has no usable mirror"))
+        SpkError::Network(i18n::no_usable_mirror(lang, name_hint))
     }))
 }
 

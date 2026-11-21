@@ -740,6 +740,7 @@ CI：
   - `make packages`、`make repo`、`make image`、`make p5-isos`；ISO 通过 Limine 内嵌 FAT32 rootfs，rootfs 也作为 QEMU 可写 ext4 盘。
   - 运维：`spk cache info|clean`（保留当前索引引用、`.part`、年龄/容量策略）；`spk status --json` 稳定 GUI JSON；事务成功写 `/var/log/spk/audit.log` JSONL；`spk verify` 校验索引和全部包，新增中文输出；P5 host 测试 90 项（含 2000 包索引、并发审计、缓存保留）。
   - `tools/spk_p5_qemu_test.py`：ISO 内 `p5.mode=verify` 校验 + ext4 rootfs 离线 install/upgrade/remove；CI `spk-p5` job 构建镜像并跑离线矩阵。
+  - 桌面发布镜像（`release-try`）通过 `tools/overlay_p5_packages.py` 写入 `spk`/`spk-sandbox`、生产公钥和远程 `https://goutoustdio.top/spaceos/repo/x86_64` 配置，不嵌入本地 repo；`make all` 只构建该桌面候选，P5 本地验证镜像需显式 `make image`。`spk --help`/常见 Clap 错误在中文环境使用中文文本。
 - 验收：从零 `make image` 后 ISO 内 `spk verify` 全绿；QEMU 离线仓库安装/升级/卸载；现有 86 host + 71 QEMU 不回归。
 
 ## 18. 目录结构建议
