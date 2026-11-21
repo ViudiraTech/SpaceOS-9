@@ -677,3 +677,59 @@ pub fn verify_ok(lang: Lang) -> String {
         "repository verification passed".to_string()
     }
 }
+
+pub fn overwrite_unowned_prompt(lang: Lang, path: &str) -> String {
+    if lang.is_zh() {
+        format!("{path} 已存在，但不属于任何已安装软件包。是否覆盖？[y/N] ")
+    } else {
+        format!("{path} exists but is not owned by any installed package. Overwrite? [y/N] ")
+    }
+}
+
+pub fn overwrite_owned_prompt(lang: Lang, path: &str, owner: &str) -> String {
+    if lang.is_zh() {
+        format!("{path} 由 {owner} 拥有。是否覆盖并转移归属？[y/N] ")
+    } else {
+        format!("{path} is owned by {owner}. Overwrite and transfer ownership? [y/N] ")
+    }
+}
+
+pub fn overwrite_unowned_detail(lang: Lang, path: &str, package: &str) -> String {
+    if lang.is_zh() {
+        format!(
+            "{path} 已存在，但不属于任何已安装软件包；使用 spk install --overwrite '{path}' {package} 覆盖，或先删除该文件；spk owns {path} 可查看归属。"
+        )
+    } else {
+        format!(
+            "{path} exists but is not owned by any installed package; use spk install --overwrite '{path}' {package}, or remove the file first; spk owns {path} shows ownership."
+        )
+    }
+}
+
+pub fn overwrite_owned_detail(lang: Lang, path: &str, package: &str, owner: &str) -> String {
+    if lang.is_zh() {
+        format!(
+            "{path} 已由 {owner} 拥有；使用 spk install --overwrite '{path}' {package}，或让包声明 replaces={owner}。"
+        )
+    } else {
+        format!(
+            "{path} is owned by {owner}; use spk install --overwrite '{path}' {package}, or declare replaces={owner}."
+        )
+    }
+}
+
+pub fn overwrite_unowned_warning(lang: Lang, path: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：覆盖了不属于任何软件包的 {path}")
+    } else {
+        format!("warning: overwrote unowned path {path}")
+    }
+}
+
+pub fn overwrite_takeover_warning(lang: Lang, path: &str, package: &str, owner: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：{package} 接管了 {path}（原属 {owner}）")
+    } else {
+        format!("warning: {package} took over {path} from {owner}")
+    }
+}

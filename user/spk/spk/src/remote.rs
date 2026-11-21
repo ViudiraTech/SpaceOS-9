@@ -442,9 +442,7 @@ pub fn sync_repo(
             stale: true,
         });
     }
-    Err(last_error.unwrap_or_else(|| {
-        SpkError::Network(i18n::no_usable_mirror(lang, name_hint))
-    }))
+    Err(last_error.unwrap_or_else(|| SpkError::Network(i18n::no_usable_mirror(lang, name_hint))))
 }
 
 fn verify_cached_package(path: &Path, package: &IndexPackage) -> Result<bool> {

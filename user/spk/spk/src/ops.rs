@@ -65,6 +65,7 @@ pub fn install(
     needed: bool,
     override_hold: bool,
     noconfirm: bool,
+    overwrite: &[String],
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
@@ -73,6 +74,7 @@ pub fn install(
             "install requires at least one package".into(),
         ));
     }
+    let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
     let repos = repo::load_repos(
@@ -118,6 +120,9 @@ pub fn install(
             operation: OperationKind::Install,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: overwrite.clone(),
+            interactive: !report.active(),
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }
@@ -130,9 +135,11 @@ pub fn upgrade(
     allow_partial: bool,
     override_hold: bool,
     noconfirm: bool,
+    overwrite: &[String],
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
+    let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     if !targets.is_empty() && !allow_partial {
         return Err(SpkError::General(i18n::partial_disabled(lang).to_string()));
@@ -183,16 +190,21 @@ pub fn upgrade(
             operation: OperationKind::Upgrade,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: overwrite.clone(),
+            interactive: !report.active(),
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn downgrade(
     paths: &Paths,
     urls: &[String],
     targets: &[String],
     override_hold: bool,
     noconfirm: bool,
+    overwrite: &[String],
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
@@ -201,6 +213,7 @@ pub fn downgrade(
             "downgrade requires package=<version> targets".into(),
         ));
     }
+    let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
     let repos = repo::load_repos(
@@ -246,16 +259,21 @@ pub fn downgrade(
             operation: OperationKind::Install,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: overwrite.clone(),
+            interactive: !report.active(),
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn reinstall(
     paths: &Paths,
     urls: &[String],
     targets: &[String],
     override_hold: bool,
     noconfirm: bool,
+    overwrite: &[String],
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
@@ -264,6 +282,7 @@ pub fn reinstall(
             "reinstall requires at least one package".into(),
         ));
     }
+    let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     let repos = repo::load_repos(
         paths,
@@ -308,6 +327,9 @@ pub fn reinstall(
             operation: OperationKind::Install,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: overwrite.clone(),
+            interactive: !report.active(),
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }
@@ -388,6 +410,9 @@ pub fn remove(
             operation: OperationKind::Remove,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: crate::overwrite::Overwrite::default(),
+            interactive: false,
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }

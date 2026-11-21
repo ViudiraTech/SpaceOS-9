@@ -730,7 +730,7 @@ CI：
   - CLI：`spk sync`（别名 `update`）、HTTP(S) `--repo`、`repo add`、全局 `--offline`/`--allow-unsigned`；配置仓库名作为缓存 id，支持同一仓库多 URL 镜像。
   - 测试：host `http_remote` 13 项（200/304/404/500 重试/超时/重定向/Range/ETag/坏签名/坏索引/CA/多镜像/多签/CLI HTTP 安装/sync/offline/安全回退）；host 总计 86 项；QEMU 71 步（63 P3 + 8 P4）使用 `-nic user,model=e1000e`，加载 `e1000e.ko`，通过 rtnetlink 配置 `eth0`，本地 HTTP 仓库跑 install/upgrade/remove/offline。内核补 `RTM_NEWLINK` 路由请求（复用已有 `link_set`），不改 syscall 编号/结构。
 
-### P5 构建、镜像与运维
+### P5 构建、镜像与运维（含文件冲突覆盖）
 
 - P5 实现记录（2026-11-23，构建/镜像/运维）：
   - `tools/build_packages.sh`：统一 `SOURCE_DATE_EPOCH`，排序 staging、0:0、固定 mtime，生成 `.BUILDINFO`，产出 hello 0.1/0.2、sudo 0.1 和 `base` 1.0；相同 `SOURCE_DATE_EPOCH` 重建 sha256 一致。
@@ -741,6 +741,7 @@ CI：
   - 运维：`spk cache info|clean`（保留当前索引引用、`.part`、年龄/容量策略）；`spk status --json` 稳定 GUI JSON；事务成功写 `/var/log/spk/audit.log` JSONL；`spk verify` 校验索引和全部包，新增中文输出；P5 host 测试 90 项（含 2000 包索引、并发审计、缓存保留）。
   - `tools/spk_p5_qemu_test.py`：ISO 内 `p5.mode=verify` 校验 + ext4 rootfs 离线 install/upgrade/remove；CI `spk-p5` job 构建镜像并跑离线矩阵。
   - 桌面发布镜像（`release-try`）通过 `tools/overlay_p5_packages.py` 写入 `spk`/`spk-sandbox`、生产公钥和远程 `https://goutoustdio.top/spaceos/repo/x86_64` 配置，不嵌入本地 repo；`make all` 只构建该桌面候选，P5 本地验证镜像需显式 `make image`。`spk --help`/常见 Clap 错误在中文环境使用中文文本。
+- 文件冲突覆盖（2026-11-21）：`install/upgrade/downgrade/reinstall --overwrite <绝对 glob>` 可重复；无 owner 覆盖、有 owner 转移 files DB 归属并从旧包 files/conffiles 移除、`replaces` 合法接管、目录存在不冲突；无 flag 且非交互/`--noconfirm` 保持 exit 5，交互终端提供 y/N；相对路径、`..`、坏 `[` glob 退出 2。文案含 `spk owns`/`replaces=` 提示，`spk --help` 与常见 Clap 错误在中文环境使用中文。
 - 验收：从零 `make image` 后 ISO 内 `spk verify` 全绿；QEMU 离线仓库安装/升级/卸载；现有 86 host + 71 QEMU 不回归。
 
 ## 18. 目录结构建议
