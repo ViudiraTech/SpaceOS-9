@@ -165,17 +165,6 @@ def main() -> int:
     if arguments.local_repo is not None and not arguments.local_repo.is_dir():
         raise SystemExit(f"local package repository missing: {arguments.local_repo}")
 
-    if arguments.local_repo is not None:
-        install_runtime(
-            stage,
-            arguments.local_repo,
-            arguments.spk,
-            arguments.spk_host,
-            arguments.repo_key,
-        )
-    else:
-        copy(arguments.spk, stage / "usr/bin/spk", 0o755)
-        copy(arguments.sandbox, stage / "usr/bin/spk-sandbox", 0o755)
     if arguments.ca_bundle.is_file():
         copy(arguments.ca_bundle, stage / "etc/ssl/certs/ca-certificates.crt", 0o644)
 
@@ -212,6 +201,17 @@ def main() -> int:
         )
         + "\n",
     )
+    if arguments.local_repo is not None:
+        install_runtime(
+            stage,
+            arguments.local_repo,
+            arguments.spk,
+            arguments.spk_host,
+            arguments.repo_key,
+        )
+    else:
+        copy(arguments.spk, stage / "usr/bin/spk", 0o755)
+        copy(arguments.sandbox, stage / "usr/bin/spk-sandbox", 0o755)
     # The desktop demo userland ships an unowned hello; a package install
     # would otherwise be rejected as an unowned file conflict.
     for path in ("usr/bin/hello", "bin/hello"):
