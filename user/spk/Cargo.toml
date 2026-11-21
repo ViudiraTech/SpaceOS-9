@@ -1,0 +1,32 @@
+#
+#       user/spk/Cargo.toml
+#       SpaceOS-9 native package manager workspace (spk, spk-host, spk-core)
+#
+#       2026/11/20 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+[workspace]
+resolver = "2"
+members = ["spk-core", "spk-host"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/ViudiraTech/SpaceKernel"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.2"
+sha2 = "0.10"
+thiserror = "2.0"
+base64 = "0.22"
+hex = "0.4"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
+tar = { version = "0.4", default-features = false }
+ruzstd = { version = "0.9", default-features = false, features = ["std", "hash"] }
+zstd = { version = "0.14", default-features = false }
+clap = { version = "4.5", features = ["derive"] }
+tempfile = "3.13"
