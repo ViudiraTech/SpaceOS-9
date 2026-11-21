@@ -1,0 +1,22 @@
+#!/bin/sh
+# Apply the Ambiance SPUI theme pack.
+set -eu
+
+if ! command -v uxconf-query >/dev/null 2>&1; then
+    printf 'spui-theme-ambiance: uxconf-query not found\n' >&2
+    exit 1
+fi
+
+uxconf-query -c appearance -p /theme/id -s ambiance -t string
+uxconf-query -c appearance -p /theme/style -s spui -t string
+uxconf-query -c appearance -p /theme/mode -s light -t string
+uxconf-query -c appearance -p /theme/accent -s '#dd4814' -t string
+uxconf-query -c desktop -p /backdrop/wallpaper -s ambiance-wave.jpg -t string
+uxconf-query -c desktop -p /backdrop/style -s cover -t string
+uxconf-query -c desktop -p /backdrop/solid-color -s '#4b1f3b' -t string
+uxconf-query -c panel -p /position -s top -t string
+uxconf-query -c panel -p /size -s 28 -t int
+uxconf-query -c panel -p /start-fullscreen -s false -t bool
+uxconf-query -c wm -p /titlebar/button-layout -s left -t string
+
+printf 'Ambiance theme applied; sign out or restart SPUI if the shell does not refresh immediately.\n'

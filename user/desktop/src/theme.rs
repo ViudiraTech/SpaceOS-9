@@ -2719,6 +2719,37 @@ mod tests {
         assert_eq!(theme.panel, 0xc0c0c0);
     }
 
+    static THEME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ThemeDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        temp_base: PathBuf,
+    }
+
+    impl ThemeDirGuard {
+        fn enter(base: PathBuf) -> Self {
+            let lock = THEME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os("SPUI_THEME_DIR");
+            std::env::set_var("SPUI_THEME_DIR", &base);
+            Self {
+                _lock: lock,
+                previous,
+                temp_base: base,
+            }
+        }
+    }
+
+    impl Drop for ThemeDirGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("SPUI_THEME_DIR", value),
+                None => std::env::remove_var("SPUI_THEME_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.temp_base);
+        }
+    }
+
     #[test]
     fn external_theme_pack_overrides_palette_and_css_skin() {
         let base = std::env::temp_dir().join(format!(
@@ -2754,8 +2785,7 @@ mod tests {
         )
         .expect("write theme");
 
-        let previous = std::env::var_os("SPUI_THEME_DIR");
-        std::env::set_var("SPUI_THEME_DIR", &base);
+        let _env = ThemeDirGuard::enter(base);
         let discovered = discover_installed_themes();
         assert!(discovered.iter().any(|t| t.id == "testpack" && t.name == "Test XP Pack"));
 
@@ -2764,11 +2794,6 @@ mod tests {
         config.theme_style = ThemeStyle::Spui;
         config.mode = ThemeMode::Light;
         let theme = Theme::from_config(&config);
-        match previous {
-            Some(value) => std::env::set_var("SPUI_THEME_DIR", value),
-            None => std::env::remove_var("SPUI_THEME_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(theme.titlebar, 0x0058e6);
         assert_eq!(theme.panel, 0xece9d8);
@@ -2781,30 +2806,70 @@ mod tests {
         assert!(theme.skin().is_some());
     }
 
-    #[test]
-    fn real_winxp_package_loads_luna_olive_silver_and_royale_noir_skins() {
-        let pkg_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/theme-winxp");
+    fn stage_real_theme_pkg(pkg_dir_name: &str, theme_id: &str) -> Option<(PathBuf, ThemeDirGuard)> {
+        let pkg_src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("packages")
+            .join(pkg_dir_name);
         if !pkg_src.join("theme.toml").exists() {
-            return;
+            return None;
         }
         let base = std::env::temp_dir().join(format!(
-            "spui_winxp_pkg_{}_{}",
+            "spui_{}_pkg_{}_{}",
+            theme_id,
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
-        let winxp_dir = base.join("winxp");
+        let theme_dir = base.join(theme_id);
         let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&winxp_dir).expect("mkdir winxp");
-        for entry in std::fs::read_dir(&pkg_src).expect("read packages/theme-winxp") {
+        std::fs::create_dir_all(&theme_dir).expect("mkdir theme");
+        for entry in std::fs::read_dir(&pkg_src).expect("read package assets") {
             let entry = entry.expect("dir entry");
             let p = entry.path();
             if p.is_file() {
-                std::fs::copy(&p, winxp_dir.join(entry.file_name())).expect("copy asset");
+                std::fs::copy(&p, theme_dir.join(entry.file_name())).expect("copy asset");
             }
         }
+        let guard = ThemeDirGuard::enter(base);
+        Some((pkg_src, guard))
+    }
 
-        let previous = std::env::var_os("SPUI_THEME_DIR");
-        std::env::set_var("SPUI_THEME_DIR", &base);
+    const CAPTION_SVGS: [&str; 12] = [
+        "close.svg",
+        "close_hover.svg",
+        "close_active.svg",
+        "minimize.svg",
+        "minimize_hover.svg",
+        "minimize_active.svg",
+        "maximize.svg",
+        "maximize_hover.svg",
+        "maximize_active.svg",
+        "restore.svg",
+        "restore_hover.svg",
+        "restore_active.svg",
+    ];
+
+    fn assert_caption_svgs_render(pkg_src: &Path, dim: (u32, u32), min_opaque_pixels: usize) {
+        for name in CAPTION_SVGS {
+            let decoded = icons::decode_theme_asset(&pkg_src.join(name), Some(dim))
+                .unwrap_or_else(|| panic!("decode {} at {:?}", name, dim));
+            assert_eq!((decoded.width, decoded.height), dim, "{}", name);
+            let opaque = decoded.pixels.iter().filter(|&&p| (p >> 24) > 20).count();
+            assert!(
+                opaque > min_opaque_pixels,
+                "{} rendered only {} opaque pixels (expected > {})",
+                name,
+                opaque,
+                min_opaque_pixels
+            );
+        }
+    }
+
+    #[test]
+    fn real_winxp_package_loads_luna_olive_silver_and_royale_noir_skins() {
+        let Some((pkg_src, _guard)) = stage_real_theme_pkg("theme-winxp", "winxp") else {
+            return;
+        };
         let discovered = discover_installed_themes();
         assert!(discovered.iter().any(|t| t.id == "winxp" && t.name == "XP Luna"));
 
@@ -2845,12 +2910,111 @@ mod tests {
         let noir = Theme::from_config(&cfg);
         assert_eq!(noir.window, 0x20242d);
         assert_eq!(noir.text, 0xeef1f7);
+    }
 
-        match previous {
-            Some(value) => std::env::set_var("SPUI_THEME_DIR", value),
-            None => std::env::remove_var("SPUI_THEME_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&base);
+    #[test]
+    fn real_aqua_package_loads_classic_graphite_and_dark_skins() {
+        let Some((pkg_src, _guard)) = stage_real_theme_pkg("theme-aqua", "aqua") else {
+            return;
+        };
+        let discovered = discover_installed_themes();
+        let aqua_meta = discovered
+            .iter()
+            .find(|t| t.id == "aqua")
+            .expect("aqua theme discovered");
+        assert_eq!(aqua_meta.name, "Aqua Classic");
+        assert_eq!(aqua_meta.button_layout, Some(ButtonLayout::Left));
+        assert_eq!(aqua_meta.panel_position, Some(PanelPosition::Top));
+
+        let wp_thumb = icons::decode_theme_asset(&pkg_src.join("aqua-wave.jpg"), Some((144, 90)))
+            .expect("decode aqua-wave.jpg thumbnail");
+        assert_eq!((wp_thumb.width, wp_thumb.height), (144, 90));
+        assert_caption_svgs_render(&pkg_src, (14, 14), 50);
+
+        // 1. Aqua Classic (light)
+        let mut cfg = DesktopConfig::default();
+        cfg.theme_id = "aqua".to_string();
+        cfg.theme_style = ThemeStyle::Spui;
+        cfg.mode = ThemeMode::Light;
+        cfg.accent = 0x1b74e4;
+        let classic = Theme::from_config(&cfg);
+        let classic_skin = classic.skin().expect("Aqua Classic skin");
+        assert_eq!(classic_skin.titlebar.title_align, TitleAlign::Center);
+        assert_eq!(classic_skin.controls.progress_chunk_w, 0);
+        assert!(classic_skin.start_button.icon.is_none());
+        assert!(classic_skin.caption_buttons.close_normal.sprite.is_some());
+        assert!(classic_skin.caption_buttons.min_normal.sprite.is_some());
+        assert!(classic_skin.caption_buttons.max_normal.sprite.is_some());
+        assert!(classic_skin.caption_buttons.restore_normal.sprite.is_some());
+
+        // 2. Graphite accent (#64748b) switches traffic lights to Graphite CSS orbs
+        cfg.accent = 0x64748b;
+        let graphite = Theme::from_config(&cfg);
+        assert_eq!(graphite.accent, 0x6a7b8c);
+        let graphite_skin = graphite.skin().expect("Graphite skin");
+        assert!(graphite_skin.caption_buttons.close_normal.sprite.is_none());
+        assert!(graphite_skin.caption_buttons.min_normal.sprite.is_none());
+        assert!(graphite_skin.caption_buttons.max_normal.sprite.is_none());
+        assert!(graphite_skin.caption_buttons.restore_normal.sprite.is_none());
+
+        // 3. Aqua Dark mode
+        cfg.mode = ThemeMode::Dark;
+        let dark = Theme::from_config(&cfg);
+        assert_eq!(dark.window, 0x252629);
+        assert_eq!(dark.text, 0xeef1f6);
+    }
+
+    #[test]
+    fn real_ambiance_package_loads_default_radiance_mate_and_dark_skins() {
+        let Some((pkg_src, _guard)) = stage_real_theme_pkg("theme-ambiance", "ambiance") else {
+            return;
+        };
+        let discovered = discover_installed_themes();
+        let meta = discovered
+            .iter()
+            .find(|t| t.id == "ambiance")
+            .expect("ambiance theme discovered");
+        assert_eq!(meta.name, "Ambiance");
+        assert_eq!(meta.button_layout, Some(ButtonLayout::Left));
+        assert_eq!(meta.panel_position, Some(PanelPosition::Top));
+
+        let wp_thumb =
+            icons::decode_theme_asset(&pkg_src.join("ambiance-wave.jpg"), Some((144, 90)))
+                .expect("decode ambiance-wave.jpg thumbnail");
+        assert_eq!((wp_thumb.width, wp_thumb.height), (144, 90));
+        assert_caption_svgs_render(&pkg_src, (19, 19), 100);
+
+        // 1. Ambiance default
+        let mut cfg = DesktopConfig::default();
+        cfg.theme_id = "ambiance".to_string();
+        cfg.theme_style = ThemeStyle::Spui;
+        cfg.mode = ThemeMode::Light;
+        cfg.accent = 0xdd4814;
+        let def = Theme::from_config(&cfg);
+        let def_skin = def.skin().expect("Ambiance skin");
+        assert_eq!(def_skin.titlebar.title_align, TitleAlign::Left);
+        assert_eq!(def_skin.controls.progress_chunk_w, 0);
+        assert!(def_skin.start_button.icon.is_none());
+        assert!(def_skin.caption_buttons.close_normal.sprite.is_some());
+        assert!(def_skin.caption_buttons.min_normal.sprite.is_some());
+        assert!(def_skin.caption_buttons.max_normal.sprite.is_some());
+        assert!(def_skin.caption_buttons.restore_normal.sprite.is_some());
+
+        // 2. Radiance (#f59e0b) light chrome
+        cfg.accent = 0xf59e0b;
+        let radiance = Theme::from_config(&cfg);
+        assert_eq!(radiance.titlebar_text, 0x3c3c3c);
+
+        // 3. MATE green (#10b981)
+        cfg.accent = 0x10b981;
+        let mate = Theme::from_config(&cfg);
+        assert_eq!(mate.accent, 0x6f913d);
+
+        // 4. Ambiance Darkness (Dark mode)
+        cfg.mode = ThemeMode::Dark;
+        let darkness = Theme::from_config(&cfg);
+        assert_eq!(darkness.window, 0x2c2b29);
+        assert_eq!(darkness.text, 0xe7e4dc);
     }
 }
 

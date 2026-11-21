@@ -836,7 +836,7 @@ impl StartScreenState {
                 || self
                     .settings
                     .as_ref()
-                    .is_none_or(|s| !s.is_text_input_focused()))
+                    .is_none_or(|s| !s.is_text_input_focused() || s.is_theme_search_focused()))
     }
 
     pub fn on_preedit(&mut self, preedit: &str) -> bool {
@@ -851,6 +851,16 @@ impl StartScreenState {
     pub fn on_commit(&mut self, committed: &str) -> StartAction {
         if !self.wants_ime() || committed.is_empty() {
             return StartAction::None;
+        }
+        if self.tab == StartTab::Settings {
+            if let Some(settings) = self.settings.as_mut() {
+                if settings.is_theme_search_focused() {
+                    if settings.on_commit_text(committed) {
+                        return StartAction::Redraw;
+                    }
+                    return StartAction::None;
+                }
+            }
         }
         let mut changed = false;
         for ch in committed.chars() {

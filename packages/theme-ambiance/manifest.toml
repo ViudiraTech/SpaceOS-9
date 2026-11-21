@@ -1,0 +1,29 @@
+#
+#       packages/theme-ambiance/manifest.toml
+#       Ambiance SPUI theme
+#
+#       2026/11/21 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "theme-ambiance"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "Ambiance SPUI theme"
+description = "Declarative Ambiance SPUI theme with warm charcoal top bar and titlebars, amber-orange close button, ivory surface, Radiance/MATE/Darkness variants and wave wallpaper."
+license = "CC-BY-SA-3.0"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = ["spui-theme"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = true
+allow_setuid = false

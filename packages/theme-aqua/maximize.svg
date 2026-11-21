@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14">
+  <defs>
+    <linearGradient id="orb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#68ed7b"/>
+      <stop offset="52%" stop-color="#28c840"/>
+      <stop offset="100%" stop-color="#159626"/>
+    </linearGradient>
+    <linearGradient id="spec" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.78"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.02"/>
+    </linearGradient>
+    <linearGradient id="innerRim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.24"/>
+    </linearGradient>
+  </defs>
+  <circle cx="7" cy="7" r="6.0" fill="url(#orb)" stroke="#1ba42e" stroke-width="0.75"/>
+  <circle cx="7" cy="7" r="5.3" fill="none" stroke="url(#innerRim)" stroke-width="0.5"/>
+  <ellipse cx="7" cy="3.9" rx="3.4" ry="1.75" fill="url(#spec)"/>
+  <ellipse cx="7" cy="10.4" rx="2.7" ry="1.0" fill="#ffffff" fill-opacity="0.26"/>
+</svg>

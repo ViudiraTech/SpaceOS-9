@@ -725,6 +725,13 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - `index.json.sig`：sha256 `7bdb18e028b6f8ab97d03bcc6445a8b90880e9853912c80cc54e69ff5fb4be11`
   - `spui-theme-kick` 用 `mkdir -p`/`touch`/`chmod`，修复 guest 无 `install` 时的 hook 127 失败
 
+- 2026-11-21：`theme-aqua 1.0.0-1`、`theme-ambiance 1.0.0-1` + 设置可扩展主题画廊：
+  - `theme-aqua-1.0.0-1-x86_64.spk`：sha256 `681cda1b9d05dfd4ae44be5b9b071711bb3015c52cad3c4ec6737d00c81766f2`
+  - `theme-ambiance-1.0.0-1-x86_64.spk`：sha256 `1925fe1a3f68b45faeeb2e7084e5148f99c696a712d133833ce9c031c6b1bbf8`
+  - `index.json`：sha256 `f159df0aadaf5066e37915f96f6623a2ebec918a6058d8616ace8b03bd7df3bd`
+  - `index.json.sig`：sha256 `8799b15524ffdff1b97570872d239571ecf27a5e864ba56ff3fb72a3898806e7`
+  - 新增 `Aqua Classic`（顶部银灰面板、左侧晶球窗口按钮、居中标题栏、Graphite/Dark 变体）与 `Ambiance`（顶部暖炭黑面板、官方 19×19 SVG 按钮、象牙白窗体、Radiance/MATE/Darkness 变体）声明式主题包，并将设置外观页重构为可分页搜索/筛选的主题画廊。
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。

@@ -1,0 +1,29 @@
+#
+#       packages/theme-aqua/manifest.toml
+#       Aqua Classic SPUI theme
+#
+#       2026/11/21 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "theme-aqua"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "Aqua Classic SPUI theme"
+description = "Declarative Aqua Classic SPUI theme with brushed silver centered titlebars, left crystal orbs, top menu bar, gel controls and blue wave wallpaper."
+license = "CC-BY-4.0"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = ["spui-theme"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = true
+allow_setuid = false

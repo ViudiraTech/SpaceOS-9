@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Aqua Classic Theme
+Comment=Apply the Aqua Classic SPUI theme
+Exec=/usr/bin/spui-theme-aqua
+Terminal=false
+Icon=preferences-desktop-theme
+Categories=Settings;DesktopSettings;
+StartupNotify=false

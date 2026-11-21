@@ -482,12 +482,16 @@ pub fn caption_button_rect_for(
         let bh = cb.height;
         let gap = cb.gap;
         let mr = cb.margin_right;
-        let y = cb.margin_top.max((th - bh) / 2);
+        let y = if cb.margin_top > 0 {
+            cb.margin_top
+        } else {
+            (th - bh) / 2
+        };
         return if buttons_left {
             match kind {
                 CaptionHit::Close => Rect::new(mr, y, bw, bh),
-                CaptionHit::Maximize => Rect::new(mr + bw + gap, y, bw, bh),
-                CaptionHit::Minimize => Rect::new(mr + (bw + gap) * 2, y, bw, bh),
+                CaptionHit::Minimize => Rect::new(mr + bw + gap, y, bw, bh),
+                CaptionHit::Maximize => Rect::new(mr + (bw + gap) * 2, y, bw, bh),
                 CaptionHit::None => Rect::default(),
             }
         } else {
@@ -610,6 +614,32 @@ fn draw_custom_caption_glyph(
     maximized: bool,
     fg: u32,
 ) {
+    if rect.w < 18 || rect.h < 18 {
+        let cx = rect.x + rect.w / 2;
+        let cy = rect.y + rect.h / 2;
+        match kind {
+            CaptionHit::Minimize => {
+                let w = (rect.w - 6).max(4);
+                canvas.fill(Rect::new(cx - w / 2, cy - 1, w, 2), fg);
+            }
+            CaptionHit::Maximize => {
+                if maximized {
+                    canvas.border_1px(Rect::new(cx - 2, cy - 3, 5, 5), fg);
+                    canvas.border_1px(Rect::new(cx - 4, cy - 1, 5, 5), fg);
+                } else {
+                    canvas.border_1px(Rect::new(cx - 3, cy - 3, 6, 6), fg);
+                    canvas.fill(Rect::new(cx - 3, cy - 2, 6, 1), fg);
+                }
+            }
+            CaptionHit::Close => {
+                let d = (rect.w.min(rect.h) / 4).max(2);
+                canvas.line(cx - d, cy - d, cx + d, cy + d, fg, 1.0);
+                canvas.line(cx + d, cy - d, cx - d, cy + d, fg, 1.0);
+            }
+            CaptionHit::None => {}
+        }
+        return;
+    }
     match kind {
         CaptionHit::Minimize => {
             canvas.fill(Rect::new(rect.x + 5, rect.bottom() - 6, 8, 3), fg);
@@ -686,15 +716,31 @@ pub fn titlebar(
 
         let cb = &skin.caption_buttons;
         let btn_cluster_w = cb.width * 3 + cb.gap * 2 + cb.margin_right;
-        let (icon_x, title_x) = if buttons_left {
-            (btn_cluster_w + 8, (btn_cluster_w + 28) as f32)
-        } else {
-            (7, 27.0)
-        };
-        icons::draw(canvas, app_icon, icon_x, (th - 16) / 2, 16, None);
-        let max_title_w = (width - btn_cluster_w - 38).max(32) as f32;
-        let shown = text.truncate(title, max_title_w, 12.5, Face::Bold);
         let baseline = th as f32 * 0.5 + 4.5;
+        let (icon_x, title_x, shown) =
+            if skin.titlebar.title_align == crate::theme::TitleAlign::Center {
+                let avail_w = (width - btn_cluster_w * 2 - 28).max(32) as f32;
+                let shown = text.truncate(title, avail_w, 12.5, Face::Bold);
+                let tw = text.measure(&shown, 12.5, Face::Bold);
+                let total_w = 20.0 + tw;
+                let min_left = if buttons_left {
+                    (btn_cluster_w + 10) as f32
+                } else {
+                    10.0
+                };
+                let group_x = ((width as f32 - total_w) * 0.5).max(min_left);
+                (group_x.round() as i32, group_x + 20.0, shown)
+            } else {
+                let (ix, tx) = if buttons_left {
+                    (btn_cluster_w + 8, (btn_cluster_w + 28) as f32)
+                } else {
+                    (7, 27.0)
+                };
+                let max_title_w = (width - btn_cluster_w - 38).max(32) as f32;
+                let shown = text.truncate(title, max_title_w, 12.5, Face::Bold);
+                (ix, tx, shown)
+            };
+        icons::draw(canvas, app_icon, icon_x, (th - 16) / 2, 16, None);
         if active {
             if let Some(sh_col) = skin.titlebar.text_shadow {
                 text.draw(
@@ -1906,17 +1952,29 @@ fn draw_progress_bar_impl(
         let inner = rect.inset(2);
         if inner.w > 2 && inner.h > 2 && p > 0.001 {
             let max_w = ((inner.w as f32) * p).round() as i32;
-            let chunk_w = ctrl.progress_chunk_w.max(2);
-            let step = chunk_w + ctrl.progress_chunk_gap.max(0);
-            let mut bx = inner.x;
-            while bx < inner.x + max_w {
-                let w = chunk_w.min(inner.x + max_w - bx).min(inner.right() - bx);
-                if w <= 0 {
-                    break;
+            if ctrl.progress_chunk_w <= 0 {
+                let r = ctrl
+                    .progress_fill
+                    .radii
+                    .unwrap_or([(inner.h / 2).max(1); 4]);
+                ctrl.progress_fill.paint(
+                    canvas,
+                    Rect::new(inner.x, inner.y, max_w.max(1).min(inner.w), inner.h),
+                    r,
+                );
+            } else {
+                let chunk_w = ctrl.progress_chunk_w.max(2);
+                let step = chunk_w + ctrl.progress_chunk_gap.max(0);
+                let mut bx = inner.x;
+                while bx < inner.x + max_w {
+                    let w = chunk_w.min(inner.x + max_w - bx).min(inner.right() - bx);
+                    if w <= 0 {
+                        break;
+                    }
+                    ctrl.progress_fill
+                        .paint(canvas, Rect::new(bx, inner.y, w, inner.h), [1; 4]);
+                    bx += step.max(1);
                 }
-                ctrl.progress_fill
-                    .paint(canvas, Rect::new(bx, inner.y, w, inner.h), [1; 4]);
-                bx += step.max(1);
             }
         }
         return;

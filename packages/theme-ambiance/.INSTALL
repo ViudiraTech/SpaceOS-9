@@ -1,0 +1,8 @@
+pre_remove() {
+    printf '警告：正在删除 Ambiance 主题；删除后 SPUI 会回退到默认主题，当前会话可能短暂显示混合样式。\n'
+    printf '请先在 系统设置 -> 外观与主题 中切换回默认主题，再删除本包。\n'
+}
+
+post_remove() {
+    :
+}

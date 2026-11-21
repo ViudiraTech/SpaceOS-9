@@ -1,0 +1,436 @@
+#
+#       packages/theme-ambiance/theme.toml
+#       Declarative Ambiance CSS + SVG theme skin for SPUI (schema = 2)
+#
+#       2026/11/21 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+schema = 2
+id = "ambiance"
+name = "Ambiance"
+subtitle = "暖炭黑标题栏与顶栏 · 左侧琥珀橙关闭钮 · 象牙白窗体"
+base_style = "spui"
+mode = "light"
+accent = "#dd4814"
+wallpaper = "ambiance-wave.jpg"
+solid_color = "#4b1f3b"
+panel_position = "top"
+panel_size = 28
+start_fullscreen = false
+button_layout = "left"
+
+[preview]
+desktop_top = "#4b1f3b"
+desktop_bottom = "#dd4814"
+window_bg = "#f2f1f0"
+window_border = "#3c3b37"
+window_top_radius = 6
+titlebar_left = "#59574f"
+titlebar_right = "#3c3b37"
+close_btn = "#dd4814"
+min_btn = "#75746d"
+max_btn = "#75746d"
+taskbar_top = "#59574f"
+taskbar_bottom = "#3c3b37"
+start_btn = "#dd4814"
+tray_bg = "#2f2e2b"
+
+[colors]
+accent = "#dd4814"
+accent_soft = "#fbdcce"
+bg_top = "#4b1f3b"
+bg_bottom = "#dd4814"
+panel = "#e9e7e4"
+panel_high = "#f6f5f3"
+panel_hover = "#e3dfda"
+panel_border = "#ccc8c2"
+text = "#3c3c3c"
+text_dim = "#575551"
+text_muted = "#7b7873"
+window = "#f2f1f0"
+window_high = "#ffffff"
+window_alt = "#e7e5e2"
+window_border = "#c8c5bf"
+window_border_active = "#dd4814"
+titlebar = "#4b4a44"
+titlebar_hi = "#5e5c54"
+titlebar_inactive = "#43423d"
+titlebar_inactive_hi = "#4d4c46"
+titlebar_text = "#dfdbd2"
+titlebar_inactive_text = "#9b9890"
+input_bg = "#ffffff"
+scrollbar_track = "#eae8e5"
+scrollbar_thumb = "#b8b4ad"
+bevel_light = "#ffffff"
+bevel_hi = "#f6f5f3"
+bevel_shadow = "#cbc7c0"
+bevel_dark = "#8e8b84"
+selection_bg = "#f07746"
+selection_text = "#ffffff"
+danger = "#df382c"
+warning = "#efb73e"
+success = "#38b44a"
+
+[window]
+top_radius = 6
+bottom_radius = 2
+border_width = 1
+active_bg = "#3c3b37"
+active_box_shadow = "inset 0 1px #706e66, inset -1px -1px #2e2d29"
+inactive_bg = "#4b4a44"
+inactive_box_shadow = "inset 0 1px #5f5d56, inset -1px -1px #33322e"
+
+[titlebar]
+height = 28
+title_align = "left"
+active_bg = "linear-gradient(to bottom, #5e5c54 0%, #4e4d47 28%, #43423c 72%, #3a3934 100%)"
+active_border_top = "1px solid #757268"
+inactive_bg = "linear-gradient(to bottom, #4b4a44 0%, #43423d 55%, #3c3b37 100%)"
+edge_glow_left = "#69665e"
+edge_glow_right = "#3a3934"
+edge_glow_width = 10
+text_color = "#dfdbd2"
+inactive_text_color = "#9b9890"
+text_shadow = "#262522"
+
+[caption_buttons]
+width = 19
+height = 19
+gap = 4
+margin_right = 6
+margin_top = 0
+radius = 10
+glyph_color = "#3d3c37"
+inactive_opacity = 0.65
+close_svg = "close.svg"
+close_bg = "radial-gradient(circle at 35% 30%, #f58d6e 0%, #e55e30 55%, #de4c19 100%)"
+close_box_shadow = "inset 0 1px #fbbaa6, inset 0 -1px #a6320c"
+close_border = "1px solid #383734"
+close_hover_svg = "close_hover.svg"
+close_hover_bg = "radial-gradient(circle at 35% 30%, #fba992 0%, #f17750 55%, #e24f1b 100%)"
+close_hover_border = "1px solid #383734"
+close_active_svg = "close_active.svg"
+close_active_bg = "radial-gradient(circle at 50% 60%, #b33810 0%, #d4491b 65%, #e66439 100%)"
+close_active_border = "1px solid #302f2c"
+min_svg = "minimize.svg"
+min_bg = "radial-gradient(circle at 35% 30%, #8e8d88 0%, #75746d 55%, #5a5955 100%)"
+min_box_shadow = "inset 0 1px #b0afa9, inset 0 -1px #3d3c37"
+min_border = "1px solid #383734"
+min_hover_svg = "minimize_hover.svg"
+min_hover_bg = "radial-gradient(circle at 35% 30%, #a5a49f 0%, #87867e 55%, #686762 100%)"
+min_hover_border = "1px solid #383734"
+min_active_svg = "minimize_active.svg"
+min_active_bg = "radial-gradient(circle at 50% 60%, #4a4945 0%, #5c5b56 65%, #73726c 100%)"
+min_active_border = "1px solid #2e2d2a"
+max_svg = "maximize.svg"
+max_bg = "radial-gradient(circle at 35% 30%, #8e8d88 0%, #75746d 55%, #5a5955 100%)"
+max_box_shadow = "inset 0 1px #b0afa9, inset 0 -1px #3d3c37"
+max_border = "1px solid #383734"
+max_hover_svg = "maximize_hover.svg"
+max_hover_bg = "radial-gradient(circle at 35% 30%, #a5a49f 0%, #87867e 55%, #686762 100%)"
+max_hover_border = "1px solid #383734"
+max_active_svg = "maximize_active.svg"
+max_active_bg = "radial-gradient(circle at 50% 60%, #4a4945 0%, #5c5b56 65%, #73726c 100%)"
+max_active_border = "1px solid #2e2d2a"
+restore_svg = "restore.svg"
+restore_bg = "radial-gradient(circle at 35% 30%, #8e8d88 0%, #75746d 55%, #5a5955 100%)"
+restore_box_shadow = "inset 0 1px #b0afa9, inset 0 -1px #3d3c37"
+restore_border = "1px solid #383734"
+restore_hover_svg = "restore_hover.svg"
+restore_hover_bg = "radial-gradient(circle at 35% 30%, #a5a49f 0%, #87867e 55%, #686762 100%)"
+restore_hover_border = "1px solid #383734"
+restore_active_svg = "restore_active.svg"
+restore_active_bg = "radial-gradient(circle at 50% 60%, #4a4945 0%, #5c5b56 65%, #73726c 100%)"
+restore_active_border = "1px solid #2e2d2a"
+
+[taskbar]
+height = 28
+bg = "linear-gradient(to bottom, #59574f 0%, #484741 36%, #3c3b37 92%, #2c2b28 100%)"
+button_radius = 4
+button_normal_bg = "linear-gradient(to bottom, #4f4e47 0%, #42413c 55%, #373632 100%)"
+button_normal_box_shadow = "inset 0 1px #64625a, inset -1px -1px #2a2926"
+button_hover_bg = "linear-gradient(to bottom, #636158 0%, #525049 55%, #44423c 100%)"
+button_hover_box_shadow = "inset 0 1px #7c796e, inset -1px -1px #2f2e2a"
+button_active_bg = "linear-gradient(to bottom, #f27c4d 0%, #e45d2a 48%, #dd4814 100%)"
+button_active_box_shadow = "inset 0 1px #f9b296, inset -1px -1px #a6320c"
+button_pressed_bg = "linear-gradient(to bottom, #b83a0e 0%, #d44918 55%, #e45d2a 100%)"
+button_pressed_box_shadow = "inset 1px 1px #852607, inset -1px -1px #f07b51"
+button_text = "#dfdbd2"
+button_active_text = "#ffffff"
+button_minimized_text = "#9b9890"
+tray_bg = "linear-gradient(to bottom, #4b4a44 0%, #3a3935 55%, #2f2e2b 100%)"
+tray_box_shadow = "inset 1px 0 #262522, inset 0 1px #615f57"
+tray_text = "#dfdbd2"
+tray_muted_text = "#b1ada4"
+
+[start_button]
+width = 84
+full_height = false
+margin_left = 4
+radius = [4, 4, 4, 4]
+label = "应用"
+text_color = "#dfdbd2"
+text_shadow = "#262522"
+normal_bg = "linear-gradient(to bottom, #54524b 0%, #45443e 55%, #3a3934 100%)"
+normal_box_shadow = "inset 0 1px #6c6a61, inset -1px -1px #2a2926"
+normal_border = "1px solid #302f2c"
+hover_bg = "linear-gradient(to bottom, #f07746 0%, #e45c2a 55%, #dd4814 100%)"
+hover_box_shadow = "inset 0 1px #f8aa8b, inset -1px -1px #9e2f0a"
+hover_border = "1px solid #b5360b"
+active_bg = "linear-gradient(to bottom, #b83a0e 0%, #d44918 55%, #e25926 100%)"
+active_box_shadow = "inset 1px 1px #802406, inset -1px -1px #f07746"
+active_border = "1px solid #8c2706"
+
+[start_menu]
+layout = "compact"
+
+[controls]
+button_radius = 4
+button_text = "#3c3c3c"
+button_primary_text = "#ffffff"
+button_normal_bg = "linear-gradient(180deg, #fafafa 0%, #efeeec 52%, #e4e2df 100%)"
+button_normal_border = "1px solid #c3c0ba"
+button_normal_box_shadow = "inset 0 1px #ffffff, inset 0 -1px #d6d3cd"
+button_hover_bg = "linear-gradient(180deg, #ffffff 0%, #f5f3f0 52%, #eae7e2 100%)"
+button_hover_border = "1px solid #e06b40"
+button_hover_box_shadow = "inset 0 1px #ffffff"
+button_active_bg = "linear-gradient(180deg, #dedbd6 0%, #e6e4e0 55%, #efedeb 100%)"
+button_active_border = "1px solid #ada9a2"
+button_primary_bg = "linear-gradient(180deg, #f37b4b 0%, #e45a28 52%, #dd4814 100%)"
+button_primary_border = "1px solid #b8390c"
+button_primary_box_shadow = "inset 0 1px #fab59a, inset 0 -1px #a6320a"
+card_radius = 4
+card_bg = "linear-gradient(180deg, #faf9f8 0%, #f1efec 100%)"
+card_border = "1px solid #d4d1cb"
+card_box_shadow = "inset 0 1px #ffffff"
+tab_radius = 4
+tab_normal_bg = "linear-gradient(180deg, #f4f3f1 0%, #e8e6e2 100%)"
+tab_normal_border = "1px solid #cbc8c2"
+tab_hover_bg = "linear-gradient(180deg, #fbfaf8 0%, #f1efec 100%)"
+tab_hover_border = "1px solid #df6b42"
+tab_hover_border_top = "1px solid #f07746"
+tab_active_bg = "#ffffff"
+tab_active_border = "1px solid #c5c1ba"
+tab_active_border_top = "1px solid #dd4814"
+tab_active_box_shadow = "inset 0 2px #f07746"
+input_bg = "#ffffff"
+input_border = "#c3c0ba"
+input_focus_border = "#dd4814"
+input_radius = 3
+scrollbar_width = 13
+scrollbar_track_bg = "linear-gradient(to right, #e5e3df 0%, #eeedea 55%, #f5f4f2 100%)"
+scrollbar_track_border = "1px solid #d4d1cb"
+scrollbar_thumb_bg = "linear-gradient(to right, #cfccc5 0%, #bcb8b0 55%, #aba79f 100%)"
+scrollbar_thumb_border = "1px solid #96928a"
+scrollbar_thumb_box_shadow = "inset 0 1px #e8e6e1"
+scrollbar_thumb_hover_bg = "linear-gradient(to right, #f37d4e 0%, #e45b29 55%, #dd4814 100%)"
+scrollbar_thumb_hover_border = "1px solid #b8390c"
+scrollbar_thumb_active_bg = "linear-gradient(to right, #cc4211 0%, #b8390c 55%, #a13008 100%)"
+scrollbar_thumb_active_border = "1px solid #8a2805"
+scrollbar_grip_light = "#eceae6"
+scrollbar_grip_dark = "#87837c"
+progress_track_bg = "#eae8e4"
+progress_track_border = "1px solid #bfbcb5"
+progress_fill_bg = "linear-gradient(180deg, #f5865a 0%, #e76130 50%, #dd4814 100%)"
+progress_chunk_w = 0
+progress_chunk_gap = 0
+
+# ==============================================================================
+# Variant 1: Radiance Light Chrome
+# Activated when user selects Amber (#f59e0b) or Slate (#64748b).
+# ==============================================================================
+[accents.radiance]
+matches = ["#f59e0b", "#64748b"]
+
+[accents.radiance.colors]
+panel = "#eceae6"
+panel_high = "#f7f6f4"
+panel_hover = "#e2dfd9"
+titlebar = "#e2dfd9"
+titlebar_hi = "#f3f1ee"
+titlebar_inactive = "#eae8e4"
+titlebar_inactive_hi = "#f6f5f3"
+titlebar_text = "#3c3c3c"
+titlebar_inactive_text = "#7c7972"
+
+[accents.radiance.window]
+active_bg = "#c9c5bd"
+active_box_shadow = "inset 0 1px #ffffff, inset -1px -1px #aba79f"
+inactive_bg = "#dad7d1"
+inactive_box_shadow = "inset 0 1px #ffffff, inset -1px -1px #bcb8b0"
+
+[accents.radiance.titlebar]
+active_bg = "linear-gradient(to bottom, #f4f2ef 0%, #eae7e2 30%, #e0ddd6 76%, #d5d1c9 100%)"
+active_border_top = "1px solid #ffffff"
+inactive_bg = "linear-gradient(to bottom, #f7f6f4 0%, #efede9 55%, #e6e3dd 100%)"
+edge_glow_left = "#ffffff"
+edge_glow_right = "#d2cec6"
+text_color = "#3c3c3c"
+inactive_text_color = "#848078"
+text_shadow = "#ffffff"
+
+[accents.radiance.taskbar]
+bg = "linear-gradient(to bottom, #f6f5f2 0%, #eae8e3 42%, #dcd9d2 95%, #c7c3bb 100%)"
+button_normal_bg = "linear-gradient(to bottom, #ffffff 0%, #eeece8 55%, #e2dfd9 100%)"
+button_normal_box_shadow = "inset 0 1px #ffffff, inset -1px -1px #bcb8b0"
+button_hover_bg = "linear-gradient(to bottom, #ffffff 0%, #f6ebe5 55%, #edd9ce 100%)"
+button_hover_box_shadow = "inset 0 1px #ffffff, inset -1px -1px #df8664"
+button_text = "#3c3c3c"
+button_minimized_text = "#7b7872"
+tray_bg = "linear-gradient(to bottom, #f4f3f0 0%, #e4e1db 55%, #d6d2cb 100%)"
+tray_box_shadow = "inset 1px 0 #c5c1b9, inset 0 1px #ffffff"
+tray_text = "#3c3c3c"
+tray_muted_text = "#6b6862"
+
+[accents.radiance.start_button]
+text_color = "#3c3c3c"
+text_shadow = "#ffffff"
+normal_bg = "linear-gradient(to bottom, #ffffff 0%, #eeece8 55%, #e1ded7 100%)"
+normal_box_shadow = "inset 0 1px #ffffff, inset -1px -1px #b8b4ac"
+normal_border = "1px solid #bcb8b0"
+
+# ==============================================================================
+# Variant 2: MATE Green Accent
+# Activated when user selects Emerald (#10b981).
+# ==============================================================================
+[accents.mate]
+matches = ["#10b981"]
+
+[accents.mate.colors]
+accent = "#6f913d"
+accent_soft = "#e1edd0"
+window_border_active = "#6f913d"
+selection_bg = "#87a556"
+
+[accents.mate.taskbar]
+button_active_bg = "linear-gradient(to bottom, #9bb96a 0%, #82a052 48%, #6f913d 100%)"
+button_active_box_shadow = "inset 0 1px #c7dc9f, inset -1px -1px #4f6b28"
+button_pressed_bg = "linear-gradient(to bottom, #54702b 0%, #688738 55%, #7c9b4b 100%)"
+
+[accents.mate.start_button]
+hover_bg = "linear-gradient(to bottom, #99b768 0%, #819f51 55%, #6f913d 100%)"
+hover_box_shadow = "inset 0 1px #c4da9d, inset -1px -1px #4b6625"
+hover_border = "1px solid #597630"
+active_bg = "linear-gradient(to bottom, #526d2a 0%, #658436 55%, #789847 100%)"
+active_border = "1px solid #445b22"
+
+[accents.mate.controls]
+button_hover_border = "1px solid #7a9949"
+button_primary_bg = "linear-gradient(180deg, #98b566 0%, #81a051 52%, #6f913d 100%)"
+button_primary_border = "1px solid #55702c"
+button_primary_box_shadow = "inset 0 1px #c8dea4, inset 0 -1px #4a6326"
+tab_hover_border = "1px solid #7e9c4d"
+tab_hover_border_top = "1px solid #87a556"
+tab_active_border_top = "1px solid #6f913d"
+tab_active_box_shadow = "inset 0 2px #87a556"
+input_focus_border = "#6f913d"
+scrollbar_thumb_hover_bg = "linear-gradient(to right, #97b566 0%, #81a051 55%, #6f913d 100%)"
+scrollbar_thumb_hover_border = "1px solid #55702c"
+progress_fill_bg = "linear-gradient(180deg, #9bb969 0%, #83a252 50%, #6f913d 100%)"
+
+# ==============================================================================
+# Variant 3: Ambiance Darkness
+# Activated when user selects Dark mode.
+# ==============================================================================
+[dark.colors]
+accent = "#dd4814"
+accent_soft = "#542a1b"
+bg_top = "#2e1324"
+bg_bottom = "#632717"
+panel = "#32312e"
+panel_high = "#3f3d39"
+panel_hover = "#494742"
+panel_border = "#52504a"
+text = "#e7e4dc"
+text_dim = "#c4c0b6"
+text_muted = "#949087"
+window = "#2c2b29"
+window_high = "#363532"
+window_alt = "#33322f"
+window_border = "#4a4843"
+window_border_active = "#dd4814"
+titlebar = "#42413c"
+titlebar_hi = "#525049"
+titlebar_inactive = "#353430"
+titlebar_inactive_hi = "#3e3d38"
+titlebar_text = "#eae6dd"
+titlebar_inactive_text = "#8f8c84"
+input_bg = "#201f1d"
+scrollbar_track = "#262523"
+scrollbar_thumb = "#5c5952"
+bevel_light = "#4e4c46"
+bevel_hi = "#403e39"
+bevel_shadow = "#1e1d1b"
+bevel_dark = "#141312"
+selection_bg = "#dd4814"
+selection_text = "#ffffff"
+
+[dark.window]
+active_bg = "#3c3b37"
+active_box_shadow = "inset 0 1px #615f57, inset -1px -1px #1e1d1b"
+inactive_bg = "#33322f"
+inactive_box_shadow = "inset 0 1px #4c4a44, inset -1px -1px #1c1b19"
+
+[dark.titlebar]
+active_bg = "linear-gradient(to bottom, #54524b 0%, #44433d 32%, #3a3934 75%, #31302c 100%)"
+active_border_top = "1px solid #6b685f"
+inactive_bg = "linear-gradient(to bottom, #3c3b37 0%, #34332f 55%, #2d2c29 100%)"
+edge_glow_left = "#5c5a52"
+edge_glow_right = "#2e2d29"
+text_color = "#eae6dd"
+inactive_text_color = "#8c8981"
+text_shadow = "#191816"
+
+[dark.taskbar]
+bg = "linear-gradient(to bottom, #4b4a44 0%, #3a3935 38%, #2e2d29 92%, #22211e 100%)"
+button_normal_bg = "linear-gradient(to bottom, #43423d 0%, #363531 55%, #2c2b28 100%)"
+button_normal_box_shadow = "inset 0 1px #57554e, inset -1px -1px #1e1d1b"
+button_hover_bg = "linear-gradient(to bottom, #54524b 0%, #43423c 55%, #373631 100%)"
+button_active_bg = "linear-gradient(to bottom, #f07746 0%, #e15726 48%, #dd4814 100%)"
+button_active_box_shadow = "inset 0 1px #f8aa8b, inset -1px -1px #9e2f0a"
+button_pressed_bg = "linear-gradient(to bottom, #a8330c 0%, #c84214 55%, #dd4814 100%)"
+button_text = "#e7e4dc"
+button_active_text = "#ffffff"
+button_minimized_text = "#8f8c84"
+tray_bg = "linear-gradient(to bottom, #3e3d38 0%, #2f2e2b 55%, #262522 100%)"
+tray_box_shadow = "inset 1px 0 #1c1b19, inset 0 1px #525049"
+tray_text = "#e7e4dc"
+tray_muted_text = "#9c988f"
+
+[dark.controls]
+button_text = "#e7e4dc"
+button_primary_text = "#ffffff"
+button_normal_bg = "linear-gradient(180deg, #474540 0%, #393833 52%, #2f2e2a 100%)"
+button_normal_border = "1px solid #595750"
+button_normal_box_shadow = "inset 0 1px #5f5d55, inset 0 -1px #201f1d"
+button_hover_bg = "linear-gradient(180deg, #54514b 0%, #43413c 52%, #373531 100%)"
+button_hover_border = "1px solid #dd4814"
+button_active_bg = "linear-gradient(180deg, #272623 0%, #2e2d2a 55%, #363531 100%)"
+button_active_border = "1px solid #4a4842"
+button_primary_bg = "linear-gradient(180deg, #f27a4a 0%, #e25826 52%, #dd4814 100%)"
+button_primary_border = "1px solid #b5360b"
+card_bg = "linear-gradient(180deg, #34332f 0%, #2c2b28 100%)"
+card_border = "1px solid #484641"
+card_box_shadow = "inset 0 1px #413f3a"
+tab_normal_bg = "linear-gradient(180deg, #3c3b36 0%, #31302c 100%)"
+tab_normal_border = "1px solid #4d4b45"
+tab_hover_bg = "linear-gradient(180deg, #474540 0%, #3a3934 100%)"
+tab_hover_border = "1px solid #df6b42"
+tab_active_bg = "#2c2b29"
+tab_active_border = "1px solid #595750"
+tab_active_border_top = "1px solid #dd4814"
+input_bg = "#201f1d"
+input_border = "#4f4d47"
+input_focus_border = "#f07746"
+scrollbar_track_bg = "linear-gradient(to right, #232220 0%, #2a2926 55%, #302f2c 100%)"
+scrollbar_track_border = "1px solid #3f3d39"
+scrollbar_thumb_bg = "linear-gradient(to right, #615e57 0%, #504d47 55%, #42403b 100%)"
+scrollbar_thumb_border = "1px solid #363530"
+scrollbar_thumb_hover_bg = "linear-gradient(to right, #f27a4a 0%, #e25826 55%, #dd4814 100%)"
+scrollbar_thumb_hover_border = "1px solid #b5360b"
+scrollbar_grip_light = "#8a867e"
+scrollbar_grip_dark = "#272623"
+progress_track_bg = "#201f1d"
+progress_track_border = "1px solid #484641"
+progress_fill_bg = "linear-gradient(180deg, #f5865a 0%, #e76130 50%, #dd4814 100%)"
