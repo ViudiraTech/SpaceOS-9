@@ -32,6 +32,7 @@ pub fn check(paths: &Paths, state: &State, lang: Lang) -> Result<()> {
 pub fn collect_errors(paths: &Paths, state: &State) -> Result<Vec<String>> {
     let mut errors = Vec::new();
     let fs = Fs::new(&paths.root)?;
+    let privileged = unsafe { libc::geteuid() } == 0;
 
     for (name, package) in &state.installed.packages {
         if name != &package.name {
@@ -60,6 +61,16 @@ pub fn collect_errors(paths: &Paths, state: &State) -> Result<Vec<String>> {
                     }
                     if !fs.is_dir(&file.path)? {
                         errors.push(format!("{}: directory is missing", file.path));
+                    } else if let Some(entry) = fs.on_disk(&file.path)? {
+                        if entry.kind != OnDiskKind::Dir {
+                            continue;
+                        }
+                        if privileged && (entry.uid != file.uid || entry.gid != file.gid) {
+                            errors.push(format!(
+                                "{}: directory owner {}:{} does not match {}:{}",
+                                file.path, entry.uid, entry.gid, file.uid, file.gid
+                            ));
+                        }
                     }
                 }
                 FileType::File | FileType::Symlink => {
@@ -102,6 +113,22 @@ pub fn collect_errors(paths: &Paths, state: &State) -> Result<Vec<String>> {
                     if entry.kind != expected {
                         errors.push(format!("{}: recorded type does not match disk", file.path));
                         continue;
+                    }
+                    if privileged && (entry.uid != file.uid || entry.gid != file.gid) {
+                        errors.push(format!(
+                            "{}: owner {}:{} does not match {}:{}",
+                            file.path, entry.uid, entry.gid, file.uid, file.gid
+                        ));
+                    }
+                    if file.file_type == FileType::File
+                        && entry.mode & 0o7777 != file.mode_bits()?
+                    {
+                        errors.push(format!(
+                            "{}: mode {:04o} does not match {:04o}",
+                            file.path,
+                            entry.mode & 0o7777,
+                            file.mode_bits()?
+                        ));
                     }
                     let conffile = package.conffiles.contains(&file.path);
                     if !conffile {

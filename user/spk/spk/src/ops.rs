@@ -41,6 +41,13 @@ impl ReportOptions {
     }
 }
 
+fn require_root(paths: &Paths, lang: Lang) -> Result<()> {
+    if paths.root == std::path::Path::new("/") && unsafe { libc::geteuid() } != 0 {
+        return Err(SpkError::Security(i18n::root_required(lang).to_string()));
+    }
+    Ok(())
+}
+
 fn prepare(paths: &Paths, lang: Lang) -> Result<(StateLock, State)> {
     let lock = lock_exclusive(paths)?;
     if let Some(txid) = journal::pending_txid(paths)? {
@@ -68,6 +75,7 @@ pub fn install(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
+    require_root(paths, lang)?;
     if targets.is_empty() {
         return Err(SpkError::Usage(
             "install requires at least one package".into(),
@@ -133,6 +141,7 @@ pub fn upgrade(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
+    require_root(paths, lang)?;
     let (_lock, state) = prepare(paths, lang)?;
     if !targets.is_empty() && !allow_partial {
         return Err(SpkError::General(i18n::partial_disabled(lang).to_string()));
@@ -196,6 +205,7 @@ pub fn downgrade(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
+    require_root(paths, lang)?;
     if targets.is_empty() {
         return Err(SpkError::Usage(
             "downgrade requires package=<version> targets".into(),
@@ -259,6 +269,7 @@ pub fn reinstall(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
+    require_root(paths, lang)?;
     if targets.is_empty() {
         return Err(SpkError::Usage(
             "reinstall requires at least one package".into(),
@@ -321,6 +332,7 @@ pub fn remove(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
+    require_root(paths, lang)?;
     if targets.is_empty() {
         return Err(SpkError::Usage(
             "remove requires at least one package".into(),
@@ -837,6 +849,7 @@ pub fn hold(paths: &Paths, targets: &[String], lang: Lang) -> Result<()> {
     if targets.is_empty() {
         return hold_list(paths);
     }
+    require_root(paths, lang)?;
     let (_lock, state) = prepare(paths, lang)?;
     let mut holds = state.holds.clone();
     for target in targets {
@@ -872,6 +885,7 @@ pub fn unhold(paths: &Paths, targets: &[String], lang: Lang) -> Result<()> {
             "unhold requires at least one package".into(),
         ));
     }
+    require_root(paths, lang)?;
     let (_lock, state) = prepare(paths, lang)?;
     let mut holds = state.holds.clone();
     for name in targets {

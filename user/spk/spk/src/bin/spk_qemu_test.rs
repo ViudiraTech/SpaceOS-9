@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -77,6 +77,22 @@ fn phase_install() -> Result<(), String> {
     expect_contains("nosuid probe", &plain, "EUID=1000")?;
     expect_contains("nosuid probe", &plain, "EGID=1000")?;
 
+    let nonroot = spk_as(
+        1000,
+        &[
+            "install",
+            "--repo",
+            "/repo/base",
+            "--noconfirm",
+            "hello=0.1.0-1",
+        ],
+    )?;
+    if nonroot.status.success() {
+        return Err("install as uid 1000 unexpectedly succeeded".into());
+    }
+    expect_contains("non-root install", &nonroot, "root")?;
+    print_output("non-root install", &nonroot);
+
     let output = spk_zh(&[
         "install",
         "--repo",
@@ -135,13 +151,37 @@ fn phase_install() -> Result<(), String> {
     let output = spk_zh(&["install", "--repo", "/repo/base", "--noconfirm", "sudo"])?;
     expect_ok("install sudo", &output)?;
     expect_contains("install sudo", &output, "正在安装 sudo")?;
-    let mode = fs::metadata("/usr/bin/sudo")
-        .map_err(|error| format!("sudo is missing: {error}"))?
-        .permissions()
-        .mode();
+    let metadata =
+        fs::metadata("/usr/bin/sudo").map_err(|error| format!("sudo is missing: {error}"))?;
+    if metadata.uid() != 0 || metadata.gid() != 0 {
+        return Err(format!(
+            "/usr/bin/sudo owner is {}:{}, not 0:0",
+            metadata.uid(),
+            metadata.gid()
+        ));
+    }
+    let mode = metadata.permissions().mode();
     if mode & 0o4000 == 0 {
         return Err(format!("/usr/bin/sudo is not setuid (mode {mode:04o})"));
     }
+
+    // Break ownership, then prove check catches it and repair restores it.
+    chown("/usr/bin/sudo", Some(1000), Some(1000))
+        .map_err(|error| format!("cannot chown test file: {error}"))?;
+    let broken = spk(&["check"])?;
+    if broken.status.success() {
+        return Err("check missed the wrong sudo owner".into());
+    }
+    expect_contains("check owner", &broken, "owner")?;
+    print_output("check owner", &broken);
+    expect_ok("repair owner", &spk(&["repair"])?)?;
+    expect_ok("check after repair", &spk(&["check"])?)?;
+    let metadata = fs::metadata("/usr/bin/sudo")
+        .map_err(|error| format!("sudo is missing after repair: {error}"))?;
+    if metadata.uid() != 0 || metadata.gid() != 0 || metadata.permissions().mode() & 0o4000 == 0 {
+        return Err("repair did not restore root:root setuid sudo".into());
+    }
+
     expect_ok("check after sudo", &spk(&["check"])?)?;
 
     run_sudo_tests()?;
@@ -993,6 +1033,16 @@ fn spk_env(args: &[&str], envs: &[(&str, &str)]) -> Result<Output, String> {
     command
         .output()
         .map_err(|error| format!("cannot run spk {}: {error}", args.join(" ")))
+}
+
+fn spk_as(uid: u32, args: &[&str]) -> Result<Output, String> {
+    Command::new(SPK)
+        .args(args)
+        .uid(uid)
+        .gid(uid)
+        .stdin(Stdio::inherit())
+        .output()
+        .map_err(|error| format!("cannot run spk {} as uid {uid}: {error}", args.join(" ")))
 }
 
 fn expect_ok(label: &str, output: &Output) -> Result<(), String> {

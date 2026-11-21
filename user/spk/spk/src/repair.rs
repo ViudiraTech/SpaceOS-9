@@ -12,7 +12,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use spk_core::fsutil::sha256_file;
-use spk_core::manifest::validate_absolute_path;
+use spk_core::manifest::{validate_absolute_path, FileType};
 
 use crate::error::{Result, SpkError};
 use crate::i18n::{self, Lang};
@@ -28,9 +28,16 @@ struct BackupInfo {
 }
 
 pub fn repair(paths: &Paths, lang: Lang) -> Result<()> {
+    if paths.root == Path::new("/") && unsafe { libc::geteuid() } != 0 {
+        return Err(SpkError::Security(i18n::root_required(lang).to_string()));
+    }
     let _lock = lock_exclusive(paths)?;
     if !paths.journal.exists() {
-        println!("{}", i18n::nothing_to_repair(lang));
+        let state = State::load(paths)?;
+        if fix_metadata(paths, &state, lang)? == 0 {
+            println!("{}", i18n::nothing_to_repair(lang));
+        }
+        crate::check::check(paths, &state, lang)?;
         return Ok(());
     }
     let (events, ended) = journal::read(&paths.journal)?;
@@ -46,8 +53,42 @@ pub fn repair(paths: &Paths, lang: Lang) -> Result<()> {
     cleanup(paths, &txid)?;
     journal::remove(paths)?;
     let state = State::load(paths)?;
+    fix_metadata(paths, &state, lang)?;
     crate::check::check(paths, &state, lang)?;
     Ok(())
+}
+
+fn fix_metadata(paths: &Paths, state: &State, lang: Lang) -> Result<usize> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(0);
+    }
+    let fs = Fs::new(&paths.root)?;
+    let mut fixed = 0usize;
+    for package in state.installed.packages.values() {
+        for file in &package.files {
+            let Some(entry) = fs.on_disk(&file.path)? else {
+                continue;
+            };
+            let mode = file.mode_bits()?;
+            let is_symlink = file.file_type == FileType::Symlink;
+            let is_dir = file.file_type == FileType::Dir;
+            if is_symlink && entry.kind != OnDiskKind::Symlink {
+                continue;
+            }
+            if is_dir && entry.kind != OnDiskKind::Dir {
+                continue;
+            }
+            let mode_mismatch = !is_symlink && entry.mode & 0o7777 != mode;
+            if entry.uid != file.uid || entry.gid != file.gid || mode_mismatch {
+                fs.set_metadata(&file.path, mode, file.uid, file.gid, is_symlink)?;
+                fixed += 1;
+            }
+        }
+    }
+    if fixed != 0 {
+        println!("{}", i18n::repair_metadata(lang, fixed));
+    }
+    Ok(fixed)
 }
 
 /// Roll back the current journal, if any. Used both by `repair` and by a
@@ -131,7 +172,7 @@ fn rollback_events(paths: &Paths, lang: Lang, events: &[Event], quiet: bool) -> 
                 validate_absolute_path(path)?;
                 if fs.on_disk(path)?.is_none() {
                     let mut created = Vec::new();
-                    fs.ensure_dir(path, *mode, &mut created)?;
+                    fs.ensure_dir(path, *mode, 0, 0, &mut created)?;
                 }
             }
             Event::Backup { path, .. } => {

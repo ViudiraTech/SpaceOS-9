@@ -290,6 +290,14 @@ pub fn nothing_to_repair(lang: Lang) -> &'static str {
     tr(lang, "nothing to repair", "无需修复")
 }
 
+pub fn repair_metadata(lang: Lang, count: usize) -> String {
+    if lang.is_zh() {
+        format!(":: 已修正 {count} 个文件的属主/权限")
+    } else {
+        format!(":: fixed ownership/mode on {count} files")
+    }
+}
+
 pub fn restoring(lang: Lang) -> &'static str {
     tr(lang, "restoring", "正在恢复")
 }
@@ -563,6 +571,45 @@ pub fn setuid_preserved(lang: Lang, package: &str) -> String {
         format!("警告：保留来自签名软件包 {package} 的 setuid/setgid 位")
     } else {
         format!("warning: preserving setuid/setgid bits from signed package {package}")
+    }
+}
+
+pub fn root_required(lang: Lang) -> &'static str {
+    if lang.is_zh() {
+        "spk 必须以 root 运行（setuid/系统文件写入需要 euid 0）"
+    } else {
+        "spk must be run as root (setuid and system writes require euid 0)"
+    }
+}
+
+pub fn setuid_not_root(lang: Lang, path: &str, uid: u32) -> String {
+    if lang.is_zh() {
+        format!("{path} 声明了 setuid/setgid，但安装后属主是 uid {uid}，不是 root 0")
+    } else {
+        format!("{path} declares setuid/setgid but is owned by uid {uid}, not root 0")
+    }
+}
+
+pub fn owner_mismatch(
+    lang: Lang,
+    path: &str,
+    want_uid: u32,
+    want_gid: u32,
+    got_uid: u32,
+    got_gid: u32,
+) -> String {
+    if lang.is_zh() {
+        format!("{path} 属主应为 {want_uid}:{want_gid}，实际为 {got_uid}:{got_gid}")
+    } else {
+        format!("{path} should be owned by {want_uid}:{want_gid}, got {got_uid}:{got_gid}")
+    }
+}
+
+pub fn mode_mismatch(lang: Lang, path: &str, want: u32, got: u32) -> String {
+    if lang.is_zh() {
+        format!("{path} 权限应为 {want:04o}，实际为 {got:04o}")
+    } else {
+        format!("{path} should be mode {want:04o}, got {got:04o}")
     }
 }
 

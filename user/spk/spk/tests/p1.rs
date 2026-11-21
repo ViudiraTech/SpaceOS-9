@@ -617,7 +617,13 @@ fn installs_through_symlinked_directory() {
     assert_ok(&out);
     assert_eq!(fs::read(root.file("/usr/bin/tool")).unwrap(), b"tool\n");
     assert_eq!(fs::read(root.file("/bin/tool")).unwrap(), b"tool\n");
-    assert!(root.check().status.success());
+    let check = root.check();
+    assert!(
+        check.status.success(),
+        "check failed: {:?}\n{}",
+        check.status.code(),
+        text(&check)
+    );
 
     assert_ok(&root.run(&["remove", "symtool"]));
     assert!(!root.file("/usr/bin/tool").exists());
