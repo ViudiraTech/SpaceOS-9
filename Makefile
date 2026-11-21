@@ -289,15 +289,17 @@ $(AUDIO_CONFIG):
 	@mkdir -p $(dir $@)
 	@printf 'pcm.!default {\n    type hw\n    card $(AUDIO_CARD)\n    device 0\n}\nctl.!default {\n    type hw\n    card $(AUDIO_CARD)\n}\n' > $@
 
-desktop-run: desktop $(AUDIO_CONFIG)
+desktop-run: release-try $(AUDIO_CONFIG)
 	ALSA_CONFIG_PATH=$(AUDIO_CONFIG) qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -m 4096 -smp $(CPUS) -serial stdio -monitor none -no-reboot -vga none -display gtk,zoom-to-fit=off -device virtio-gpu-pci,xres=1280,yres=800 -device virtio-tablet-pci -device virtio-keyboard-pci -nic $(or $(QEMU_NIC),user,model=e1000e) -drive file=$(DESKTOP_IMAGE),if=none,id=root,format=raw -device nvme,serial=SPROOT,drive=root -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -audiodev $(AUDIO_BACKEND),id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 -device sb16,audiodev=snd0 -cdrom $(ISO)
 
 # Reproducible release candidate requested by the release checklist.  The ISO
 # boots the release kernel; the matching desktop rootfs is build/rootfs/ext4.img.
 RELEASE_TRY := build/spacekernel-release-try.iso
 
-release-try:
+release-try: packages
 	$(MAKE) desktop PROFILE=release ARCH=x86_64
+	SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" python3 -I tools/overlay_p5_packages.py 		--stage build/rootfs/stage 		--trust-key packages/keys/ed25519:b4280a08406a53c5.pub 		--epoch $(SOURCE_DATE_EPOCH)
+	python3 tools/build_desktop_rootfs.py --reuse-stage --image build/rootfs/ext4.img
 	cp build/x86_64/release/SpaceKernel-x86_64.iso $(RELEASE_TRY)
 	cp build/rootfs/ext4.img build/spacekernel-release-try-rootfs.img
 	@printf 'Release image ready: %s\n' '$(RELEASE_TRY)'
