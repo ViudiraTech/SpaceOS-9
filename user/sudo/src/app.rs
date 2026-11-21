@@ -368,6 +368,7 @@ pub fn execute(paths: &Paths, options: Options) -> Result<i32, String> {
     let args = command_for_shell(&options);
     let code = exec::run(RunSpec {
         program: &program,
+        argv0: options.command.first().map(String::as_str).unwrap_or(""),
         args: &args,
         target_user: &target,
         target_gid,

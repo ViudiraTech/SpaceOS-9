@@ -17,6 +17,10 @@ use crate::config::User;
 
 pub struct RunSpec<'a> {
     pub program: &'a Path,
+    /// Original command spelling, used as argv[0].  Multi-call binaries such as
+    /// BusyBox dispatch applets from argv[0], so canonicalizing /bin/su to
+    /// /bin/bbsuid must not rewrite it.
+    pub argv0: &'a str,
     pub args: &'a [String],
     pub target_user: &'a User,
     pub target_gid: u32,
@@ -95,6 +99,7 @@ pub fn run(spec: RunSpec<'_>) -> Result<i32, String> {
             command.arg0(argv0);
         }
     } else {
+        command.arg0(spec.argv0);
         command.args(spec.args);
     }
 
