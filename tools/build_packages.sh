@@ -48,6 +48,7 @@ fi
 "$ROOT/packages/hello/build.sh" 0.2.0 "$BUILD/packages/hello-0.2.0"
 "$ROOT/packages/sudo/build.sh" "$BUILD/packages/sudo"
 "$ROOT/packages/theme-winxp/build.sh" "$BUILD/packages/theme-winxp"
+"$ROOT/packages/base-core/build.sh" "$BUILD/packages/base-core"
 "$ROOT/packages/base/build.sh" "$BUILD/packages/base"
 "$ROOT/packages/spk-runtime/build.sh" "$BUILD/packages/spk-runtime"
 
@@ -89,8 +90,9 @@ pack_one() {
 pack_one hello 0.1.0-1 "$ROOT/packages/hello/manifest.toml" "$BUILD/packages/hello-0.1.0"
 pack_one hello 0.2.0-1 "$ROOT/packages/hello/manifest-0.2.0.toml" "$BUILD/packages/hello-0.2.0"
 pack_one sudo 0.1.0-3 "$ROOT/packages/sudo/manifest.toml" "$BUILD/packages/sudo"
-pack_one base 1.0.0-5 "$ROOT/packages/base/manifest.toml" "$BUILD/packages/base"
+pack_one base-core 1.0.0-6 "$ROOT/packages/base-core/manifest.toml" "$BUILD/packages/base-core"
+pack_one base 1.0.0-6 "$ROOT/packages/base/manifest.toml" "$BUILD/packages/base"
 pack_one theme-winxp 1.0.0-4 "$ROOT/packages/theme-winxp/manifest.toml" "$BUILD/packages/theme-winxp"
-pack_one spk-runtime 1.0.0-1 "$ROOT/packages/spk-runtime/manifest.toml" "$BUILD/packages/spk-runtime"
+pack_one spk-runtime 1.0.0-2 "$ROOT/packages/spk-runtime/manifest.toml" "$BUILD/packages/spk-runtime"
 
 printf 'reproducible packages in %s\n' "$REPO"

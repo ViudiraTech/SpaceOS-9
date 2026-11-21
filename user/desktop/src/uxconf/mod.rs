@@ -528,6 +528,7 @@ impl ThemePreset {
                 ("panel", "/position", Value::String("bottom".to_string())),
                 ("panel", "/size", Value::Int(44)),
                 ("panel", "/start-fullscreen", Value::Bool(false)),
+                ("wm", "/titlebar/button-layout", Value::String("right".to_string())),
             ],
             Self::Spui4 => vec![
                 ("appearance", "/theme/id", Value::String("spui-4".to_string())),
@@ -554,8 +555,10 @@ impl ThemePreset {
                     "/backdrop/solid-color",
                     Value::String("#1e293b".to_string()),
                 ),
+                ("panel", "/position", Value::String("bottom".to_string())),
                 ("panel", "/size", Value::Int(46)),
                 ("panel", "/start-fullscreen", Value::Bool(true)),
+                ("wm", "/titlebar/button-layout", Value::String("right".to_string())),
             ],
             Self::Win98 => vec![
                 ("appearance", "/theme/id", Value::String("win98".to_string())),
@@ -579,6 +582,7 @@ impl ThemePreset {
                 ),
                 ("panel", "/position", Value::String("bottom".to_string())),
                 ("panel", "/start-fullscreen", Value::Bool(false)),
+                ("wm", "/titlebar/button-layout", Value::String("right".to_string())),
             ],
         }
     }

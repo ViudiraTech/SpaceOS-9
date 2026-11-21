@@ -14,8 +14,10 @@ for name in spk spk-sandbox; do
 done
 
 rm -rf "$STAGE"
-install -d -m 0755 "$STAGE/usr/bin"
+install -d -m 0755 "$STAGE/usr/bin" "$STAGE/etc/spk/hooks.d"
 install -m 0755 "$BIN/spk" "$STAGE/usr/bin/spk"
 install -m 0755 "$BIN/spk-sandbox" "$STAGE/usr/bin/spk-sandbox"
+install -m 0755 "$ROOT/packages/base-core/spui-theme-kick" "$STAGE/usr/bin/spui-theme-kick"
+install -m 0644 "$ROOT/packages/base-core/90-spui-theme-reload.hook" "$STAGE/etc/spk/hooks.d/90-spui-theme-reload.hook"
 
 printf 'staged spk-runtime in %s\n' "$STAGE"

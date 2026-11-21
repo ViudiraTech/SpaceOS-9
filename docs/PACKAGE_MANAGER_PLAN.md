@@ -708,6 +708,16 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - 包含 `/usr/bin/spk`、`/usr/bin/spk-sandbox`；overlay 安装后 `spk list` 有记录
   - `base` 仍只用于 P5 最小 rootfs；桌面不覆盖 Alpine musl/BusyBox/systemg
 
+- 2026-11-21：`base` 元包拆分 + `spk-runtime 1.0.0-2`。
+  - `base-1.0.0-6-x86_64.spk`：sha256 `de09e95a44695de6aeff4981cea2d6798b36ce6fa0d5bc1eca2b0aa9ba07bce4`
+  - `base-core-1.0.0-6-x86_64.spk`：sha256 `6ee76349e5c5f7b8796e6b755910c22f41cfa720c46be585df6aa54391e5a92c`
+  - `spk-runtime-1.0.0-2-x86_64.spk`：sha256 `aa79925950df7cca2fa096308746454b15db8f1383ede275f0fc0873d45d5560`
+  - `index.json`：sha256 `21538bfc9ccf0fa5904fbeb7c36ebd4cbd012e65d041a4a99b5a482658086a8a`
+  - `index.json.sig`：sha256 `9db3cd73c0bd380588ccc6c893cb92ec124dd92fd867319d9efff2b0b20a4398`
+  - `base` 依赖 `base-core`；P5 显式安装 `base base-core`，桌面由 `spk-runtime` 提供 `base-core`
+  - overlay 在 user namespace 中安装 `spk-runtime`、`base`、`sudo`，桌面 `spk list` 显示这三个包
+  - 旧 `base-1.0.0-5`、`spk-runtime-1.0.0-1` 已删除
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。

@@ -70,6 +70,7 @@ def install_base(stage: pathlib.Path, repo: pathlib.Path, spk: pathlib.Path) -> 
         "--repo",
         str(repo),
         "base",
+        "base-core",
     )
 
 
