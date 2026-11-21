@@ -12,6 +12,9 @@
 //! packed `0xRRGGBB`; palettes use neutral zinc/graphite grays (zero dark-navy
 //! neon tint) paired with a clean light mode and restrained native metrics.
 
+use std::fs;
+use std::path::PathBuf;
+
 use crate::draw::mix;
 use uxconf::{DesktopConfig, ThemeMode, ThemeStyle};
 
@@ -23,6 +26,125 @@ pub const TASKBAR_HEIGHT: i32 = 46;
 pub const RADIUS_WINDOW: i32 = 6;
 pub const RADIUS_POPUP: i32 = 8;
 pub const RADIUS_CONTROL: i32 = 5;
+
+const SYSTEM_THEME_DIR: &str = "/usr/share/spui/themes";
+const USER_THEME_SUBDIR: &str = ".local/share/spui/themes";
+
+#[derive(Clone, Debug)]
+struct ExternalTheme {
+    base_style: Option<ThemeStyle>,
+    mode: Option<ThemeMode>,
+    accent: Option<u32>,
+    colors: toml::value::Table,
+}
+
+fn theme_dir_candidates(id: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::var_os("SPUI_THEME_DIR") {
+        candidates.push(PathBuf::from(dir).join(id).join("theme.toml"));
+    }
+    candidates.push(PathBuf::from(SYSTEM_THEME_DIR).join(id).join("theme.toml"));
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join(USER_THEME_SUBDIR)
+                .join(id)
+                .join("theme.toml"),
+        );
+    }
+    candidates
+}
+
+fn valid_theme_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn load_external_theme(id: &str) -> Option<ExternalTheme> {
+    if !valid_theme_id(id) {
+        return None;
+    }
+    let text = theme_dir_candidates(id)
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok())?;
+    let root: toml::Value = toml::from_str(&text).ok()?;
+    let base_style = root
+        .get("base_style")
+        .and_then(toml::Value::as_str)
+        .map(ThemeStyle::parse);
+    let mode = root
+        .get("mode")
+        .and_then(toml::Value::as_str)
+        .map(ThemeMode::parse);
+    let accent = root.get("accent").and_then(parse_color);
+    let colors = root
+        .get("colors")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    Some(ExternalTheme {
+        base_style,
+        mode,
+        accent,
+        colors,
+    })
+}
+
+fn parse_color(value: &toml::Value) -> Option<u32> {
+    let text = value.as_str()?.trim().trim_start_matches('#');
+    if text.len() != 6 {
+        return None;
+    }
+    u32::from_str_radix(text, 16).ok()
+}
+
+fn apply_external_colors(theme: &mut Theme, colors: &toml::value::Table) {
+    for (key, value) in colors {
+        let Some(color) = parse_color(value) else {
+            continue;
+        };
+        match key.as_str() {
+            "accent" => theme.accent = color,
+            "accent_soft" => theme.accent_soft = color,
+            "bg_top" => theme.bg_top = color,
+            "bg_bottom" => theme.bg_bottom = color,
+            "panel" => theme.panel = color,
+            "panel_high" => theme.panel_high = color,
+            "panel_hover" => theme.panel_hover = color,
+            "panel_border" => theme.panel_border = color,
+            "text" => theme.text = color,
+            "text_dim" => theme.text_dim = color,
+            "text_muted" => theme.text_muted = color,
+            "window" => theme.window = color,
+            "window_high" => theme.window_high = color,
+            "window_alt" => theme.window_alt = color,
+            "window_border" => theme.window_border = color,
+            "window_border_active" => theme.window_border_active = color,
+            "titlebar" => theme.titlebar = color,
+            "titlebar_hi" => theme.titlebar_hi = color,
+            "titlebar_inactive" => theme.titlebar_inactive = color,
+            "titlebar_inactive_hi" => theme.titlebar_inactive_hi = color,
+            "titlebar_text" => theme.titlebar_text = color,
+            "titlebar_inactive_text" => theme.titlebar_inactive_text = color,
+            "input_bg" => theme.input_bg = color,
+            "scrollbar_track" => theme.scrollbar_track = color,
+            "scrollbar_thumb" => theme.scrollbar_thumb = color,
+            "bevel_light" => theme.bevel_light = color,
+            "bevel_hi" => theme.bevel_hi = color,
+            "bevel_shadow" => theme.bevel_shadow = color,
+            "bevel_dark" => theme.bevel_dark = color,
+            "selection_bg" => theme.selection_bg = color,
+            "selection_text" => theme.selection_text = color,
+            "danger" => theme.danger = color,
+            "warning" => theme.warning = color,
+            "success" => theme.success = color,
+            _ => {}
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
@@ -67,12 +189,28 @@ pub struct Theme {
 
 impl Theme {
     pub fn from_config(config: &DesktopConfig) -> Self {
-        let mut theme = match (config.theme_style, config.mode) {
-            (ThemeStyle::VortexGlass, mode) => Self::vortexglass_with_accent(config.accent, mode),
-            (ThemeStyle::Win98, mode) => Self::win98_with_accent(config.accent, mode),
-            (ThemeStyle::Spui, ThemeMode::Dark) => Self::dark_with_accent(config.accent),
-            (ThemeStyle::Spui, ThemeMode::Light) => Self::light_with_accent(config.accent),
+        let external = load_external_theme(&config.theme_id);
+        let style = external
+            .as_ref()
+            .and_then(|theme| theme.base_style)
+            .unwrap_or(config.theme_style);
+        let mode = external
+            .as_ref()
+            .and_then(|theme| theme.mode)
+            .unwrap_or(config.mode);
+        let accent = external
+            .as_ref()
+            .and_then(|theme| theme.accent)
+            .unwrap_or(config.accent);
+        let mut theme = match (style, mode) {
+            (ThemeStyle::VortexGlass, mode) => Self::vortexglass_with_accent(accent, mode),
+            (ThemeStyle::Win98, mode) => Self::win98_with_accent(accent, mode),
+            (ThemeStyle::Spui, ThemeMode::Dark) => Self::dark_with_accent(accent),
+            (ThemeStyle::Spui, ThemeMode::Light) => Self::light_with_accent(accent),
         };
+        if let Some(external) = external {
+            apply_external_colors(&mut theme, &external.colors);
+        }
         theme.font_scale = config.font_scale;
         theme
     }
@@ -557,6 +695,41 @@ mod tests {
         assert_eq!(theme.radius_popup(), 0);
         assert_eq!(theme.radius_control(), 0);
         assert_eq!(theme.panel, 0xc0c0c0);
+    }
+
+    #[test]
+    fn external_theme_pack_overrides_palette() {
+        let base = std::env::temp_dir().join(format!(
+            "spui_external_theme_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let theme_dir = base.join("testpack");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&theme_dir).expect("mkdir theme");
+        std::fs::write(
+            theme_dir.join("theme.toml"),
+            "schema = 1\nid = \"testpack\"\nbase_style = \"spui\"\nmode = \"light\"\naccent = \"#0054e3\"\n[colors]\ntitlebar = \"#0058e6\"\npanel = \"#ece9d8\"\ntext = \"#000000\"\n",
+        )
+        .expect("write theme");
+
+        let previous = std::env::var_os("SPUI_THEME_DIR");
+        std::env::set_var("SPUI_THEME_DIR", &base);
+        let mut config = DesktopConfig::default();
+        config.theme_id = "testpack".to_string();
+        config.theme_style = ThemeStyle::Spui;
+        config.mode = ThemeMode::Light;
+        let theme = Theme::from_config(&config);
+        match previous {
+            Some(value) => std::env::set_var("SPUI_THEME_DIR", value),
+            None => std::env::remove_var("SPUI_THEME_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(theme.titlebar, 0x0058e6);
+        assert_eq!(theme.panel, 0xece9d8);
+        assert_eq!(theme.text, 0x000000);
+        assert_eq!(theme.accent, 0x0054e3);
     }
 }
 

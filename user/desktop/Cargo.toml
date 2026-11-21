@@ -47,6 +47,7 @@ resvg = { version = "0.45", default-features = false }
 png = "0.17"
 zune-jpeg = "0.4"
 libc = "0.2"
+toml = "0.8"
 
 [profile.release]
 opt-level = 2

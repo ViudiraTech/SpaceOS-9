@@ -310,6 +310,43 @@ install -m 0644 "$ROOT/packages/theme-foo/index.theme" \
 
 打包、签名、安装流程与带二进制的包完全一样。只要不设 `scripts = true`，就不需要 `.INSTALL`；不需要 `allow_setuid`，也不会有 root 属主/权限校验之外的特殊要求。
 
+### 4.6 自动加载主题包（SPUI）
+
+SPUI 在启动时按 `theme/id` 扫描以下位置，不把主题硬编码进二进制：
+
+```text
+/usr/share/spui/themes/<id>/theme.toml
+$HOME/.local/share/spui/themes/<id>/theme.toml
+```
+
+`theme.toml` 示例：
+
+```toml
+schema = 1
+id = "winxp"
+name = "Windows XP Luna"
+base_style = "spui"        # spui | win98 | vortexglass
+mode = "light"
+accent = "#0054e3"
+wallpaper = "winxp-bliss.jpg"
+
+[colors]
+titlebar = "#0058e6"
+titlebar_hi = "#3a93ff"
+window = "#ece9d8"
+panel = "#ece9d8"
+text = "#000000"
+selection_bg = "#316ac5"
+```
+
+- `base_style` 选择现有渲染家族；颜色在基础主题上覆盖。
+- `[colors]` 的键与 `Theme` 字段同名，值用 `#RRGGBB`。
+- 主题包还可以安装壁纸到 `/usr/share/spui/wallpapers/`，并提供一个
+  `uxconf-query` 应用脚本设置 `/theme/id`、`/theme/style`、`/backdrop/wallpaper`。
+- 新主题不需要修改 SPUI 代码；`theme/id` 会保留外部 id，启动时自动加载。
+
+示例包：`packages/theme-winxp`。
+
 ## 5. 安装脚本 `.INSTALL`
 
 放在 staging 根，`scripts = true`。

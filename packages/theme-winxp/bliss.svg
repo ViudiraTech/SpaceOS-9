@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1200" viewBox="0 0 1920 1200">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e5fb4"/>
+      <stop offset="0.55" stop-color="#6fb4e8"/>
+      <stop offset="1" stop-color="#c9e8fa"/>
+    </linearGradient>
+    <linearGradient id="hill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7fbf4d"/>
+      <stop offset="0.7" stop-color="#4f8f32"/>
+      <stop offset="1" stop-color="#2f5f22"/>
+    </linearGradient>
+    <linearGradient id="hill2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a8d96b"/>
+      <stop offset="1" stop-color="#609f3b"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fffbe0" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#fff3a8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1920" height="1200" fill="url(#sky)"/>
+  <circle cx="1560" cy="250" r="210" fill="url(#sun)"/>
+  <g fill="#ffffff" opacity="0.72">
+    <ellipse cx="360" cy="250" rx="150" ry="42"/>
+    <ellipse cx="470" cy="220" rx="120" ry="55"/>
+    <ellipse cx="575" cy="255" rx="135" ry="38"/>
+    <ellipse cx="1320" cy="370" rx="170" ry="42"/>
+    <ellipse cx="1445" cy="338" rx="120" ry="52"/>
+    <ellipse cx="1560" cy="382" rx="150" ry="36"/>
+  </g>
+  <path d="M0 820 C 260 690, 520 680, 760 790 C 1000 900, 1210 760, 1450 700 C 1660 650, 1810 710, 1920 760 L1920 1200 L0 1200 Z" fill="url(#hill2)"/>
+  <path d="M0 940 C 260 760, 540 760, 800 900 C 1040 1030, 1280 850, 1520 800 C 1700 765, 1830 820, 1920 860 L1920 1200 L0 1200 Z" fill="url(#hill)"/>
+  <path d="M0 1080 C 330 980, 660 1030, 940 1110 C 1220 1190, 1590 1080, 1920 1010 L1920 1200 L0 1200 Z" fill="#2e5c24"/>
+  <g opacity="0.35" fill="#ffffff">
+    <ellipse cx="220" cy="880" rx="80" ry="12"/>
+    <ellipse cx="980" cy="930" rx="110" ry="14"/>
+    <ellipse cx="1580" cy="900" rx="90" ry="12"/>
+  </g>
+</svg>

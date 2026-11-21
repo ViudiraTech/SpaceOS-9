@@ -1,0 +1,20 @@
+#!/bin/sh
+# Apply the Windows XP Luna-inspired SPUI theme pack.
+set -eu
+
+if ! command -v uxconf-query >/dev/null 2>&1; then
+    printf 'spui-theme-winxp: uxconf-query not found\n' >&2
+    exit 1
+fi
+
+uxconf-query -c appearance -p /theme/id -s winxp -t string
+uxconf-query -c appearance -p /theme/style -s spui -t string
+uxconf-query -c appearance -p /theme/mode -s light -t string
+uxconf-query -c appearance -p /theme/accent -s '#0054e3' -t string
+uxconf-query -c desktop -p /backdrop/wallpaper -s winxp-bliss.jpg -t string
+uxconf-query -c desktop -p /backdrop/style -s cover -t string
+uxconf-query -c desktop -p /backdrop/solid-color -s '#3a6ea5' -t string
+uxconf-query -c panel -p /position -s bottom -t string
+uxconf-query -c panel -p /size -s 44 -t int
+
+printf 'Windows XP theme applied; sign out or restart SPUI if the shell does not refresh immediately.\n'
