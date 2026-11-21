@@ -694,6 +694,13 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - `.INSTALL` 的 `pre_remove` 打印“将回退默认主题”警告；SPUI 检测到主题文件缺失时重置主题/壁纸/面板
   - 旧 `theme-winxp-1.0.0-3` 已从生产仓库删除
 
+- 2026-11-21：`base 1.0.0-5`：主题变更 hook + SPUI reload stamp。
+  - `base-1.0.0-5-x86_64.spk`：sha256 `323ff45462d7997ddd70f1ffc69e47845db0be282770520f2f144ec7669eb501`
+  - `index.json`：sha256 `b285f355d89f9842c8ee1224dd206384a19f76ca7147449f985200b7050192ad`
+  - `index.json.sig`：sha256 `cd37f197f477a3c9392c32495c53e05f7edaaeba639ea19ed8348e998c355280`
+  - 系统 hook `90-spui-theme-reload.hook` 监听主题/壁纸路径的 install/upgrade/remove，执行 `spui-theme-kick` 刷新 `/run/spui-theme.stamp`
+  - SPUI 主循环检测 stamp mtime 变化并热重载主题；旧 `base-1.0.0-4` 已删除
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。

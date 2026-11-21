@@ -32,7 +32,8 @@ install -d -m 0755 \
     "$STAGE/lib" \
     "$STAGE/sbin" \
     "$STAGE/usr/bin" \
-    "$STAGE/etc/ssl/certs"
+    "$STAGE/etc/ssl/certs" \
+    "$STAGE/etc/spk/hooks.d"
 
 install -m 0755 "$SPK_BIN" "$STAGE/usr/bin/spk"
 install -m 0755 "$SANDBOX_BIN" "$STAGE/usr/bin/spk-sandbox"
@@ -43,6 +44,8 @@ ln -s ld-musl-x86_64.so.1 "$STAGE/lib/libc.musl-x86_64.so.1"
 install -m 0644 "$CA_BUNDLE" "$STAGE/etc/ssl/certs/ca-certificates.crt"
 install -d -m 0755 "$STAGE/usr/share/doc/base"
 install -m 0644 "$ROOT/packages/base/THIRD_PARTY_NOTICES.md" "$STAGE/usr/share/doc/base/THIRD_PARTY_NOTICES.md"
+install -m 0755 "$ROOT/packages/base/spui-theme-kick" "$STAGE/usr/bin/spui-theme-kick"
+install -m 0644 "$ROOT/packages/base/90-spui-theme-reload.hook" "$STAGE/etc/spk/hooks.d/90-spui-theme-reload.hook"
 if [ -f "$SYSTEMG" ]; then
     install -m 0755 "$SYSTEMG" "$STAGE/sbin/systemg"
 fi

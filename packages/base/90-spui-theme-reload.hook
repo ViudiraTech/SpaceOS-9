@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Path
+Target = usr/share/spui/themes/*
+Target = usr/share/spui/wallpapers/*
+
+[Action]
+Description = Reload SPUI theme packs
+When = PostTransaction
+Exec = /usr/bin/spui-theme-kick
