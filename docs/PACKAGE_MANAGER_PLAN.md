@@ -718,6 +718,13 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - overlay 在 user namespace 中安装 `spk-runtime`、`base`、`sudo`，桌面 `spk list` 显示这三个包
   - 旧 `base-1.0.0-5`、`spk-runtime-1.0.0-1` 已删除
 
+- 2026-11-21：`base-core 1.0.0-7` / `spk-runtime 1.0.0-3`：hook 改用 BusyBox 命令。
+  - `base-core-1.0.0-7-x86_64.spk`：sha256 `bce187550becafa9456a105bdb6f3132c3580704e9603ff88c96ccecf04c750d`
+  - `spk-runtime-1.0.0-3-x86_64.spk`：sha256 `ad15fde4e393dfaaf95c1666a19c0887d59341c4768c1d7551ecdfa1edaf7ec2`
+  - `index.json`：sha256 `fd51433874d0f5a59e70e931bd5f1129923b8c1f1ff1c060276f4b61dd25a786`
+  - `index.json.sig`：sha256 `7bdb18e028b6f8ab97d03bcc6445a8b90880e9853912c80cc54e69ff5fb4be11`
+  - `spui-theme-kick` 用 `mkdir -p`/`touch`/`chmod`，修复 guest 无 `install` 时的 hook 127 失败
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
