@@ -19,6 +19,7 @@ pub enum SpkError {
     FileConflict { message: String, lines: Vec<String> },
     Check { message: String, lines: Vec<String> },
     RolledBack(String),
+    Script(String),
     Io(std::io::Error),
     Json(serde_json::Error),
 }
@@ -30,7 +31,7 @@ impl SpkError {
             Self::Signature(_) => 3,
             Self::Dependency { .. } => 4,
             Self::FileConflict { .. } => 5,
-            Self::RolledBack(_) => 6,
+            Self::RolledBack(_) | Self::Script(_) => 6,
             _ => 1,
         }
     }
@@ -51,7 +52,8 @@ impl fmt::Display for SpkError {
             Self::Usage(message)
             | Self::General(message)
             | Self::Signature(message)
-            | Self::RolledBack(message) => f.write_str(message),
+            | Self::RolledBack(message)
+            | Self::Script(message) => f.write_str(message),
             Self::Dependency { message, .. }
             | Self::FileConflict { message, .. }
             | Self::Check { message, .. } => f.write_str(message),

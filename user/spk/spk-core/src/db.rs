@@ -55,6 +55,11 @@ pub struct InstalledPackage {
     #[serde(default)]
     pub conffiles: Vec<String>,
     pub scripts: bool,
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    /// Signed install script kept for removal scriptlets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_script: Option<String>,
     pub allow_setuid: bool,
     pub install_date: u64,
     pub install_reason: InstallReason,
@@ -183,6 +188,8 @@ mod tests {
                 replaces: vec![],
                 conffiles: vec![],
                 scripts: false,
+                triggers: Vec::new(),
+                install_script: None,
                 allow_setuid: false,
                 install_date: 1760000000,
                 install_reason: InstallReason::Explicit,

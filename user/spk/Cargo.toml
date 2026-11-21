@@ -30,5 +30,6 @@ ruzstd = { version = "0.9", default-features = false, features = ["std", "hash"]
 zstd = { version = "0.14", default-features = false }
 clap = { version = "4.5", features = ["derive"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
+libc = "0.2"
 tempfile = "3.13"
 proptest = "1.12"

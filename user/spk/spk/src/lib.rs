@@ -9,6 +9,7 @@
 pub mod check;
 pub mod crash;
 pub mod error;
+pub mod hooks;
 pub mod i18n;
 pub mod journal;
 pub mod ops;
@@ -16,7 +17,9 @@ pub mod query;
 pub mod repair;
 pub mod repo;
 pub mod rootfs;
+pub mod sandbox;
 pub mod solver;
 pub mod state;
 pub mod transaction;
+pub mod triggers;
 pub mod util;

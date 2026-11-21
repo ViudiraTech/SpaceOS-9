@@ -30,6 +30,12 @@ struct Cli {
     /// Machine-readable transaction plans and errors
     #[arg(long, global = true)]
     json: bool,
+    /// Script failure policy: rollback (default) or keep (debug only)
+    #[arg(long = "script-failure", global = true, default_value = "rollback")]
+    script_failure: String,
+    /// Run .INSTALL without the sandbox (debug only)
+    #[arg(long = "no-sandbox-scripts", global = true)]
+    no_sandbox_scripts: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -148,6 +154,7 @@ enum TrustCommand {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
+    let lang = Lang::detect(cli.lang.as_deref());
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -159,7 +166,7 @@ fn main() -> ExitCode {
                 });
                 println!("{}", serde_json::to_string_pretty(&payload).unwrap());
             } else {
-                eprintln!("error: {error}");
+                eprintln!("{}{error}", spk_ops::i18n::error_label(lang));
                 for line in error.lines() {
                     eprintln!("{line}");
                 }
@@ -171,6 +178,15 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), SpkError> {
     let lang = Lang::detect(cli.lang.as_deref());
+    let script_failure_keep = match cli.script_failure.as_str() {
+        "rollback" => false,
+        "keep" => true,
+        other => {
+            return Err(SpkError::Usage(format!(
+                "invalid --script-failure '{other}'; use rollback or keep"
+            )))
+        }
+    };
     let paths = Paths::new(&cli.root)?;
     match cli.command {
         Command::Install {
@@ -189,6 +205,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             ReportOptions {
                 json: cli.json,
                 print,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
             },
             lang,
         ),
@@ -208,6 +226,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             ReportOptions {
                 json: cli.json,
                 print,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
             },
             lang,
         ),
@@ -225,6 +245,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             ReportOptions {
                 json: cli.json,
                 print,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
             },
             lang,
         ),
@@ -242,6 +264,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             ReportOptions {
                 json: cli.json,
                 print,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
             },
             lang,
         ),
@@ -262,6 +286,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             ReportOptions {
                 json: cli.json,
                 print,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
             },
             lang,
         ),

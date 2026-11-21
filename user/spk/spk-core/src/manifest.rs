@@ -30,6 +30,8 @@ pub const META_MANIFEST: &str = "manifest.toml";
 pub const META_INSTALL: &str = ".INSTALL";
 pub const META_CHANGELOG: &str = ".CHANGELOG";
 pub const META_BUILDINFO: &str = ".BUILDINFO";
+pub const HOOK_PREFIX: &str = "/usr/lib/spk/hooks/";
+pub const TRIGGER_PREFIX: &str = "/usr/lib/spk/triggers/";
 pub const RESERVED_ROOT_FILES: &[&str] =
     &[META_MANIFEST, META_INSTALL, META_CHANGELOG, META_BUILDINFO];
 
@@ -107,6 +109,9 @@ pub struct Manifest {
     pub conffiles: Vec<String>,
     #[serde(default)]
     pub scripts: bool,
+    /// Path globs that activate this package's file trigger.
+    #[serde(default)]
+    pub triggers: Vec<String>,
     #[serde(default)]
     pub allow_setuid: bool,
     #[serde(default)]
@@ -251,6 +256,34 @@ impl Manifest {
         }
 
         let files = self.files_by_path();
+        if !self.triggers.is_empty() && !self.scripts {
+            return Err(Error::Manifest("triggers require scripts = true".into()));
+        }
+        for trigger in &self.triggers {
+            validate_trigger_pattern(trigger)?;
+        }
+        if !self.files.is_empty() {
+            if !self.triggers.is_empty() {
+                let trigger = trigger_path(&self.name);
+                match files.get(trigger.as_str()) {
+                    Some(file) if file.file_type == FileType::File => {}
+                    _ => {
+                        return Err(Error::Manifest(format!(
+                            "trigger package requires regular file {trigger}"
+                        )))
+                    }
+                }
+            }
+            for file in &self.files {
+                if file.path.starts_with(HOOK_PREFIX) && !self.scripts {
+                    return Err(Error::Manifest(format!(
+                        "{}: package hooks require scripts = true",
+                        file.path
+                    )));
+                }
+            }
+        }
+
         let mut conffiles = BTreeSet::new();
         for path in &self.conffiles {
             validate_absolute_path(path)?;
@@ -272,6 +305,36 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+pub fn trigger_path(name: &str) -> String {
+    format!("{TRIGGER_PREFIX}{name}.trigger")
+}
+
+fn validate_trigger_pattern(pattern: &str) -> Result<()> {
+    if !pattern.starts_with('/') || pattern.ends_with('/') || pattern.contains('\0') {
+        return Err(Error::Manifest(format!(
+            "invalid trigger pattern '{pattern}'"
+        )));
+    }
+    if pattern.len() > MAX_PATH_LEN {
+        return Err(Error::Manifest(format!(
+            "trigger pattern exceeds {MAX_PATH_LEN} bytes"
+        )));
+    }
+    for component in pattern.split('/') {
+        if component == ".." || component == "." {
+            return Err(Error::Manifest(format!(
+                "trigger pattern contains traversal: '{pattern}'"
+            )));
+        }
+    }
+    if pattern.chars().any(|ch| ch.is_control()) {
+        return Err(Error::Manifest(
+            "trigger pattern contains control characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn package_filename(name: &str, epoch: u64, version: &str, release: u64, arch: &str) -> String {

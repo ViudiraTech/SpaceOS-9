@@ -1,0 +1,22 @@
+name = "script-ok"
+epoch = 0
+version = "0.2.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "P3b fixture script-ok"
+description = "spk P3b test fixture"
+license = "LicenseRef-Proprietary"
+url = "https://github.com/ViudiraTech/SpaceKernel"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = []
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = true
+triggers = []
+allow_setuid = false
