@@ -101,7 +101,14 @@ def main() -> int:
     arguments = parser.parse_args()
     if not arguments.no_build:
         build()
-    qemu(INSTALL_ISO, BUILD / "p5-install.log", ROOTFS, "SPK_P5_OK")
+    # Boot a disposable copy so the delivered ext4 image keeps its pristine,
+    # reproducible on-disk state (the kernel mounts it read-write).
+    qemu_rootfs = BUILD / "qemu-rootfs.img"
+    shutil.copy2(ROOTFS, qemu_rootfs)
+    try:
+        qemu(INSTALL_ISO, BUILD / "p5-install.log", qemu_rootfs, "SPK_P5_OK")
+    finally:
+        qemu_rootfs.unlink(missing_ok=True)
     qemu(VERIFY_ISO, BUILD / "p5-verify.log", None, "SPK_P5_VERIFY_OK")
     print("P5 QEMU matrix PASS")
     return 0

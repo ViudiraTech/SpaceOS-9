@@ -202,12 +202,19 @@ def build_fat(stage: pathlib.Path, image: pathlib.Path, seed: str) -> None:
     with image.open("wb") as file:
         file.truncate(128 * 1024 * 1024)
     run(["mkfs.vfat", "-F", "32", "-n", "SPACEROOT", "-i", f"0x{seed[:8]}", str(image)])
-    for entry in sorted(stage.iterdir(), key=lambda item: item.name):
-        # trusted.d would contain the ':' key name; the bundle is used instead.
-        if entry.name in ("proc", "sys", "dev", "trusted.d"):
-            continue
-        run(["mcopy", "-i", str(image), "-s", str(entry), "::/"])
 
+    def copy_tree(directory: pathlib.Path, prefix: str) -> None:
+        for entry in sorted(directory.iterdir(), key=lambda item: item.name):
+            if prefix == "" and entry.name in ("proc", "sys", "dev", "trusted.d"):
+                continue
+            relative = entry.name if prefix == "" else f"{prefix}/{entry.name}"
+            if entry.is_dir():
+                run(["mmd", "-i", str(image), f"::{relative}"])
+                copy_tree(entry, relative)
+            elif entry.is_file():
+                run(["mcopy", "-i", str(image), str(entry), f"::{relative}"])
+
+    copy_tree(stage, "")
 
 def shlex_quote(text: str) -> str:
     return "'" + text.replace("'", "'\\''") + "'"
