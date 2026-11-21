@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::keys::is_valid_key_id;
 use crate::manifest::{
-    is_sha256_hex, validate_abi, validate_arch, validate_package_name, Dependency, Manifest,
+    is_sha256_hex, package_filename, validate_abi, validate_arch, validate_package_name,
+    Dependency, Manifest,
 };
 use crate::version::{validate_pkgver, Version};
 use crate::{Error, Result};
@@ -100,9 +101,12 @@ impl IndexPackage {
                 self.name, self.filename
             )));
         }
-        let expected = format!(
-            "{}-{}-{}-{}.spk",
-            self.name, self.version, self.release, self.arch
+        let expected = package_filename(
+            &self.name,
+            self.epoch,
+            &self.version,
+            self.release,
+            &self.arch,
         );
         if self.filename != expected {
             return Err(Error::Index(format!(

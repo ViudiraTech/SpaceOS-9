@@ -16,8 +16,15 @@ use crate::version::{validate_pkgver, Version};
 use crate::{Error, Result};
 
 pub const ARCHES: &[&str] = &["x86_64", "aarch64", "riscv64"];
-pub const MAX_PATH_LEN: usize = 4096;
+/// SpaceOS syscalls copy paths through a 512-byte buffer including the NUL
+/// terminator, so the longest usable absolute path is 511 bytes. Linux allows
+/// PATH_MAX 4096; the tighter SpaceOS limit is enforced here so packages that
+/// cannot be installed are rejected at build time.
+pub const MAX_PATH_LEN: usize = 511;
 pub const MAX_COMPONENT_LEN: usize = 255;
+/// Package payloads may never replace the package database, the lock file or
+/// the trust store.
+pub const RESERVED_PREFIXES: &[&str] = &["/var/lib/spk", "/etc/spk/trusted.d"];
 pub const META_MANIFEST: &str = "manifest.toml";
 pub const META_INSTALL: &str = ".INSTALL";
 pub const META_CHANGELOG: &str = ".CHANGELOG";
@@ -130,9 +137,12 @@ impl Manifest {
     }
 
     pub fn package_filename(&self) -> String {
-        format!(
-            "{}-{}-{}-{}.spk",
-            self.name, self.version, self.release, self.arch
+        package_filename(
+            &self.name,
+            self.epoch,
+            &self.version,
+            self.release,
+            &self.arch,
         )
     }
 
@@ -246,17 +256,30 @@ impl Manifest {
             if !conffiles.insert(path.as_str()) {
                 return Err(Error::Manifest(format!("duplicate conffile '{path}'")));
             }
-            match files.get(path.as_str()) {
-                Some(file) if file.file_type == FileType::File => {}
-                _ => {
-                    return Err(Error::Manifest(format!(
-                        "conffile '{path}' is not a regular file in this package"
-                    )))
+            // Source manifests may omit the generated files table; `spk build`
+            // revalidates after filling it.
+            if !self.files.is_empty() {
+                match files.get(path.as_str()) {
+                    Some(file) if file.file_type == FileType::File => {}
+                    _ => {
+                        return Err(Error::Manifest(format!(
+                            "conffile '{path}' is not a regular file in this package"
+                        )))
+                    }
                 }
             }
         }
         Ok(())
     }
+}
+
+pub fn package_filename(name: &str, epoch: u64, version: &str, release: u64, arch: &str) -> String {
+    let version = if epoch == 0 {
+        version.to_string()
+    } else {
+        format!("{epoch}:{version}")
+    };
+    format!("{name}-{version}-{release}-{arch}.spk")
 }
 
 fn ancestors(path: &str) -> Vec<&str> {
@@ -336,6 +359,16 @@ pub fn validate_absolute_path(path: &str) -> Result<()> {
             "'{path}' collides with package metadata"
         )));
     }
+    if RESERVED_PREFIXES.iter().any(|prefix| {
+        path == *prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }) {
+        return Err(Error::UnsafePath(format!(
+            "'{path}' is inside a reserved package-manager path"
+        )));
+    }
     Ok(())
 }
 
@@ -350,6 +383,11 @@ pub fn validate_relative_path(path: &str) -> Result<()> {
     }
     if path.ends_with('/') {
         return Err(Error::UnsafePath(format!("'{path}' has a trailing slash")));
+    }
+    if path.len() + 1 > MAX_PATH_LEN {
+        return Err(Error::UnsafePath(format!(
+            "archive path would exceed the {MAX_PATH_LEN}-byte absolute path limit"
+        )));
     }
     validate_components(path, path)
 }
@@ -639,6 +677,28 @@ size = 12345
         for bad in ["", "/usr", "../etc", "usr/../etc", "usr//bin", "usr/"] {
             assert!(validate_relative_path(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn epoch_enters_the_filename() {
+        let manifest = Manifest::from_toml(&EXAMPLE.replace("epoch = 0", "epoch = 2")).unwrap();
+        assert_eq!(manifest.package_filename(), "foo-2:1.2.3-1-x86_64.spk");
+    }
+
+    #[test]
+    fn reserved_paths_and_spaceos_length_limit() {
+        for bad in [
+            "/var/lib/spk/installed.json",
+            "/etc/spk/trusted.d/ed25519:x.pub",
+        ] {
+            assert!(validate_absolute_path(bad).is_err(), "{bad}");
+        }
+        assert!(validate_absolute_path("/var/lib/spkfoo/x").is_ok());
+        let long = format!("/{}/{}", "a".repeat(254), "b".repeat(256));
+        assert!(validate_absolute_path(&long).is_err());
+        let at_limit = format!("/{}/{}", "a".repeat(254), "b".repeat(255));
+        assert_eq!(at_limit.len(), MAX_PATH_LEN);
+        assert!(validate_absolute_path(&at_limit).is_ok());
     }
 
     #[test]

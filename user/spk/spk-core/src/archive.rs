@@ -8,8 +8,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -109,6 +110,10 @@ pub fn is_meta_path(path: &str) -> bool {
 /// Read every tar entry of an uncompressed payload and enforce the package
 /// path/type policy. This is the single place where tar input becomes trusted.
 pub fn scan_tar<R: Read>(reader: R) -> Result<RawScan> {
+    scan_tar_with(reader, None)
+}
+
+fn scan_tar_with<R: Read>(reader: R, extract_root: Option<&Path>) -> Result<RawScan> {
     let mut archive = tar::Archive::new(reader);
     let mut scan = RawScan::default();
     let mut seen = BTreeSet::new();
@@ -238,18 +243,29 @@ pub fn scan_tar<R: Read>(reader: R) -> Result<RawScan> {
                 let mut hasher = Sha256::new();
                 let mut buffer = [0u8; 64 * 1024];
                 let mut total = 0u64;
+                let mut staged = match extract_root {
+                    Some(root) => Some(create_staged_file(root, &path)?),
+                    None => None,
+                };
                 loop {
                     let read = entry.read(&mut buffer)?;
                     if read == 0 {
                         break;
                     }
                     hasher.update(&buffer[..read]);
+                    if let Some(file) = staged.as_mut() {
+                        file.write_all(&buffer[..read])?;
+                    }
                     total += read as u64;
                 }
                 if total != declared_size {
                     return Err(Error::Package(format!(
                         "'{path}': expected {declared_size} bytes, read {total}"
                     )));
+                }
+                if let Some(file) = staged {
+                    drop(file);
+                    set_staged_mode(extract_root.unwrap(), &path, mode)?;
                 }
                 scan.entries.push(EntryInfo {
                     path,
@@ -267,6 +283,9 @@ pub fn scan_tar<R: Read>(reader: R) -> Result<RawScan> {
                     return Err(Error::Package(format!(
                         "'{path}': directory entry carries data"
                     )));
+                }
+                if let Some(root) = extract_root {
+                    extract_dir(root, &path, mode)?;
                 }
                 scan.entries.push(EntryInfo {
                     path,
@@ -294,6 +313,9 @@ pub fn scan_tar<R: Read>(reader: R) -> Result<RawScan> {
                     })?
                     .to_string();
                 validate_symlink_target(&format!("/{path}"), &target)?;
+                if let Some(root) = extract_root {
+                    extract_symlink(root, &path, &target)?;
+                }
                 scan.entries.push(EntryInfo {
                     path,
                     kind,
@@ -309,6 +331,47 @@ pub fn scan_tar<R: Read>(reader: R) -> Result<RawScan> {
     }
 
     Ok(scan)
+}
+
+fn create_staged_file(root: &Path, path: &str) -> Result<File> {
+    let full = root.join(path);
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&full)?)
+}
+
+fn set_staged_mode(root: &Path, path: &str, mode: u32) -> Result<()> {
+    fs::set_permissions(root.join(path), fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+fn extract_dir(root: &Path, path: &str, mode: u32) -> Result<()> {
+    extract_dir_impl(root, path, mode).map_err(Error::from)
+}
+
+fn extract_dir_impl(root: &Path, path: &str, mode: u32) -> std::io::Result<()> {
+    let full = root.join(path);
+    fs::create_dir_all(&full)?;
+    fs::set_permissions(&full, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+fn extract_symlink(root: &Path, path: &str, target: &str) -> Result<()> {
+    extract_symlink_impl(root, path, target).map_err(Error::from)
+}
+
+fn extract_symlink_impl(root: &Path, path: &str, target: &str) -> std::io::Result<()> {
+    let full = root.join(path);
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(target, &full)?;
+    Ok(())
 }
 
 fn ancestors(path: &str) -> Vec<String> {
@@ -440,6 +503,30 @@ pub fn inspect_spk(path: &Path) -> Result<InspectedPackage> {
         changelog: scanned.changelog,
         buildinfo: scanned.buildinfo,
     })
+}
+
+/// Verify and unpack a `.spk` payload into a fresh staging directory. The
+/// directory is removed again if any check fails, so a partial tree never
+/// reaches the commit phase.
+pub fn extract_spk(path: &Path, dest: &Path) -> Result<ScannedPackage> {
+    if dest.exists() {
+        return Err(Error::Package(format!(
+            "staging directory {} already exists",
+            dest.display()
+        )));
+    }
+    fs::create_dir_all(dest)?;
+    let result = (|| -> Result<ScannedPackage> {
+        let reader = BufReader::new(File::open(path)?);
+        let decoder =
+            ruzstd::decoding::StreamingDecoder::new_with_max_window_size(reader, MAX_ZSTD_WINDOW)
+                .map_err(|e| Error::Package(format!("zstd: {e}")))?;
+        verify_scan(scan_tar_with(decoder, Some(dest))?)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(dest);
+    }
+    result
 }
 
 #[cfg(test)]

@@ -17,6 +17,8 @@
 4. **可复现**：包、索引、ISO 都能从源码重复构建。
 5. **安全默认**：签名索引、逐文件哈希、路径逃逸防护、脚本沙箱、setuid 白名单。
 
+暂不规划：A/B 系统 OTA；先完成 `spk upgrade` 与依赖求解。
+
 ## 1. 能力清单（完整目标）
 
 仓库与同步：
@@ -75,7 +77,10 @@ foo-1.2.3-1-x86_64.spk
 ```
 
 - tar 条目排序、mtime、uid/gid 固定，保证可复现。
+- `.spk` 为 tar + zstd。目标端 `spk` 只依赖纯 Rust `ruzstd` 解码；host 侧打包使用 bundled C zstd，C zstd 不进入目标端依赖树。
 - 路径必须相对、无 `..`、无绝对路径、无设备/FIFO；符号链接目标不得逃逸安装根。
+- 路径总长不超过 511 字节：SpaceOS syscall 的路径缓冲为 512 字节（含 NUL），Linux 的 PATH_MAX 4096 不适用。`/var/lib/spk` 与 `/etc/spk/trusted.d` 为保留前缀，包不得写入。
+- manifest 文件表带 `type`（`file`/`dir`/`symlink`）与 symlink 的 `target`；目录 `sha256="" size=0`，symlink 的 `sha256`/`size` 对目标字符串计算。
 - 文件模式/属主记录在 manifest；setuid/setgid 默认剥离，manifest 显式 `allow_setuid` 才保留。
 - 硬链接安排在 P2 之后支持；P1 先按普通文件处理并告警。
 
@@ -105,15 +110,34 @@ scripts = true
 allow_setuid = false
 
 [[files]]
+path = "/usr"
+type = "dir"
+mode = "0755"
+uid = 0
+gid = 0
+sha256 = ""
+size = 0
+
+[[files]]
 path = "/usr/bin/foo"
 mode = "0755"
 uid = 0
 gid = 0
 sha256 = "..."
 size = 12345
+
+[[files]]
+path = "/usr/bin/foo-link"
+type = "symlink"
+target = "/usr/bin/foo"
+mode = "0777"
+sha256 = "<SHA-256 of the target string>"
+size = 11
 ```
 
-- `files` 由 `spk build` 扫描 staging 自动生成；手工清单仅用于校验。
+- `type` 缺省为 `file`。目录条目没有摘要与大小；symlink 的 `sha256`/`size` 对 `target` 字符串计算。
+- `files` 由 `spk build` 扫描 staging 自动生成；源 manifest 可省略 `files`，生成后再次校验，`conffiles` 也在生成后校验。手工清单仅用于校验。
+- 包文件名：`epoch = 0` 时为 `name-version-release-arch.spk`；`epoch != 0` 时为 `name-epoch:version-release-arch.spk`（与 Arch 包文件名一致），因此 epoch 不会撞名。
 - 依赖语法：`name`、`name=1.2.3-1`、`name>=1.2`、`name<2`、`name>1`、`name<=2`；`provides` 支持虚拟包与 ABI（`splibc-abi=1`）。
 - `conflicts`/`replaces` 进入求解器；`replaces` 可在同一事务中替换旧包。
 - 可选 `optdepends`（仅展示，不强制）。
@@ -220,7 +244,7 @@ size = 12345
 ```
 /var/lib/spk/
 ├── installed.json        # name -> {version, arch, files, depends, ...}
-├── files.json            # path -> {pkg, sha256, mode, size}
+├── files.json            # path -> {pkg, sha256, mode, size}；只记录非目录路径
 ├── world.json            # 用户显式安装集合
 ├── repos.json            # 仓库列表、优先级、最后同步时间
 ├── journal               # 当前/最近事务日志（txid、阶段、已写文件）
@@ -229,7 +253,8 @@ size = 12345
 ```
 
 - 所有状态文件：写临时文件 → `fsync` → `rename`；目录 fsync。
-- `journal` 记录每个阶段与已落地文件；`spk repair` 依据 journal 回滚或继续。
+- `files.json` 不记录目录：目录归属从 `installed.json` 各包的 `files` 派生；共享目录只有在为空时才移除。
+- `journal` 为 JSONL 追加日志，每条意图在动作前写入并 `fsync`；`spk repair` 依据 journal 逆序回滚或前滚。
 - 锁：`/var/lib/spk/lock`（flock），同一时间只允许一个写事务。
 
 ### 6.2 事务阶段
@@ -574,6 +599,18 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
 - `public/CNAME` 目前是 `goutoustdio.rainyland.top`，使用 `goutoustdio.top` 时同步。
 - 备份 `/data/spaceos/repo` 到 R2；恢复流程写入运维文档。
 
+### 12.1 发布记录
+
+- 2026-11-21：P0 仓库发布到 `https://goutoustdio.top/spaceos/repo/x86_64`。
+  - `hello-0.1.0-1-x86_64.spk`：sha256 `fbd694046e2c82917628347c175c48266396c7cd39deb2db8ac0752d83663399`
+  - `index.json`：sha256 `2efbe0d047420d9cdcf4cd33c1e8d7b0d46e292c73f4f6624bc0d6695b704e43`
+  - `index.json.sig`：sha256 `6e00275464758c6df0abf2dadf73dcdf110a052c82da5c1bafb34c10c3437b77`
+  - 公钥：`https://goutoustdio.top/spaceos/repo/keys/ed25519:b4280a08406a53c5.pub`，key_id `ed25519:b4280a08406a53c5`
+  - 目录浏览：`https://goutoustdio.top/spaceos/repo/`（serve-index details 视图，隐藏点文件）
+  - 线上 `spk-host verify`：`hello 0.1.0-1 ... OK`、`index.json: OK`
+  - 站点已加入“SpaceOS 9 软件源”入口（下载页按钮、导航、页脚、首页卡片、介绍页）
+  - `index.json`/`.sig` no-cache；`.spk` immutable；Range 206 已验证
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
@@ -628,17 +665,19 @@ CI：
 - 定稿 manifest/index/DB schema；Rust workspace；`spk-host` 的 keygen/index/sign；单元测试。
 - 验收：本地仓库可生成、签名、验签。
 
-### P1 包与事务核心
+### P1 包、事务与完整升级
 
 - tar/zstd、sha256、staging、文件 DB、锁、原子安装/回滚、journal。
 - `install/remove/list/info/files/owns`。
-- 验收：QEMU 本地仓库安装/卸载，中断后可 repair。
+- 完整 `upgrade`：版本比较、depends/provides/conflicts/replaces 求解、事务集合、`downgrade/reinstall`、world 一致、冲突链输出；不做“仅无冲突时可用”的简化版。
+- 验收：QEMU 本地仓库 hello 0.1 → 0.2 升级成功；构造依赖冲突/文件冲突/升级失败，事务回滚；中断后 repair；world 与 DB/文件一致。
+- 实现记录（2026-11-21）：`user/spk/spk`（musl 静态）、信任库与本地/file 仓库、回溯求解、install/upgrade/downgrade/reinstall/remove(-Rs)/check/repair；host 集成 10 项与 QEMU 三阶段矩阵通过（含升级中 SIGKILL + repair、ext4 回放）。
 
-### P2 求解器
+### P2 求解器边界与高级变更
 
-- 版本比较、depends/provides/conflicts/replaces、回溯求解、冲突链输出。
-- `upgrade/downgrade/reinstall`、world 一致性。
-- 验收：复杂依赖图、冲突、循环依赖测试全过。
+- 复杂依赖图、循环依赖、虚拟包/提供者、hold/pin、部分升级策略、多仓库优先级下的求解。
+- 冲突诊断、求解性能、`--print`/`--json` 事务计划。
+- 验收：复杂图、冲突、循环、hold、多仓库测试全过；求解结果可复现。
 
 ### P3 脚本、钩子、触发器
 
@@ -665,16 +704,16 @@ CI：
 ```
 SpaceKernel/
 ├── docs/PACKAGE_MANAGER_PLAN.md
-├── user/spk/                 # Rust workspace：spk（目标端） + spk-host
-│   ├── Cargo.toml
-│   ├── src/
-│   └── tests/
+├── user/spk/                 # Rust workspace
+│   ├── spk-core/             # schema、版本、签名、tar 安全/解包（目标端可直接用）
+│   ├── spk-host/             # keygen/pack/index/sign/verify
+│   └── spk/                  # 目标端 CLI + 求解/事务/repair/check
 ├── packages/
-│   ├── base/manifest.toml
-│   └── hello/manifest.toml
+│   ├── hello/                # 0.1.0 / 0.2.0
+│   └── spk-tests/            # solver/file-conflict fixtures
 ├── tools/
-│   ├── build_packages.sh
-│   └── publish_repo.sh
+│   ├── build_local_repo.sh
+│   └── spk_qemu_test.py
 └── repo/                     # 构建产物（gitignore）
 ```
 
@@ -682,13 +721,19 @@ SpaceKernel/
 
 - ABI 稳定性：`spaceos-1` 的升级策略；splibc 与 musl 两条用户态路线的边界。
 - `spk` 自身链接 splibc 还是 musl；若要求全原生，需要自定义 Rust target/sysroot。
-- 纯 Rust zstd（`ruzstd`）对大文件/多帧的性能；必要时用 C zstd 或未压缩 tar。
+- zstd 已定稿：目标端只用 `ruzstd` 解码，host 侧打包用 bundled C zstd；目标 `spk` 正常依赖树不含 `zstd`/`zstd-sys`。`ruzstd` 对超大/多帧包的性能仍需在 P4 压测。
+- epoch 命名已定稿：非 0 时进入文件名（见 §3.2），不再保留为开放问题。
+- SpaceOS syscall 路径缓冲为 512 字节（含 NUL），包路径上限 511 字节；build/index/install 都会拒绝超长路径。
+- VFS `openat` 尚未实现 `O_NOFOLLOW`，祖先符号链接会被跟随；`spk` 用 lstat 级联解析把写入限制在 `--root` 内，但仍存在 TOCTOU 窗口，待内核补齐后收紧。
+- `statvfs` 没有独立 syscall；`spk` 的磁盘空间检查使用 `statfs`。
+- `copy_file_range`（x86_64 syscall 326）未实现；std 会回退并打印 unimplemented 告警。`spk` 的备份/恢复改用 read/write 复制，目标端不再触发该路径。
+- 已修复（2026-11-21）：ext4 `extent_truncate()` 释放目录数据块时使用 `metadata=false`，没有写 revoke；掉电后 jbd2 回放会把旧目录块覆盖到复用该块的文件（QEMU 第三阶段复现 `files.json` 指向目录块）。修复为目录数据块按元数据释放并生成 revoke。QEMU 三阶段在阶段 1↔2 不调用 `sync`、强制日志回放：boot 2/3 分别回放 14/98 个事务、6/28 条 revoke，最终阶段 sync 供离线检查，矩阵全部通过。
 - TLS 根证书与离线信任链；`rustls` 在 SpaceOS 上的 ring 后端可用性。
 - FadeHost `/data` 在 redeploy/迁移/备份恢复后的持久性需实测。
 - 10 GB 仓库容量与保留策略；R2 作为大文件后端的接入。
 - 多架构 CI 成本；交叉编译工具链。
 - 脚本沙箱在 SpaceOS 上的实现（命名空间/seccomp 等价物是否具备）。
-- 是否支持 `optdepends`、`replaces` 的完整语义（P2 前定稿）。
+- `optdepends` 的展示语义尚未定稿；`replaces` 已在 P1 求解器中实现（同事务移除被替换包）。
 
 ## 20. 特权工具：sudo / doas（与 spk 同期）
 
@@ -758,15 +803,16 @@ sudo -e file...
 
 ## 21. 任务清单
 
-- [ ] 定稿 manifest/index/DB schema（第 3、4、6 节）。
-- [ ] 建 Rust workspace 与 `spk-host`：keygen/index/sign。
-- [ ] 实现 `.spk` 打包/解包、sha256、tar 安全检查。
-- [ ] 实现文件 DB、锁、原子安装、journal/repair。
-- [ ] 实现 `install/remove/list/info/files/owns` 并 QEMU 验证。
-- [ ] 实现版本比较与依赖求解器、冲突链输出。
+- [x] 定稿 manifest/index/DB schema（第 3、4、6 节）。
+- [x] 建 Rust workspace 与 `spk-host`：keygen/index/sign。
+- [x] 实现 `.spk` 打包/解包、sha256、tar 安全检查。
+- [x] 实现文件 DB、锁、原子安装、journal/repair。
+- [x] 实现 `install/remove/list/info/files/owns` 并 QEMU 验证。
+- [x] 实现完整 `upgrade`（求解/替换/回滚）并 QEMU 验证。
+- [x] 实现版本比较与依赖求解器、冲突链输出。
 - [ ] 实现 `.INSTALL`、hooks.d、triggers、脚本沙箱。
 - [ ] 实现多仓库/镜像/签名信任/防降级。
-- [ ] 给 `goutoustdio-site` 提 `/spaceos/repo` 路由 PR，部署 `hello` 测试仓库。
+- [x] 给 `goutoustdio-site` 提 `/spaceos/repo` 路由 PR，部署 `hello` 测试仓库。
 - [ ] 接入 `make packages/repo/image`，ISO 用包构建。
 - [ ] 接入 QEMU 测试矩阵与 CI。
 - [ ] 多架构与 R2 备份/大文件后端。

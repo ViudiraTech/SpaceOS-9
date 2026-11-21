@@ -1230,6 +1230,9 @@ impl State {
     /// Release every mapped block at or past logical block `from`.
     fn extent_truncate(&mut self, ino: u32, from: u32) -> Result<(), VfsError> {
         self.load_extents(ino)?;
+        // Directory data blocks are journaled metadata. Freeing one without a
+        // revoke lets a stale directory block be replayed over its next user.
+        let metadata = le16(self.inode_raw(ino)?, 0) & S_IFMT == S_IFDIR;
         let memory = self.inodes.get_mut(&ino).ok_or(VfsError::IoError)?;
         let list = memory.extents.as_mut().ok_or(VfsError::IoError)?;
         let mut freed: Vec<(u64, u32)> = Vec::new();
@@ -1250,7 +1253,7 @@ impl State {
         *list = kept;
         let mut total = 0i64;
         for (start, count) in freed {
-            self.free_blocks_range(start, count, false)?;
+            self.free_blocks_range(start, count, metadata)?;
             total += i64::from(count);
         }
         self.adjust_blocks(ino, -total)?;

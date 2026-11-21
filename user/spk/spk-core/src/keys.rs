@@ -137,6 +137,20 @@ impl KeyPair {
 }
 
 impl PublicKey {
+    pub fn file(&self) -> PublicKeyFile {
+        PublicKeyFile {
+            schema: KEY_SCHEMA,
+            algorithm: ALGORITHM.to_string(),
+            key_id: self.key_id.clone(),
+            comment: self.comment.clone(),
+            public_key: BASE64.encode(self.bytes),
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        pretty_json(&self.file())
+    }
+
     pub fn from_file(path: &Path) -> Result<Self> {
         let size = fs::metadata(path)?.len();
         if size > MAX_KEY_FILE_SIZE {

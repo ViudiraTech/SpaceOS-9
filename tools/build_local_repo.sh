@@ -48,11 +48,17 @@ if [ -z "$PUB" ] || [ ! -f "$PUB" ]; then
 fi
 
 mkdir -p "$REPO_DIR"
-"$ROOT/packages/hello/build.sh" "$ROOT/build/packages/hello"
-"$SPK_HOST" pack \
-    --manifest "$ROOT/packages/hello/manifest.toml" \
-    --root "$ROOT/build/packages/hello" \
-    --output "$REPO_DIR/hello-0.1.0-1-$ARCH.spk"
+for version in 0.1.0 0.2.0; do
+    case "$version" in
+        0.1.0) manifest=$ROOT/packages/hello/manifest.toml ;;
+        0.2.0) manifest=$ROOT/packages/hello/manifest-0.2.0.toml ;;
+    esac
+    "$ROOT/packages/hello/build.sh" "$version" "$ROOT/build/packages/hello-$version"
+    "$SPK_HOST" pack \
+        --manifest "$manifest" \
+        --root "$ROOT/build/packages/hello-$version" \
+        --output "$REPO_DIR/hello-$version-1-$ARCH.spk"
+done
 "$SPK_HOST" index \
     --repo-dir "$REPO_DIR" \
     --repo spaceos-main \

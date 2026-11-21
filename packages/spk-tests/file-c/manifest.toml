@@ -1,0 +1,21 @@
+name = "file-c"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "File conflict fixture C"
+description = "spk P1 test fixture"
+license = "LicenseRef-Proprietary"
+url = "https://github.com/ViudiraTech/SpaceKernel"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = []
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false
