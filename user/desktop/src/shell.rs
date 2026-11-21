@@ -673,6 +673,49 @@ fn vortex_menu_footer_rects() -> (Rect, Rect, Rect, Rect, Rect) {
     (logout, reboot, power_off, confirm_cancel, confirm_ok)
 }
 
+fn custom_menu_row_rect(sm: &crate::theme::StartMenuSkin, index: usize) -> Rect {
+    let body_top = sm.header_height + 8;
+    let left_w = (sm.width / 2 + 6).clamp(180, sm.width - 140);
+    let extra_gap = if index >= 2 { 8 } else { 0 };
+    Rect::new(
+        8,
+        body_top + index as i32 * 44 + extra_gap,
+        left_w - 14,
+        42,
+    )
+}
+
+fn custom_menu_search_rect(sm: &crate::theme::StartMenuSkin) -> Rect {
+    let left_w = (sm.width / 2 + 6).clamp(180, sm.width - 140);
+    Rect::new(10, sm.height - sm.footer_height - 40, left_w - 18, 28)
+}
+
+fn custom_menu_place_rect(sm: &crate::theme::StartMenuSkin, index: usize) -> Rect {
+    let body_top = sm.header_height + 10;
+    let left_w = (sm.width / 2 + 6).clamp(180, sm.width - 140);
+    let right_x = 2 + left_w + 6;
+    let right_w = (sm.width - right_x - 8).max(120);
+    let extra_gap = if index >= 3 { 10 } else { 0 };
+    Rect::new(
+        right_x,
+        body_top + index as i32 * 38 + extra_gap,
+        right_w,
+        34,
+    )
+}
+
+fn custom_menu_footer_rects(
+    sm: &crate::theme::StartMenuSkin,
+) -> (Rect, Rect, Rect, Rect, Rect) {
+    let fy = sm.height - sm.footer_height + (sm.footer_height - 28) / 2;
+    let power_off = Rect::new(sm.width - 108, fy, 98, 28);
+    let reboot = Rect::new(sm.width - 182, fy, 68, 28);
+    let logout = Rect::new(sm.width - 256, fy, 68, 28);
+    let confirm_cancel = Rect::new(sm.width - 170, fy, 74, 28);
+    let confirm_ok = Rect::new(sm.width - 88, fy, 78, 28);
+    (logout, reboot, power_off, confirm_cancel, confirm_ok)
+}
+
 fn compact_footer_rects() -> (Rect, Rect, Rect, Rect, Rect) {
     let logout = Rect::new(MENU_WIDTH - 222, MENU_HEIGHT - 42, 66, 30);
     let reboot = Rect::new(MENU_WIDTH - 150, MENU_HEIGHT - 42, 66, 30);
@@ -788,7 +831,53 @@ impl TaskbarLayout {
         show_pinned: bool,
         is_vortex: bool,
     ) -> Self {
-        let start = if is_vortex {
+        Self::compute_with_start(
+            screen_w,
+            panel_h,
+            tray_w,
+            show_pinned,
+            is_vortex,
+            None,
+        )
+    }
+
+    fn compute_for_theme(
+        theme: &Theme,
+        screen_w: i32,
+        panel_h: i32,
+        tray_w: i32,
+        show_pinned: bool,
+    ) -> Self {
+        let custom_start = theme.skin().map(|s| {
+            let sb = &s.start_button;
+            if sb.full_height {
+                Rect::new(sb.margin_left, 0, sb.width, panel_h)
+            } else {
+                let bh = (panel_h - 8).clamp(24, 42);
+                Rect::new(sb.margin_left.max(4), (panel_h - bh) / 2, sb.width, bh)
+            }
+        });
+        Self::compute_with_start(
+            screen_w,
+            panel_h,
+            tray_w,
+            show_pinned,
+            theme.is_vortexglass(),
+            custom_start,
+        )
+    }
+
+    fn compute_with_start(
+        screen_w: i32,
+        panel_h: i32,
+        tray_w: i32,
+        show_pinned: bool,
+        is_vortex: bool,
+        custom_start: Option<Rect>,
+    ) -> Self {
+        let start = if let Some(sr) = custom_start {
+            sr
+        } else if is_vortex {
             let orb = (panel_h - 4).clamp(32, 46);
             Rect::new(6, (panel_h - orb) / 2, orb.max(42), orb)
         } else {
@@ -1203,10 +1292,22 @@ impl Shell {
     fn menu_dims(&self) -> (i32, i32) {
         if self.config.panel_start_fullscreen {
             (i32::from(self.x.width), i32::from(self.x.height))
+        } else if let Some(ref sm) = self.theme.skin().and_then(|s| s.start_menu.as_ref()) {
+            (sm.width, sm.height)
         } else if self.theme.is_vortexglass() {
             (VORTEX_MENU_WIDTH, VORTEX_MENU_HEIGHT)
         } else {
             (MENU_WIDTH, MENU_HEIGHT)
+        }
+    }
+
+    fn menu_x(&self) -> i32 {
+        if self.config.panel_start_fullscreen {
+            0
+        } else if let Some(ref sm) = self.theme.skin().and_then(|s| s.start_menu.as_ref()) {
+            sm.offset_x
+        } else {
+            6
         }
     }
 
@@ -1234,10 +1335,15 @@ impl Shell {
 
     fn menu_y(&self) -> i32 {
         let (_, mh) = self.menu_dims();
+        let gap = self
+            .theme
+            .skin()
+            .and_then(|s| s.start_menu.as_ref())
+            .map_or(6, |sm| sm.gap_y);
         if self.config.panel_position == PanelPosition::Top {
-            self.panel_height() + 6
+            self.panel_height() + gap
         } else {
-            (self.taskbar_y() - mh - 6).max(8)
+            (self.taskbar_y() - mh - gap).max(0)
         }
     }
 
@@ -1246,7 +1352,13 @@ impl Shell {
             (0i16, 0i16, self.x.width, self.x.height, false)
         } else {
             let (vw, vh) = self.menu_dims();
-            (6i16, self.menu_y() as i16, vw as u16, vh as u16, true)
+            (
+                self.menu_x() as i16,
+                self.menu_y() as i16,
+                vw as u16,
+                vh as u16,
+                true,
+            )
         };
         self.x.move_resize(self.menu, mx, my, mw, mh)?;
         if rounded {
@@ -1367,12 +1479,12 @@ impl Shell {
     }
 
     fn taskbar_layout(&self) -> TaskbarLayout {
-        TaskbarLayout::compute_styled(
+        TaskbarLayout::compute_for_theme(
+            &self.theme,
             i32::from(self.x.width),
             self.panel_height(),
             self.tray_width(),
             self.config.panel_show_pinned,
-            self.theme.is_vortexglass(),
         )
     }
 
@@ -4315,7 +4427,7 @@ impl Shell {
         let (mx, my) = if self.config.panel_start_fullscreen {
             (0, 0)
         } else {
-            (6, self.menu_y())
+            (self.menu_x(), self.menu_y())
         };
         let rx = mx + caret.x;
         let ry = my + caret.y;
@@ -4581,6 +4693,42 @@ impl Shell {
     }
 
     fn menu_hit(&self, x: i32, y: i32) -> Hit {
+        if let Some(ref sm) = self.theme.skin().and_then(|s| s.start_menu.as_ref()) {
+            if sm.layout == crate::theme::StartMenuLayoutKind::TwoColumn {
+                let (logout, reboot, power_off, confirm_cancel, confirm_ok) =
+                    custom_menu_footer_rects(sm);
+                if self.menu_confirm_power.is_some() {
+                    if confirm_cancel.contains(x, y) {
+                        return Hit::ConfirmPowerCancel;
+                    }
+                    if confirm_ok.contains(x, y) {
+                        return Hit::ConfirmPowerOk;
+                    }
+                    return Hit::None;
+                }
+                let filtered = self.filtered_apps();
+                for (slot, &app_idx) in filtered.iter().take(7).enumerate() {
+                    if custom_menu_row_rect(sm, slot).contains(x, y) {
+                        return Hit::MenuRow(app_idx);
+                    }
+                }
+                for (i, _) in VORTEX_PLACES.iter().enumerate() {
+                    if custom_menu_place_rect(sm, i).contains(x, y) {
+                        return Hit::MenuPlace(i);
+                    }
+                }
+                if logout.contains(x, y) {
+                    return Hit::Logout;
+                }
+                if reboot.contains(x, y) {
+                    return Hit::Reboot;
+                }
+                if power_off.contains(x, y) {
+                    return Hit::PowerOff;
+                }
+                return Hit::None;
+            }
+        }
         let is_vortex = self.theme.is_vortexglass();
         let (logout, reboot, power_off, confirm_cancel, confirm_ok) = if is_vortex {
             vortex_menu_footer_rects()
@@ -5020,7 +5168,9 @@ impl Shell {
         let h = self.panel_height();
         let show_pinned = self.config.panel_show_pinned;
         let is_vortex = self.theme.is_vortexglass();
-        let layout = TaskbarLayout::compute_styled(w, h, self.tray_width(), show_pinned, is_vortex);
+        let skin_opt = self.theme.skin();
+        let layout =
+            TaskbarLayout::compute_for_theme(&self.theme, w, h, self.tray_width(), show_pinned);
         let start = layout.start;
         let pinned_rects: [Rect; PINNED_MODES.len()] =
             std::array::from_fn(|i| layout.pinned_rect(h, i));
@@ -5041,7 +5191,9 @@ impl Shell {
         };
 
         let canvas = &mut self.taskbar_canvas;
-        if is_vortex {
+        if let Some(skin) = skin_opt {
+            skin.taskbar.bg.paint(canvas, Rect::new(0, 0, w, h), [0; 4]);
+        } else if is_vortex {
             if canvas.is_argb() {
                 canvas.clear_transparent(Rect::new(0, 0, w, h), self.theme.panel);
             } else {
@@ -5080,12 +5232,53 @@ impl Shell {
             }
         }
 
-        // Start button (SpaceOS Starlight Crystal Orb in VortexGlass; pill/bevel otherwise).
+        // Start button (Declarative skin, SpaceOS Starlight Crystal Orb in VortexGlass, or pill/bevel).
         let start_pressed = self.menu_open || ui::is_rect_pressed(start);
         let start_active = start_pressed || self.hover == Hit::Start;
         let start_t = ui::animate_bool(start, start_active, ui::MOTION_HOVER);
         let mut start_shift = 0;
-        if is_vortex {
+        if let Some(skin) = skin_opt {
+            let sb = &skin.start_button;
+            let sb_surf = if start_pressed {
+                start_shift = 1;
+                &sb.active
+            } else if self.hover == Hit::Start {
+                &sb.hover
+            } else {
+                &sb.normal
+            };
+            sb_surf.paint(canvas, start, sb.radii);
+            if sb_surf.sprite.is_none() {
+                if let Some(ref ic_sp) = sb.icon {
+                    let iy = start.y + (start.h - ic_sp.height as i32) / 2 + start_shift;
+                    canvas.blit_sprite(start.x + 10 + start_shift, iy, ic_sp);
+                } else {
+                    icons::draw(
+                        canvas,
+                        Icon::SpaceLogo,
+                        start.x + 10 + start_shift,
+                        start.y + (start.h - 20) / 2 + start_shift,
+                        20,
+                        None,
+                    );
+                }
+                let tx = (start.x + 35 + start_shift) as f32;
+                let ty = start.y as f32 + start.h as f32 * 0.5 + 4.8 + start_shift as f32;
+                if let Some(sh_col) = sb.text_shadow {
+                    self.text.draw(
+                        canvas,
+                        &sb.label,
+                        tx + 1.0,
+                        ty + 1.0,
+                        13.5,
+                        sh_col,
+                        Face::Bold,
+                    );
+                }
+                self.text
+                    .draw(canvas, &sb.label, tx, ty, 13.5, sb.text_color, Face::Bold);
+            }
+        } else if is_vortex {
             let radius = (start.w.min(start.h) as f32 * 0.48).max(12.0);
             draw_space_start_orb(
                 canvas,
@@ -5163,7 +5356,7 @@ impl Shell {
 
         let sep_h = (h - 14).clamp(16, 26);
         let sep_y = (h - sep_h) / 2;
-        if is_vortex {
+        if skin_opt.is_some() || is_vortex {
             canvas.fill_alpha(Rect::new(layout.start_sep_x, sep_y, 1, sep_h), 0x0a1420, 0.30);
             canvas.fill_alpha(Rect::new(layout.start_sep_x + 1, sep_y, 1, sep_h), 0xffffff, 0.38);
         } else {
@@ -5177,9 +5370,19 @@ impl Shell {
                     continue;
                 };
                 let pin_pressed = ui::is_rect_pressed(rect);
-                let pin_shift = i32::from(is_win98 && pin_pressed);
+                let pin_shift = i32::from((is_win98 || skin_opt.is_some()) && pin_pressed);
                 let hov_t = ui::animate_bool(rect, self.hover == Hit::Pinned(i), ui::MOTION_HOVER);
-                if is_win98 {
+                if let Some(skin) = skin_opt {
+                    if pin_pressed {
+                        skin.taskbar
+                            .button_pressed
+                            .paint(canvas, rect, [skin.taskbar.button_radius; 4]);
+                    } else if self.hover == Hit::Pinned(i) {
+                        skin.taskbar
+                            .button_hover
+                            .paint(canvas, rect, [skin.taskbar.button_radius; 4]);
+                    }
+                } else if is_win98 {
                     if pin_pressed {
                         canvas.fill(
                             rect,
@@ -5221,7 +5424,7 @@ impl Shell {
                     None,
                 );
             }
-            if is_vortex {
+            if skin_opt.is_some() || is_vortex {
                 canvas.fill_alpha(Rect::new(layout.pinned_sep_x, sep_y, 1, sep_h), 0x0a1420, 0.30);
                 canvas.fill_alpha(Rect::new(layout.pinned_sep_x + 1, sep_y, 1, sep_h), 0xffffff, 0.38);
             } else {
@@ -5238,7 +5441,21 @@ impl Shell {
             let is_hover = self.hover == Hit::Window(index);
             let hov_t = ui::animate_bool(rect, is_hover, ui::MOTION_HOVER);
             let mut win_shift = 0;
-            if is_win98 {
+            if let Some(skin) = skin_opt {
+                let tb = &skin.taskbar;
+                let btn_surf = if is_pressed {
+                    win_shift = 1;
+                    &tb.button_pressed
+                } else if is_active {
+                    win_shift = 1;
+                    &tb.button_active
+                } else if is_hover {
+                    &tb.button_hover
+                } else {
+                    &tb.button_normal
+                };
+                btn_surf.paint(canvas, rect, [tb.button_radius; 4]);
+            } else if is_win98 {
                 if is_sunken {
                     if is_active {
                         canvas.dither_checkerboard(rect, self.theme.panel, self.theme.bevel_light);
@@ -5351,7 +5568,15 @@ impl Shell {
             );
             let max_w = (rect.w - 38).max(20) as f32;
             let label = self.text.truncate(&managed.title, max_w, 12.0, Face::Ui);
-            let fg = if is_vortex {
+            let fg = if let Some(skin) = skin_opt {
+                if is_active {
+                    skin.taskbar.button_active_text
+                } else if managed.minimized {
+                    skin.taskbar.button_minimized_text
+                } else {
+                    skin.taskbar.button_text
+                }
+            } else if is_vortex {
                 if self.theme.is_dark() {
                     if managed.minimized { 0xbccad8 } else { 0xf5f9fd }
                 } else if is_active {
@@ -5368,7 +5593,7 @@ impl Shell {
             } else {
                 self.theme.text_dim
             };
-            let face = if (is_win98 || is_vortex) && is_active {
+            let face = if (is_win98 || is_vortex || skin_opt.is_some()) && is_active {
                 Face::Bold
             } else {
                 Face::Ui
@@ -5385,10 +5610,15 @@ impl Shell {
         }
 
         // Right tray: IME toggle, wired network status, speaker volume icon, bell & clock.
-        if is_win98 {
+        if let Some(ref tray_surf) = skin_opt.and_then(|s| s.taskbar.tray_bg.as_ref()) {
+            let tray_x = (ime.x - 8).max(0);
+            let tray_rect = Rect::new(tray_x, 0, w - tray_x, h);
+            tray_surf.paint(canvas, tray_rect, [0; 4]);
+        } else if is_win98 {
             let well = Rect::new(ime.x - 4, 4, w - (ime.x - 4) - 4, h - 8);
             canvas.bevel_1px(well, self.theme.bevel_shadow, self.theme.bevel_hi);
         }
+        let tray_fg_override = skin_opt.map(|s| (s.taskbar.tray_text, s.taskbar.tray_muted_text));
         let ime_pressed = (self.ctx_open && self.ctx_is_ime) || ui::is_rect_pressed(ime);
         let ime_shift = i32::from(is_win98 && ime_pressed);
         let ime_hov = ui::animate_bool(ime, self.hover == Hit::ImeTray, ui::MOTION_HOVER);
@@ -5411,8 +5641,12 @@ impl Shell {
                 canvas.rounded_rect(
                     ime,
                     ctrl_r,
-                    if is_vortex { 0xffffff } else { self.theme.accent },
-                    if is_vortex {
+                    if is_vortex || tray_fg_override.is_some() {
+                        0xffffff
+                    } else {
+                        self.theme.accent
+                    },
+                    if is_vortex || tray_fg_override.is_some() {
                         0.22 + 0.16 * ime_hov
                     } else {
                         0.16 + 0.10 * ime_hov
@@ -5422,19 +5656,27 @@ impl Shell {
                 canvas.rounded_rect(
                     ime,
                     ctrl_r,
-                    if is_vortex {
+                    if is_vortex || tray_fg_override.is_some() {
                         0xffffff
                     } else {
                         self.theme.panel_hover
                     },
-                    if is_vortex { 0.30 * ime_hov } else { ime_hov },
+                    if is_vortex || tray_fg_override.is_some() {
+                        0.26 * ime_hov
+                    } else {
+                        ime_hov
+                    },
                 );
             }
-            if is_vortex && (ime_hov > 0.001 || (ime_on && self.ime_chinese)) {
+            if (is_vortex || tray_fg_override.is_some())
+                && (ime_hov > 0.001 || (ime_on && self.ime_chinese))
+            {
                 canvas.rounded_border(ime, ctrl_r, 0xffffff, 0.35, 1);
             }
         }
-        let ime_fg = if !ime_on {
+        let ime_fg = if let Some((t_fg, t_muted)) = tray_fg_override {
+            if !ime_on { t_muted } else { t_fg }
+        } else if !ime_on {
             self.theme.text_muted
         } else if is_vortex {
             if self.theme.is_dark() {
@@ -5488,11 +5730,27 @@ impl Shell {
             canvas.rounded_rect(
                 net,
                 ctrl_r,
-                if is_vortex { 0xffffff } else { self.theme.panel_hover },
-                if is_vortex { 0.30 * net_hov } else { net_hov },
+                if is_vortex || tray_fg_override.is_some() {
+                    0xffffff
+                } else {
+                    self.theme.panel_hover
+                },
+                if is_vortex || tray_fg_override.is_some() {
+                    0.26 * net_hov
+                } else {
+                    net_hov
+                },
             );
         }
-        let (net_icon, net_tint) = if net_connected {
+        let (net_icon, net_tint) = if let Some((t_fg, t_muted)) = tray_fg_override {
+            if net_connected {
+                (Icon::NetworkWired, t_fg)
+            } else if self.net_status.has_device && self.net_status.up {
+                (Icon::NetworkWired, 0xffe066)
+            } else {
+                (Icon::NetworkOffline, t_muted)
+            }
+        } else if net_connected {
             (Icon::NetworkWired, self.theme.text)
         } else if self.net_status.has_device && self.net_status.up {
             (Icon::NetworkWired, self.theme.warning)
@@ -5522,22 +5780,30 @@ impl Shell {
             canvas.rounded_rect(
                 vol,
                 ctrl_r,
-                if self.vol_open {
+                if self.vol_open && tray_fg_override.is_none() {
                     self.theme.accent_soft
-                } else if is_vortex {
+                } else if is_vortex || tray_fg_override.is_some() {
                     0xffffff
                 } else {
                     self.theme.panel_hover
                 },
-                if is_vortex && !self.vol_open {
-                    0.30 * vol_hov
+                if (is_vortex || tray_fg_override.is_some()) && !self.vol_open {
+                    0.26 * vol_hov
+                } else if tray_fg_override.is_some() {
+                    0.34
                 } else {
                     vol_hov
                 },
             );
         }
         let vol_icon = Icon::for_volume(self.config.sound_master_volume, self.config.sound_muted);
-        let vol_tint = if self.config.sound_muted || self.config.sound_master_volume <= 0 {
+        let vol_tint = if let Some((t_fg, t_muted)) = tray_fg_override {
+            if self.config.sound_muted || self.config.sound_master_volume <= 0 {
+                t_muted
+            } else {
+                t_fg
+            }
+        } else if self.config.sound_muted || self.config.sound_master_volume <= 0 {
             self.theme.text_muted
         } else if self.vol_open {
             self.theme.accent
@@ -5566,8 +5832,16 @@ impl Shell {
             canvas.rounded_rect(
                 bell,
                 ctrl_r,
-                if is_vortex { 0xffffff } else { self.theme.panel_hover },
-                if is_vortex { 0.30 * bell_hov } else { bell_hov },
+                if is_vortex || tray_fg_override.is_some() {
+                    0xffffff
+                } else {
+                    self.theme.panel_hover
+                },
+                if is_vortex || tray_fg_override.is_some() {
+                    0.26 * bell_hov
+                } else {
+                    bell_hov
+                },
             );
         }
         icons::draw(
@@ -5580,14 +5854,16 @@ impl Shell {
             bell.x + (bell.w - 18) / 2 + bell_shift,
             bell.y + (bell.h - 18) / 2 + bell_shift,
             18,
-            Some(if self.toast.is_some() {
+            Some(if let Some((t_fg, t_muted)) = tray_fg_override {
+                if self.toast.is_some() { 0xffe066 } else { t_fg.max(t_muted) }
+            } else if self.toast.is_some() {
                 self.theme.accent
             } else {
                 self.theme.text_dim
             }),
         );
         if !is_win98 {
-            if is_vortex {
+            if is_vortex || tray_fg_override.is_some() {
                 canvas.fill_alpha(Rect::new(layout.clock_sep_x, sep_y, 1, sep_h), 0x0a1420, 0.25);
                 canvas.fill_alpha(Rect::new(layout.clock_sep_x + 1, sep_y, 1, sep_h), 0xffffff, 0.36);
             } else {
@@ -5623,12 +5899,16 @@ impl Shell {
         } else {
             (w - 14) as f32
         };
-        let clock_fg = if is_vortex {
+        let clock_fg = if let Some((t_fg, _)) = tray_fg_override {
+            t_fg
+        } else if is_vortex {
             if self.theme.is_dark() { 0xf4f8fc } else { 0x0d1826 }
         } else {
             self.theme.text
         };
-        let date_fg = if is_vortex {
+        let date_fg = if let Some((_, t_muted)) = tray_fg_override {
+            t_muted
+        } else if is_vortex {
             if self.theme.is_dark() { 0xc0d0e0 } else { 0x1e2c3e }
         } else {
             self.theme.text_muted
@@ -5907,6 +6187,289 @@ impl Shell {
         self.sync_menu_ime_spot(search_caret);
     }
 
+    fn draw_menu_custom_two_column(&mut self, sm: &'static crate::theme::StartMenuSkin) {
+        let filtered = self.filtered_apps();
+        let canvas = &mut self.menu_canvas;
+        let (w, h) = (sm.width, sm.height);
+        let top_r = sm.top_radius;
+        let bot_r = sm.bottom_radius;
+        canvas.clear(sm.frame_border);
+
+        // 1. Top User Banner
+        let header_r = Rect::new(0, 0, w, sm.header_height);
+        sm.header_bg.paint(canvas, header_r, [top_r, top_r, 0, 0]);
+        if sm.header_top_sheen {
+            canvas.fill_alpha(Rect::new(4, 1, (w - 8).max(1), 2), 0xffffff, 0.42);
+            canvas.fill_alpha(Rect::new(6, 3, (w - 12).max(1), 1), 0xffffff, 0.18);
+        }
+        let avatar_box = Rect::new(10, (sm.header_height - 44) / 2, 44, 44);
+        canvas.rounded_rect(avatar_box, 4, 0xffffff, 0.96);
+        canvas.rounded_border(avatar_box, 4, sm.avatar_border, 0.95, 2);
+        icons::draw(
+            canvas,
+            Icon::SpaceLogo,
+            avatar_box.x + 6,
+            avatar_box.y + 6,
+            32,
+            None,
+        );
+        let identity = session_identity();
+        let shown_id = self.text.truncate(&identity, (w - 80) as f32, 14.5, Face::Bold);
+        let id_y = (sm.header_height / 2 + 5) as f32;
+        if let Some(sh) = sm.header_text_shadow {
+            self.text
+                .draw(canvas, &shown_id, 63.0, id_y + 1.0, 14.5, sh, Face::Bold);
+        }
+        self.text.draw(
+            canvas,
+            &shown_id,
+            62.0,
+            id_y,
+            14.5,
+            sm.header_text,
+            Face::Bold,
+        );
+
+        // 2. Two-column body (Left programs + Right system places)
+        let body_top = sm.header_height;
+        let body_h = (h - sm.footer_height - body_top).max(40);
+        let left_w = (w / 2 + 6).clamp(180, w - 140);
+        let left_pane = Rect::new(2, body_top, left_w, body_h);
+        let right_pane = Rect::new(2 + left_w, body_top, (w - 4 - left_w).max(40), body_h);
+        canvas.fill(left_pane, sm.left_bg);
+        canvas.fill(right_pane, sm.right_bg);
+        canvas.fill(
+            Rect::new(right_pane.x, body_top, 1, body_h),
+            sm.right_border_left,
+        );
+
+        // Center-fading 2px orange highlight divider under the header banner
+        if let Some(orange) = sm.orange_divider {
+            let mid = (w / 2).max(1);
+            for x in 2..(w - 2) {
+                let dist = (x - mid).abs() as f32 / mid as f32;
+                let a = (1.0 - dist).clamp(0.0, 1.0);
+                if a > 0.01 {
+                    canvas.fill_alpha(Rect::new(x, body_top, 1, 2), orange, a * 0.92);
+                }
+            }
+        }
+
+        // Left column: pinned + frequent applications
+        if filtered.is_empty() {
+            self.text.draw_centered(
+                canvas,
+                "未找到匹配的应用",
+                left_pane.x as f32 + left_pane.w as f32 * 0.5,
+                (body_top + 140) as f32,
+                12.0,
+                sm.left_subtext,
+                Face::Ui,
+            );
+        } else {
+            for (slot, &app_idx) in filtered.iter().take(7).enumerate() {
+                if slot == 2 {
+                    let sep_y = custom_menu_row_rect(sm, slot).y - 5;
+                    let l_mid = left_pane.x + left_pane.w / 2;
+                    for x in (left_pane.x + 10)..(left_pane.right() - 10) {
+                        let dist = (x - l_mid).abs() as f32 / (left_pane.w as f32 * 0.5);
+                        let a = (1.0 - dist).clamp(0.0, 1.0) * 0.22;
+                        canvas.fill_alpha(Rect::new(x, sep_y, 1, 1), 0x000000, a);
+                    }
+                }
+                let app = &APPS[app_idx];
+                let row = custom_menu_row_rect(sm, slot);
+                let hovered = self.hover == Hit::MenuRow(app_idx)
+                    || (slot == 0 && !self.menu_query.is_empty());
+                if hovered {
+                    canvas.fill(row, sm.item_hover_bg);
+                }
+                let title_fg = if hovered {
+                    sm.item_hover_text
+                } else {
+                    sm.left_text
+                };
+                let sub_fg = if hovered {
+                    sm.item_hover_text
+                } else {
+                    sm.left_subtext
+                };
+                icons::draw(canvas, app.icon, row.x + 6, row.y + 6, 30, None);
+                self.text.draw(
+                    canvas,
+                    app.name,
+                    (row.x + 42) as f32,
+                    (row.y + 18) as f32,
+                    12.0,
+                    title_fg,
+                    if slot < 2 { Face::Bold } else { Face::Ui },
+                );
+                let max_sub = (row.w - 46).max(30) as f32;
+                let sub_shown = self.text.truncate(app.subtitle, max_sub, 10.0, Face::Ui);
+                self.text.draw(
+                    canvas,
+                    &sub_shown,
+                    (row.x + 42) as f32,
+                    (row.y + 33) as f32,
+                    10.0,
+                    sub_fg,
+                    Face::Ui,
+                );
+            }
+        }
+
+        // Bottom of Left Column: All Programs badge + compact search input
+        let search_r = custom_menu_search_rect(sm);
+        let ap_sep_y = search_r.y - 26;
+        let l_mid = left_pane.x + left_pane.w / 2;
+        for x in (left_pane.x + 10)..(left_pane.right() - 10) {
+            let dist = (x - l_mid).abs() as f32 / (left_pane.w as f32 * 0.5);
+            let a = (1.0 - dist).clamp(0.0, 1.0) * 0.25;
+            canvas.fill_alpha(Rect::new(x, ap_sep_y, 1, 1), 0x000000, a);
+        }
+        self.text.draw(
+            canvas,
+            &sm.all_programs_label,
+            (left_pane.x + 38) as f32,
+            (search_r.y - 8) as f32,
+            11.5,
+            sm.left_text,
+            Face::Bold,
+        );
+        // Green triangle arrow next to "所有程序"
+        let ax = left_pane.x + 114;
+        let ay = search_r.y - 17;
+        for dy in 0..9 {
+            let span = (5 - (dy - 4_i32).abs()).max(1);
+            canvas.fill(Rect::new(ax, ay + dy, span, 1), sm.all_programs_arrow);
+        }
+
+        let search_caret = ui::text_input_ime(
+            canvas,
+            &mut self.text,
+            &self.theme,
+            search_r,
+            &self.menu_query,
+            &self.menu_ime_preedit,
+            "搜索程序...",
+            true,
+            Some(Icon::Search),
+        );
+
+        // Right column: Places & System Tools
+        for (i, place) in VORTEX_PLACES.iter().enumerate() {
+            if i == 3 {
+                let sep_y = custom_menu_place_rect(sm, i).y - 6;
+                let r_mid = right_pane.x + right_pane.w / 2;
+                for x in (right_pane.x + 10)..(right_pane.right() - 10) {
+                    let dist = (x - r_mid).abs() as f32 / (right_pane.w as f32 * 0.5);
+                    let a = (1.0 - dist).clamp(0.0, 1.0) * 0.65;
+                    canvas.fill_alpha(Rect::new(x, sep_y, 1, 1), sm.right_border_left, a);
+                }
+            }
+            let pr = custom_menu_place_rect(sm, i);
+            let hovered = self.hover == Hit::MenuPlace(i);
+            if hovered {
+                canvas.fill(pr, sm.item_hover_bg);
+            }
+            let fg = if hovered {
+                sm.item_hover_text
+            } else {
+                sm.right_text
+            };
+            icons::draw(canvas, place.icon, pr.x + 6, pr.y + 6, 22, None);
+            self.text.draw(
+                canvas,
+                place.label,
+                (pr.x + 34) as f32,
+                (pr.y + 21) as f32,
+                11.5,
+                fg,
+                if i < 3 { Face::Bold } else { Face::Ui },
+            );
+        }
+
+        // 3. Bottom Footer Bar with Iconic Square Logout / Reboot / Turn Off Computer Badges
+        let footer_r = Rect::new(0, h - sm.footer_height, w, sm.footer_height);
+        sm.footer_bg.paint(canvas, footer_r, [0, 0, bot_r, bot_r]);
+        let (logout, reboot, power_off, confirm_cancel, confirm_ok) =
+            custom_menu_footer_rects(sm);
+        if let Some(action) = self.menu_confirm_power {
+            let (prompt, ok_label, ok_icon) = match action {
+                PowerAction::Reboot => ("确认重新启动计算机？", "重启", Icon::Refresh),
+                PowerAction::PowerOff => ("确认关闭计算机？", "关机", Icon::Shutdown),
+            };
+            self.text.draw(
+                canvas,
+                prompt,
+                14.0,
+                (footer_r.y + 26) as f32,
+                12.0,
+                sm.footer_text,
+                Face::Bold,
+            );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                confirm_cancel,
+                "取消",
+                None,
+                false,
+                self.hover == Hit::ConfirmPowerCancel,
+            );
+            ui::button(
+                canvas,
+                &mut self.text,
+                &self.theme,
+                confirm_ok,
+                ok_label,
+                Some(ok_icon),
+                true,
+                self.hover == Hit::ConfirmPowerOk,
+            );
+        } else {
+            for (btn_r, badge_surf, icon, label, hit_kind) in [
+                (logout, &sm.logout_badge, Icon::Logout, "注销", Hit::Logout),
+                (reboot, &sm.reboot_badge, Icon::Refresh, "重启", Hit::Reboot),
+                (
+                    power_off,
+                    &sm.shutdown_badge,
+                    Icon::Shutdown,
+                    "关闭计算机",
+                    Hit::PowerOff,
+                ),
+            ] {
+                let hov = self.hover == hit_kind;
+                if hov {
+                    canvas.rounded_rect(btn_r, 3, 0x103896, 0.55);
+                }
+                let badge = Rect::new(btn_r.x + 3, btn_r.y + (btn_r.h - 22) / 2, 22, 22);
+                badge_surf.paint(canvas, badge, [3; 4]);
+                icons::draw(canvas, icon, badge.x + 3, badge.y + 3, 16, Some(0xffffff));
+                self.text.draw(
+                    canvas,
+                    label,
+                    (badge.right() + 5) as f32,
+                    (btn_r.y + 19) as f32,
+                    11.5,
+                    sm.footer_text,
+                    Face::Ui,
+                );
+            }
+        }
+
+        // Outer Frame Border
+        canvas.rounded_border_corners(
+            Rect::new(0, 0, w, h),
+            [top_r, top_r, bot_r, bot_r],
+            sm.frame_border,
+            1.0,
+            2,
+        );
+        self.sync_menu_ime_spot(search_caret);
+    }
+
     fn draw_menu(&mut self) {
         if self.config.panel_start_fullscreen {
             let host = ShellConfigHost::new(&self.x, &mut self.config, &mut self.ux_client);
@@ -5924,6 +6487,12 @@ impl Shell {
                 .ime_spot(i32::from(self.x.width), i32::from(self.x.height));
             self.sync_menu_ime_spot(caret);
             return;
+        }
+        if let Some(ref sm) = self.theme.skin().and_then(|s| s.start_menu.as_ref()) {
+            if sm.layout == crate::theme::StartMenuLayoutKind::TwoColumn {
+                self.draw_menu_custom_two_column(sm);
+                return;
+            }
         }
         if self.theme.is_vortexglass() {
             self.draw_menu_vortex();
@@ -6270,7 +6839,7 @@ impl Shell {
             let r = if self.config.panel_start_fullscreen {
                 area
             } else {
-                Rect::new(6, self.menu_y(), area.w, area.h).expand(16)
+                Rect::new(self.menu_x(), self.menu_y(), area.w, area.h).expand(16)
             };
             self.comp.mark_dirty(r);
             return Ok(());
@@ -6500,7 +7069,7 @@ impl Shell {
             } else {
                 self.comp.mark_dirty(
                     Rect::new(
-                        6,
+                        self.menu_x(),
                         self.menu_y(),
                         self.menu_canvas.width as i32,
                         self.menu_canvas.height as i32,
@@ -7423,7 +7992,7 @@ impl Shell {
             let (mx, base_y) = if fullscreen {
                 (0, 0)
             } else {
-                (6, self.menu_y())
+                (self.menu_x(), self.menu_y())
             };
             let slide = if fullscreen {
                 0

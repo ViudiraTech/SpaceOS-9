@@ -17,6 +17,7 @@ license = "LicenseRef-Proprietary"
 spime = { path = "../spime" }
 uxconf = { package = "spui", path = "../desktop" }
 x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "render", "shape", "randr", "composite", "damage", "xfixes"] }
+toml = "0.8"
 ttf-parser = "0.25"
 ab_glyph_rasterizer = "0.1"
 resvg = { version = "0.45", default-features = false }

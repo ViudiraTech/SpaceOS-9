@@ -15,8 +15,17 @@ install -d -m 0755 \
 
 install -m 0644 "$ROOT/packages/theme-winxp/theme.toml" \
     "$STAGE/usr/share/spui/themes/winxp/theme.toml"
-install -m 0644 "$ROOT/packages/theme-winxp/bliss.svg" \
-    "$STAGE/usr/share/spui/themes/winxp/bliss.svg"
+for svg in \
+    bliss.svg \
+    xp-flag.svg \
+    close.svg close_hover.svg close_active.svg \
+    minimize.svg minimize_hover.svg minimize_active.svg \
+    maximize.svg maximize_hover.svg maximize_active.svg \
+    restore.svg restore_hover.svg restore_active.svg
+do
+    install -m 0644 "$ROOT/packages/theme-winxp/$svg" \
+        "$STAGE/usr/share/spui/themes/winxp/$svg"
+done
 install -m 0644 "$ROOT/packages/theme-winxp/winxp-bliss.jpg" \
     "$STAGE/usr/share/spui/wallpapers/winxp-bliss.jpg"
 install -m 0644 "$ROOT/packages/theme-winxp/README.md" \

@@ -521,6 +521,60 @@ pub fn decode_jpeg(path: &Path) -> Option<Sprite> {
     }
 }
 
+/// Decode an SVG file from disk into a premultiplied ARGB [`Sprite`], using either its
+/// intrinsic SVG `viewBox` dimensions or `target_size`.
+pub fn decode_svg_file(path: &Path, target_size: Option<(u32, u32)>) -> Option<Sprite> {
+    let xml = fs::read_to_string(path).ok()?;
+    decode_svg_str(&xml, target_size)
+}
+
+/// Decode an SVG string into a premultiplied ARGB [`Sprite`].
+pub fn decode_svg_str(xml: &str, target_size: Option<(u32, u32)>) -> Option<Sprite> {
+    let tree = Tree::from_str(xml, &Options::default()).ok()?;
+    let ts = tree.size();
+    let (w, h) = target_size.unwrap_or_else(|| {
+        (
+            ts.width().round().clamp(1.0, 1024.0) as u32,
+            ts.height().round().clamp(1.0, 1024.0) as u32,
+        )
+    });
+    let mut pixmap = Pixmap::new(w.max(1), h.max(1))?;
+    let sx = w as f32 / ts.width().max(1.0);
+    let sy = h as f32 / ts.height().max(1.0);
+    resvg::render(&tree, Transform::from_scale(sx, sy), &mut pixmap.as_mut());
+    Some(Sprite::from_rgba_premul(w, h, pixmap.data()))
+}
+
+/// Decode a theme package sprite asset (`.svg`, `.png`, or `.jpg`/`.jpeg`).
+pub fn decode_theme_asset(path: &Path, target_size: Option<(u32, u32)>) -> Option<Sprite> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)?;
+    match ext.as_str() {
+        "svg" => decode_svg_file(path, target_size),
+        "png" => {
+            let sp = decode_png(path)?;
+            if let Some((tw, th)) = target_size {
+                if sp.width != tw || sp.height != th {
+                    return Some(sp.scale_bilinear(tw.max(1), th.max(1)));
+                }
+            }
+            Some(sp)
+        }
+        "jpg" | "jpeg" => {
+            let sp = decode_jpeg(path)?;
+            if let Some((tw, th)) = target_size {
+                if sp.width != tw || sp.height != th {
+                    return Some(sp.scale_bilinear(tw.max(1), th.max(1)));
+                }
+            }
+            Some(sp)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
