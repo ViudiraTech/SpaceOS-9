@@ -9,6 +9,9 @@
 /user/spui_ui/target/
 /build/
 
+# Locally generated spk repository artifacts and signing keys.
+/repo/
+
 # Local demos / unmerged scratch demos.
 /pelican-bicycle/
 

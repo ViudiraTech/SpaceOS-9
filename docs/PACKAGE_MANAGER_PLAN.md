@@ -1,0 +1,775 @@
+# SpaceOS-9 原生包管理器（spk）完整执行计划
+
+> 状态：设计定稿草案，未开始实现。
+> 来源：本文件由 Uinxed-Kernel 会话整理，供 SpaceKernel 会话继续执行。
+> 目标仓库：`~/Project/SpaceKernel`。
+> 托管：FadeHost Standard（app `goutoustdio`，域名 `https://goutoustdio.top`）。
+
+## 0. 定位与原则
+
+`spk` 是 SpaceOS-9 的原生包管理器，目标是成为**完整、可长期维护**的系统组件，而不是最小演示。
+
+设计原则：
+
+1. **语义完整**：依赖求解、冲突/替代/提供、文件冲突、conffile、安装脚本、钩子/触发器、签名信任、镜像、回滚、修复、多架构、离线仓库，全部纳入设计。
+2. **风格向 pacman / apk 看齐**：输出短、直接、可脚本化；不使用 apt 的冗长 “Reading package lists... / The following NEW packages will be installed...” 文案。
+3. **事务正确性优先**：任何失败都必须能回滚；文件数据库与磁盘状态一致；崩溃可恢复。
+4. **可复现**：包、索引、ISO 都能从源码重复构建。
+5. **安全默认**：签名索引、逐文件哈希、路径逃逸防护、脚本沙箱、setuid 白名单。
+
+## 1. 能力清单（完整目标）
+
+仓库与同步：
+
+- 多仓库、优先级、镜像与故障切换；本地目录仓库（ISO/离线）。
+- 同步数据库、增量更新、索引签名与信任链。
+- 包检索、按名称/提供者/文件查询。
+
+安装与变更：
+
+- install / remove / upgrade / downgrade / reinstall。
+- 依赖求解（含冲突、替代、提供、虚拟包）、事务集合计算。
+- 文件冲突检测、目录共享、conffile 三向合并策略。
+- 安装脚本、post-transaction hooks、文件触发器（triggers）。
+- 原子安装、失败回滚、断电/中断恢复、`repair`。
+- 升级前备份、降级、保留旧包。
+
+质量与安全：
+
+- 逐文件 SHA-256、包签名、索引签名、密钥轮换/吊销。
+- `verify`（文件数据库校验）、`check`（依赖完整性）、`audit`（历史记录）。
+- 路径逃逸/符号链接逃逸/设备文件防护；setuid 默认拒绝。
+- 脚本沙箱（命名空间/只读源/超时/禁网，按需）。
+
+其他：
+
+- 多架构（x86_64 / aarch64 / riscv64）独立索引与交叉构建。
+- 并行下载、Range 断点续传、缓存与保留策略。
+- 完整日志、事务 ID、可解析输出（`--json`）、退出码。
+- 本地化（默认英文，提供 zh_CN 等 gettext 目录）。
+- 前端接口：CLI 为第一前端；GUI/系统更新器通过稳定 CLI/daemon 接口接入。
+
+## 2. 术语与命名
+
+- `spk`：包管理器二进制；`spkd`（可选）：常驻下载/事务代理。
+- `.spk`：包文件，tar + zstd。
+- `index.json`：每个仓库/架构的包索引；`index.json.sig`：分离签名。
+- `world`：用户显式安装的包集合（类似 pacman 的 world / apk 的 world）。
+- `transaction`：一次安装/卸载/升级的完整事务，带唯一 `txid`。
+- `conffile`：配置文件，升级时保留用户修改。
+- `hook`/`trigger`：包安装后按条件执行的系统动作。
+
+## 3. 包格式规范
+
+### 3.1 结构
+
+```
+foo-1.2.3-1-x86_64.spk
+├── manifest.toml          # 必需
+├── .INSTALL               # 可选：pre/post install/upgrade/remove 脚本
+├── .CHANGELOG             # 可选
+├── .BUILDINFO             # 可选：构建环境、源码、编译器版本
+├── usr/bin/foo
+├── usr/lib/libfoo.so
+└── usr/share/foo/...
+```
+
+- tar 条目排序、mtime、uid/gid 固定，保证可复现。
+- 路径必须相对、无 `..`、无绝对路径、无设备/FIFO；符号链接目标不得逃逸安装根。
+- 文件模式/属主记录在 manifest；setuid/setgid 默认剥离，manifest 显式 `allow_setuid` 才保留。
+- 硬链接安排在 P2 之后支持；P1 先按普通文件处理并告警。
+
+### 3.2 manifest.toml
+
+```toml
+name = "foo"
+epoch = 0
+version = "1.2.3"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "..."
+description = "..."
+license = "MIT"
+url = "https://..."
+packager = "..."
+build_date = 1760000000
+
+depends = ["bar>=2.0", "baz"]
+provides = ["foo-abi=1"]
+conflicts = ["foo-legacy"]
+replaces = ["foo-old"]
+
+conffiles = ["/etc/foo.conf"]
+scripts = true
+allow_setuid = false
+
+[[files]]
+path = "/usr/bin/foo"
+mode = "0755"
+uid = 0
+gid = 0
+sha256 = "..."
+size = 12345
+```
+
+- `files` 由 `spk build` 扫描 staging 自动生成；手工清单仅用于校验。
+- 依赖语法：`name`、`name=1.2.3-1`、`name>=1.2`、`name<2`、`name>1`、`name<=2`；`provides` 支持虚拟包与 ABI（`splibc-abi=1`）。
+- `conflicts`/`replaces` 进入求解器；`replaces` 可在同一事务中替换旧包。
+- 可选 `optdepends`（仅展示，不强制）。
+
+### 3.3 脚本约定
+
+`.INSTALL` 支持：
+
+- `pre_install` / `post_install`
+- `pre_upgrade` / `post_upgrade`
+- `pre_remove` / `post_remove`
+
+约定：
+
+- 脚本以 `/bin/sh` 执行，传入 `$1`（新版本）等参数，风格类似 pacman。
+- 默认在受限环境运行：只读源根 + staging 根、无网络、超时、独立进程组。
+- manifest `scripts = true` 才允许；签名索引必须覆盖脚本。
+- 失败策略：`pre_*` 失败中止事务；`post_*` 失败记录并回滚（可配置）。
+
+## 4. 仓库规范
+
+### 4.1 布局
+
+```
+/spaceos/repo/
+├── x86_64/
+│   ├── index.json
+│   ├── index.json.sig
+│   ├── foo-1.2.3-1-x86_64.spk
+│   └── ...
+├── aarch64/
+└── riscv64/
+```
+
+可选的 per-repo 元数据：
+
+```
+/pool/<name>/<filename>        # 大仓库可用 pool 布局
+/deltas/<from>-<to>.spkdelta  # 可选增量
+```
+
+### 4.2 index.json
+
+```json
+{
+  "schema": 1,
+  "repo": "spaceos-main",
+  "arch": "x86_64",
+  "generated_at": 1760000000,
+  "key_id": "ed25519:...",
+  "packages": [
+    {
+      "name": "foo",
+      "epoch": 0,
+      "version": "1.2.3",
+      "release": 1,
+      "arch": "x86_64",
+      "abi": "spaceos-1",
+      "filename": "foo-1.2.3-1-x86_64.spk",
+      "size": 12345,
+      "sha256": "...",
+      "depends": ["bar>=2.0"],
+      "provides": ["foo-abi=1"],
+      "conflicts": [],
+      "replaces": [],
+      "summary": "..."
+    }
+  ]
+}
+```
+
+- `index.json.sig` 为分离签名，覆盖 index 原文；客户端按 `key_id` 查信任库。
+- 仓库可提供 `index.json.zst` 压缩版，客户端优先取压缩版。
+- 镜像：同一仓库可有多个 URL；客户端按优先级/延迟切换，签名保证一致性。
+- 保留策略：每个包保留最近 N 个版本（默认 3），`.spk` 内容不可变，长缓存。
+
+## 5. 依赖与求解
+
+### 5.1 版本比较
+
+- 顺序：`epoch` > `version` > `release`。
+- `version` 按点分段：数字段按数值比较，字母段按字典序，数字段大于字母段（类 Arch/alpm 规则）。
+- 提供者约束：`provides` 可带版本；虚拟包版本参与比较。
+
+### 5.2 求解器
+
+目标：完整、可解释、可回滚的依赖求解。
+
+- 输入：world + 目标操作 + 仓库集合。
+- 约束：depends、conflicts、replaces、provides、已安装包、显式版本约束。
+- 算法：回溯 + 冲突驱动（类似 SAT/DPLL 思路）；对每个候选版本尝试，冲突时回溯；输出完整事务集合。
+- 失败时输出冲突链（pacman 风格）：
+  ```
+  :: installing foo (1.2.3-1) breaks dependency 'foo<1.2' required by bar
+  ```
+- 循环依赖：允许，按 SCC 处理（安装顺序内成环的包一起提交）。
+- 部分升级策略：默认拒绝（类似 pacman `-Syu` 的全量升级）；`--allow-partial` 仅调试用。
+- 求解结果可 `--print` 输出事务计划，供脚本消费。
+
+## 6. 数据库与事务
+
+### 6.1 状态文件
+
+```
+/var/lib/spk/
+├── installed.json        # name -> {version, arch, files, depends, ...}
+├── files.json            # path -> {pkg, sha256, mode, size}
+├── world.json            # 用户显式安装集合
+├── repos.json            # 仓库列表、优先级、最后同步时间
+├── journal               # 当前/最近事务日志（txid、阶段、已写文件）
+├── backup/<txid>/        # 升级前旧文件备份
+└── staging/<txid>/       # 解包暂存
+```
+
+- 所有状态文件：写临时文件 → `fsync` → `rename`；目录 fsync。
+- `journal` 记录每个阶段与已落地文件；`spk repair` 依据 journal 回滚或继续。
+- 锁：`/var/lib/spk/lock`（flock），同一时间只允许一个写事务。
+
+### 6.2 事务阶段
+
+1. `resolve`：求解、生成计划、用户确认。
+2. `download`：并行下载到 `/var/cache/spk`，校验 sha256。
+3. `verify`：校验包签名/索引签名、manifest 与文件哈希。
+4. `stage`：解包到 staging，做路径安全检查。
+5. `conflict`：文件冲突、目录/文件类型冲突、conffile 冲突。
+6. `backup`：备份将被覆盖/删除的旧文件。
+7. `commit`：逐文件原子写入（临时文件 + rename），更新权限/属主。
+8. `scripts`：按顺序执行 pre/post 脚本。
+9. `db`：更新 `files.json`/`installed.json`/`world.json`。
+10. `hooks`：运行 post-transaction hooks 与文件触发器。
+11. `cleanup`：清理 staging、旧缓存、写审计日志。
+
+失败处理：
+
+- 阶段 1–4 失败：无系统变更。
+- 阶段 5–9 失败：按 journal 逆序回滚，恢复 backup。
+- 阶段 10 失败：记录错误，事务仍视为已提交；提供 `spk repair --hooks` 重跑。
+
+### 6.3 conffile 策略
+
+- 首次安装：写入文件，记录 hash。
+- 升级：用户未改 → 覆盖；用户改过且新版本也改 → 生成 `.spksave` 并提示；用户改过但新版本未改 → 保留。
+- 卸载：默认保留 conffile（改名 `.spksave`），`--purge` 删除。
+- 提供 `--diff` 查看差异。
+
+### 6.4 卸载与共享目录
+
+- 反序删除文件；目录仅在空时删除。
+- 多包共享的目录不删除；文件所有权数据库精确到路径。
+- `--recursive` 卸载无依赖者的孤立依赖（类似 `pacman -Rs`）。
+
+## 7. 钩子与触发器
+
+### 7.1 post-transaction hooks（pacman 风格）
+
+声明式钩子，放在 `/etc/spk/hooks.d/*.hook` 或包内：
+
+```ini
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/lib/firmware/*
+
+[Action]
+Description = Updating firmware index...
+When = PostTransaction
+Exec = /usr/bin/spk-firmware-index
+```
+
+- `Operation`：Install/Upgrade/Remove。
+- `Type`：Package/Path。
+- 按 `When`（PreTransaction/PostTransaction）执行；输出风格类似 pacman “Running post-transaction hooks...”。
+
+### 7.2 文件触发器（apk 风格）
+
+包可声明 trigger（例如 `busybox` 的 applet 链接）：
+
+```
+trigger = ["/bin/*"]
+```
+
+安装/卸载命中路径后，先收集，再统一执行一次，输出：
+
+```
+Executing busybox-1.36.1-r5.trigger
+```
+
+### 7.3 脚本沙箱
+
+- 默认：`chroot` 到 staging + 只读源根，禁用网络，超时 60s，限制输出。
+- `--no-sandbox-scripts` 仅调试；签名索引 + 显式 `scripts = true` 才能运行。
+
+## 8. 签名与信任
+
+- 仓库密钥：ed25519；`index.json.sig` 分离签名；包本身可选内嵌签名。
+- 客户端信任库：`/etc/spk/trusted.d/<key_id>.pub`；ISO 内置初始公钥。
+- 信任级别：`trusted` / `marginal` / `revoked`；`require_signature` 默认 true。
+- 密钥轮换：新旧双签过渡；吊销列表随索引发布。
+- 防降级：索引可带 `min_version`/`revoked_versions`；客户端拒绝已知坏版本。
+- 首次信任（TOFU）仅允许在显式 `--trust-key` 时使用，并记录告警。
+
+## 9. CLI 规格
+
+### 9.1 命令
+
+```
+spk sync / update                 # 同步索引
+spk install <pkg>...              # 安装（可带版本约束）
+spk remove <pkg>...               # 卸载
+spk upgrade [<pkg>...]            # 升级
+spk reinstall <pkg>...
+spk downgrade <pkg>=<ver>
+spk list / info / search / files / owns
+spk verify / check / repair / audit
+spk repo add|remove|list|priority
+spk build <dir> -o <out.spk>
+spk index <repo-dir> --sign <key>
+spk keygen / sign / trust
+spk clean / cache
+spk --print / --json / --noconfirm / --dry-run
+```
+
+### 9.2 退出码
+
+- 0 成功
+- 1 一般错误
+- 2 用法错误
+- 3 签名/校验失败
+- 4 依赖/冲突失败
+- 5 文件冲突
+- 6 事务回滚（系统已恢复）
+
+### 9.3 输出原则
+
+- 短、可解析、可脚本化；默认英文，gettext 支持 zh_CN。
+- 面向人的进度用 `::` 前缀（pacman 风格），包操作用 `(n/m)` 计数（apk/pacman 风格）。
+- 错误用 `error:` / `ERROR:`，警告用 `warning:` / `WARNING:`，保持与经典工具一致的辨识度。
+- 不使用 apt 的 “Reading package lists... / Building dependency tree... / The following NEW packages will be installed:” 风格。
+
+## 10. 经典文案（pacman / apk 风格）
+
+以下为 `spk` 输出文案基线；中文本地化保持同样结构。
+
+### 10.0 文案混合规则
+
+`spk` 的文案是**有意混合** pacman 与 apk 的经典句式，按场景分工，避免同一类信息出现两种风格：
+
+| 场景 | 采用 | 基线示例 |
+| --- | --- | --- |
+| 同步、升级摘要、事务确认、post-transaction hooks | pacman | `:: Synchronizing package databases...`、`Packages (n)`、`:: Proceed with installation? [Y/n]`、`:: Running post-transaction hooks...` |
+| 单包安装/升级/删除、完成语、文件触发器 | apk | `(1/1) Installing foo (1.2.3-r0)`、`Executing foo-1.2.3-r0.trigger`、`OK: 123 MiB in 45 packages` |
+| 索引缺失、依赖不可满足 | apk | `WARNING: Ignoring index.json: No such file or directory`、`ERROR: unsatisfiable constraints:` |
+| 目标不存在、事务/文件冲突、签名未知信任 | pacman | `error: target not found: foo`、`error: failed to prepare transaction`、`error: signature from "..." is unknown trust` |
+| sudo 首次训诫 | sudo / ReliefOS zh_CN | 见 10.6 |
+| zh_CN 同步与无变更 | pacman zh_CN | `:: 正在同步软件包数据库...`、` 今日无事可做` |
+
+规则：
+
+- `::` 只用于阶段标题（pacman 风格）；包级进度统一 `(n/m)`（apk/pacman 共用）。
+- 包操作动词固定为 `Installing` / `Upgrading` / `Removing` / `Reinstalling`（apk 风格）；结束语统一 `OK: N MiB in M packages`。
+- 事务类错误用 `error:` / `warning:`；索引/约束类用 `ERROR:` / `WARNING:`。同一类信息不要混用两种前缀。
+- 中文：同步、升级摘要、无变更沿用 pacman zh_CN；apk 风格的行可以保留英文，或按统一术语表翻译，但不得逐条混搭。
+- 不使用 apt 的 “Reading package lists...” / “The following NEW packages will be installed” 风格。
+
+### 10.1 同步与事务摘要（pacman 风格）
+
+```
+:: Synchronizing package databases...
+ core is up to date
+ extra is up to date
+:: Starting full system upgrade...
+resolving dependencies...
+looking for conflicting packages...
+
+Packages (2) foo-1.2.3-1  bar-2.0-1
+
+Total Download Size:    1.23 MiB
+Total Installed Size:   4.56 MiB
+Net Upgrade Size:       0.78 MiB
+
+:: Proceed with installation? [Y/n]
+(2/2) checking keys in keyring
+(2/2) checking package integrity
+(2/2) loading package files
+(2/2) checking for file conflicts
+(2/2) checking available disk space
+:: Processing package changes...
+(1/2) installing foo
+(2/2) installing bar
+:: Running post-transaction hooks...
+(1/1) Arming ConditionNeedsUpdate...
+```
+
+### 10.2 安装与结束语（apk 风格）
+
+```
+fetch https://goutoustdio.top/spaceos/repo/x86_64/index.json
+(1/1) Installing foo (1.2.3-r0)
+Executing foo-1.2.3-r0.trigger
+OK: 123 MiB in 45 packages
+```
+
+### 10.3 错误与警告（两家的经典句式）
+
+```
+error: target not found: foo
+error: failed to prepare transaction (could not satisfy dependencies)
+:: installing foo (1.2.3-1) breaks dependency 'foo<1.2' required by bar
+error: package 'foo' is not installed
+error: signature from "SpaceOS Build <build@spaceos>" is unknown trust
+warning: /etc/foo.conf installed as /etc/foo.conf.spksave
+
+WARNING: Ignoring index.json: No such file or directory
+ERROR: unsatisfiable constraints:
+  foo (missing):
+    required by: world[foo]
+WARNING: This spk-tools is OLD! Some packages might not function properly
+```
+
+### 10.4 卸载/查询
+
+```
+checking dependencies...
+
+Packages (1) foo-1.2.3-1
+
+Total Removed Size:  4.56 MiB
+
+:: Do you want to remove these packages? [Y/n]
+(1/1) removing foo
+```
+
+```
+Name            : foo
+Version         : 1.2.3-1
+Architecture    : x86_64
+Depends On      : bar>=2.0  baz
+Provides        : foo-abi=1
+Installed Size  : 4.56 MiB
+Install Date    : ...
+Install Reason  : Explicitly installed
+```
+
+### 10.5 约定
+
+- 确认提示统一 `[Y/n]`；`--noconfirm` 跳过。
+- 进度计数 `(n/m)`；长操作可 append 百分比。
+- `::` 仅用于阶段标题；`error:`/`warning:` 前缀用于诊断。
+- 所有面向机器的信息支持 `--json`。
+
+### 10.6 sudo 首次训诫
+
+```
+We trust you have received the usual lecture from the local System Administrator.
+It usually boils down to these three things:
+
+    #1) Respect the privacy of others.
+    #2) Think before you type.
+    #3) With great power comes great responsibility.
+```
+
+中文（zh_CN，取自 ReliefOS / Alpine 系发行版的经典本地化文案，作为 `spk` 与 `sudo` 的中文基线）：
+
+```
+我们信任您已经从系统管理员那里了解了日常注意事项。
+总结起来无外乎这三点：
+
+    #1) 尊重别人的隐私。
+    #2) 输入前要先考虑（后果和风险）。
+    #3) 权力越大，责任越大。
+
+为安全起见，您键入的密码将不可见。
+
+密码：
+```
+
+- `lecture = once|always|never`，默认 once（按用户）。
+- `lecture_file` 可覆盖默认文案；`sudo -k` 不清除训诫记录。
+- 实现细节见第 20 节。
+
+### 10.7 pacman 中文基线（zh_CN）
+
+`spk` 的 zh_CN 文案直接对齐 pacman 的经典翻译，保持“短、直接”的风格：
+
+```
+:: 正在同步软件包数据库...
+ core 已经是最新版本
+ extra 已经是最新版本
+:: 正在进行全面系统更新...
+ 今日无事可做
+```
+
+完整事务：
+
+```
+正在解析依赖关系...
+正在查找软件包冲突...
+
+软件包 (2) foo-1.2.3-1  bar-2.0-1
+
+全部下载大小：    1.23 MiB
+全部安装大小：    4.56 MiB
+净更新大小：      0.78 MiB
+
+:: 进行安装吗？[Y/n]
+(1/1) 正在检查密钥环中的密钥
+(1/1) 正在检查软件包完整性
+(1/1) 正在加载软件包文件
+(1/1) 正在检查文件冲突
+(1/1) 正在检查可用磁盘空间
+:: 正在处理软件包的变化...
+(1/1) 正在安装 foo
+:: 正在运行事务后钩子...
+```
+
+约定：
+
+- “今日无事可做”是 pacman zh_CN 对 “ there is nothing to do” 的经典译法，`spk` 在无变更时沿用。
+- 包名后的状态用 “已经是最新版本”；错误用 `错误：`/`警告：` 或保留 `error:`/`warning:`，两者择一后全局统一。
+- 不使用 apt 的 “正在读取软件包列表... / 正在分析软件包的依赖关系树...” 风格。
+
+## 11. 构建集成
+
+- 包定义：`packages/<name>/manifest.toml` + 可选 `build.sh`；产物进 staging。
+- `tools/build_userland.sh` 产出 staging；`spk build` 生成 `files` 与 `.spk`。
+- Makefile：
+  - `make packages`：构建所有包。
+  - `make repo`：生成并签名索引。
+  - `make image`：用 `spk` 把 base 包装入 rootfs，生成文件数据库。
+- 可复现：`SOURCE_DATE_EPOCH`、排序 tar、固定 mtime/uid/gid、记录编译器与源码版本。
+- ISO 内置本地仓库（只读目录或 `/repo`），离线可安装；首次联网后加在线仓库。
+- CI：构建包 → 生成索引 → QEMU 安装测试 → 发布。
+
+## 12. FadeHost 托管（goutoustdio）
+
+`goutoustdio-site` 是 Express 应用，`server/index.js` 已有 `app.use(express.static(pub))`。增加持久盘路由：
+
+```js
+app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
+  index: false,
+  etag: true,
+  lastModified: true,
+  setHeaders(res, filePath) {
+    if (filePath.endsWith("index.json") || filePath.endsWith(".sig"))
+      res.set("Cache-Control", "no-cache");
+    else
+      res.set("Cache-Control", "public, max-age=31536000, immutable");
+  },
+}));
+```
+
+- `/data` 为 FadeHost 持久盘（Standard 10 GB，当前仅用 26 MB）。
+- URL：`https://goutoustdio.top/spaceos/repo/<arch>`。
+- 包文件放 `/data/spaceos/repo/`，不提交 Git。
+- 发布脚本：构建 → 签名 → 上传 GitHub Releases/R2 → app 内 `curl` 到 `/data` → 原子替换 index。
+- 10 GB 预算：只放 `.spk`/index/delta；保留 N-2 版本；70% 告警；大文件走 R2。
+- `public/CNAME` 目前是 `goutoustdio.rainyland.top`，使用 `goutoustdio.top` 时同步。
+- 备份 `/data/spaceos/repo` 到 R2；恢复流程写入运维文档。
+
+## 13. 安全模型
+
+- 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
+- 对策：签名索引 + 逐文件 hash + 路径/符号链接校验 + setuid 白名单 + 脚本沙箱 + 防降级 + 磁盘配额 + 事务回滚。
+- 信任边界：`spk` 以 root 运行；所有输入（index、manifest、tar、脚本）视为不可信。
+- 日志与审计：事务 ID、操作者、时间、包版本、结果；`spk audit` 可查。
+
+## 14. 性能与规模
+
+- 并行下载（默认 4 连接）、Range 续传、缓存校验。
+- 索引按架构拆分；大型仓库支持 zstd 压缩索引。
+- 文件数据库按路径排序存储，查找 O(log n) 或哈希索引。
+- 大量小文件安装使用批量 rename + 目录 fsync，避免逐文件全局锁。
+- 包解压流式处理，避免整包读入内存。
+
+## 15. 多架构
+
+- 每个 arch 独立 `index.json`；包名/版本相同但 arch 不同。
+- manifest 必填 `arch`；`abi` 与 `splibc` 版本参与依赖。
+- 交叉构建：`tools/build_*.sh` 产出对应 staging；`spk build --arch`。
+- 客户端只接受匹配当前 arch 的包；`--allow-foreign` 仅用于调试。
+
+## 16. 测试计划
+
+Host 侧（Rust 单元/集成）：
+
+- 版本比较、依赖求解、冲突/替代/提供、环检测。
+- 索引生成/签名/验签、manifest 校验、JSON schema。
+- tar 安全：`..`、绝对路径、符号链接逃逸、设备文件、超长路径、稀疏文件。
+- 事务状态机：每个阶段注入失败，验证回滚与 journal 恢复。
+
+QEMU 侧（扩展现有 `tools/qemu_test.py`）：
+
+- 安装/卸载/升级/降级/重装；孤立依赖清理。
+- 缺失依赖、冲突、文件冲突、conffile 三向合并。
+- 坏包（hash/签名/截断）、磁盘满、只读根、安装中 kill -9。
+- hooks/triggers 顺序与幂等；脚本沙箱逃逸测试。
+- 多架构镜像安装测试。
+
+模糊测试：
+
+- index.json/manifest.toml 解析；tar 路径；版本字符串。
+
+CI：
+
+- 构建 → 生成包/索引 → QEMU 全矩阵 → 发布仓库。
+
+## 17. 实施阶段（完整目标）
+
+### P0 规范与骨架
+
+- 定稿 manifest/index/DB schema；Rust workspace；`spk-host` 的 keygen/index/sign；单元测试。
+- 验收：本地仓库可生成、签名、验签。
+
+### P1 包与事务核心
+
+- tar/zstd、sha256、staging、文件 DB、锁、原子安装/回滚、journal。
+- `install/remove/list/info/files/owns`。
+- 验收：QEMU 本地仓库安装/卸载，中断后可 repair。
+
+### P2 求解器
+
+- 版本比较、depends/provides/conflicts/replaces、回溯求解、冲突链输出。
+- `upgrade/downgrade/reinstall`、world 一致性。
+- 验收：复杂依赖图、冲突、循环依赖测试全过。
+
+### P3 脚本、钩子、触发器
+
+- `.INSTALL`、hooks.d、文件 triggers、沙箱、幂等与失败策略。
+- 验收：busybox 式 trigger、升级脚本、沙箱逃逸测试。
+
+### P4 仓库与信任
+
+- 多仓库/镜像/优先级、索引压缩、签名信任库、密钥轮换/吊销、防降级。
+- 验收：坏签名/坏镜像/降级攻击被拒绝。
+
+### P5 构建与镜像
+
+- `make packages/repo/image`、可复现、ISO 内置仓库、base 包。
+- 验收：从零构建的 ISO 内 `spk verify` 全绿。
+
+### P6 运维与规模
+
+- 增量/delta（可选）、缓存保留、审计、`--json`、本地化、GUI 接口。
+- 验收：仓库规模/并发/磁盘配额测试通过。
+
+## 18. 目录结构建议
+
+```
+SpaceKernel/
+├── docs/PACKAGE_MANAGER_PLAN.md
+├── user/spk/                 # Rust workspace：spk（目标端） + spk-host
+│   ├── Cargo.toml
+│   ├── src/
+│   └── tests/
+├── packages/
+│   ├── base/manifest.toml
+│   └── hello/manifest.toml
+├── tools/
+│   ├── build_packages.sh
+│   └── publish_repo.sh
+└── repo/                     # 构建产物（gitignore）
+```
+
+## 19. 风险与开放问题
+
+- ABI 稳定性：`spaceos-1` 的升级策略；splibc 与 musl 两条用户态路线的边界。
+- `spk` 自身链接 splibc 还是 musl；若要求全原生，需要自定义 Rust target/sysroot。
+- 纯 Rust zstd（`ruzstd`）对大文件/多帧的性能；必要时用 C zstd 或未压缩 tar。
+- TLS 根证书与离线信任链；`rustls` 在 SpaceOS 上的 ring 后端可用性。
+- FadeHost `/data` 在 redeploy/迁移/备份恢复后的持久性需实测。
+- 10 GB 仓库容量与保留策略；R2 作为大文件后端的接入。
+- 多架构 CI 成本；交叉编译工具链。
+- 脚本沙箱在 SpaceOS 上的实现（命名空间/seccomp 等价物是否具备）。
+- 是否支持 `optdepends`、`replaces` 的完整语义（P2 前定稿）。
+
+## 20. 特权工具：sudo / doas（与 spk 同期）
+
+目标：SpaceOS 提供原生特权提升工具，兼容 sudo 常用用法，同时支持 doas 式极简配置；与 spk 的 setuid 白名单、conffile、包事务集成。
+
+### 20.1 前置条件
+
+- 内核支持 setuid exec，且 `spk` 允许 `sudo` 保留 setuid 位；若内核暂不支持，改用 `sudod` 守护进程 + Unix socket + `SO_PEERCRED`/`SCM_CREDENTIALS` 的模型。
+- `/etc/shadow`、密码哈希（sha512-crypt/yescrypt）、`/etc/passwd`、`/etc/group`。
+- TTY/会话标识、审计日志。
+
+### 20.2 CLI
+
+```
+sudo [-u user] [-g group] [-i|-s] [-E] [-k|-K] [-v] [-l] command [args...]
+sudo -e file...
+```
+
+- 默认只允许 `wheel`/`sudo` 组；策略来自 `/etc/sudoers` 子集或 `/etc/doas.conf`。
+- `-k` 清除 ticket，`-v` 延长，`-l` 列出规则，`-e` 安全编辑。
+- 环境：重置 PATH、清除 LD_*；`--preserve-env` 走白名单。
+
+### 20.3 认证与 ticket
+
+- 读取 shadow 校验密码；失败计数 + 指数退避 + 可配置锁定。
+- ticket 默认按 (user, tty) 15 分钟；`timestamp_type=tty|global`；文件放 `/run/sudo/ts/`，0600。
+- 无 TTY 默认拒绝交互式认证（可配置）。
+
+### 20.4 配置
+
+- `/etc/sudoers` 子集：`Defaults`、`User_Alias`、`Host_Alias`、`Cmnd_Alias`、`user host=(runas) NOPASSWD: cmd`。
+- doas 兼容：`/etc/doas.conf` 的 `permit|deny [nopass] [as user] cmd`。
+- 解析失败 fail closed；配置权限 0440 root。
+
+### 20.5 首次训诫（lecture）
+
+- `lecture = once|always|never`，默认 once；`lecture_file` 可覆盖。
+- 首次运行输出第 10.6 节的英文/中文训诫，并写入 timestamp。
+- `sudo -k` 不清除训诫记录（与 sudo 一致，可配置）。
+
+### 20.6 安全
+
+- setuid 二进制的环境、文件描述符、信号处理；禁止 PATH/LD_* 注入。
+- 命令使用绝对路径解析；`secure_path`。
+- 审计记录 user/tty/cwd/command/结果；可选日志后端。
+- 密码不回显；超时清理；Ctrl-C 不泄漏。
+
+### 20.7 打包与 spk 集成
+
+- `packages/sudo/`：二进制、`/etc/sudoers` 与 `/etc/doas.conf` 示例。
+- manifest `allow_setuid = true`，spk 安装时告警并记录到 DB。
+- hook：安装/升级前做 sudoers 语法检查（等价 `visudo -c`）。
+- 升级 sudo 时保留旧二进制备份，失败回滚。
+
+### 20.8 测试
+
+- 认证成功/失败/锁定/超时；ticket 过期与 `-k`。
+- sudoers/doas 规则矩阵、NOPASSWD、runas、命令别名。
+- 环境注入、PATH、fd 泄漏、无 TTY。
+- lecture once/always/never；zh_CN 文案。
+- setuid 安装/卸载/升级回滚。
+
+### 20.9 里程碑
+
+- 与 spk P1/P3 同期：先落地 `sudod`（或 setuid 版本），再做 sudoers/doas 解析、lecture、ticket、审计。
+- 验收：普通用户按规则执行命令；未授权拒绝；审计完整；spk 事务可回滚。
+
+## 21. 任务清单
+
+- [ ] 定稿 manifest/index/DB schema（第 3、4、6 节）。
+- [ ] 建 Rust workspace 与 `spk-host`：keygen/index/sign。
+- [ ] 实现 `.spk` 打包/解包、sha256、tar 安全检查。
+- [ ] 实现文件 DB、锁、原子安装、journal/repair。
+- [ ] 实现 `install/remove/list/info/files/owns` 并 QEMU 验证。
+- [ ] 实现版本比较与依赖求解器、冲突链输出。
+- [ ] 实现 `.INSTALL`、hooks.d、triggers、脚本沙箱。
+- [ ] 实现多仓库/镜像/签名信任/防降级。
+- [ ] 给 `goutoustdio-site` 提 `/spaceos/repo` 路由 PR，部署 `hello` 测试仓库。
+- [ ] 接入 `make packages/repo/image`，ISO 用包构建。
+- [ ] 接入 QEMU 测试矩阵与 CI。
+- [ ] 多架构与 R2 备份/大文件后端。
+- [ ] 实现 sudo/doas（认证、ticket、sudoers/doas.conf、lecture、审计）。
+- [ ] spk 支持 setuid 白名单与 sudoers 校验钩子。
+- [ ] sudo 安装/升级/回滚的 QEMU 测试。
