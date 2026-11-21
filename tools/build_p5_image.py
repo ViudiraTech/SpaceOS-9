@@ -123,7 +123,10 @@ def rootfs_skeleton(stage: pathlib.Path, epoch: int, repo: pathlib.Path, key_id:
     write_file(
         stage / "etc/systemg/console.service",
         "[Unit]\nDescription=Console shell\n\n[Service]\nType=simple\n"
-        "ExecStart=/bin/sh\nRestart=always\nRestartSec=1\n",
+        # Force interactive mode: SpaceKernel's /dev/console is a console
+        # inode without a full TTY ioctl surface, so BusyBox otherwise treats
+        # the inherited fd as a non-interactive pipe and never prints a prompt.
+        "ExecStart=/bin/sh -i\nRestart=always\nRestartSec=1\n",
     )
     write_file(
         stage / "etc/systemg/spk-verify.service",
