@@ -3,6 +3,6 @@
 # poll the mtime and reload their declarative theme when it changes.
 set -eu
 
-install -d -m 0755 /run
+mkdir -p /run
 touch /run/spui-theme.stamp
 chmod 0644 /run/spui-theme.stamp

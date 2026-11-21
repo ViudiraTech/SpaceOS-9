@@ -9,7 +9,7 @@
 name = "spk-runtime"
 epoch = 0
 version = "1.0.0"
-release = 2
+release = 3
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "spk package manager runtime for desktop images"
