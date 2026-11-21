@@ -396,6 +396,7 @@ pub struct Shell {
     last_net_refresh: Instant,
     last_launch: Option<(&'static str, Instant)>,
     last_composite: Instant,
+    theme_stamp: Option<std::time::SystemTime>,
     dirty_rects_buf: Vec<Rect>,
     comp_plan_buf: Vec<WinCompPlan>,
     capture_keep_buf: Vec<Window>,
@@ -1261,6 +1262,7 @@ impl Shell {
             last_net_refresh: Instant::now(),
             last_launch: None,
             last_composite: Instant::now() - Duration::from_millis(32),
+            theme_stamp: crate::theme::theme_reload_stamp(),
             dirty_rects_buf: Vec::with_capacity(16),
             comp_plan_buf: Vec::with_capacity(8),
             capture_keep_buf: Vec::with_capacity(16),
@@ -1783,6 +1785,23 @@ impl Shell {
         }
     }
 
+    fn reload_theme_pack(&mut self) -> Result<()> {
+        let prev = self.config.clone();
+        if let Some(missing) = crate::theme::fallback_missing_theme(&mut self.config) {
+            eprintln!(
+                "theme '{missing}' is no longer installed; falling back to the default theme"
+            );
+        }
+        if self.config != prev {
+            self.apply_live_config_diff(prev)?;
+        } else {
+            self.theme = Theme::from_config(&self.config);
+            self.reload_wallpaper(true);
+            self.comp.mark_full_dirty();
+        }
+        Ok(())
+    }
+
     fn poll_uxconf(&mut self) -> Result<()> {
         let prev = self.config.clone();
         let (mut changed, events) = self
@@ -1819,6 +1838,11 @@ impl Shell {
         const FRAME_BUDGET: Duration = Duration::from_millis(16);
         let mut comp_animating = false;
         while self.running {
+            let reload_stamp = crate::theme::theme_reload_stamp();
+            if reload_stamp != self.theme_stamp {
+                self.theme_stamp = reload_stamp;
+                self.reload_theme_pack()?;
+            }
             self.poll_uxconf()?;
 
             let mut net_dirty = false;

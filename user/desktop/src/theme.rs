@@ -35,6 +35,15 @@ pub const TASKBAR_HEIGHT: i32 = 46;
 pub const RADIUS_WINDOW: i32 = 6;
 pub const RADIUS_POPUP: i32 = 8;
 pub const RADIUS_CONTROL: i32 = 5;
+pub const THEME_RELOAD_STAMP: &str = "/run/spui-theme.stamp";
+
+/// Timestamp touched by the spk system hook after any theme/wallpaper package
+/// change.  SPUI reloads its theme when this changes.
+pub fn theme_reload_stamp() -> Option<SystemTime> {
+    fs::metadata(THEME_RELOAD_STAMP)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
 
 const SYSTEM_THEME_DIR: &str = "/usr/share/spui/themes";
 const USER_THEME_SUBDIR: &str = ".local/share/spui/themes";
