@@ -238,13 +238,11 @@ fn load_policy(
 
 fn command_for_shell(options: &Options) -> Vec<String> {
     if options.login || options.shell {
-        if options.command.is_empty() {
-            Vec::new()
-        } else {
-            options.command.clone()
-        }
-    } else {
         options.command.clone()
+    } else {
+        // exec::run already uses command[0] as the program; do not pass it
+        // again as argv[1].
+        options.command.get(1..).unwrap_or(&[]).to_vec()
     }
 }
 
@@ -646,4 +644,40 @@ fn write_file_atomically(
         let _ = directory.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(command: &[&str], login: bool, shell: bool) -> Options {
+        Options {
+            target_user: None,
+            target_group: None,
+            login,
+            shell,
+            preserve_env: false,
+            non_interactive: false,
+            stdin_password: false,
+            doas: false,
+            command: command.iter().map(|value| value.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn direct_command_does_not_repeat_the_program() {
+        assert_eq!(
+            command_for_shell(&options(&["spk", "sync"], false, false)),
+            vec!["sync".to_string()]
+        );
+    }
+
+    #[test]
+    fn shell_command_keeps_the_program() {
+        assert_eq!(
+            command_for_shell(&options(&["spk", "sync"], false, true)),
+            vec!["spk".to_string(), "sync".to_string()]
+        );
+        assert!(command_for_shell(&options(&[], true, false)).is_empty());
+    }
 }
