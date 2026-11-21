@@ -649,6 +649,15 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - `spk check` 校验磁盘属主/权限，`spk repair` 修正；QEMU 覆盖非 root 拒绝、sudo root:root 4755、repair
   - 旧 `base-1.0.0-2` 已从生产仓库删除；`SOURCE_DATE_EPOCH=1795255334`
 
+- 2026-11-21：`base 1.0.0-4` / `sudo 0.1.0-2`：中文 CLI、overwrite、locale 回退与 sudo argv 修复。
+  - `base-1.0.0-4-x86_64.spk`：sha256 `640db9caad39a023b258fb6aabe108e2d99b9b7f95db108fcd0642a4406e87a8`
+  - `sudo-0.1.0-2-x86_64.spk`：sha256 `05e6f49165a0dfc347986da765a9e14320a4d910b680cbf54a6b6991c11e4d4b`
+  - `index.json`：sha256 `52038a4e0c55ef514fa41e624155389a1df8b59aa8a5678876db6170b437c852`
+  - `index.json.sig`：sha256 `0e2f5ea5afa0c9bd0bdf29f6c399767195ebd25936399dddd7e91b2a6d53d9da`
+  - spk：中文 `--help`/错误、`--overwrite`/交互 y/N、`/etc/locale.conf` 语言回退
+  - sudo：修复 `command_for_shell` 重复传程序名（`sudo spk sync` 变成 `spk spk sync`）
+  - 旧 `base-1.0.0-3`、`sudo-0.1.0-1` 已从生产仓库删除
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
