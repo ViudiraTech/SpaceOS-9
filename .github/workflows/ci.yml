@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Rust toolchain and musl target
         run: |
-          rustup component add rust-src rustfmt
+          rustup component add rust-src rustfmt clippy
           rustup target add x86_64-unknown-linux-musl
       - name: Install QEMU, OVMF, ext4, ISO, musl and userland tools
         run: |
