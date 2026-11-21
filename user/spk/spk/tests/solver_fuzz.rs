@@ -15,6 +15,7 @@ use spk_core::manifest::Dependency;
 use spk_core::version::Version;
 use spk_ops::i18n::Lang;
 use spk_ops::repo::LoadedRepo;
+use spk_ops::security::SecurityState;
 use spk_ops::solver::{parse_spec, solve, Operation, Solution, TargetKind};
 use spk_ops::state::State;
 
@@ -46,6 +47,7 @@ fn package(
 fn repo(packages: Vec<IndexPackage>) -> LoadedRepo {
     let mut index = Index::new("fuzz", "x86_64", 0, "ed25519:0123456789abcdef");
     index.packages = packages;
+    let security = SecurityState::from_index(&index);
     LoadedRepo {
         name: "fuzz".into(),
         key_id: index.key_id.clone(),
@@ -53,6 +55,10 @@ fn repo(packages: Vec<IndexPackage>) -> LoadedRepo {
         index,
         priority: 0,
         order: 0,
+        security,
+        mirrors: Vec::new(),
+        package_cache: None,
+        offline: false,
     }
 }
 

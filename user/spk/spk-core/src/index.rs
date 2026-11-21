@@ -6,7 +6,7 @@
 //       Copyright (C) 2026 ViudiraTech.
 //
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -153,7 +153,22 @@ pub struct Index {
     pub arch: String,
     pub generated_at: u64,
     pub key_id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub min_version: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_versions: Vec<RevokedVersion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_keys: Vec<String>,
     pub packages: Vec<IndexPackage>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RevokedVersion {
+    pub name: String,
+    pub version: String,
+    #[serde(default)]
+    pub reason: String,
 }
 
 impl Index {
@@ -164,6 +179,9 @@ impl Index {
             arch: arch.to_string(),
             generated_at,
             key_id: key_id.to_string(),
+            min_version: BTreeMap::new(),
+            revoked_versions: Vec::new(),
+            revoked_keys: Vec::new(),
             packages: Vec::new(),
         }
     }
@@ -194,6 +212,43 @@ impl Index {
                 "malformed index key id '{}'",
                 self.key_id
             )));
+        }
+        for (name, version) in &self.min_version {
+            validate_package_name(name)?;
+            Version::parse(version).map_err(|error| {
+                Error::Index(format!("min_version for {name} is invalid: {error}"))
+            })?;
+        }
+        let mut revoked = BTreeSet::new();
+        for item in &self.revoked_versions {
+            validate_package_name(&item.name)?;
+            Version::parse(&item.version).map_err(|error| {
+                Error::Index(format!(
+                    "revoked version {} {} is invalid: {error}",
+                    item.name, item.version
+                ))
+            })?;
+            if !revoked.insert((item.name.clone(), item.version.clone())) {
+                return Err(Error::Index(format!(
+                    "duplicate revoked version {} {}",
+                    item.name, item.version
+                )));
+            }
+            if item.reason.chars().any(|ch| ch.is_control()) {
+                return Err(Error::Index(format!(
+                    "revoked version {} has a malformed reason",
+                    item.name
+                )));
+            }
+        }
+        let mut revoked_keys = BTreeSet::new();
+        for key in &self.revoked_keys {
+            if !is_valid_key_id(key) {
+                return Err(Error::Index(format!("malformed revoked key id '{key}'")));
+            }
+            if !revoked_keys.insert(key) {
+                return Err(Error::Index(format!("duplicate revoked key id '{key}'")));
+            }
         }
         let mut seen = BTreeSet::new();
         for package in &self.packages {

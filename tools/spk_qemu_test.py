@@ -56,6 +56,10 @@ def run(command, **kwargs):
 def cargo(command: list[str]) -> None:
     environment = os.environ.copy()
     environment["RUSTUP_TOOLCHAIN"] = "nightly-2026-05-24"
+    # ring/rustls needs a C toolchain for the musl target; clang can assemble
+    # the pre-generated objects without a musl-gcc wrapper.
+    environment.setdefault("CC_x86_64_unknown_linux_musl", "clang")
+    environment.setdefault("AR_x86_64_unknown_linux_musl", "ar")
     run(
         ["cargo", *command],
         cwd="/tmp",
@@ -64,6 +68,7 @@ def cargo(command: list[str]) -> None:
 
 
 def build_artifacts() -> None:
+    run(["make", "-C", str(ROOT), "modules", "ARCH=x86_64", "PROFILE=release"], cwd=ROOT)
     if not (ROOT / "build" / "userland" / "libsplibc.a").exists():
         run([str(ROOT / "tools" / "build_userland.sh")], cwd=ROOT)
     cargo(
@@ -270,10 +275,61 @@ def prepare_repositories() -> str:
                 str(key / "spk-bad-test.pub"),
             ]
         )
+    http_repo = BUILD / "repo-http"
+    http_repo.mkdir(parents=True)
+    for package in base.glob("*.spk"):
+        shutil.copy2(package, http_repo / package.name)
+    for name in ("http-pkg", "http-pkg-1.1"):
+        pack(
+            ROOT / "packages" / "spk-tests" / name / "manifest.toml",
+            ROOT / "build" / "spk-tests" / name,
+            http_repo,
+        )
+    run(
+        [
+            str(HOST_BIN),
+            "index",
+            "--repo-dir",
+            str(http_repo),
+            "--repo",
+            "qemu-test",
+            "--arch",
+            "x86_64",
+            "--key",
+            str(keys / "spk-test.key"),
+        ]
+    )
+    run(
+        [
+            str(HOST_BIN),
+            "verify",
+            "--repo-dir",
+            str(http_repo),
+            "--key",
+            str(keys / "spk-test.pub"),
+        ]
+    )
     return key_id
 
 
-def build_rootfs(key_id: str) -> None:
+def start_http_server(directory: pathlib.Path):
+    import http.server
+    import threading
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(directory), **kwargs)
+
+        def log_message(self, format, *args):
+            log("http " + (format % args))
+
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, server.server_address[1]
+
+
+def build_rootfs(key_id: str, http_base: str) -> None:
     stage = BUILD / "root"
     for directory in (
         "sbin",
@@ -281,6 +337,8 @@ def build_rootfs(key_id: str) -> None:
         "lib",
         "usr/bin",
         "usr/share/spk-tests",
+        "lib/modules",
+        "etc/ssl/certs",
         "etc/spk/trusted.d",
         "etc/spk/hooks.d",
         "var/log",
@@ -359,6 +417,17 @@ def build_rootfs(key_id: str) -> None:
         raise SystemExit(f"missing {sandbox_probe}; run packages/spk-tests/build.sh")
     shutil.copy2(sandbox_probe, stage / "usr/bin/sandbox-probe")
     (stage / "usr/bin/sandbox-probe").chmod(0o755)
+    module = ROOT / "build" / "modules" / "x86_64" / "e1000e.ko"
+    if not module.is_file():
+        raise SystemExit(f"missing {module}; run make modules ARCH=x86_64 PROFILE=release")
+    shutil.copy2(module, stage / "lib/modules/e1000e.ko")
+    (stage / "lib/modules/e1000e.ko").chmod(0o644)
+    (stage / "etc/spk-http-base").write_text(http_base + "\n")
+    (stage / "etc/spk-http-base").chmod(0o644)
+    ca_bundle = pathlib.Path("/etc/ssl/certs/ca-certificates.crt")
+    if ca_bundle.is_file():
+        shutil.copy2(ca_bundle, stage / "etc/ssl/certs/ca-certificates.crt")
+        (stage / "etc/ssl/certs/ca-certificates.crt").chmod(0o644)
     for directory in ("base", "update", "bad"):
         for package in (BUILD / f"repo-{directory}").iterdir():
             shutil.copy2(package, stage / "repo" / directory / package.name)
@@ -508,7 +577,7 @@ def boot(marker: str, timeout: float, log_path: pathlib.Path, accel: str) -> tup
         "none",
         "-no-reboot",
         "-nic",
-        "none",
+        "user,model=e1000e",
         "-drive",
         "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
         "-drive",
@@ -656,7 +725,9 @@ def main() -> int:
         if not arguments.no_build:
             build_artifacts()
             key_id = prepare_repositories()
-            build_rootfs(key_id)
+            http_server, http_port = start_http_server(BUILD / "repo-http")
+            http_base = f"http://10.0.2.2:{http_port}"
+            build_rootfs(key_id, http_base)
             build_iso()
         else:
             key_id = subprocess.check_output(

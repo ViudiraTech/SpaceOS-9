@@ -161,7 +161,7 @@ deps:
 	rustup target add $(TARGET)
 	cargo fetch --target $(TARGET)
 
-modules:
+modules: deps
 	@if [ "$(CONFIG_MODULES)" = "y" ]; then \
 	  tools/build_modules.sh "$(ARCH)" "$(MODULE_OUT)" "$(MODULE_LIST)"; \
 	else \

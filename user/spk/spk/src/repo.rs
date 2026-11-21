@@ -6,31 +6,127 @@
 //       Copyright (C) 2026 ViudiraTech.
 //
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use spk_core::fsutil::atomic_write;
 use spk_core::index::Index;
-use spk_core::keys::{read_signature, PublicKey};
+use spk_core::keys::{read_signature, verify_any, PublicKey, SignatureFile};
 
 use crate::error::{Result, SpkError};
+use crate::security::SecurityState;
 use crate::state::Paths;
 
 #[derive(Clone, Debug)]
 pub struct LoadedRepo {
     pub name: String,
     pub key_id: String,
+    /// Local repository directory, or the cached snapshot directory for a
+    /// remote repository.
     pub dir: PathBuf,
     pub index: Index,
     pub priority: i32,
     pub order: usize,
+    pub security: SecurityState,
+    /// Base URLs for remote mirrors; empty for a local repository.
+    pub mirrors: Vec<String>,
+    /// Content-addressed package cache, present for remote repositories.
+    pub package_cache: Option<PathBuf>,
+    pub offline: bool,
 }
 
 impl LoadedRepo {
-    pub fn package_path(&self, filename: &str) -> PathBuf {
-        self.dir.join(filename)
+    pub fn package_path(&self, package: &spk_core::index::IndexPackage) -> PathBuf {
+        match &self.package_cache {
+            Some(cache) => cache.join(format!("{}.spk", package.sha256)),
+            None => self.dir.join(&package.filename),
+        }
     }
+
+    pub fn allows(&self, package: &spk_core::index::IndexPackage) -> bool {
+        self.security.reason(package).is_none()
+    }
+
+    pub fn rejection(&self, package: &spk_core::index::IndexPackage) -> Option<String> {
+        self.security.reason(package)
+    }
+
+    pub fn ensure_package(&self, package: &spk_core::index::IndexPackage) -> Result<PathBuf> {
+        match &self.package_cache {
+            Some(cache) => {
+                crate::remote::ensure_package(cache, &self.mirrors, package, self.offline)
+            }
+            None => {
+                let path = self.dir.join(&package.filename);
+                if !path.is_file() {
+                    return Err(SpkError::General(format!(
+                        "repository file {} is missing",
+                        path.display()
+                    )));
+                }
+                Ok(path)
+            }
+        }
+    }
+}
+
+/// Verify a detached signature over an index using any trusted, non-revoked
+/// key. Missing signatures are accepted only with `--allow-unsigned`.
+pub fn verify_index_bytes(
+    paths: &Paths,
+    bytes: &[u8],
+    signature: Option<&SignatureFile>,
+    allow_unsigned: bool,
+) -> Result<String> {
+    let signature = match signature {
+        Some(signature) => signature,
+        None if allow_unsigned => {
+            eprintln!("warning: --allow-unsigned: index has no signature");
+            return Ok(String::new());
+        }
+        None => {
+            return Err(SpkError::Signature(
+                "repository index has no signature".into(),
+            ))
+        }
+    };
+    let keys = trust_keys(paths)?;
+    if keys.is_empty() {
+        return Err(SpkError::Signature(
+            "no trusted repository keys are configured".into(),
+        ));
+    }
+    let revoked = revoked_keys(paths)?;
+    let key_id = verify_any(bytes, signature, &keys, &revoked)?;
+    if signature.schema != spk_core::keys::SIGNATURE_SCHEMA {
+        return Err(SpkError::Signature("unsupported signature schema".into()));
+    }
+    Ok(key_id)
+}
+
+pub fn revoked_keys(paths: &Paths) -> Result<BTreeSet<String>> {
+    let entries = match fs::read_dir(&paths.revoked) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut revoked = BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let key_id = name.strip_suffix(".revoked").unwrap_or(name);
+        if spk_core::keys::is_valid_key_id(key_id) {
+            revoked.insert(key_id.to_string());
+        }
+    }
+    Ok(revoked)
 }
 
 pub fn target_arch() -> &'static str {
@@ -41,6 +137,7 @@ pub fn load_repos(
     paths: &Paths,
     urls: &[String],
     lang: crate::i18n::Lang,
+    remote_options: crate::remote::RemoteOptions,
 ) -> Result<Vec<LoadedRepo>> {
     let mut repos = Vec::new();
     if urls.is_empty() {
@@ -59,9 +156,48 @@ pub fn load_repos(
             ));
         }
         for (order, (_, config)) in configs.into_iter().enumerate() {
+            let remote_urls: Vec<String> = config
+                .urls
+                .iter()
+                .filter(|url| is_remote_url(url))
+                .cloned()
+                .collect();
+            if !remote_urls.is_empty() {
+                match load_remote_repo(
+                    paths,
+                    &config.name,
+                    &remote_urls,
+                    config.priority,
+                    order,
+                    remote_options,
+                    lang,
+                ) {
+                    Ok(repo) => repos.push(repo),
+                    Err(error @ SpkError::Signature(_)) => return Err(error),
+                    Err(SpkError::Security(error)) => return Err(SpkError::Security(error)),
+                    Err(error) => {
+                        eprintln!(
+                            "{}",
+                            crate::i18n::repo_mirror_unavailable(
+                                lang,
+                                &config.name,
+                                &remote_urls.join(", "),
+                                &error.to_string()
+                            )
+                        );
+                    }
+                }
+                continue;
+            }
             let mut loaded = None;
             for url in &config.urls {
-                match load_repo(paths, url, config.priority, order) {
+                match load_repo(
+                    paths,
+                    url,
+                    config.priority,
+                    order,
+                    remote_options.allow_unsigned,
+                ) {
                     Ok(mut repo) => {
                         repo.name = config.name.clone();
                         loaded = Some(repo);
@@ -93,9 +229,23 @@ pub fn load_repos(
         }
     } else {
         for (order, url) in urls.iter().enumerate() {
-            match load_repo(paths, url, 0, order) {
+            let result = if is_remote_url(url) {
+                load_remote_repo(
+                    paths,
+                    "",
+                    std::slice::from_ref(url),
+                    0,
+                    order,
+                    remote_options,
+                    lang,
+                )
+            } else {
+                load_repo(paths, url, 0, order, remote_options.allow_unsigned)
+            };
+            match result {
                 Ok(repo) => repos.push(repo),
                 Err(SpkError::Signature(error)) => return Err(SpkError::Signature(error)),
+                Err(SpkError::Security(error)) => return Err(SpkError::Security(error)),
                 Err(error) => {
                     eprintln!(
                         "{}",
@@ -112,6 +262,38 @@ pub fn load_repos(
     }
     validate_consistency(&repos)?;
     Ok(repos)
+}
+
+pub fn is_remote_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn load_remote_repo(
+    paths: &Paths,
+    name_hint: &str,
+    urls: &[String],
+    priority: i32,
+    order: usize,
+    options: crate::remote::RemoteOptions,
+    lang: crate::i18n::Lang,
+) -> Result<LoadedRepo> {
+    let synced = crate::remote::sync_repo(paths, name_hint, urls, options, lang)?;
+    Ok(LoadedRepo {
+        name: if name_hint.is_empty() {
+            synced.index.repo.clone()
+        } else {
+            name_hint.to_string()
+        },
+        key_id: synced.key_id,
+        dir: synced.dir,
+        index: synced.index,
+        priority,
+        order,
+        security: synced.security,
+        mirrors: synced.mirrors,
+        package_cache: Some(paths.package_cache.clone()),
+        offline: options.offline,
+    })
 }
 
 type PackageIdentity = (String, u64, String, u64, String);
@@ -156,15 +338,16 @@ pub fn local_path(url: &str) -> Result<PathBuf> {
         }
         return Ok(PathBuf::from(path));
     }
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Err(SpkError::General(format!(
-            "remote repository '{url}' arrives in P4; use a local path or file:// for now"
-        )));
-    }
     Ok(PathBuf::from(url))
 }
 
-pub fn load_repo(paths: &Paths, url: &str, priority: i32, order: usize) -> Result<LoadedRepo> {
+pub fn load_repo(
+    paths: &Paths,
+    url: &str,
+    priority: i32,
+    order: usize,
+    allow_unsigned: bool,
+) -> Result<LoadedRepo> {
     let dir = local_path(url)?;
     let index_path = dir.join("index.json");
     let sig_path = dir.join("index.json.sig");
@@ -178,24 +361,20 @@ pub fn load_repo(paths: &Paths, url: &str, priority: i32, order: usize) -> Resul
         }
         Err(error) => return Err(error.into()),
     };
-    let signature = read_signature(&sig_path)?;
-    let keys = trust_keys(paths)?;
-    let key = keys
-        .iter()
-        .find(|key| key.key_id == signature.key_id)
-        .ok_or_else(|| {
-            SpkError::Signature(format!(
-                "signature from {} is unknown trust",
-                signature.key_id
-            ))
-        })?;
-    key.verify(&bytes, &signature)?;
+    let signature = if sig_path.is_file() {
+        Some(read_signature(&sig_path)?)
+    } else {
+        None
+    };
+    let key_id = verify_index_bytes(paths, &bytes, signature.as_ref(), allow_unsigned)?;
     let index = Index::from_slice(&bytes)?;
-    if index.key_id != signature.key_id {
-        return Err(SpkError::Signature(format!(
-            "index key id {} does not match signature {}",
-            index.key_id, signature.key_id
-        )));
+    if let Some(signature) = &signature {
+        if index.key_id != signature.key_id {
+            return Err(SpkError::Signature(format!(
+                "index key id {} does not match primary signature {}",
+                index.key_id, signature.key_id
+            )));
+        }
     }
     if index.arch != target_arch() {
         return Err(SpkError::General(format!(
@@ -205,13 +384,18 @@ pub fn load_repo(paths: &Paths, url: &str, priority: i32, order: usize) -> Resul
             target_arch()
         )));
     }
+    let security = SecurityState::from_index(&index);
     Ok(LoadedRepo {
         name: index.repo.clone(),
-        key_id: index.key_id.clone(),
+        key_id,
         dir,
         index,
         priority,
         order,
+        security,
+        mirrors: Vec::new(),
+        package_cache: None,
+        offline: false,
     })
 }
 
@@ -270,6 +454,15 @@ pub fn add(paths: &Paths, name: &str, url: &str, priority: Option<i32>) -> Resul
     spk_core::index::validate_repo_name(name)?;
     if url.trim().is_empty() {
         return Err(SpkError::Usage("repository URL must not be empty".into()));
+    }
+    if !url.starts_with("http://")
+        && !url.starts_with("https://")
+        && !url.starts_with("file://")
+        && !url.starts_with('/')
+    {
+        return Err(SpkError::Usage(format!(
+            "repository URL must be http(s), file:// or an absolute path: {url}"
+        )));
     }
     let _lock = crate::state::lock_exclusive(paths)?;
     let mut state = crate::state::State::load(paths)?;

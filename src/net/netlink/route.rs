@@ -1036,7 +1036,8 @@ fn input(request: &Request<'_>, _ext: &mut super::msg::ExtAck) -> Result<(), i32
         RTM_GETNEIGH => neighbor_get(request, false),
         RTM_NEWNEIGH => neighbor_add(request),
         RTM_DELNEIGH => neighbor_delete(request),
-        RTM_NEWLINK | RTM_DELLINK => Err(-(abi::EOPNOTSUPP as i32)),
+        RTM_NEWLINK => link_set(request),
+        RTM_DELLINK => Err(-(abi::EOPNOTSUPP as i32)),
         _ => Err(-(abi::EOPNOTSUPP as i32)),
     }
 }

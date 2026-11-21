@@ -48,8 +48,8 @@ jobs:
       - name: Host model and ABI tests
         run: make test-host
 
-  spk-p3:
-    name: spk P3 host + QEMU sandbox matrix
+  spk-p4:
+    name: spk P4 host + HTTP/QEMU matrix
     runs-on: ubuntu-24.04
     needs: check
     steps:
@@ -63,7 +63,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf \
             fakeroot e2fsprogs xorriso mtools dosfstools musl-tools \
-            clang lld make gcc curl xz-utils bzip2 llvm
+            clang lld make gcc curl xz-utils bzip2 llvm ca-certificates
       - uses: actions/cache@v4
         with:
           path: |
@@ -73,24 +73,27 @@ jobs:
             build/downloads
             build/toolchain
             build/userland
-          key: spk-p3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'user/spk/Cargo.lock') }}
+          key: spk-p4-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'user/spk/Cargo.lock') }}
       - name: Build static userland and BusyBox
         run: |
           mkdir -p build/downloads
           tools/build_userland.sh
           tools/build_busybox.sh
       - name: spk and sudo host tests + clippy
+        env:
+          CC_x86_64_unknown_linux_musl: clang
+          AR_x86_64_unknown_linux_musl: ar
         run: |
           cargo test --manifest-path user/spk/Cargo.toml
           cargo test --manifest-path user/sudo/Cargo.toml
           cargo clippy --manifest-path user/spk/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path user/sudo/Cargo.toml --all-targets -- -D warnings
-      - name: P3 QEMU matrix (KVM when available, TCG otherwise)
+      - name: P4 QEMU matrix, including local HTTP repository (KVM when available, TCG otherwise)
         run: tools/spk_qemu_test.py --timeout 900
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: spk-p3-qemu
+          name: spk-p4-qemu
           path: |
             build/spk-qemu/*.log
             build/spk-qemu/result.json

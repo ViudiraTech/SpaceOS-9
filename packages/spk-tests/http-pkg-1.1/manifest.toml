@@ -1,0 +1,22 @@
+name = "http-pkg"
+epoch = 0
+version = "1.1.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "P4 HTTP repository fixture"
+description = "spk P4 test fixture"
+license = "LicenseRef-Proprietary"
+url = "https://github.com/ViudiraTech/SpaceKernel"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = []
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+triggers = []
+allow_setuid = false

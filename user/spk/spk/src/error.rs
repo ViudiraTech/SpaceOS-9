@@ -20,6 +20,8 @@ pub enum SpkError {
     Check { message: String, lines: Vec<String> },
     RolledBack(String),
     Script(String),
+    Network(String),
+    Security(String),
     Io(std::io::Error),
     Json(serde_json::Error),
 }
@@ -53,7 +55,9 @@ impl fmt::Display for SpkError {
             | Self::General(message)
             | Self::Signature(message)
             | Self::RolledBack(message)
-            | Self::Script(message) => f.write_str(message),
+            | Self::Script(message)
+            | Self::Network(message)
+            | Self::Security(message) => f.write_str(message),
             Self::Dependency { message, .. }
             | Self::FileConflict { message, .. }
             | Self::Check { message, .. } => f.write_str(message),

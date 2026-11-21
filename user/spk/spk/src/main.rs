@@ -36,6 +36,12 @@ struct Cli {
     /// Run .INSTALL without the sandbox (debug only)
     #[arg(long = "no-sandbox-scripts", global = true)]
     no_sandbox_scripts: bool,
+    /// Use cached indexes/packages without network access
+    #[arg(long, global = true)]
+    offline: bool,
+    /// Accept an unsigned index (debug only)
+    #[arg(long = "allow-unsigned", global = true)]
+    allow_unsigned: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -114,6 +120,12 @@ enum Command {
     Check,
     /// Recover an interrupted transaction
     Repair,
+    /// Synchronize configured repository indexes
+    #[command(alias = "update")]
+    Sync {
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+    },
     /// Manage configured repositories
     Repo {
         #[command(subcommand)]
@@ -207,6 +219,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 print,
                 script_failure_keep,
                 no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
             },
             lang,
         ),
@@ -228,6 +242,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 print,
                 script_failure_keep,
                 no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
             },
             lang,
         ),
@@ -247,6 +263,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 print,
                 script_failure_keep,
                 no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
             },
             lang,
         ),
@@ -266,6 +284,21 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 print,
                 script_failure_keep,
                 no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
+            },
+            lang,
+        ),
+        Command::Sync { repos } => ops::sync(
+            &paths,
+            &repos,
+            ReportOptions {
+                json: cli.json,
+                print: false,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
             },
             lang,
         ),
@@ -288,6 +321,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 print,
                 script_failure_keep,
                 no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
             },
             lang,
         ),

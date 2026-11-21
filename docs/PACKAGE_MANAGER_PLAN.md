@@ -705,16 +705,20 @@ CI：
 
 - 多仓库/镜像/优先级、索引压缩、签名信任库、密钥轮换/吊销、防降级。
 - 验收：坏签名/坏镜像/降级攻击被拒绝。
+- P4 实现记录（2026-11-23，spk/spk-host/内核/QEMU）：
+  - 传输层为内置 HTTP/1.1（`std::net::TcpStream`）+ `rustls` 0.23/ring，支持重定向（拒绝 HTTPS→HTTP 降级）、`Content-Length`/chunked、连接/读写超时、CA bundle（`/etc/ssl/certs/ca-certificates.crt`，`SPK_CA_BUNDLE` 仅测试）、Range/206/416；目标端静态 musl 构建时需要 `CC_x86_64_unknown_linux_musl=clang AR_x86_64_unknown_linux_musl=ar`。
+  - 远程索引缓存位于 `var/cache/spk/repos/<repo-id>/`：`snapshots/<index-sha>/index.json|index.json.sig|meta.json`、原子 `current`、`security.json`；索引/签名请求带 `Cache-Control: no-cache`，支持 ETag/If-None-Match 304；失败保留旧索引并回退（`stale`），坏签名/坏索引/安全回退 fail-closed。
+  - 包缓存 `var/cache/spk/packages/<sha256>.spk`，下载使用 `.spk.part` + Range 续传，校验大小与 sha256 后原子 rename；镜像 failover、重试/退避、24 小时 `.part` 清理、30 天/2 GiB 保留策略。
+  - 信任库 `/etc/spk/trusted.d/<key_id>.pub`，`verify_any` 支持主签名 + `signatures` 多签格式（生产仍是单 key `ed25519:b4280a08406a53c5`）；本地 `/etc/spk/revoked.d/<key_id>[.revoked]` 与签名内 `revoked_keys` 均拒绝。host `spk-host index --key ... --key ...` 写多签，`--security <json>` 写可选 `min_version`/`revoked_versions`/`revoked_keys`；空字段使用 `skip_serializing_if`，生产现有 index/sig 字节不变。
+  - 防降级：本地 `security.json.generated_at` 形成回滚下限；签名内 `min_version`/`revoked_versions` 被求解器过滤，显式安装/降级目标版本直接拒绝；`--allow-unsigned` 仅用于调试，缺失签名可接受但存在的坏签名绝不接受。
+  - CLI：`spk sync`（别名 `update`）、HTTP(S) `--repo`、`repo add`、全局 `--offline`/`--allow-unsigned`；配置仓库名作为缓存 id，支持同一仓库多 URL 镜像。
+  - 测试：host `http_remote` 13 项（200/304/404/500 重试/超时/重定向/Range/ETag/坏签名/坏索引/CA/多镜像/多签/CLI HTTP 安装/sync/offline/安全回退）；host 总计 86 项；QEMU 71 步（63 P3 + 8 P4）使用 `-nic user,model=e1000e`，加载 `e1000e.ko`，通过 rtnetlink 配置 `eth0`，本地 HTTP 仓库跑 install/upgrade/remove/offline。内核补 `RTM_NEWLINK` 路由请求（复用已有 `link_set`），不改 syscall 编号/结构。
 
-### P5 构建与镜像
+### P5 构建、镜像与运维
 
-- `make packages/repo/image`、可复现、ISO 内置仓库、base 包。
-- 验收：从零构建的 ISO 内 `spk verify` 全绿。
-
-### P6 运维与规模
-
-- 增量/delta（可选）、缓存保留、审计、`--json`、本地化、GUI 接口。
-- 验收：仓库规模/并发/磁盘配额测试通过。
+- `make packages/repo/image`、可复现、ISO 内置仓库、base 包（含 spk/spk-sandbox/BusyBox、`/etc/spk/setuid.allow`）。
+- 增量/delta（可选）、缓存保留、审计、`--json`、本地化、GUI 接口、CI 并行/性能。
+- 验收：从零构建的 ISO 内 `spk verify` 全绿；仓库规模/并发/磁盘配额测试通过。
 
 ## 18. 目录结构建议
 
@@ -750,7 +754,9 @@ SpaceKernel/
 - 已实现（2026-11-21）：内核 setuid/setgid exec（euid/suid、egid/sgid、fsuid/fsgid 重置、`no_new_privs` 与 `MS_NOSUID` 抑制、`AT_SECURE`、dumpable=0、`MS_NOEXEC`/`MS_NOSUID` 挂载标志）。修复 `setgid`/`setregid`/`setresgid`/`setfsgid` 以 egid==0 判断特权、导致 4755 setuid-root sudo（egid 仍为调用者）无法切换主组的问题；按 Linux 语义改为 euid==0。QEMU sudo/doas 全链路（含 `-u` 非 root 目标）通过。
 - OOBE 空密码已支持：DDM 对空字符串生成 `$6$` 哈希并验证；sudo 接受空 shadow 哈希/空密码；首次授权成功提示包含空密码警告；OOBE 界面注明“空密码账户首次 sudo/doas 授权会收到一次性安全提示”。
 - P3a 内核原语已落地：`openat2` + `O_NOFOLLOW/O_PATH` + `RESOLVE_BENEATH/IN_ROOT/NO_SYMLINKS/NO_XDEV/NO_MAGICLINKS`；`chroot` 使 `FsContext.root` 参与绝对路径/绝对符号链接/`..` 解析；private mount namespace 与 bind/只读挂载；procfs `hidepid`；seccomp cBPF。沙箱仍按 P3b 以非 root `spk-script` + 只读 source + staging 视图组合使用。
-- P3a 的 mount namespace 目前是 private 传播语义；shared/slave peer group 传播、seccomp `USER_NOTIF/NEW_LISTENER/TRACE` 未接入（沙箱不使用），列入 P4。
+- P3a 的 mount namespace 目前是 private 传播语义；shared/slave peer group 传播、seccomp `USER_NOTIF/NEW_LISTENER/TRACE` 未接入（沙箱不使用），P4 仍未接入，列入后续。
+- P4 的线上索引暂不写 `min_version`/`revoked_versions`/`revoked_keys`，也不启用多签/轮换；客户端已兼容缺失字段。需要撤销或轮换时由维护者用 `spk-host index --security` 生成新 index/sig，并更新信任库。
+- SpaceKernel 尚未实现 `SIOCGIF*`/`SIOCSIF*` 网络 ioctl；QEMU HTTP 测试改用 rtnetlink（`RTM_NEWLINK`/`RTM_NEWADDR`/`RTM_NEWROUTE`），并在内核补齐 `RTM_NEWLINK` 分发。BusyBox `ip` 的 ioctl 路径仍不可用。
 - P3b 沙箱以非 root `spk-script` 运行 `.INSTALL`/包 hook/trigger，系统级动作由 root-owned `/etc/spk/hooks.d` 承担；`.INSTALL` 在文件提交前执行 pre/post，失败时无系统写入可回滚（等价回滚结果）；`--no-sandbox-scripts` 仅调试并打印警告。
 - `spk-sandbox` 及其脚本/沙箱依赖进入 P5 base 镜像；P3b 通过 QEMU rootfs 验证，生产 ISO 仍需打包 `spk`/`spk-sandbox` 与 BusyBox。
 - `pkgver` 现要求首尾为字母数字；alpm `rpmvercmp` 对前导/尾随分隔符的字符串不满足传递性（与上游一致），fuzz 在合法 `pkgver` 域验证全序，避免求解器排序出现不一致。
@@ -849,7 +855,7 @@ sudo -e file...
 - [x] 实现版本比较与依赖求解器、冲突链输出。
 - [ ] 实现 `.INSTALL`、hooks.d、triggers、脚本沙箱。
 - [x] 实现多仓库/镜像优先级/故障切换/签名信任。
-- [ ] 实现防降级、密钥轮换/吊销（P4）。
+- [x] 实现防降级、密钥轮换/吊销格式（P4；线上暂不启用安全字段/多签）。
 - [x] 给 `goutoustdio-site` 提 `/spaceos/repo` 路由 PR，部署 `hello` 测试仓库。
 - [ ] 接入 `make packages/repo/image`，ISO 用包构建。
 - [x] 接入 QEMU 三阶段测试矩阵（含 P2 hold/多仓库与 sudo/doas）。
@@ -863,4 +869,4 @@ sudo -e file...
 - [x] P2 hold/pin、多仓库、`--print`/`--json`、复杂图/环/provides/replaces、fuzz 与性能测试。
 - [x] P3a 内核：openat2/O_NOFOLLOW/O_PATH、chroot、mount namespace/bind/RO/pivot_root、proc hidepid、seccomp cBPF 与内核/QEMU 测试。
 - [x] P3b：.INSTALL/hooks.d/triggers、非 root 沙箱、sudoers/doas 校验、setuid 包升级/降级、QEMU 矩阵与 CI。
-- [ ] P4：HTTP(S) 仓库、镜像优先级线上化、防降级、密钥轮换/吊销；seccomp USER_NOTIF/TRACE 与完整 shared mount propagation。
+- [x] P4：HTTP(S) 仓库、镜像优先级、防降级、密钥轮换/吊销格式；seccomp USER_NOTIF/TRACE 与完整 shared mount propagation 仍留待后续。
