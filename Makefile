@@ -158,12 +158,8 @@ export SPK_REPO_KEY
 export SPK_REPO_PUBLIC
 export SPK_SECURITY
 
-.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all all-packages kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos p5-image
-all: release-try
-
-# P5 package/image verification image (minimal base + local repo) is separate
-# from the desktop OS image built by `all`/`desktop`.
-p5-image: image
+.PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all all-packages kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
+all: release-try image
 
 # Packaging needs the musl target, BusyBox/musl sources and a CA bundle.
 # Use `make desktop`, `make iso`, `make kernel` or `make packages` for narrower
