@@ -6,15 +6,15 @@
 //       Copyright (C) 2026 ViudiraTech.
 //
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use spk_core::archive::inspect_spk;
 use spk_core::fsutil::{atomic_write, sha256_file};
-use spk_core::index::{validate_repo_name, Index, IndexPackage};
-use spk_core::keys::{read_signature, signature_path, write_signature, PublicKey};
+use spk_core::index::{validate_repo_name, Index, IndexPackage, RevokedVersion};
+use spk_core::keys::{read_signature, signature_path, write_signature, PublicKey, SignatureEntry};
 use spk_core::manifest::validate_arch;
 use spk_core::{Error, Result};
 
@@ -30,6 +30,19 @@ pub struct VerifyReport {
     pub packages: Vec<String>,
 }
 
+/// Optional signed security metadata for an index. An empty object keeps the
+/// historical byte-for-byte index format used by the production repository.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    #[serde(default)]
+    pub min_version: BTreeMap<String, String>,
+    #[serde(default)]
+    pub revoked_versions: Vec<RevokedVersion>,
+    #[serde(default)]
+    pub revoked_keys: Vec<String>,
+}
+
 pub fn generate(
     repo_dir: &Path,
     repo: &str,
@@ -37,6 +50,36 @@ pub fn generate(
     key_path: &Path,
     generated_at: Option<u64>,
     sign: bool,
+) -> Result<IndexResult> {
+    generate_with_keys(
+        repo_dir,
+        repo,
+        arch,
+        &[key_path.to_path_buf()],
+        generated_at,
+        sign,
+    )
+}
+
+pub fn generate_with_keys(
+    repo_dir: &Path,
+    repo: &str,
+    arch: &str,
+    key_paths: &[PathBuf],
+    generated_at: Option<u64>,
+    sign: bool,
+) -> Result<IndexResult> {
+    generate_with_keys_and_security(repo_dir, repo, arch, key_paths, generated_at, sign, None)
+}
+
+pub fn generate_with_keys_and_security(
+    repo_dir: &Path,
+    repo: &str,
+    arch: &str,
+    key_paths: &[PathBuf],
+    generated_at: Option<u64>,
+    sign: bool,
+    security: Option<&SecurityConfig>,
 ) -> Result<IndexResult> {
     validate_repo_name(repo)?;
     validate_arch(arch)?;
@@ -47,11 +90,17 @@ pub fn generate(
         )));
     }
 
+    if key_paths.is_empty() {
+        return Err(Error::Index("at least one signing key is required".into()));
+    }
     let (public, signing) = if sign {
-        let key = spk_core::keys::load_secret_key(key_path)?;
-        (key.public(), Some(key))
+        let keys: Vec<_> = key_paths
+            .iter()
+            .map(|path| spk_core::keys::load_secret_key(path))
+            .collect::<Result<Vec<_>>>()?;
+        (keys[0].public(), Some(keys))
     } else {
-        (PublicKey::from_file(key_path)?, None)
+        (PublicKey::from_file(&key_paths[0])?, None)
     };
 
     let mut paths = Vec::new();
@@ -74,6 +123,11 @@ pub fn generate(
 
     let generated_at = generated_at.unwrap_or(default_generated_at()?);
     let mut index = Index::new(repo, arch, generated_at, &public.key_id);
+    if let Some(security) = security {
+        index.min_version = security.min_version.clone();
+        index.revoked_versions = security.revoked_versions.clone();
+        index.revoked_keys = security.revoked_keys.clone();
+    }
     let mut identities = BTreeSet::new();
     for (name, path) in paths {
         let inspected = inspect_spk(&path)?;
@@ -117,8 +171,20 @@ pub fn generate(
     atomic_write(&index_path, &bytes, 0o644)?;
 
     let mut warnings = Vec::new();
-    if let Some(key) = signing {
-        let signature = key.sign(&bytes);
+    if let Some(keys) = signing {
+        let mut signature = keys[0].sign(&bytes);
+        if keys.len() > 1 {
+            signature.signatures = keys
+                .iter()
+                .map(|key| {
+                    let signed = key.sign(&bytes);
+                    SignatureEntry {
+                        key_id: signed.key_id,
+                        signature: signed.signature,
+                    }
+                })
+                .collect();
+        }
         write_signature(&signature_path(&index_path), &signature)?;
     } else {
         let stale = signature_path(&index_path);

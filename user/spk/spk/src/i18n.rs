@@ -597,3 +597,19 @@ pub fn staging_symlink_changed(lang: Lang, path: &str) -> String {
         format!("scriptlet changed the target of declared symlink {path}")
     }
 }
+
+pub fn repo_using_cache(lang: Lang, name: &str, error: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：仓库“{name}”同步失败，使用本地缓存：{error}")
+    } else {
+        format!("warning: repository '{name}' sync failed; using cached index: {error}")
+    }
+}
+
+pub fn repo_synced(lang: Lang, name: &str, packages: usize) -> String {
+    if lang.is_zh() {
+        format!(":: 仓库 {name} 已同步（{packages} 个软件包）")
+    } else {
+        format!(":: repository {name} synchronized ({packages} packages)")
+    }
+}

@@ -326,6 +326,8 @@ pub fn execute(
     let _ = fs::remove_dir_all(paths.state.join("triggers").join(&txid));
     let _ = fs::remove_dir_all(paths.sandbox.join(&txid));
     let _ = fs::remove_dir_all(paths.scripts.join(&txid));
+    let keep = crate::remote::package_cache_keep(repos);
+    let _ = crate::remote::prune_package_cache(paths, &keep);
     println!(
         "{}",
         i18n::ok_summary(
@@ -624,7 +626,7 @@ fn stage_packages(
         let repo = repos.get(repo_index).ok_or_else(|| {
             SpkError::General(format!("repository index {repo_index} disappeared"))
         })?;
-        let package_path = repo.package_path(&index.filename);
+        let package_path = repo.ensure_package(index)?;
         let metadata = fs::metadata(&package_path)
             .map_err(|error| SpkError::General(format!("{}: {error}", package_path.display())))?;
         if metadata.len() != index.size {

@@ -32,6 +32,10 @@ pub struct Paths {
     pub journal: PathBuf,
     pub sandbox: PathBuf,
     pub scripts: PathBuf,
+    pub cache: PathBuf,
+    pub repo_cache: PathBuf,
+    pub package_cache: PathBuf,
+    pub revoked: PathBuf,
 }
 
 impl Paths {
@@ -53,6 +57,10 @@ impl Paths {
             journal: state.join("journal"),
             sandbox: state.join("sandbox"),
             scripts: state.join("scripts"),
+            cache: root.join("var/cache/spk"),
+            repo_cache: root.join("var/cache/spk/repos"),
+            package_cache: root.join("var/cache/spk/packages"),
+            revoked: root.join("etc/spk/revoked.d"),
             trusted: root.join(TRUST_DIR),
             state,
             root,
@@ -65,12 +73,15 @@ impl Paths {
         create_dir(&self.backup)?;
         create_dir(&self.sandbox)?;
         create_dir(&self.scripts)?;
-        create_dir(&self.root.join("var/cache/spk"))?;
+        create_dir(&self.cache)?;
+        create_dir(&self.repo_cache)?;
+        create_dir(&self.package_cache)?;
         Ok(())
     }
 
     pub fn ensure_trust(&self) -> Result<()> {
         create_dir(&self.trusted)?;
+        create_dir(&self.revoked)?;
         Ok(())
     }
 

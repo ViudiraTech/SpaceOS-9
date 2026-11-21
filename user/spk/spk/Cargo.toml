@@ -38,8 +38,13 @@ clap.workspace = true
 rustix.workspace = true
 thiserror.workspace = true
 libc.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
 spk-host = { path = "../spk-host" }
+rcgen = "0.13"

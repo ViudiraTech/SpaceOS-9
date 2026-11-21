@@ -30,6 +30,8 @@ pub struct ReportOptions {
     pub print: bool,
     pub script_failure_keep: bool,
     pub no_sandbox_scripts: bool,
+    pub offline: bool,
+    pub allow_unsigned: bool,
 }
 
 impl ReportOptions {
@@ -72,7 +74,15 @@ pub fn install(
     }
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
-    let repos = repo::load_repos(paths, urls, lang)?;
+    let repos = repo::load_repos(
+        paths,
+        urls,
+        lang,
+        crate::remote::RemoteOptions {
+            offline: report.offline,
+            allow_unsigned: report.allow_unsigned,
+        },
+    )?;
     if !report.json {
         println!("{}", i18n::resolving(lang));
         println!("{}", i18n::looking_for_conflicts(lang));
@@ -126,7 +136,15 @@ pub fn upgrade(
     if !targets.is_empty() && !allow_partial {
         return Err(SpkError::General(i18n::partial_disabled(lang).to_string()));
     }
-    let repos = repo::load_repos(paths, urls, lang)?;
+    let repos = repo::load_repos(
+        paths,
+        urls,
+        lang,
+        crate::remote::RemoteOptions {
+            offline: report.offline,
+            allow_unsigned: report.allow_unsigned,
+        },
+    )?;
     if !report.json {
         if targets.is_empty() {
             println!("{}", i18n::starting_full_upgrade(lang));
@@ -184,7 +202,15 @@ pub fn downgrade(
     }
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
-    let repos = repo::load_repos(paths, urls, lang)?;
+    let repos = repo::load_repos(
+        paths,
+        urls,
+        lang,
+        crate::remote::RemoteOptions {
+            offline: report.offline,
+            allow_unsigned: report.allow_unsigned,
+        },
+    )?;
     if !report.json {
         println!("{}", i18n::resolving(lang));
         println!("{}", i18n::looking_for_conflicts(lang));
@@ -238,7 +264,15 @@ pub fn reinstall(
         ));
     }
     let (_lock, state) = prepare(paths, lang)?;
-    let repos = repo::load_repos(paths, urls, lang)?;
+    let repos = repo::load_repos(
+        paths,
+        urls,
+        lang,
+        crate::remote::RemoteOptions {
+            offline: report.offline,
+            allow_unsigned: report.allow_unsigned,
+        },
+    )?;
     if !report.json {
         println!("{}", i18n::resolving(lang));
         println!("{}", i18n::looking_for_conflicts(lang));
@@ -590,6 +624,49 @@ fn write_holds(paths: &Paths, holds: &spk_core::db::HoldsDb) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(holds)?;
     bytes.push(b'\n');
     atomic_write(&paths.db_path("holds.json"), &bytes, 0o644)?;
+    Ok(())
+}
+
+pub fn sync(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang) -> Result<()> {
+    let (_lock, _state) = prepare(paths, lang)?;
+    let repos = repo::load_repos(
+        paths,
+        urls,
+        lang,
+        crate::remote::RemoteOptions {
+            offline: report.offline,
+            allow_unsigned: report.allow_unsigned,
+        },
+    )?;
+    if repos.is_empty() {
+        return Err(crate::error::SpkError::General(
+            "no usable repositories to synchronize".into(),
+        ));
+    }
+    for loaded in &repos {
+        if !report.json {
+            println!(
+                "{}",
+                i18n::repo_synced(lang, &loaded.name, loaded.index.packages.len())
+            );
+        }
+    }
+    if report.json {
+        let packages: usize = repos.iter().map(|repo| repo.index.packages.len()).sum();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "repositories": repos.iter().map(|repo| serde_json::json!({
+                    "name": repo.name,
+                    "key_id": repo.key_id,
+                    "packages": repo.index.packages.len(),
+                    "generated_at": repo.index.generated_at,
+                })).collect::<Vec<_>>(),
+                "packages": packages,
+            }))?
+        );
+    }
     Ok(())
 }
 

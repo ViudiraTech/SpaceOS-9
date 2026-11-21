@@ -17,7 +17,7 @@ use spk_core::keys::{
     load_secret_key, sign_file, signature_path, write_keypair, PublicKey, DEFAULT_COMMENT,
 };
 use spk_core::Error;
-use spk_host::{generate, pack, verify_index, verify_repo};
+use spk_host::{pack, verify_index, verify_repo};
 
 #[derive(Parser)]
 #[command(
@@ -70,11 +70,14 @@ enum Command {
         repo: String,
         #[arg(long)]
         arch: String,
-        /// Private key to sign with, or public key with --no-sign
-        #[arg(long)]
-        key: PathBuf,
+        /// Private keys to sign with (repeat for dual signatures), or public key with --no-sign
+        #[arg(long, num_args = 1..)]
+        key: Vec<PathBuf>,
         #[arg(long)]
         generated_at: Option<u64>,
+        /// Optional JSON security metadata (min_version/revoked_versions/revoked_keys)
+        #[arg(long)]
+        security: Option<PathBuf>,
         #[arg(long)]
         no_sign: bool,
     },
@@ -192,9 +195,25 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             arch,
             key,
             generated_at,
+            security,
             no_sign,
         } => {
-            let result = generate(&repo_dir, &repo, &arch, &key, generated_at, !no_sign)?;
+            let security = match security {
+                Some(path) => {
+                    let bytes = std::fs::read(&path)?;
+                    Some(serde_json::from_slice::<spk_host::SecurityConfig>(&bytes)?)
+                }
+                None => None,
+            };
+            let result = spk_host::generate_with_keys_and_security(
+                &repo_dir,
+                &repo,
+                &arch,
+                &key,
+                generated_at,
+                !no_sign,
+                security.as_ref(),
+            )?;
             for warning in &result.warnings {
                 eprintln!("warning: {warning}");
             }

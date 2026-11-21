@@ -52,12 +52,21 @@ pub struct PublicKeyFile {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
+pub struct SignatureEntry {
+    pub key_id: String,
+    pub signature: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct SignatureFile {
     pub schema: u32,
     pub algorithm: String,
     pub key_id: String,
     pub sha256: String,
     pub signature: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<SignatureEntry>,
 }
 
 pub struct KeyPair {
@@ -111,6 +120,7 @@ impl KeyPair {
             key_id: self.key_id.clone(),
             sha256: sha256_bytes(data),
             signature: BASE64.encode(signature.to_bytes()),
+            signatures: Vec::new(),
         }
     }
 
@@ -236,6 +246,65 @@ impl PublicKey {
             .verify_strict(data, &sig)
             .map_err(|e| Error::Signature(format!("ed25519 verification failed: {e}")))
     }
+}
+
+/// Verify any signature over `data` from a trusted, non-revoked key. The
+/// top-level signature remains the primary/backward-compatible one; the
+/// optional `signatures` array carries rotation dual-signatures.
+pub fn verify_any(
+    data: &[u8],
+    file: &SignatureFile,
+    trusted: &[PublicKey],
+    revoked: &std::collections::BTreeSet<String>,
+) -> Result<String> {
+    if file.schema != SIGNATURE_SCHEMA || file.algorithm != ALGORITHM {
+        return Err(Error::Signature(
+            "unsupported signature schema or algorithm".into(),
+        ));
+    }
+    let digest = sha256_bytes(data);
+    if file.sha256 != digest {
+        return Err(Error::Signature(format!(
+            "file digest mismatch: signature covers {}, file is {}",
+            file.sha256, digest
+        )));
+    }
+    let mut entries = Vec::with_capacity(1 + file.signatures.len());
+    entries.push((file.key_id.as_str(), file.signature.as_str()));
+    entries.extend(
+        file.signatures
+            .iter()
+            .map(|entry| (entry.key_id.as_str(), entry.signature.as_str())),
+    );
+    for (key_id, encoded) in entries {
+        if revoked.contains(key_id) {
+            continue;
+        }
+        let Some(key) = trusted.iter().find(|key| key.key_id == key_id) else {
+            continue;
+        };
+        let raw = match BASE64.decode(encoded) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return Err(Error::Signature(format!(
+                    "malformed signature encoding: {error}"
+                )))
+            }
+        };
+        let raw: [u8; 64] = raw
+            .try_into()
+            .map_err(|_| Error::Signature("signature must be 64 bytes".into()))?;
+        if key
+            .verifying
+            .verify_strict(data, &Signature::from_bytes(&raw))
+            .is_ok()
+        {
+            return Ok(key_id.to_string());
+        }
+    }
+    Err(Error::Signature(
+        "no trusted, non-revoked signature over the file".into(),
+    ))
 }
 
 fn validate_key_file_header(schema: u32, algorithm: &str, key_id: &str) -> Result<()> {

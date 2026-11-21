@@ -261,6 +261,19 @@ pub fn solve(
     lang: Lang,
     override_hold: bool,
 ) -> Result<Solution> {
+    let explicit: Vec<&PkgSpec> = match &operation {
+        Operation::Install { specs, .. } | Operation::Downgrade(specs) => specs.iter().collect(),
+        _ => Vec::new(),
+    };
+    for spec in explicit {
+        if let Some(version) = &spec.version {
+            for repo in repos {
+                if let Some(reason) = repo.security.rejects_target(&spec.name, version) {
+                    return Err(SpkError::Security(format!("{}: {reason}", repo.name)));
+                }
+            }
+        }
+    }
     let request = operation.into_request();
     let mut solver = Solver::new(state, repos, lang, override_hold)?;
     solver.plan(&request)?;
@@ -286,6 +299,9 @@ impl<'a> Solver<'a> {
         }
         for (repo_index, repo) in repos.iter().enumerate() {
             for package in &repo.index.packages {
+                if !repo.allows(package) {
+                    continue;
+                }
                 let candidate = Candidate::from_index(package.clone(), repo_index)?;
                 let name = candidate.name.clone();
                 let entry = by_name.entry(name).or_default();
@@ -1107,6 +1123,7 @@ mod tests {
     fn repo(packages: Vec<IndexPackage>) -> LoadedRepo {
         let mut index = Index::new("test", "x86_64", 0, "ed25519:0123456789abcdef");
         index.packages = packages;
+        let security = crate::security::SecurityState::from_index(&index);
         LoadedRepo {
             name: "test".into(),
             key_id: index.key_id.clone(),
@@ -1114,6 +1131,10 @@ mod tests {
             index,
             priority: 0,
             order: 0,
+            security,
+            mirrors: Vec::new(),
+            package_cache: None,
+            offline: false,
         }
     }
 
