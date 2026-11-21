@@ -1,8 +1,8 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Windows XP Theme
-Comment=Apply the Windows XP Luna-inspired SPUI theme
+Name=XP Luna Theme
+Comment=Apply the XP Luna SPUI theme
 Exec=/usr/bin/spui-theme-winxp
 Terminal=false
 Icon=preferences-desktop-theme

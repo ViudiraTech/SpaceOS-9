@@ -682,6 +682,18 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - `index.json.sig`：sha256 `04d56076012dfa20b7aee0689bdcfbab789e1f669ed66a215025e3e2c25f8a57`
   - 旧 `theme-winxp-1.0.0-1` 已从生产仓库删除
 
+- 2026-11-21：`theme-winxp 1.0.0-3`：替换为 1080p Bliss 原图壁纸、移除四色旗帜改用 SpaceOS 徽标、去掉所有可见文案中的 `Windows` / `win` 字样（改称 `XP Luna`）。
+  - `theme-winxp-1.0.0-3-x86_64.spk`：sha256 `7e13e5be779a210518a20a9cc59bbc28eb1c7d6bef03f74144028eadf1dee68c`
+  - `index.json`：sha256 `7e50d0e6d8a64bea8bb7bedfce380ad0131ff6124bf20e6e8368d2f4c75b8ae0`
+  - `index.json.sig`：sha256 `732c203b090363b4706d023afec05e3404ca6656ede0370bea441ad85d214c06`
+
+- 2026-11-21：`theme-winxp 1.0.0-4`：删除主题包前警告，并在 SPUI 启动/配置更新时回退默认主题。
+  - `theme-winxp-1.0.0-4-x86_64.spk`：sha256 `8c69a943e8bb9c0c189187dab70bddda15ca8751984858d42f25375e4c5c8a5a`
+  - `index.json`：sha256 `6a92ff68a0c6a916f7683d69b70a3a5780f795663243338eb3432b0a553d151f`
+  - `index.json.sig`：sha256 `db584244fd884fea154f6195ade5222118f4bfb0d6519b33bc0c304dbdedd5e0`
+  - `.INSTALL` 的 `pre_remove` 打印“将回退默认主题”警告；SPUI 检测到主题文件缺失时重置主题/壁纸/面板
+  - 旧 `theme-winxp-1.0.0-3` 已从生产仓库删除
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。

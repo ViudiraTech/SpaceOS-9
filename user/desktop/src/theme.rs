@@ -566,6 +566,36 @@ pub fn valid_theme_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+pub fn theme_pack_available(id: &str) -> bool {
+    let lower = id.trim().to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "vortexglass" | "spui" | "spui-4" | "spui4" | "win98" | "windows98"
+    ) {
+        return true;
+    }
+    load_external_theme(&lower, ThemeMode::Light, 0x3b82f6).is_some()
+}
+
+/// Reset a configuration that points at a removed external theme back to the
+/// built-in default, preventing a half-removed theme from leaving a mixed UI.
+pub fn fallback_missing_theme(config: &mut DesktopConfig) -> Option<String> {
+    let missing = config.theme_id.clone();
+    if theme_pack_available(&missing) {
+        return None;
+    }
+    let default = DesktopConfig::default();
+    config.theme_id = default.theme_id;
+    config.theme_style = default.theme_style;
+    config.mode = default.mode;
+    config.accent = default.accent;
+    config.wallpaper = default.wallpaper;
+    config.panel_position = default.panel_position;
+    config.panel_size = default.panel_size;
+    config.panel_start_fullscreen = default.panel_start_fullscreen;
+    Some(missing)
+}
+
 /// Discover all external theme packages installed under `/usr/share/spui/themes`
 /// or `$HOME/.local/share/spui/themes`.
 pub fn discover_installed_themes() -> Vec<InstalledThemeInfo> {
@@ -2732,7 +2762,11 @@ mod tests {
         let previous = std::env::var_os("SPUI_THEME_DIR");
         std::env::set_var("SPUI_THEME_DIR", &base);
         let discovered = discover_installed_themes();
-        assert!(discovered.iter().any(|t| t.id == "winxp" && t.name == "Windows XP Luna"));
+        assert!(discovered.iter().any(|t| t.id == "winxp" && t.name == "XP Luna"));
+
+        let wp_thumb = icons::decode_theme_asset(&pkg_src.join("winxp-bliss.jpg"), Some((144, 90)))
+            .expect("decode winxp-bliss.jpg thumbnail");
+        assert_eq!((wp_thumb.width, wp_thumb.height), (144, 90));
 
         // 1. Default Luna Blue
         let mut cfg = DesktopConfig::default();
@@ -2749,7 +2783,7 @@ mod tests {
         assert!(luna_skin.caption_buttons.min_normal.sprite.is_some());
         assert!(luna_skin.caption_buttons.max_normal.sprite.is_some());
         assert!(luna_skin.caption_buttons.restore_normal.sprite.is_some());
-        assert!(luna_skin.start_button.icon.is_some());
+        assert!(luna_skin.start_button.icon.is_none());
         assert!(luna_skin.start_menu.is_some());
 
         // 2. Olive Green (Homestead) via #10b981 accent swatch
