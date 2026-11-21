@@ -72,6 +72,7 @@ pub fn install(
     needed: bool,
     override_hold: bool,
     noconfirm: bool,
+    overwrite: &[String],
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
@@ -81,6 +82,7 @@ pub fn install(
             "install requires at least one package".into(),
         ));
     }
+    let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
     let repos = repo::load_repos(
@@ -126,6 +128,9 @@ pub fn install(
             operation: OperationKind::Install,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: overwrite.clone(),
+            interactive: !report.active(),
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }
@@ -138,10 +143,12 @@ pub fn upgrade(
     allow_partial: bool,
     override_hold: bool,
     noconfirm: bool,
+    overwrite: &[String],
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
     require_root(paths, lang)?;
+    let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     if !targets.is_empty() && !allow_partial {
         return Err(SpkError::General(i18n::partial_disabled(lang).to_string()));
@@ -192,16 +199,21 @@ pub fn upgrade(
             operation: OperationKind::Upgrade,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: overwrite.clone(),
+            interactive: !report.active(),
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn downgrade(
     paths: &Paths,
     urls: &[String],
     targets: &[String],
     override_hold: bool,
     noconfirm: bool,
+    overwrite: &[String],
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
@@ -211,6 +223,7 @@ pub fn downgrade(
             "downgrade requires package=<version> targets".into(),
         ));
     }
+    let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
     let repos = repo::load_repos(
@@ -256,16 +269,21 @@ pub fn downgrade(
             operation: OperationKind::Install,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: overwrite.clone(),
+            interactive: !report.active(),
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn reinstall(
     paths: &Paths,
     urls: &[String],
     targets: &[String],
     override_hold: bool,
     noconfirm: bool,
+    overwrite: &[String],
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
@@ -275,6 +293,7 @@ pub fn reinstall(
             "reinstall requires at least one package".into(),
         ));
     }
+    let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     let repos = repo::load_repos(
         paths,
@@ -319,6 +338,9 @@ pub fn reinstall(
             operation: OperationKind::Install,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: overwrite.clone(),
+            interactive: !report.active(),
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }
@@ -400,6 +422,9 @@ pub fn remove(
             operation: OperationKind::Remove,
             script_failure_keep: report.script_failure_keep,
             no_sandbox_scripts: report.no_sandbox_scripts,
+            overwrite: crate::overwrite::Overwrite::default(),
+            interactive: false,
+            approved_overwrites: std::cell::RefCell::new(BTreeSet::new()),
         },
     )
 }
@@ -740,7 +765,7 @@ pub fn verify(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang)
         },
     )?;
     if repos.is_empty() {
-        return Err(SpkError::General("no usable repositories to verify".into()));
+        return Err(SpkError::General(i18n::no_verify_repositories(lang).into()));
     }
     let mut results = Vec::new();
     for loaded in &repos {
@@ -752,21 +777,21 @@ pub fn verify(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang)
             let metadata = std::fs::metadata(&path)?;
             if metadata.len() != package.size {
                 return Err(SpkError::Check {
-                    message: format!("{}: size mismatch", package.name),
-                    lines: vec![format!(
-                        "{}: index {}, file {}",
-                        path.display(),
+                    message: i18n::verify_size_mismatch(
+                        lang,
+                        &package.name,
                         package.size,
-                        metadata.len()
-                    )],
+                        metadata.len(),
+                    ),
+                    lines: vec![format!("{}", path.display())],
                 });
             }
             let digest = spk_core::fsutil::sha256_file(&path)?;
             if digest != package.sha256 {
                 return Err(SpkError::Check {
-                    message: format!("{}: sha256 mismatch", package.name),
+                    message: i18n::verify_hash_mismatch(lang, &package.name),
                     lines: vec![format!(
-                        "{}: index {}, file {}",
+                        "{}: {} != {}",
                         path.display(),
                         package.sha256,
                         digest

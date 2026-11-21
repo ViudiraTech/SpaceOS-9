@@ -6,9 +6,10 @@
 //       Copyright (C) 2026 ViudiraTech.
 //
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -47,6 +48,9 @@ pub struct Options {
     pub operation: OperationKind,
     pub script_failure_keep: bool,
     pub no_sandbox_scripts: bool,
+    pub overwrite: crate::overwrite::Overwrite,
+    pub interactive: bool,
+    pub approved_overwrites: RefCell<BTreeSet<String>>,
 }
 
 struct Staged {
@@ -780,6 +784,43 @@ fn staged_digest(staged: &Staged, file: &PackageFile) -> Result<(String, u64)> {
     }
 }
 
+fn approve_overwrite(
+    options: &Options,
+    path: &str,
+    owner: Option<&str>,
+    replaces_owner: bool,
+) -> Result<bool> {
+    if replaces_owner || options.overwrite.matches(path) {
+        return Ok(true);
+    }
+    if options.approved_overwrites.borrow().contains(path) {
+        return Ok(true);
+    }
+    if !options.interactive || options.noconfirm || !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    let question = match owner {
+        Some(owner) => i18n::overwrite_owned_prompt(options.lang, path, owner),
+        None => i18n::overwrite_unowned_prompt(options.lang, path),
+    };
+    eprint!("{question}");
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return Ok(false);
+    }
+    let answer = answer.trim().to_ascii_lowercase();
+    if answer == "y" || answer == "yes" {
+        options
+            .approved_overwrites
+            .borrow_mut()
+            .insert(path.to_string());
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn build_plan(
     paths: &Paths,
     state: &State,
@@ -812,6 +853,8 @@ fn build_plan(
             }
         }
     }
+    let mut takeovers: BTreeMap<String, String> = BTreeMap::new();
+    let mut warnings = Vec::new();
     for action in &solution.actions {
         let staged = staged
             .get(&action.to.name)
@@ -829,17 +872,39 @@ fn build_plan(
             );
             owner.sha256 = sha256;
             owner.size = size;
-            if let Some(existing) = owners.get(&file.path) {
-                if existing.package != owner.package {
-                    return Err(SpkError::FileConflict {
-                        message: i18n::file_conflict_header(options.lang).to_string(),
-                        lines: vec![i18n::file_conflict(
+            let existing_package = owners
+                .get(&file.path)
+                .map(|existing| existing.package.clone());
+            if let Some(existing_package) = existing_package {
+                if existing_package != owner.package {
+                    let replaces_owner = staged.manifest.replaces.iter().any(|entry| {
+                        entry.split(['<', '>', '=']).next() == Some(existing_package.as_str())
+                    });
+                    if approve_overwrite(
+                        options,
+                        &file.path,
+                        Some(&existing_package),
+                        replaces_owner,
+                    )? {
+                        takeovers.insert(file.path.clone(), existing_package.clone());
+                        owners.remove(&file.path);
+                        warnings.push(i18n::overwrite_takeover_warning(
                             options.lang,
                             &file.path,
                             &owner.package,
-                            &existing.package,
-                        )],
-                    });
+                            &existing_package,
+                        ));
+                    } else {
+                        return Err(SpkError::FileConflict {
+                            message: i18n::file_conflict_header(options.lang).to_string(),
+                            lines: vec![i18n::overwrite_owned_detail(
+                                options.lang,
+                                &file.path,
+                                &owner.package,
+                                &existing_package,
+                            )],
+                        });
+                    }
                 }
             }
             owners.insert(file.path.clone(), owner);
@@ -873,7 +938,6 @@ fn build_plan(
 
     let mut writes = Vec::new();
     let mut saves = Vec::new();
-    let mut warnings = Vec::new();
     let mut installed_size = 0u64;
     for action in &solution.actions {
         let staged = staged.get(&action.to.name).expect("staged");
@@ -894,20 +958,27 @@ fn build_plan(
             })?;
             if old_record.is_none() {
                 if on_disk.is_some() {
-                    return Err(SpkError::FileConflict {
-                        message: i18n::file_conflict_header(options.lang).to_string(),
-                        lines: vec![i18n::file_conflict_unowned(
-                            options.lang,
-                            &file.path,
-                            &action.to.name,
-                        )],
-                    });
+                    if approve_overwrite(options, &file.path, None, false)? {
+                        warnings.push(i18n::overwrite_unowned_warning(options.lang, &file.path));
+                    } else {
+                        return Err(SpkError::FileConflict {
+                            message: i18n::file_conflict_header(options.lang).to_string(),
+                            lines: vec![i18n::overwrite_unowned_detail(
+                                options.lang,
+                                &file.path,
+                                &action.to.name,
+                            )],
+                        });
+                    }
                 }
             } else if let Some(record) = old_record {
-                if record.pkg != action.to.name && !affected.contains(&record.pkg) {
+                if record.pkg != action.to.name
+                    && !affected.contains(&record.pkg)
+                    && !takeovers.contains_key(&file.path)
+                {
                     return Err(SpkError::FileConflict {
                         message: i18n::file_conflict_header(options.lang).to_string(),
-                        lines: vec![i18n::file_conflict(
+                        lines: vec![i18n::overwrite_owned_detail(
                             options.lang,
                             &file.path,
                             &action.to.name,
@@ -1016,6 +1087,12 @@ fn build_plan(
     for (name, package) in &state.installed.packages {
         if !affected.contains(name) {
             installed.packages.insert(name.clone(), package.clone());
+        }
+    }
+    for (path, old_owner) in &takeovers {
+        if let Some(package) = installed.packages.get_mut(old_owner) {
+            package.files.retain(|file| file.path != *path);
+            package.conffiles.retain(|conffile| conffile != path);
         }
     }
     let mut world = state.world.clone();

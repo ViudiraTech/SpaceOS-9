@@ -4,6 +4,7 @@
 > 来源：本文件由 Uinxed-Kernel 会话整理，供 SpaceKernel 会话继续执行。
 > 目标仓库：`~/Project/SpaceKernel`。
 > 托管：FadeHost Standard（app `goutoustdio`，域名 `https://goutoustdio.top`）。
+> 新增软件包的操作手册见 [ADDING_PACKAGES.md](ADDING_PACKAGES.md)。
 
 ## 0. 定位与原则
 
@@ -649,6 +650,15 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - `spk check` 校验磁盘属主/权限，`spk repair` 修正；QEMU 覆盖非 root 拒绝、sudo root:root 4755、repair
   - 旧 `base-1.0.0-2` 已从生产仓库删除；`SOURCE_DATE_EPOCH=1795255334`
 
+- 2026-11-21：`base 1.0.0-4` / `sudo 0.1.0-2`：中文 CLI、overwrite、locale 回退与 sudo argv 修复。
+  - `base-1.0.0-4-x86_64.spk`：sha256 `640db9caad39a023b258fb6aabe108e2d99b9b7f95db108fcd0642a4406e87a8`
+  - `sudo-0.1.0-2-x86_64.spk`：sha256 `05e6f49165a0dfc347986da765a9e14320a4d910b680cbf54a6b6991c11e4d4b`
+  - `index.json`：sha256 `52038a4e0c55ef514fa41e624155389a1df8b59aa8a5678876db6170b437c852`
+  - `index.json.sig`：sha256 `0e2f5ea5afa0c9bd0bdf29f6c399767195ebd25936399dddd7e91b2a6d53d9da`
+  - spk：中文 `--help`/错误、`--overwrite`/交互 y/N、`/etc/locale.conf` 语言回退
+  - sudo：修复 `command_for_shell` 重复传程序名（`sudo spk sync` 变成 `spk spk sync`）
+  - 旧 `base-1.0.0-3`、`sudo-0.1.0-1` 已从生产仓库删除
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
@@ -738,7 +748,7 @@ CI：
   - CLI：`spk sync`（别名 `update`）、HTTP(S) `--repo`、`repo add`、全局 `--offline`/`--allow-unsigned`；配置仓库名作为缓存 id，支持同一仓库多 URL 镜像。
   - 测试：host `http_remote` 13 项（200/304/404/500 重试/超时/重定向/Range/ETag/坏签名/坏索引/CA/多镜像/多签/CLI HTTP 安装/sync/offline/安全回退）；host 总计 86 项；QEMU 71 步（63 P3 + 8 P4）使用 `-nic user,model=e1000e`，加载 `e1000e.ko`，通过 rtnetlink 配置 `eth0`，本地 HTTP 仓库跑 install/upgrade/remove/offline。内核补 `RTM_NEWLINK` 路由请求（复用已有 `link_set`），不改 syscall 编号/结构。
 
-### P5 构建、镜像与运维
+### P5 构建、镜像与运维（含文件冲突覆盖）
 
 - P5 实现记录（2026-11-23，构建/镜像/运维）：
   - `tools/build_packages.sh`：统一 `SOURCE_DATE_EPOCH`，排序 staging、0:0、固定 mtime，生成 `.BUILDINFO`，产出 hello 0.1/0.2、sudo 0.1 和 `base` 1.0；相同 `SOURCE_DATE_EPOCH` 重建 sha256 一致。
@@ -748,6 +758,8 @@ CI：
   - `make packages`、`make repo`、`make image`、`make p5-isos`；ISO 通过 Limine 内嵌 FAT32 rootfs，rootfs 也作为 QEMU 可写 ext4 盘。
   - 运维：`spk cache info|clean`（保留当前索引引用、`.part`、年龄/容量策略）；`spk status --json` 稳定 GUI JSON；事务成功写 `/var/log/spk/audit.log` JSONL；`spk verify` 校验索引和全部包，新增中文输出；P5 host 测试 90 项（含 2000 包索引、并发审计、缓存保留）。
   - `tools/spk_p5_qemu_test.py`：ISO 内 `p5.mode=verify` 校验 + ext4 rootfs 离线 install/upgrade/remove；CI `spk-p5` job 构建镜像并跑离线矩阵。
+  - 桌面发布镜像（`release-try`）通过 `tools/overlay_p5_packages.py` 写入 `spk`/`spk-sandbox`、生产公钥和远程 `https://goutoustdio.top/spaceos/repo/x86_64` 配置，不嵌入本地 repo；`make all` 只构建该桌面候选，P5 本地验证镜像需显式 `make image`。`spk --help`/常见 Clap 错误在中文环境使用中文文本。
+- 文件冲突覆盖（2026-11-21）：`install/upgrade/downgrade/reinstall --overwrite <绝对 glob>` 可重复；无 owner 覆盖、有 owner 转移 files DB 归属并从旧包 files/conffiles 移除、`replaces` 合法接管、目录存在不冲突；无 flag 且非交互/`--noconfirm` 保持 exit 5，交互终端提供 y/N；相对路径、`..`、坏 `[` glob 退出 2。文案含 `spk owns`/`replaces=` 提示，`spk --help` 与常见 Clap 错误在中文环境使用中文。
 - 验收：从零 `make image` 后 ISO 内 `spk verify` 全绿；QEMU 离线仓库安装/升级/卸载；现有 86 host + 71 QEMU 不回归。
 
 ## 18. 目录结构建议

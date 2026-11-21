@@ -150,7 +150,7 @@ P5_DIR := build/p5
 P5_ROOTFS := $(P5_DIR)/rootfs.img
 P5_FAT := $(P5_DIR)/rootfs.fat
 P5_ISO := $(P5_DIR)/SpaceOS9-p5.iso
-P5_CMDLINE ?= console=ttyS0 init=/sbin/systemg
+P5_CMDLINE ?= console=ttyS0 root=/dev/nvme0n1 rootfstype=ext4 init=/sbin/systemg
 P5_PROFILE ?= release
 ISO_DATE := $(shell date -u -d @$(SOURCE_DATE_EPOCH) +%Y%m%d%H%M%S00 2>/dev/null || echo 1970010100000000)
 P5_TRUST_KEY ?= $(if $(SPK_REPO_PUBLIC),$(SPK_REPO_PUBLIC),$(if $(SPK_REPO_KEY),$(patsubst %.key,%.pub,$(SPK_REPO_KEY)),build/keys/repo.pub))
@@ -159,11 +159,12 @@ export SPK_REPO_PUBLIC
 export SPK_SECURITY
 
 .PHONY: bench desktop desktop-iso desktop-spui desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all all-packages kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
-all: release-try image
+all: release-try
 
 # Packaging needs the musl target, BusyBox/musl sources and a CA bundle.
-# Use `make desktop`, `make iso`, `make kernel` or `make packages` for narrower
-# builds; `make all` is the full build.
+# `make all` builds the desktop release candidate. P5 package/image
+# verification is explicit: `make packages`, `make repo`, `make image`.
+# Use `make desktop`, `make iso`, `make kernel` for narrower builds.
 all-packages: packages repo
 
 defconfig:
@@ -288,15 +289,17 @@ $(AUDIO_CONFIG):
 	@mkdir -p $(dir $@)
 	@printf 'pcm.!default {\n    type hw\n    card $(AUDIO_CARD)\n    device 0\n}\nctl.!default {\n    type hw\n    card $(AUDIO_CARD)\n}\n' > $@
 
-desktop-run: desktop $(AUDIO_CONFIG)
+desktop-run: release-try $(AUDIO_CONFIG)
 	ALSA_CONFIG_PATH=$(AUDIO_CONFIG) qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -m 4096 -smp $(CPUS) -serial stdio -monitor none -no-reboot -vga none -display gtk,zoom-to-fit=off -device virtio-gpu-pci,xres=1280,yres=800 -device virtio-tablet-pci -device virtio-keyboard-pci -nic $(or $(QEMU_NIC),user,model=e1000e) -drive file=$(DESKTOP_IMAGE),if=none,id=root,format=raw -device nvme,serial=SPROOT,drive=root -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -audiodev $(AUDIO_BACKEND),id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 -device sb16,audiodev=snd0 -cdrom $(ISO)
 
 # Reproducible release candidate requested by the release checklist.  The ISO
 # boots the release kernel; the matching desktop rootfs is build/rootfs/ext4.img.
 RELEASE_TRY := build/spacekernel-release-try.iso
 
-release-try:
+release-try: packages
 	$(MAKE) desktop PROFILE=release ARCH=x86_64
+	SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" python3 -I tools/overlay_p5_packages.py 		--stage build/rootfs/stage 		--trust-key packages/keys/ed25519:b4280a08406a53c5.pub 		--epoch $(SOURCE_DATE_EPOCH)
+	python3 tools/build_desktop_rootfs.py --reuse-stage --image build/rootfs/ext4.img
 	cp build/x86_64/release/SpaceKernel-x86_64.iso $(RELEASE_TRY)
 	cp build/rootfs/ext4.img build/spacekernel-release-try-rootfs.img
 	@printf 'Release image ready: %s\n' '$(RELEASE_TRY)'
@@ -374,7 +377,7 @@ help:
 	@printf '%s\n' \
 	  'make menuconfig   Configure architecture, drivers, modules and QEMU' \
 	  'make defconfig    Restore checked-in Kconfig defaults' \
-	  'make             Full build: desktop, packages, repo and image' \
+	  'make             Desktop release candidate (release-try)' \
 	  'make desktop     Build desktop ISO and rootfs only' \
 	  'make run         Boot ISO in QEMU' \
 	  'make debug       Start QEMU paused with GDB port 1234' \
@@ -383,5 +386,5 @@ help:
 	  'make check       Format and check all target architectures' \
 	  'make packages    Build reproducible .spk packages' \
 	  'make repo        Build and sign the local repository' \
-	  'make image       Build the P5 base rootfs and image' \
+	  'make image       Build the P5 package/image verification rootfs' \
 	  'make release-try Build release desktop ISO at build/spacekernel-release-try.iso'

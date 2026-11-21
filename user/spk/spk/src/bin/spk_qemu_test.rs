@@ -364,6 +364,33 @@ fn phase_conflicts_and_cleanup() -> Result<(), String> {
         return Err(format!("file-c content changed to '{shared}'"));
     }
     expect_ok("check after file conflict", &spk(&["check"])?)?;
+
+    // Explicit --overwrite transfers ownership from file-c to file-d.
+    let output = spk_zh(&[
+        "install",
+        "--repo",
+        "/repo/base",
+        "--noconfirm",
+        "--overwrite",
+        "/usr/share/spk-tests/shared",
+        "file-d",
+    ])?;
+    expect_ok("overwrite file-d", &output)?;
+    let content =
+        fs::read_to_string("/usr/share/spk-tests/shared").map_err(|error| error.to_string())?;
+    if content.trim() != "from-d" {
+        return Err(format!("overwrite left content '{content}'"));
+    }
+    let owns = text(&spk(&["owns", "/usr/share/spk-tests/shared"])?);
+    if !owns.contains("file-d") {
+        return Err(format!("overwrite did not transfer ownership: {owns}"));
+    }
+    let files_c = text(&spk(&["files", "file-c"])?);
+    if files_c.contains("/usr/share/spk-tests/shared") {
+        return Err("file-c still lists the overwritten path".into());
+    }
+    expect_ok("check after overwrite", &spk(&["check"])?)?;
+    expect_ok("remove file-d", &spk(&["remove", "--noconfirm", "file-d"])?)?;
     expect_ok("remove file-c", &spk(&["remove", "--noconfirm", "file-c"])?)?;
 
     expect_ok(
@@ -876,7 +903,7 @@ fn run_p3_script_tests() -> Result<(), String> {
         "--repo",
         "/repo/base",
         "--noconfirm",
-        "sudo=0.1.0-1",
+        "sudo=0.1.0-2",
     ])?;
     expect_ok("sudo downgrade", &output)?;
     expect_contains("sudo downgrade", &output, "正在降级 sudo")?;

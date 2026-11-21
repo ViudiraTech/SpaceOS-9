@@ -14,29 +14,63 @@ pub enum Lang {
 
 impl Lang {
     pub fn detect(explicit: Option<&str>) -> Self {
+        Self::detect_for(std::path::Path::new("/"), explicit)
+    }
+
+    /// Resolve the output language from, in order: `--lang`, the environment,
+    /// then the target root's `/etc/locale.conf`.  The config fallback matters
+    /// under privilege tools such as doas, which scrub the environment.
+    pub fn detect_for(root: &std::path::Path, explicit: Option<&str>) -> Self {
         if let Some(value) = explicit {
-            return if value.starts_with("zh") {
-                Self::ZhCn
-            } else {
-                Self::En
-            };
+            return Self::from_value(value);
         }
         for variable in ["SPK_LANG", "LC_ALL", "LC_MESSAGES", "LANG"] {
             if let Ok(value) = std::env::var(variable) {
-                if value.starts_with("zh") {
-                    return Self::ZhCn;
-                }
                 if !value.is_empty() {
-                    return Self::En;
+                    return Self::from_value(&value);
+                }
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(root.join("etc/locale.conf")) {
+            for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+                if let Some(value) = locale_value(&text, key) {
+                    return Self::from_value(&value);
                 }
             }
         }
         Self::En
     }
 
+    fn from_value(value: &str) -> Self {
+        if value.trim().starts_with("zh") {
+            Self::ZhCn
+        } else {
+            Self::En
+        }
+    }
+
     pub fn is_zh(self) -> bool {
         self == Self::ZhCn
     }
+}
+
+fn locale_value(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() == key {
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub fn tr<'a>(lang: Lang, en: &'a str, zh: &'a str) -> &'a str {
@@ -173,7 +207,7 @@ pub fn checking_dependencies(lang: Lang) -> &'static str {
 
 pub fn ok_summary(lang: Lang, size: &str, count: usize) -> String {
     if lang.is_zh() {
-        format!("OK: {size} in {count} 个软件包")
+        format!("OK: {size}，共 {count} 个软件包")
     } else {
         format!(
             "OK: {size} in {count} package{}",
@@ -669,10 +703,138 @@ pub fn verifying_repo(lang: Lang, name: &str) -> String {
     }
 }
 
+pub fn no_sync_repositories(lang: Lang) -> &'static str {
+    tr(
+        lang,
+        "no usable repositories to synchronize",
+        "没有可用于同步的仓库",
+    )
+}
+
+pub fn no_verify_repositories(lang: Lang) -> &'static str {
+    tr(
+        lang,
+        "no usable repositories to verify",
+        "没有可用于校验的仓库",
+    )
+}
+
+pub fn offline_not_cached(lang: Lang, name: &str) -> String {
+    if lang.is_zh() {
+        format!("仓库 {name} 未缓存，且指定了 --offline")
+    } else {
+        format!("repository {name} is not cached and --offline was given")
+    }
+}
+
+pub fn no_usable_mirror(lang: Lang, name: &str) -> String {
+    if lang.is_zh() {
+        format!("仓库 {name} 没有可用镜像")
+    } else {
+        format!("repository {name} has no usable mirror")
+    }
+}
+
+pub fn verify_size_mismatch(lang: Lang, name: &str, indexed: u64, actual: u64) -> String {
+    if lang.is_zh() {
+        format!("{name}: 大小不匹配：索引 {indexed}，文件 {actual}")
+    } else {
+        format!("{name}: size mismatch: index {indexed}, file {actual}")
+    }
+}
+
+pub fn verify_hash_mismatch(lang: Lang, name: &str) -> String {
+    if lang.is_zh() {
+        format!("{name}: sha256 不匹配")
+    } else {
+        format!("{name}: sha256 mismatch")
+    }
+}
+
 pub fn verify_ok(lang: Lang) -> String {
     if lang.is_zh() {
         "仓库校验通过".to_string()
     } else {
         "repository verification passed".to_string()
+    }
+}
+
+pub fn overwrite_unowned_prompt(lang: Lang, path: &str) -> String {
+    if lang.is_zh() {
+        format!("{path} 已存在，但不属于任何已安装软件包。是否覆盖？[y/N] ")
+    } else {
+        format!("{path} exists but is not owned by any installed package. Overwrite? [y/N] ")
+    }
+}
+
+pub fn overwrite_owned_prompt(lang: Lang, path: &str, owner: &str) -> String {
+    if lang.is_zh() {
+        format!("{path} 由 {owner} 拥有。是否覆盖并转移归属？[y/N] ")
+    } else {
+        format!("{path} is owned by {owner}. Overwrite and transfer ownership? [y/N] ")
+    }
+}
+
+pub fn overwrite_unowned_detail(lang: Lang, path: &str, package: &str) -> String {
+    if lang.is_zh() {
+        format!(
+            "{path} 已存在，但不属于任何已安装软件包；使用 spk install --overwrite '{path}' {package} 覆盖，或先删除该文件；spk owns {path} 可查看归属。"
+        )
+    } else {
+        format!(
+            "{path} exists but is not owned by any installed package; use spk install --overwrite '{path}' {package}, or remove the file first; spk owns {path} shows ownership."
+        )
+    }
+}
+
+pub fn overwrite_owned_detail(lang: Lang, path: &str, package: &str, owner: &str) -> String {
+    if lang.is_zh() {
+        format!(
+            "{path} 已由 {owner} 拥有；使用 spk install --overwrite '{path}' {package}，或让包声明 replaces={owner}。"
+        )
+    } else {
+        format!(
+            "{path} is owned by {owner}; use spk install --overwrite '{path}' {package}, or declare replaces={owner}."
+        )
+    }
+}
+
+pub fn overwrite_unowned_warning(lang: Lang, path: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：覆盖了不属于任何软件包的 {path}")
+    } else {
+        format!("warning: overwrote unowned path {path}")
+    }
+}
+
+pub fn overwrite_takeover_warning(lang: Lang, path: &str, package: &str, owner: &str) -> String {
+    if lang.is_zh() {
+        format!("警告：{package} 接管了 {path}（原属 {owner}）")
+    } else {
+        format!("warning: {package} took over {path} from {owner}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locale_conf_values_are_parsed() {
+        let text = "# comment\nLANG=zh_CN.UTF-8\nLC_MESSAGES=en_US.UTF-8\n";
+        assert_eq!(locale_value(text, "LANG").as_deref(), Some("zh_CN.UTF-8"));
+        assert_eq!(
+            locale_value(text, "LC_MESSAGES").as_deref(),
+            Some("en_US.UTF-8")
+        );
+        assert_eq!(locale_value(text, "LC_ALL"), None);
+    }
+
+    #[test]
+    fn language_values_use_prefix_fallback() {
+        assert_eq!(Lang::from_value("zh_CN.UTF-8"), Lang::ZhCn);
+        assert_eq!(Lang::from_value("zh_TW"), Lang::ZhCn);
+        assert_eq!(Lang::from_value("en_US.UTF-8"), Lang::En);
+        assert_eq!(Lang::from_value("C.UTF-8"), Lang::En);
     }
 }
