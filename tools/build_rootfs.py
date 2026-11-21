@@ -137,6 +137,12 @@ def main() -> int:
         path.write_text(content)
         run("mcopy", "-i", str(IMAGE), str(path), f"::/etc/{name}")
 
+    ca_bundle = pathlib.Path("/etc/ssl/certs/ca-certificates.crt")
+    if ca_bundle.is_file():
+        run("mmd", "-i", str(IMAGE), "::/etc/ssl")
+        run("mmd", "-i", str(IMAGE), "::/etc/ssl/certs")
+        run("mcopy", "-i", str(IMAGE), str(ca_bundle), "::/etc/ssl/certs/ca-certificates.crt")
+
     setuid_allow = staging / "setuid.allow"
     setuid_allow.write_text("/usr/bin/sudo\n/usr/bin/doas\n")
     run("mcopy", "-i", str(IMAGE), str(setuid_allow), "::/etc/spk/setuid.allow")

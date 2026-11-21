@@ -146,6 +146,7 @@ fn phase_install() -> Result<(), String> {
 
     run_sudo_tests()?;
     run_p3_script_tests()?;
+    run_p4_http_tests()?;
 
     // Exercise setuid package removal before the reboot matrix continues.
     let output = spk_zh(&["remove", "--noconfirm", "sudo"])?;
@@ -349,6 +350,238 @@ fn phase_conflicts_and_cleanup() -> Result<(), String> {
     rustix::fs::sync();
     finish_phase("SPK_QEMU_OK");
     Ok(())
+}
+
+fn run_p4_http_tests() -> Result<(), String> {
+    setup_network()?;
+    let base = fs::read_to_string("/etc/spk-http-base")
+        .map_err(|error| format!("read /etc/spk-http-base: {error}"))?
+        .trim()
+        .to_string();
+    if !base.starts_with("http://") {
+        return Err(format!("invalid http test base '{base}'"));
+    }
+    let output = spk_zh(&["repo", "add", "p4-http", &base, "--priority", "20"])?;
+    expect_ok("repo add http", &output)?;
+
+    let output = spk_zh(&["sync"])?;
+    expect_ok("sync http", &output)?;
+    expect_contains("sync http", &output, "已同步")?;
+
+    let output = spk_zh(&["install", "--noconfirm", "http-pkg=1.0.0-1"])?;
+    expect_ok("install http-pkg", &output)?;
+    expect_contains("install http-pkg", &output, "正在安装 http-pkg")?;
+    let content = fs::read_to_string("/usr/share/spk-tests/http-pkg")
+        .map_err(|error| format!("http-pkg file missing: {error}"))?;
+    if content.trim() != "http-v1" {
+        return Err(format!("unexpected http-pkg content '{content}'"));
+    }
+
+    let output = spk_zh(&["install", "--noconfirm", "http-pkg=1.1.0-1"])?;
+    expect_ok("upgrade http-pkg", &output)?;
+    expect_contains("upgrade http-pkg", &output, "正在升级 http-pkg")?;
+    let content = fs::read_to_string("/usr/share/spk-tests/http-pkg")
+        .map_err(|error| format!("http-pkg file missing after upgrade: {error}"))?;
+    if content.trim() != "http-v2" {
+        return Err(format!("unexpected upgraded http-pkg content '{content}'"));
+    }
+
+    let output = spk_zh(&["remove", "--noconfirm", "http-pkg"])?;
+    expect_ok("remove http-pkg", &output)?;
+    if fs::metadata("/usr/share/spk-tests/http-pkg").is_ok() {
+        return Err("remove http-pkg left its file behind".into());
+    }
+
+    let output = spk_zh(&["--offline", "install", "--noconfirm", "http-pkg=1.1.0-1"])?;
+    expect_ok("offline http-pkg", &output)?;
+    expect_contains("offline http-pkg", &output, "正在安装 http-pkg")?;
+    let content = fs::read_to_string("/usr/share/spk-tests/http-pkg")
+        .map_err(|error| format!("offline http-pkg file missing: {error}"))?;
+    if content.trim() != "http-v2" {
+        return Err(format!("unexpected offline http-pkg content '{content}'"));
+    }
+    let output = spk_zh(&["remove", "--noconfirm", "http-pkg"])?;
+    expect_ok("remove offline http-pkg", &output)?;
+    expect_ok("check after http", &spk(&["check"])?)?;
+    Ok(())
+}
+
+fn setup_network() -> Result<(), String> {
+    if !std::path::Path::new("/sys/class/net/eth0").exists() {
+        let file = fs::File::open("/lib/modules/e1000e.ko")
+            .map_err(|error| format!("open e1000e.ko: {error}"))?;
+        use std::os::unix::io::AsRawFd;
+        let result = unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), 0, 0) };
+        if result < 0 {
+            return Err(format!(
+                "finit_module(e1000e) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        for _ in 0..50 {
+            if std::path::Path::new("/sys/class/net/eth0").exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if !std::path::Path::new("/sys/class/net/eth0").exists() {
+            return Err("e1000e did not create eth0".into());
+        }
+    }
+    // libc's if_nametoindex uses SIOCGIFINDEX; SpaceKernel exposes the index
+    // through sysfs, so read it there instead of relying on the legacy ioctl.
+    let ifindex = fs::read_to_string("/sys/class/net/eth0/ifindex")
+        .map_err(|error| format!("read eth0 ifindex: {error}"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| format!("parse eth0 ifindex: {error}"))?;
+    if ifindex == 0 {
+        return Err("eth0 has no ifindex".into());
+    }
+    // BusyBox `ip link set` uses SIOCSIFFLAGS; the kernel exposes the same
+    // operation through rtnetlink RTM_NEWLINK. Configure through netlink so
+    // the test does not depend on the legacy socket ioctl path.
+    netlink_request(16, link_payload(ifindex))?;
+    let address = [10, 0, 2, 15];
+    netlink_request(20, address_payload(ifindex, &address))?;
+    netlink_request(24, route_payload(ifindex, [10, 0, 2, 2]))?;
+    let base = fs::read_to_string("/etc/spk-http-base")
+        .map_err(|error| error.to_string())?
+        .trim()
+        .to_string();
+    let response = Command::new("/bin/busybox")
+        .args([
+            "wget",
+            "-q",
+            "-O",
+            "/dev/null",
+            &format!("{base}/index.json"),
+        ])
+        .output()
+        .map_err(|error| format!("busybox wget: {error}"))?;
+    if !response.status.success() {
+        return Err(format!(
+            "guest cannot reach the host HTTP server: {}{}",
+            String::from_utf8_lossy(&response.stdout),
+            String::from_utf8_lossy(&response.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn netlink_request(kind: u16, payload: Vec<u8>) -> Result<(), String> {
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_ACK: u16 = 4;
+    const NLM_F_EXCL: u16 = 0x200;
+    const NLM_F_CREATE: u16 = 0x400;
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE) };
+    if fd < 0 {
+        return Err(format!(
+            "netlink socket: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let result = (|| {
+        let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        address.nl_family = libc::AF_NETLINK as u16;
+        if unsafe {
+            libc::bind(
+                fd,
+                &address as *const libc::sockaddr_nl as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        } < 0
+        {
+            return Err(format!("bind netlink: {}", std::io::Error::last_os_error()));
+        }
+        let length = 16 + payload.len();
+        let mut message = Vec::with_capacity(length);
+        message.extend_from_slice(&(length as u32).to_le_bytes());
+        message.extend_from_slice(&kind.to_le_bytes());
+        message.extend_from_slice(
+            &(NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL).to_le_bytes(),
+        );
+        message.extend_from_slice(&1u32.to_le_bytes());
+        message.extend_from_slice(&0u32.to_le_bytes());
+        message.extend_from_slice(&payload);
+        let sent = unsafe { libc::send(fd, message.as_ptr() as *const _, message.len(), 0) };
+        if sent < 0 {
+            return Err(format!("send netlink: {}", std::io::Error::last_os_error()));
+        }
+        let mut reply = [0u8; 4096];
+        let read = unsafe { libc::recv(fd, reply.as_mut_ptr() as *mut _, reply.len(), 0) };
+        if read < 0 {
+            return Err(format!("recv netlink: {}", std::io::Error::last_os_error()));
+        }
+        let read = read as usize;
+        if read < 20 {
+            return Err("short netlink reply".into());
+        }
+        let reply_kind = u16::from_le_bytes([reply[4], reply[5]]);
+        if reply_kind != 2 {
+            return Err(format!("unexpected netlink reply type {reply_kind}"));
+        }
+        let error = i32::from_le_bytes([reply[16], reply[17], reply[18], reply[19]]);
+        if error != 0 {
+            return Err(format!("netlink error {error}"));
+        }
+        Ok(())
+    })();
+    unsafe {
+        libc::close(fd);
+    }
+    result
+}
+
+fn put_attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
+    let length = 4 + data.len();
+    out.extend_from_slice(&(length as u16).to_le_bytes());
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(data);
+    while !out.len().is_multiple_of(4) {
+        out.push(0);
+    }
+}
+
+fn link_payload(ifindex: u32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(16);
+    payload.push(0);
+    payload.push(0);
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&(ifindex as i32).to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload
+}
+
+fn address_payload(ifindex: u32, address: &[u8; 4]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(24);
+    payload.push(2);
+    payload.push(24);
+    payload.push(0);
+    payload.push(0);
+    payload.extend_from_slice(&ifindex.to_le_bytes());
+    put_attr(&mut payload, 2, address);
+    put_attr(&mut payload, 1, address);
+    payload
+}
+
+fn route_payload(ifindex: u32, gateway: [u8; 4]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(20);
+    payload.push(2);
+    payload.push(0);
+    payload.push(0);
+    payload.push(0);
+    payload.push(254);
+    payload.push(3);
+    payload.push(0);
+    payload.push(1);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    put_attr(&mut payload, 5, &gateway);
+    payload.extend_from_slice(&8u16.to_le_bytes());
+    payload.extend_from_slice(&4u16.to_le_bytes());
+    payload.extend_from_slice(&ifindex.to_le_bytes());
+    payload
 }
 
 fn expect_code(label: &str, output: &Output, code: i32) -> Result<(), String> {

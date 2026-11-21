@@ -26,6 +26,8 @@ stage() {
     printf 'staged %s in %s\n' "$name" "$stage_dir"
 }
 
+stage http-pkg http-pkg "http-v1"
+stage http-pkg-1.1 http-pkg "http-v2"
 stage dep-a dep-a "dep-a"
 stage dep-b dep-b "dep-b"
 stage file-c shared "from-c"
