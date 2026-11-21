@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stage the Windows XP Luna-inspired SPUI theme package.
+# Stage the XP Luna SPUI theme package.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -16,8 +16,6 @@ install -d -m 0755 \
 install -m 0644 "$ROOT/packages/theme-winxp/theme.toml" \
     "$STAGE/usr/share/spui/themes/winxp/theme.toml"
 for svg in \
-    bliss.svg \
-    xp-flag.svg \
     close.svg close_hover.svg close_active.svg \
     minimize.svg minimize_hover.svg minimize_active.svg \
     maximize.svg maximize_hover.svg maximize_active.svg \
@@ -34,5 +32,6 @@ install -m 0755 "$ROOT/packages/theme-winxp/spui-theme-winxp" \
     "$STAGE/usr/bin/spui-theme-winxp"
 install -m 0644 "$ROOT/packages/theme-winxp/spui-theme-winxp.desktop" \
     "$STAGE/usr/share/applications/spui-theme-winxp.desktop"
+install -m 0644 "$ROOT/packages/theme-winxp/.INSTALL" "$STAGE/.INSTALL"
 
 printf 'staged theme-winxp in %s\n' "$STAGE"

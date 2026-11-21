@@ -1,5 +1,5 @@
 #!/bin/sh
-# Apply the Windows XP Luna-inspired SPUI theme pack.
+# Apply the XP Luna SPUI theme pack.
 set -eu
 
 if ! command -v uxconf-query >/dev/null 2>&1; then
@@ -18,4 +18,4 @@ uxconf-query -c panel -p /position -s bottom -t string
 uxconf-query -c panel -p /size -s 36 -t int
 uxconf-query -c panel -p /start-fullscreen -s false -t bool
 
-printf 'Windows XP theme applied; sign out or restart SPUI if the shell does not refresh immediately.\n'
+printf 'XP Luna theme applied; sign out or restart SPUI if the shell does not refresh immediately.\n'

@@ -1,6 +1,6 @@
 #
 #       packages/theme-winxp/theme.toml
-#       Declarative Windows XP Luna CSS + SVG theme skin for SPUI (schema = 2)
+#       Declarative XP Luna CSS + SVG theme skin for SPUI (schema = 2)
 #
 #       2026/11/21 By JiTianYu391
 #       Copyright (C) 2026 ViudiraTech.
@@ -8,7 +8,7 @@
 
 schema = 2
 id = "winxp"
-name = "Windows XP Luna"
+name = "XP Luna"
 subtitle = "Luna 蓝调胶质标题栏 · 绿色开始按钮 · 双栏开始菜单"
 base_style = "spui"
 mode = "light"
@@ -170,7 +170,6 @@ full_height = true
 margin_left = 0
 radius = [0, 13, 13, 0]
 label = "开始"
-icon_svg = "xp-flag.svg"
 text_color = "#ffffff"
 text_shadow = "#123e10"
 normal_bg = "linear-gradient(to bottom, #74c56d 0%, #43a13d 12%, #379231 48%, #2e8428 54%, #257820 88%, #185814 100%)"
@@ -268,7 +267,7 @@ progress_chunk_w = 8
 progress_chunk_gap = 2
 
 # ==============================================================================
-# Official Windows XP Color Scheme Variant 1: Olive Green (Homestead)
+# XP Color Scheme Variant 1: Olive Green (Homestead)
 # Activated when user selects Green (#10b981) or Amber (#f59e0b) accent swatch.
 # ==============================================================================
 [accents.olive]
@@ -367,7 +366,7 @@ scrollbar_grip_light = "#f2f6ea"
 scrollbar_grip_dark = "#6d804c"
 
 # ==============================================================================
-# Official Windows XP Color Scheme Variant 2: Metallic Silver
+# XP Color Scheme Variant 2: Metallic Silver
 # Activated when user selects Slate/Silver (#64748b), Violet (#8b5cf6) or Indigo (#6366f1).
 # ==============================================================================
 [accents.silver]
@@ -473,7 +472,7 @@ scrollbar_grip_light = "#ffffff"
 scrollbar_grip_dark = "#7a8190"
 
 # ==============================================================================
-# Official Windows XP Dark Theme Variant: Royale Noir / Zune Dark
+# XP Dark Theme Variant: Royale Noir / Zune Dark
 # Activated automatically when user switches Appearance Mode to Dark ("深色").
 # ==============================================================================
 [dark.colors]

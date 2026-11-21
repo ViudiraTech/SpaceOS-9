@@ -17,7 +17,7 @@
 use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
 use crate::text::TextRenderer;
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
 use crate::ui::{self, CaptionHit};
 use crate::x11::{CursorKind, Key, Result, X};
 use spime::client::SpimeClient;
@@ -187,10 +187,42 @@ impl App {
     pub fn new(title: &str, icon: Icon, width: u16, height: u16) -> Result<Self> {
         let x = X::connect()?;
         let mut uxconf = UxConfClient::connect().ok();
-        let config = uxconf
+        let mut config = uxconf
             .as_mut()
             .map(UxConfClient::load_desktop_config)
             .unwrap_or_default();
+        if let Some(missing) = theme::fallback_missing_theme(&mut config) {
+            eprintln!(
+                "theme '{missing}' is no longer installed; falling back to the default theme"
+            );
+            if let Some(client) = uxconf.as_mut() {
+                let _ = client.set(
+                    "appearance",
+                    "/theme/id",
+                    Value::String(config.theme_id.clone()),
+                );
+                let _ = client.set(
+                    "appearance",
+                    "/theme/style",
+                    Value::String(config.theme_style.as_str().to_string()),
+                );
+                let _ = client.set(
+                    "appearance",
+                    "/theme/mode",
+                    Value::String(config.mode.as_str().to_string()),
+                );
+                let _ = client.set(
+                    "appearance",
+                    "/theme/accent",
+                    Value::String(format!("#{:06x}", config.accent)),
+                );
+                let _ = client.set(
+                    "desktop",
+                    "/backdrop/wallpaper",
+                    Value::String(config.wallpaper.clone()),
+                );
+            }
+        }
         let watch = UxConfWatch::subscribe(None).ok();
         let theme = Theme::from_config(&config);
 
@@ -434,6 +466,11 @@ impl App {
     }
 
     fn sync_config_visuals(&mut self) {
+        if let Some(missing) = theme::fallback_missing_theme(&mut self.config) {
+            eprintln!(
+                "theme '{missing}' is no longer installed; falling back to the default theme"
+            );
+        }
         self.theme = Theme::from_config(&self.config);
         self.text.set_ui_scale(self.theme.ui_scale());
         if self.maximized {
