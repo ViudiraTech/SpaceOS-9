@@ -93,9 +93,23 @@ def build_artifacts() -> None:
             str(ROOT / "target"),
         ]
     )
+    cargo(
+        [
+            "build",
+            "--manifest-path",
+            str(ROOT / "user" / "sudo" / "Cargo.toml"),
+            "--bins",
+            "--release",
+            "--target",
+            "x86_64-unknown-linux-musl",
+            "--target-dir",
+            str(ROOT / "target"),
+        ]
+    )
     run([str(ROOT / "packages" / "hello" / "build.sh"), "0.1.0"], cwd=ROOT)
     run([str(ROOT / "packages" / "hello" / "build.sh"), "0.2.0"], cwd=ROOT)
     run([str(ROOT / "packages" / "spk-tests" / "build.sh")], cwd=ROOT)
+    run([str(ROOT / "packages" / "sudo" / "build.sh")], cwd=ROOT)
 
 
 def pack(manifest: pathlib.Path, staging: pathlib.Path, output_dir: pathlib.Path) -> None:
@@ -148,6 +162,11 @@ def prepare_repositories() -> str:
             ROOT / "build" / "spk-tests" / name,
             base,
         )
+    pack(
+        ROOT / "packages" / "sudo" / "manifest.toml",
+        ROOT / "build" / "packages" / "sudo",
+        base,
+    )
     for package in base.glob("*.spk"):
         shutil.copy2(package, update / package.name)
     pack(
@@ -189,6 +208,11 @@ def build_rootfs(key_id: str) -> None:
         "sbin",
         "usr/bin",
         "etc/spk/trusted.d",
+        "var/log",
+        "var/lib/sudo",
+        "var/tmp",
+        "home/test",
+        "home/empty",
         "repo/base",
         "repo/update",
         "var/lib",
@@ -211,6 +235,63 @@ def build_rootfs(key_id: str) -> None:
     for directory in ("base", "update"):
         for package in (BUILD / f"repo-{directory}").iterdir():
             shutil.copy2(package, stage / "repo" / directory / package.name)
+    probe = ROOT / "build" / "spk-tests" / "setuid-probe"
+    if not probe.exists():
+        raise SystemExit(f"missing {probe}; run packages/spk-tests/build.sh")
+    setuid = stage / "usr/bin/setuid-probe"
+    shutil.copy2(probe, setuid)
+    setuid.chmod(0o6755)
+    plain = stage / "usr/bin/nosetuid-probe"
+    shutil.copy2(probe, plain)
+    plain.chmod(0o0755)
+    for name in ("sudo-probe", "sudo-probe-pw"):
+        target = stage / "usr/bin" / name
+        shutil.copy2(probe, target)
+        target.chmod(0o0755)
+    edit_probe = ROOT / "build" / "spk-tests" / "sudo-edit-probe"
+    if not edit_probe.exists():
+        raise SystemExit(f"missing {edit_probe}; run packages/spk-tests/build.sh")
+    shutil.copy2(edit_probe, stage / "usr/bin/sudo-edit-probe")
+    (stage / "usr/bin/sudo-edit-probe").chmod(0o0755)
+
+    hash_value = subprocess.check_output(
+        ["openssl", "passwd", "-6", "-salt", "spktest", "testpass"],
+        text=True,
+    ).strip()
+    if not hash_value.startswith("$6$"):
+        raise SystemExit("openssl did not produce a SHA-512 crypt hash")
+    (stage / "etc/passwd").write_text(
+        "root:x:0:0:root:/root:/bin/sh\n"
+        "test:x:1000:1000:Test User:/home/test:/bin/sh\n"
+        "empty:x:1001:1001:Empty User:/home/empty:/bin/sh\n"
+    )
+    (stage / "etc/group").write_text(
+        "root:x:0:\ntest:x:1000:\nempty:x:1001:\nwheel:x:10:test\n"
+    )
+    (stage / "etc/shadow").write_text(
+        f"root:!::0:::::\ntest:{hash_value}:20000:0:99999:7:::\nempty::20000:0:99999:7:::\n"
+    )
+    (stage / "etc/sudoers").write_text(
+        "Defaults lecture=never,timestamp_timeout=15,timestamp_type=global,"
+        "secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n"
+        "test ALL=(root) NOPASSWD: /usr/bin/sudo-probe\n"
+        "test ALL=(empty) NOPASSWD: /usr/bin/sudo-probe\n"
+        "test ALL=(root) /usr/bin/sudo-probe-pw\n"
+        "test ALL=(root) sudoedit\n"
+        "empty ALL=(root) /usr/bin/sudo-probe-pw\n"
+    )
+    (stage / "etc/doas.conf").write_text(
+        "permit nopass test as root cmd /usr/bin/sudo-probe\n"
+    )
+    (stage / "etc/spk/setuid.allow").write_text("/usr/bin/sudo\n/usr/bin/doas\n")
+    (stage / "etc/test-edit").write_text("original\n")
+    for name in ("etc/passwd", "etc/group"):
+        (stage / name).chmod(0o644)
+    (stage / "etc/shadow").chmod(0o600)
+    for name in ("etc/sudoers", "etc/doas.conf"):
+        (stage / name).chmod(0o440)
+    (stage / "etc/spk/setuid.allow").chmod(0o644)
+    (stage / "etc/test-edit").chmod(0o644)
     public = BUILD / "keys" / "spk-test.pub"
     shutil.copy2(public, stage / "etc" / "spk" / "trusted.d" / f"{key_id}.pub")
     (stage / "etc" / "spk" / "trusted.d" / f"{key_id}.pub").chmod(0o644)
@@ -271,7 +352,7 @@ def build_iso() -> None:
         raise SystemExit("ISO build did not produce the expected file")
 
 
-def boot(marker: str, timeout: float, log_path: pathlib.Path, accel: str) -> bool:
+def boot(marker: str, timeout: float, log_path: pathlib.Path, accel: str) -> tuple[bool, bool]:
     command = [
         "qemu-system-x86_64",
         "-machine",
@@ -317,6 +398,7 @@ def boot(marker: str, timeout: float, log_path: pathlib.Path, accel: str) -> boo
     buffer = ""
     deadline = time.time() + timeout
     detected = False
+    failed = False
     try:
         while time.time() < deadline:
             if process.poll() is not None and not selector.get_map():
@@ -330,6 +412,7 @@ def boot(marker: str, timeout: float, log_path: pathlib.Path, accel: str) -> boo
                 chunks.append(text)
                 buffer += text
                 if "SPK_QEMU_FAIL" in buffer:
+                    failed = True
                     detected = True
                     marker = "SPK_QEMU_FAIL"
                     break
@@ -374,10 +457,10 @@ def boot(marker: str, timeout: float, log_path: pathlib.Path, accel: str) -> boo
     for line in body.splitlines():
         if any(token in line for token in interesting):
             print(f"  | {line}")
-    if not detected:
-        tail = "\n".join(body.splitlines()[-40:])
+    if not detected or failed:
+        tail = "\n".join(body.splitlines()[-60:])
         log(f"boot did not reach {marker!r}; tail:\n{tail}")
-    return detected
+    return detected and not failed, failed
 
 
 def offline_checks() -> bool:
@@ -451,14 +534,14 @@ def main() -> int:
             path = BUILD / f"boot{index}.log"
             log(f"boot {index}: waiting for {marker!r} ({accel})")
             started = time.time()
-            if not boot(marker, timeout, path, accel):
-                if accel == "kvm":
-                    log("KVM boot failed; retrying this phase under TCG")
-                    accel = "tcg"
-                    if not boot(marker, max(timeout, 600.0), path, accel):
-                        return report(arguments.result, False, key_id, logs)
-                else:
-                    return report(arguments.result, False, key_id, logs)
+            ok, guest_failed = boot(marker, timeout, path, accel)
+            if not ok and not guest_failed and accel == "kvm":
+                log("KVM boot failed; retrying this phase under TCG")
+                accel = "tcg"
+                path = BUILD / f"boot{index}-tcg.log"
+                ok, guest_failed = boot(marker, max(timeout, 600.0), path, accel)
+            if not ok:
+                return report(arguments.result, False, key_id, logs)
             logs.append({"phase": index, "marker": marker, "seconds": round(time.time() - started, 1)})
         ok = offline_checks()
         return report(arguments.result, ok, key_id, logs)

@@ -8,6 +8,11 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 OUT=${1:-$ROOT/build/spk-tests}
+CC=${CC:-clang}
+LD=${LD:-ld.lld}
+CFLAGS="-target x86_64-unknown-none -ffreestanding -fno-builtin -fno-pic -fno-pie \
+ -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
+ -mno-red-zone -O2 -Wall -Wextra -Werror -I$ROOT/user/splibc/include"
 
 stage() {
     name=$1
@@ -27,3 +32,21 @@ stage file-c shared "from-c"
 stage file-d shared "from-d"
 stage app app "app"
 stage lib lib "lib"
+
+# Kernel setuid-exec probe (run by QEMU as uid/gid 1000).
+if [ -f "$ROOT/build/userland/obj/crt0.o" ] && [ -f "$ROOT/build/userland/libsplibc.a" ]; then
+    $CC $CFLAGS -c "$ROOT/packages/spk-tests/setuid-probe.c" -o "$OUT/setuid-probe.o"
+    $LD -m elf_x86_64 -T "$ROOT/user/userland.ld" --no-dynamic-linker -static \
+        -o "$OUT/setuid-probe" "$ROOT/build/userland/obj/crt0.o" \
+        "$OUT/setuid-probe.o" "$ROOT/build/userland/libsplibc.a"
+    printf 'built setuid-probe in %s\n' "$OUT"
+fi
+
+# sudoedit probe used by the QEMU sudo test.
+if [ -f "$ROOT/build/userland/obj/crt0.o" ] && [ -f "$ROOT/build/userland/libsplibc.a" ]; then
+    $CC $CFLAGS -c "$ROOT/packages/spk-tests/sudo-edit-probe.c" -o "$OUT/sudo-edit-probe.o"
+    $LD -m elf_x86_64 -T "$ROOT/user/userland.ld" --no-dynamic-linker -static \
+        -o "$OUT/sudo-edit-probe" "$ROOT/build/userland/obj/crt0.o" \
+        "$OUT/sudo-edit-probe.o" "$ROOT/build/userland/libsplibc.a"
+    printf 'built sudo-edit-probe in %s\n' "$OUT"
+fi

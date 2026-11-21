@@ -1,0 +1,35 @@
+#
+#       user/sudo/Cargo.toml
+#       SpaceOS-9 setuid sudo / doas
+#
+#       2026/11/21 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+[package]
+name = "sudo"
+version = "0.1.0"
+edition = "2021"
+description = "SpaceOS-9 setuid sudo and doas"
+license = "LicenseRef-Proprietary"
+
+[lib]
+name = "sudo_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sudo"
+path = "src/bin/sudo.rs"
+
+[[bin]]
+name = "doas"
+path = "src/bin/doas.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+sha-crypt = "0.6"
+yescrypt = "0.1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.13"

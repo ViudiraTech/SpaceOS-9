@@ -1,0 +1,29 @@
+#
+#       packages/sudo/manifest.toml
+#       SpaceOS-9 setuid sudo / doas
+#
+#       2026/11/21 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "sudo"
+epoch = 0
+version = "0.1.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "SpaceOS-9 sudo and doas"
+description = "Setuid sudo/doas with shadow authentication, tickets, sudoers/doas.conf, lecture and audit."
+license = "LicenseRef-Proprietary"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = ["sudo"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = true
