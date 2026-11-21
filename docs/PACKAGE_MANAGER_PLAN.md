@@ -666,6 +666,12 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - SPUI 启动扫描 `/usr/share/spui/themes/<id>/theme.toml`；主题包不改代码
   - 主题包含原创 `winxp-bliss.jpg`、`theme.toml`、`spui-theme-winxp` 应用脚本
 
+- 2026-11-21：`sudo 0.1.0-3`：保留 argv[0]，修复 `sudo su` 走 BusyBox applet。
+  - `sudo-0.1.0-3-x86_64.spk`：sha256 `9f97b3f3c97b735c16095dbc80dd95dc645006ca6f9ebb09b2720424d94ca78e`
+  - `index.json`：sha256 `9c9fc98c48c9267177a845663265b718a8709e79005e5585346f359586d3441d`
+  - `index.json.sig`：sha256 `58dc94507abdd8c0275d2bb86dc4c2fe5f8e87cba4fc8aee7ab56786c9e6489b`
+  - 旧 `sudo-0.1.0-2` 已从生产仓库删除
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
