@@ -24,6 +24,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: nightly-2026-05-24
 
 jobs:
   check:
