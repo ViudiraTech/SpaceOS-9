@@ -1037,10 +1037,11 @@ pub fn self_test_late() -> bool {
         return false;
     }
 
-    // Wake worker and give it up to 40ms to resample + mix both streams into `hw_sub`.
+    // Wake worker and give it up to 2s to resample + mix both streams into
+    // `hw_sub`; CI runners can be much slower than the local TCG/KVM path.
     let mut mixed_nonzero = false;
     let mut hw_appl = 0u64;
-    for _ in 0..40 {
+    for _ in 0..400 {
         crate::sched::sleep_micros(5_000);
         let runtime = hw_sub.runtime.lock();
         hw_appl = runtime.appl_ptr;
