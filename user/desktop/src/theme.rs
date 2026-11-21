@@ -1,22 +1,31 @@
 /*
  *
  *       user/desktop/src/theme.rs
- *       SPUI 4.0 neutral graphite dark & crisp light palettes and metrics
+ *       SPUI 4.0 palettes, metrics, package discovery and declarative CSS/SVG theme engine
  *
  *       2026/10/30 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
  *
  */
 
-//! Visual constants for the desktop shell and its applications. Colors are
-//! packed `0xRRGGBB`; palettes use neutral zinc/graphite grays (zero dark-navy
-//! neon tint) paired with a clean light mode and restrained native metrics.
+//! Visual constants and declarative theme skin engine for the desktop shell and
+//! its applications. Built-in themes (`VortexGlass`, `Spui`, `Win98`) and external
+//! `.spk` theme packages under `/usr/share/spui/themes/<id>/theme.toml` share a
+//! zero-allocation runtime `Theme` handle. External theme packages can declare
+//! multi-stop CSS `linear-gradient` / `radial-gradient` backgrounds, multi-layer
+//! `inset` `box-shadow` bevels, per-corner `border-radius`, `text-shadow`, dark/accent
+//! sub-variants and `.svg`/`.png` sprites for every window, taskbar, Start menu and
+//! widget slot without hardcoding theme-specific renderers into SPUI.
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
-use crate::draw::mix;
-use uxconf::{DesktopConfig, ThemeMode, ThemeStyle};
+use crate::draw::{mix, Canvas, Rect, Sprite};
+use crate::icons;
+use uxconf::{DesktopConfig, PanelPosition, ThemeMode, ThemeStyle, THEME_PRESETS, WALLPAPERS, WALLPAPER_DIR};
 
 pub const TITLEBAR_HEIGHT: i32 = 34;
 pub const VORTEX_TITLEBAR_HEIGHT: i32 = 30;
@@ -30,32 +39,526 @@ pub const RADIUS_CONTROL: i32 = 5;
 const SYSTEM_THEME_DIR: &str = "/usr/share/spui/themes";
 const USER_THEME_SUBDIR: &str = ".local/share/spui/themes";
 
+/// Miniature preview specification for an external theme card in System Settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThemePreviewSpec {
+    pub desktop_top: u32,
+    pub desktop_bottom: u32,
+    pub window_bg: u32,
+    pub window_border: u32,
+    pub window_top_radius: i32,
+    pub titlebar_left: u32,
+    pub titlebar_right: u32,
+    pub close_btn: u32,
+    pub taskbar_top: u32,
+    pub taskbar_bottom: u32,
+    pub start_btn: u32,
+    pub tray_bg: u32,
+}
+
+/// Metadata for an installed external theme package discovered on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledThemeInfo {
+    pub id: String,
+    pub name: String,
+    pub subtitle: String,
+    pub base_style: ThemeStyle,
+    pub mode: ThemeMode,
+    pub accent: u32,
+    pub wallpaper: Option<String>,
+    pub solid_color: Option<u32>,
+    pub panel_position: Option<PanelPosition>,
+    pub panel_size: Option<i32>,
+    pub start_fullscreen: Option<bool>,
+    pub preview: ThemePreviewSpec,
+}
+
+/// Discovered wallpaper entry combining built-in and theme-installed wallpapers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredWallpaper {
+    pub file: String,
+    pub label: String,
+}
+
+/// Parsed CSS background specification (`solid`, `linear-gradient`, or `radial-gradient`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CssBackground {
+    Solid(u32, f32),
+    LinearV(Vec<(f32, u32)>, f32),
+    LinearH(Vec<(f32, u32)>, f32),
+    LinearDiag(Vec<(f32, u32)>, f32),
+    Radial {
+        cx_pct: f32,
+        cy_pct: f32,
+        stops: Vec<(f32, u32)>,
+        alpha: f32,
+    },
+}
+
+impl CssBackground {
+    pub fn primary_color(&self) -> u32 {
+        match self {
+            Self::Solid(c, _) => *c,
+            Self::LinearV(s, _) | Self::LinearH(s, _) | Self::LinearDiag(s, _) => {
+                s.first().map_or(0, |x| x.1)
+            }
+            Self::Radial { stops, .. } => stops.first().map_or(0, |x| x.1),
+        }
+    }
+
+    pub fn paint(&self, canvas: &mut Canvas, rect: Rect, radii: [i32; 4]) {
+        if rect.is_empty() {
+            return;
+        }
+        match self {
+            Self::Solid(color, alpha) => {
+                canvas.rounded_rect_corners(rect, radii, *color, *alpha);
+            }
+            Self::LinearV(stops, alpha) => {
+                canvas.multi_stop_gradient_v(rect, stops, radii, *alpha);
+            }
+            Self::LinearH(stops, alpha) => {
+                canvas.multi_stop_gradient_h(rect, stops, radii, *alpha);
+            }
+            Self::LinearDiag(stops, alpha) => {
+                canvas.multi_stop_gradient_diag(rect, stops, radii, *alpha);
+            }
+            Self::Radial {
+                cx_pct,
+                cy_pct,
+                stops,
+                alpha,
+            } => {
+                canvas.multi_stop_radial_gradient(rect, *cx_pct, *cy_pct, stops, radii, *alpha);
+            }
+        }
+    }
+}
+
+/// Single `inset` layer from a CSS `box-shadow` declaration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CssInsetShadow {
+    pub dx: i32,
+    pub dy: i32,
+    pub blur: i32,
+    pub spread: i32,
+    pub color: u32,
+    pub alpha: f32,
+}
+
+/// Complete declarative CSS + SVG surface for any UI widget state.
+#[derive(Clone, Debug, Default)]
+pub struct CssSurface {
+    pub bg: Option<CssBackground>,
+    pub box_shadows: Vec<CssInsetShadow>,
+    pub border: Option<(u32, f32, i32)>,
+    pub border_top: Option<(u32, i32)>,
+    pub border_right: Option<(u32, i32)>,
+    pub border_bottom: Option<(u32, i32)>,
+    pub border_left: Option<(u32, i32)>,
+    pub radii: Option<[i32; 4]>,
+    pub sprite: Option<Sprite>,
+}
+
+impl CssSurface {
+    pub fn is_empty(&self) -> bool {
+        self.bg.is_none()
+            && self.box_shadows.is_empty()
+            && self.border.is_none()
+            && self.border_top.is_none()
+            && self.border_right.is_none()
+            && self.border_bottom.is_none()
+            && self.border_left.is_none()
+            && self.sprite.is_none()
+    }
+
+    pub fn paint(&self, canvas: &mut Canvas, rect: Rect, default_radii: [i32; 4]) {
+        if rect.is_empty() {
+            return;
+        }
+        let radii = self.radii.unwrap_or(default_radii);
+        if let Some(ref bg) = self.bg {
+            bg.paint(canvas, rect, radii);
+        }
+        if let Some(ref sp) = self.sprite {
+            if sp.width == rect.w as u32 && sp.height == rect.h as u32 {
+                canvas.blit_sprite(rect.x, rect.y, sp);
+            } else {
+                let scaled = sp.scale_bilinear(rect.w.max(1) as u32, rect.h.max(1) as u32);
+                canvas.blit_sprite(rect.x, rect.y, &scaled);
+            }
+        }
+        let border_inset = self.border.map_or(0, |(_, _, w)| w.max(0));
+        let shadow_rect = rect.inset(border_inset);
+        if !self.box_shadows.is_empty() && !shadow_rect.is_empty() {
+            let inner_radii = [
+                (radii[0] - border_inset).max(0),
+                (radii[1] - border_inset).max(0),
+                (radii[2] - border_inset).max(0),
+                (radii[3] - border_inset).max(0),
+            ];
+            paint_css_inset_shadows(canvas, shadow_rect, &self.box_shadows, inner_radii);
+        }
+        if let Some((color, alpha, width)) = self.border {
+            if width > 0 {
+                canvas.rounded_border_corners(rect, radii, color, alpha, width);
+            }
+        }
+        if let Some((color, w)) = self.border_top {
+            let w = w.max(1);
+            paint_clipped_strip(
+                canvas,
+                rect,
+                radii,
+                Rect::new(rect.x, rect.y, rect.w, w),
+                color,
+                1.0,
+            );
+        }
+        if let Some((color, w)) = self.border_bottom {
+            let w = w.max(1);
+            paint_clipped_strip(
+                canvas,
+                rect,
+                radii,
+                Rect::new(rect.x, rect.bottom() - w, rect.w, w),
+                color,
+                1.0,
+            );
+        }
+        if let Some((color, w)) = self.border_left {
+            let w = w.max(1);
+            paint_clipped_strip(
+                canvas,
+                rect,
+                radii,
+                Rect::new(rect.x, rect.y, w, rect.h),
+                color,
+                1.0,
+            );
+        }
+        if let Some((color, w)) = self.border_right {
+            let w = w.max(1);
+            paint_clipped_strip(
+                canvas,
+                rect,
+                radii,
+                Rect::new(rect.right() - w, rect.y, w, rect.h),
+                color,
+                1.0,
+            );
+        }
+    }
+}
+
+fn paint_clipped_strip(
+    canvas: &mut Canvas,
+    outer: Rect,
+    radii: [i32; 4],
+    strip: Rect,
+    color: u32,
+    alpha: f32,
+) {
+    let target = strip.intersect(outer);
+    if target.is_empty() || alpha <= 0.001 {
+        return;
+    }
+    if radii == [0, 0, 0, 0] {
+        canvas.fill_alpha(target, color, alpha);
+        return;
+    }
+    let clip = canvas.clip_rect(target);
+    if clip.is_empty() {
+        return;
+    }
+    canvas.mark_dirty(clip);
+    for y in clip.y..clip.bottom() {
+        for x in clip.x..clip.right() {
+            let cov = Canvas::corner_point_coverage(outer, radii, x, y);
+            if cov > 0.0 {
+                canvas.blend_pixel(x, y, color, alpha * cov);
+            }
+        }
+    }
+}
+
+/// Paint CSS `box-shadow: inset ...` layers in reverse declaration order (first declared is topmost).
+pub fn paint_css_inset_shadows(
+    canvas: &mut Canvas,
+    rect: Rect,
+    shadows: &[CssInsetShadow],
+    radii: [i32; 4],
+) {
+    for sh in shadows.iter().rev() {
+        if sh.alpha <= 0.001 {
+            continue;
+        }
+        let spread = sh.spread.max(0);
+        if sh.dx == 0 && sh.dy == 0 {
+            let w = spread.max(sh.blur).max(1);
+            canvas.rounded_border_corners(rect, radii, sh.color, sh.alpha, w);
+            continue;
+        }
+        if sh.dx > 0 {
+            let w = (sh.dx + spread).clamp(1, rect.w);
+            paint_clipped_strip(
+                canvas,
+                rect,
+                radii,
+                Rect::new(rect.x, rect.y, w, rect.h),
+                sh.color,
+                sh.alpha,
+            );
+        } else if sh.dx < 0 {
+            let w = (-sh.dx + spread).clamp(1, rect.w);
+            paint_clipped_strip(
+                canvas,
+                rect,
+                radii,
+                Rect::new(rect.right() - w, rect.y, w, rect.h),
+                sh.color,
+                sh.alpha,
+            );
+        }
+        if sh.dy > 0 {
+            let h = (sh.dy + spread).clamp(1, rect.h);
+            paint_clipped_strip(
+                canvas,
+                rect,
+                radii,
+                Rect::new(rect.x, rect.y, rect.w, h),
+                sh.color,
+                sh.alpha,
+            );
+        } else if sh.dy < 0 {
+            let h = (-sh.dy + spread).clamp(1, rect.h);
+            paint_clipped_strip(
+                canvas,
+                rect,
+                radii,
+                Rect::new(rect.x, rect.bottom() - h, rect.w, h),
+                sh.color,
+                sh.alpha,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowSkin {
+    pub top_radius: i32,
+    pub bottom_radius: i32,
+    pub border_width: i32,
+    pub active_frame: CssSurface,
+    pub inactive_frame: CssSurface,
+}
+
+#[derive(Clone, Debug)]
+pub struct TitlebarSkin {
+    pub height: i32,
+    pub active: CssSurface,
+    pub inactive: CssSurface,
+    pub edge_glow_left: Option<(u32, i32)>,
+    pub edge_glow_right: Option<(u32, i32)>,
+    pub text_color: u32,
+    pub inactive_text_color: u32,
+    pub text_shadow: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CaptionButtonsSkin {
+    pub width: i32,
+    pub height: i32,
+    pub gap: i32,
+    pub margin_right: i32,
+    pub margin_top: i32,
+    pub radius: i32,
+    pub close_normal: CssSurface,
+    pub close_hover: CssSurface,
+    pub close_active: CssSurface,
+    pub min_normal: CssSurface,
+    pub min_hover: CssSurface,
+    pub min_active: CssSurface,
+    pub max_normal: CssSurface,
+    pub max_hover: CssSurface,
+    pub max_active: CssSurface,
+    pub restore_normal: CssSurface,
+    pub restore_hover: CssSurface,
+    pub restore_active: CssSurface,
+    pub glyph_color: u32,
+    pub inactive_opacity: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskbarSkin {
+    pub height: Option<i32>,
+    pub bg: CssSurface,
+    pub button_normal: CssSurface,
+    pub button_hover: CssSurface,
+    pub button_active: CssSurface,
+    pub button_pressed: CssSurface,
+    pub button_radius: i32,
+    pub button_text: u32,
+    pub button_active_text: u32,
+    pub button_minimized_text: u32,
+    pub tray_bg: Option<CssSurface>,
+    pub tray_text: u32,
+    pub tray_muted_text: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct StartButtonSkin {
+    pub width: i32,
+    pub full_height: bool,
+    pub margin_left: i32,
+    pub radii: [i32; 4],
+    pub normal: CssSurface,
+    pub hover: CssSurface,
+    pub active: CssSurface,
+    pub label: String,
+    pub text_color: u32,
+    pub text_shadow: Option<u32>,
+    pub icon: Option<Sprite>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartMenuLayoutKind {
+    Compact,
+    TwoColumn,
+}
+
+#[derive(Clone, Debug)]
+pub struct StartMenuSkin {
+    pub layout: StartMenuLayoutKind,
+    pub width: i32,
+    pub height: i32,
+    pub offset_x: i32,
+    pub gap_y: i32,
+    pub top_radius: i32,
+    pub bottom_radius: i32,
+    pub frame_border: u32,
+    pub header_height: i32,
+    pub header_bg: CssSurface,
+    pub header_top_sheen: bool,
+    pub header_text: u32,
+    pub header_text_shadow: Option<u32>,
+    pub avatar_border: u32,
+    pub orange_divider: Option<u32>,
+    pub left_bg: u32,
+    pub left_text: u32,
+    pub left_subtext: u32,
+    pub right_bg: u32,
+    pub right_border_left: u32,
+    pub right_text: u32,
+    pub item_hover_bg: u32,
+    pub item_hover_text: u32,
+    pub all_programs_label: String,
+    pub all_programs_arrow: u32,
+    pub footer_height: i32,
+    pub footer_bg: CssSurface,
+    pub footer_text: u32,
+    pub logout_badge: CssSurface,
+    pub reboot_badge: CssSurface,
+    pub shutdown_badge: CssSurface,
+}
+
+#[derive(Clone, Debug)]
+pub struct ControlsSkin {
+    pub button_normal: CssSurface,
+    pub button_hover: CssSurface,
+    pub button_active: CssSurface,
+    pub button_primary: CssSurface,
+    pub button_radius: i32,
+    pub button_text: u32,
+    pub button_primary_text: u32,
+    pub card: CssSurface,
+    pub card_radius: i32,
+    pub tab_normal: CssSurface,
+    pub tab_hover: CssSurface,
+    pub tab_active: CssSurface,
+    pub tab_radii: [i32; 4],
+    pub tab_text: u32,
+    pub tab_active_text: u32,
+    pub input_bg: u32,
+    pub input_border: u32,
+    pub input_focus_border: u32,
+    pub input_radius: i32,
+    pub scrollbar_width: i32,
+    pub scrollbar_track: CssSurface,
+    pub scrollbar_thumb: CssSurface,
+    pub scrollbar_thumb_hover: CssSurface,
+    pub scrollbar_thumb_active: CssSurface,
+    pub scrollbar_grip_light: Option<u32>,
+    pub scrollbar_grip_dark: Option<u32>,
+    pub progress_track: CssSurface,
+    pub progress_fill: CssSurface,
+    pub progress_chunk_w: i32,
+    pub progress_chunk_gap: i32,
+}
+
+/// Complete parsed declarative skin for an external theme package.
+#[derive(Clone, Debug)]
+pub struct CustomThemeSkin {
+    pub cache_key: (String, ThemeMode, u32, u64),
+    pub window: WindowSkin,
+    pub titlebar: TitlebarSkin,
+    pub caption_buttons: CaptionButtonsSkin,
+    pub taskbar: TaskbarSkin,
+    pub start_button: StartButtonSkin,
+    pub start_menu: Option<StartMenuSkin>,
+    pub controls: ControlsSkin,
+}
+
+/// Copyable static reference wrapper around [`CustomThemeSkin`] so [`Theme`] stays `Copy + Eq`.
+#[derive(Clone, Copy, Debug)]
+pub struct SkinRef(pub &'static CustomThemeSkin);
+
+impl PartialEq for SkinRef {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0) || self.0.cache_key == other.0.cache_key
+    }
+}
+
+impl Eq for SkinRef {}
+
+impl std::ops::Deref for SkinRef {
+    type Target = CustomThemeSkin;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ExternalTheme {
+    id: String,
     base_style: Option<ThemeStyle>,
-    mode: Option<ThemeMode>,
-    accent: Option<u32>,
+    default_mode: Option<ThemeMode>,
+    default_accent: Option<u32>,
     colors: toml::value::Table,
+    skin: Option<SkinRef>,
+}
+
+fn theme_root_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os("SPUI_THEME_DIR") {
+        dirs.push(PathBuf::from(dir));
+    }
+    dirs.push(PathBuf::from(SYSTEM_THEME_DIR));
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(USER_THEME_SUBDIR));
+    }
+    dirs
 }
 
 fn theme_dir_candidates(id: &str) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(dir) = std::env::var_os("SPUI_THEME_DIR") {
-        candidates.push(PathBuf::from(dir).join(id).join("theme.toml"));
-    }
-    candidates.push(PathBuf::from(SYSTEM_THEME_DIR).join(id).join("theme.toml"));
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(
-            PathBuf::from(home)
-                .join(USER_THEME_SUBDIR)
-                .join(id)
-                .join("theme.toml"),
-        );
-    }
-    candidates
+    theme_root_dirs()
+        .into_iter()
+        .map(|dir| dir.join(id).join("theme.toml"))
+        .collect()
 }
 
-fn valid_theme_id(id: &str) -> bool {
+pub fn valid_theme_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
@@ -63,42 +566,1424 @@ fn valid_theme_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn load_external_theme(id: &str) -> Option<ExternalTheme> {
+/// Discover all external theme packages installed under `/usr/share/spui/themes`
+/// or `$HOME/.local/share/spui/themes`.
+pub fn discover_installed_themes() -> Vec<InstalledThemeInfo> {
+    let mut found: Vec<InstalledThemeInfo> = Vec::new();
+    for root_dir in theme_root_dirs() {
+        let Ok(entries) = fs::read_dir(&root_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(dir_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !valid_theme_id(dir_name) {
+                continue;
+            }
+            let toml_path = path.join("theme.toml");
+            let Ok(text) = fs::read_to_string(&toml_path) else {
+                continue;
+            };
+            let Ok(root_val) = toml::from_str::<toml::Value>(&text) else {
+                continue;
+            };
+            let Some(table) = root_val.as_table() else {
+                continue;
+            };
+            let id = table
+                .get("id")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(dir_name)
+                .trim()
+                .to_string();
+            if !valid_theme_id(&id)
+                || THEME_PRESETS.iter().any(|p| p.id().eq_ignore_ascii_case(&id))
+                || found.iter().any(|item| item.id == id)
+            {
+                continue;
+            }
+            let name = table
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
+            let subtitle = table
+                .get("subtitle")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("已安装的 SPUI 外部主题软件包")
+                .to_string();
+            let base_style = table
+                .get("base_style")
+                .and_then(toml::Value::as_str)
+                .map(ThemeStyle::parse)
+                .unwrap_or(ThemeStyle::Spui);
+            let mode = table
+                .get("mode")
+                .and_then(toml::Value::as_str)
+                .map(ThemeMode::parse)
+                .unwrap_or(ThemeMode::Light);
+            let accent = table
+                .get("accent")
+                .and_then(parse_color)
+                .unwrap_or(0x0054e3);
+            let wallpaper = table
+                .get("wallpaper")
+                .and_then(toml::Value::as_str)
+                .map(str::to_string);
+            let solid_color = table.get("solid_color").and_then(parse_color).or_else(|| {
+                table
+                    .get("colors")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|c| c.get("bg_top"))
+                    .and_then(parse_color)
+            });
+            let panel_position = table
+                .get("panel_position")
+                .and_then(toml::Value::as_str)
+                .map(PanelPosition::parse);
+            let panel_size = table
+                .get("panel_size")
+                .and_then(toml::Value::as_integer)
+                .map(|v| (v as i32).clamp(28, 60));
+            let start_fullscreen = table
+                .get("start_fullscreen")
+                .and_then(toml::Value::as_bool);
+            let preview = parse_preview_spec(table, accent);
+
+            found.push(InstalledThemeInfo {
+                id,
+                name,
+                subtitle,
+                base_style,
+                mode,
+                accent,
+                wallpaper,
+                solid_color,
+                panel_position,
+                panel_size,
+                start_fullscreen,
+                preview,
+            });
+        }
+    }
+    found.sort_by(|a, b| a.id.cmp(&b.id));
+    found
+}
+
+/// Discover all wallpapers in `/usr/share/spui/wallpapers`, starting with the 4 built-in
+/// wallpapers and appending any additional `.jpg`/`.png` wallpapers installed by packages.
+pub fn discover_wallpapers() -> Vec<DiscoveredWallpaper> {
+    let mut list: Vec<DiscoveredWallpaper> = WALLPAPERS
+        .iter()
+        .map(|w| DiscoveredWallpaper {
+            file: w.file.to_string(),
+            label: w.label.to_string(),
+        })
+        .collect();
+    let Ok(entries) = fs::read_dir(WALLPAPER_DIR) else {
+        return list;
+    };
+    let mut extras: Vec<DiscoveredWallpaper> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if list.iter().any(|w| w.file == fname) || extras.iter().any(|w| w.file == fname) {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png") {
+            continue;
+        }
+        let label = match fname {
+            "winxp-bliss.jpg" => "蓝天绿茵 (XP Bliss)".to_string(),
+            other => other
+                .rsplit_once('.')
+                .map_or(other, |(stem, _)| stem)
+                .replace(['-', '_'], " "),
+        };
+        extras.push(DiscoveredWallpaper {
+            file: fname.to_string(),
+            label,
+        });
+    }
+    extras.sort_by(|a, b| a.file.cmp(&b.file));
+    list.extend(extras);
+    list
+}
+
+fn parse_preview_spec(table: &toml::value::Table, accent: u32) -> ThemePreviewSpec {
+    let colors = table.get("colors").and_then(toml::Value::as_table);
+    let preview = table.get("preview").and_then(toml::Value::as_table);
+    let get_c = |key: &str, color_key: &str, fallback: u32| -> u32 {
+        preview
+            .and_then(|p| p.get(key))
+            .and_then(parse_color)
+            .or_else(|| colors.and_then(|c| c.get(color_key)).and_then(parse_color))
+            .unwrap_or(fallback)
+    };
+    let titlebar_left = get_c("titlebar_left", "titlebar", accent);
+    let titlebar_right = get_c("titlebar_right", "titlebar_hi", mix(titlebar_left, 0xffffff, 0.28));
+    let window_top_radius = preview
+        .and_then(|p| p.get("window_top_radius"))
+        .and_then(toml::Value::as_integer)
+        .or_else(|| {
+            table
+                .get("window")
+                .and_then(toml::Value::as_table)
+                .and_then(|w| w.get("top_radius"))
+                .and_then(toml::Value::as_integer)
+        })
+        .unwrap_or(6) as i32;
+    ThemePreviewSpec {
+        desktop_top: get_c("desktop_top", "bg_top", 0x3a6ea5),
+        desktop_bottom: get_c("desktop_bottom", "bg_bottom", 0x7ba7d7),
+        window_bg: get_c("window_bg", "window", 0xece9d8),
+        window_border: get_c("window_border", "window_border_active", accent),
+        window_top_radius: window_top_radius.clamp(0, 10),
+        titlebar_left,
+        titlebar_right,
+        close_btn: get_c("close_btn", "danger", 0xe0432e),
+        taskbar_top: get_c("taskbar_top", "titlebar", 0x245edb),
+        taskbar_bottom: get_c("taskbar_bottom", "window_border_active", 0x1941a5),
+        start_btn: get_c("start_btn", "success", 0x3c9c24),
+        tray_bg: get_c("tray_bg", "titlebar_hi", 0x0f8ee9),
+    }
+}
+
+fn merge_toml_tables(base: &mut toml::value::Table, overlay: &toml::value::Table) {
+    for (k, v) in overlay {
+        if matches!(k.as_str(), "dark" | "accents") {
+            continue;
+        }
+        match (base.get_mut(k), v) {
+            (Some(toml::Value::Table(base_sub)), toml::Value::Table(over_sub)) => {
+                merge_toml_tables(base_sub, over_sub);
+            }
+            _ => {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+fn select_accent_variant<'a>(
+    accents_table: &'a toml::value::Table,
+    accent: u32,
+) -> Option<&'a toml::value::Table> {
+    let hex = format!("#{:06x}", accent & 0x00ff_ffff);
+    if let Some(sub) = accents_table.get(&hex).and_then(toml::Value::as_table) {
+        return Some(sub);
+    }
+    // Check named alias list inside each accent variant subtable (`matches = ["#10b981", "#f59e0b"]`).
+    for (_, val) in accents_table {
+        if let Some(sub) = val.as_table() {
+            if let Some(arr) = sub.get("matches").and_then(toml::Value::as_array) {
+                if arr
+                    .iter()
+                    .filter_map(parse_color)
+                    .any(|c| c == (accent & 0x00ff_ffff))
+                {
+                    return Some(sub);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn file_mtime_key(path: &Path) -> u64 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
+static SKIN_CACHE: OnceLock<Mutex<HashMap<(String, ThemeMode, u32, u64), &'static CustomThemeSkin>>> =
+    OnceLock::new();
+
+fn load_external_theme(id: &str, req_mode: ThemeMode, req_accent: u32) -> Option<ExternalTheme> {
     if !valid_theme_id(id) {
         return None;
     }
-    let text = theme_dir_candidates(id)
+    let toml_path = theme_dir_candidates(id)
         .into_iter()
-        .find_map(|path| fs::read_to_string(path).ok())?;
-    let root: toml::Value = toml::from_str(&text).ok()?;
-    let base_style = root
+        .find(|path| path.is_file())?;
+    let theme_dir = toml_path.parent()?.to_path_buf();
+    let mtime = file_mtime_key(&toml_path);
+    let text = fs::read_to_string(&toml_path).ok()?;
+    let root_val: toml::Value = toml::from_str(&text).ok()?;
+    let mut table = root_val.as_table()?.clone();
+
+    let base_style = table
         .get("base_style")
         .and_then(toml::Value::as_str)
         .map(ThemeStyle::parse);
-    let mode = root
+    let default_mode = table
         .get("mode")
         .and_then(toml::Value::as_str)
         .map(ThemeMode::parse);
-    let accent = root.get("accent").and_then(parse_color);
-    let colors = root
+    let default_accent = table.get("accent").and_then(parse_color);
+
+    // Apply accent color variant tables and dark mode overlay defined in `theme.toml`.
+    if let Some(accents_tbl) = table.get("accents").and_then(toml::Value::as_table).cloned() {
+        if let Some(acc_sub) = select_accent_variant(&accents_tbl, req_accent) {
+            merge_toml_tables(&mut table, acc_sub);
+        }
+    }
+    if req_mode == ThemeMode::Dark {
+        if let Some(dark_tbl) = table.get("dark").and_then(toml::Value::as_table).cloned() {
+            merge_toml_tables(&mut table, &dark_tbl);
+        }
+    }
+
+    let colors = table
         .get("colors")
         .and_then(toml::Value::as_table)
         .cloned()
         .unwrap_or_default();
+
+    let has_skin_sections = table.contains_key("window")
+        || table.contains_key("titlebar")
+        || table.contains_key("taskbar")
+        || table.contains_key("controls")
+        || table.get("schema").and_then(toml::Value::as_integer).unwrap_or(1) >= 2;
+
+    let skin = if has_skin_sections {
+        let key = (id.to_string(), req_mode, req_accent & 0x00ff_ffff, mtime);
+        let cache = SKIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = cache.lock().ok()?;
+        if let Some(&cached) = guard.get(&key) {
+            Some(SkinRef(cached))
+        } else {
+            let parsed = parse_custom_skin(id, key.clone(), &table, &theme_dir);
+            let leaked: &'static CustomThemeSkin = Box::leak(Box::new(parsed));
+            guard.insert(key, leaked);
+            Some(SkinRef(leaked))
+        }
+    } else {
+        None
+    };
+
     Some(ExternalTheme {
+        id: id.to_string(),
         base_style,
-        mode,
-        accent,
+        default_mode,
+        default_accent,
         colors,
+        skin,
     })
 }
 
-fn parse_color(value: &toml::Value) -> Option<u32> {
-    let text = value.as_str()?.trim().trim_start_matches('#');
-    if text.len() != 6 {
+/// Parse a CSS color string (`#RRGGBB`, `#RGB`, `rgb(r,g,b)`, `rgba(r,g,b,a)`, or named literal).
+pub fn parse_css_color_str(raw: &str) -> Option<(u32, f32)> {
+    let s = raw.trim();
+    if s.is_empty() {
         return None;
     }
-    u32::from_str_radix(text, 16).ok()
+    if let Some(hex) = s.strip_prefix('#') {
+        let hex = hex.trim();
+        if hex.len() == 6 {
+            let rgb = u32::from_str_radix(hex, 16).ok()?;
+            return Some((rgb, 1.0));
+        } else if hex.len() == 3 {
+            let r = u32::from_str_radix(&hex[0..1], 16).ok()?;
+            let g = u32::from_str_radix(&hex[1..2], 16).ok()?;
+            let b = u32::from_str_radix(&hex[2..3], 16).ok()?;
+            let rgb = ((r * 17) << 16) | ((g * 17) << 8) | (b * 17);
+            return Some((rgb, 1.0));
+        } else if hex.len() == 8 {
+            let rgba = u32::from_str_radix(hex, 16).ok()?;
+            let rgb = (rgba >> 8) & 0x00ff_ffff;
+            let a = (rgba & 0xff) as f32 / 255.0;
+            return Some((rgb, a));
+        }
+    }
+    let lower = s.to_ascii_lowercase();
+    if let Some(inner) = lower
+        .strip_prefix("rgba(")
+        .or_else(|| lower.strip_prefix("rgb("))
+        .and_then(|v| v.strip_suffix(')'))
+    {
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if parts.len() >= 3 {
+            let r = parts[0].parse::<f32>().ok()?.clamp(0.0, 255.0) as u32;
+            let g = parts[1].parse::<f32>().ok()?.clamp(0.0, 255.0) as u32;
+            let b = parts[2].parse::<f32>().ok()?.clamp(0.0, 255.0) as u32;
+            let a = if parts.len() >= 4 {
+                parts[3].parse::<f32>().ok()?.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            return Some(((r << 16) | (g << 8) | b, a));
+        }
+    }
+    match lower.as_str() {
+        "white" => Some((0xffffff, 1.0)),
+        "black" => Some((0x000000, 1.0)),
+        "silver" => Some((0xc0c0c0, 1.0)),
+        "gray" | "grey" => Some((0x808080, 1.0)),
+        "transparent" => Some((0x000000, 0.0)),
+        _ => None,
+    }
+}
+
+fn parse_color(value: &toml::Value) -> Option<u32> {
+    parse_css_color_str(value.as_str()?).map(|(c, _)| c)
+}
+
+fn split_top_level_commas(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                out.push(input[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn parse_gradient_stop_tokens(tokens: &[&str]) -> Vec<(f32, u32)> {
+    let mut raw_stops: Vec<(Option<f32>, u32)> = Vec::new();
+    for &tok in tokens {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        // A token may be `<color>`, `<color> <pct>%`, or `<color> <pct1>% <pct2>%`.
+        // Note that `rgb(r, g, b)` may contain spaces inside parentheses.
+        let color_end = if let Some(close_idx) = tok.find(')') {
+            close_idx + 1
+        } else {
+            tok.find(char::is_whitespace).unwrap_or(tok.len())
+        };
+        let color_part = &tok[..color_end];
+        let Some((rgb, _)) = parse_css_color_str(color_part) else {
+            continue;
+        };
+        let rest = tok[color_end..].trim();
+        if rest.is_empty() {
+            raw_stops.push((None, rgb));
+        } else {
+            let mut pushed = false;
+            for pos_tok in rest.split_whitespace() {
+                if let Some(pct_str) = pos_tok.strip_suffix('%') {
+                    if let Ok(pct) = pct_str.parse::<f32>() {
+                        raw_stops.push((Some((pct / 100.0).clamp(0.0, 1.0)), rgb));
+                        pushed = true;
+                    }
+                } else if let Ok(val) = pos_tok.trim_end_matches("px").parse::<f32>() {
+                    raw_stops.push((Some(val.clamp(0.0, 1.0)), rgb));
+                    pushed = true;
+                }
+            }
+            if !pushed {
+                raw_stops.push((None, rgb));
+            }
+        }
+    }
+    if raw_stops.is_empty() {
+        return Vec::new();
+    }
+    if raw_stops[0].0.is_none() {
+        raw_stops[0].0 = Some(0.0);
+    }
+    let last_idx = raw_stops.len() - 1;
+    if raw_stops[last_idx].0.is_none() {
+        raw_stops[last_idx].0 = Some(1.0);
+    }
+    // Fill any interior `None` positions linearly between known neighbors.
+    let mut i = 0;
+    while i < raw_stops.len() {
+        if raw_stops[i].0.is_none() {
+            let prev_pos = raw_stops[i.saturating_sub(1)].0.unwrap_or(0.0);
+            let mut j = i + 1;
+            while j < raw_stops.len() && raw_stops[j].0.is_none() {
+                j += 1;
+            }
+            let next_pos = raw_stops
+                .get(j)
+                .and_then(|s| s.0)
+                .unwrap_or(1.0)
+                .max(prev_pos);
+            let span = (j - i + 1) as f32;
+            for k in i..j {
+                let frac = (k - i + 1) as f32 / span;
+                raw_stops[k].0 = Some(prev_pos + (next_pos - prev_pos) * frac);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    raw_stops
+        .into_iter()
+        .map(|(p, c)| (p.unwrap_or(0.0), c))
+        .collect()
+}
+
+/// Parse a CSS `background` / `background-image` string (`#hex`, `linear-gradient(...)`, `radial-gradient(...)`).
+pub fn parse_css_background(raw: &str) -> Option<CssBackground> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    if let Some(inner) = lower
+        .strip_prefix("linear-gradient(")
+        .and_then(|v| v.strip_suffix(')'))
+    {
+        let parts = split_top_level_commas(inner);
+        if parts.is_empty() {
+            return None;
+        }
+        let first = parts[0].trim();
+        let (dir, stop_slice) = if first == "to bottom" || first == "180deg" {
+            (0, &parts[1..])
+        } else if first == "to right" || first == "90deg" {
+            (1, &parts[1..])
+        } else if first == "135deg" || first == "to bottom right" {
+            (2, &parts[1..])
+        } else if first.ends_with("deg") || first.starts_with("to ") {
+            (0, &parts[1..])
+        } else {
+            (0, &parts[..])
+        };
+        let stops = parse_gradient_stop_tokens(stop_slice);
+        if stops.is_empty() {
+            return None;
+        }
+        return Some(match dir {
+            1 => CssBackground::LinearH(stops, 1.0),
+            2 => CssBackground::LinearDiag(stops, 1.0),
+            _ => CssBackground::LinearV(stops, 1.0),
+        });
+    }
+    if let Some(inner) = lower
+        .strip_prefix("radial-gradient(")
+        .and_then(|v| v.strip_suffix(')'))
+    {
+        let parts = split_top_level_commas(inner);
+        if parts.is_empty() {
+            return None;
+        }
+        let first = parts[0].trim();
+        let mut cx_pct = 0.5f32;
+        let mut cy_pct = 0.5f32;
+        let stop_slice = if let Some(at_pos) = first.find("at ") {
+            let coords = &first[at_pos + 3..];
+            let mut nums = coords
+                .split_whitespace()
+                .filter_map(|t| t.strip_suffix('%').and_then(|n| n.parse::<f32>().ok()));
+            if let Some(cx) = nums.next() {
+                cx_pct = (cx / 100.0).clamp(0.0, 1.0);
+            }
+            if let Some(cy) = nums.next() {
+                cy_pct = (cy / 100.0).clamp(0.0, 1.0);
+            }
+            &parts[1..]
+        } else if first.starts_with("circle") || first.starts_with("ellipse") {
+            &parts[1..]
+        } else {
+            &parts[..]
+        };
+        let stops = parse_gradient_stop_tokens(stop_slice);
+        if stops.is_empty() {
+            return None;
+        }
+        return Some(CssBackground::Radial {
+            cx_pct,
+            cy_pct,
+            stops,
+            alpha: 1.0,
+        });
+    }
+    parse_css_color_str(s).map(|(c, a)| CssBackground::Solid(c, a))
+}
+
+/// Parse a CSS `box-shadow` string into [`CssInsetShadow`] layers.
+pub fn parse_css_box_shadow(raw: &str) -> Vec<CssInsetShadow> {
+    let s = raw.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("unset") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for item in split_top_level_commas(s) {
+        let item = item.trim();
+        if !item.contains("inset") {
+            continue;
+        }
+        // Tokenize while keeping `rgb(...)` / `rgba(...)` intact as a single token.
+        let mut tokens: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut paren = 0i32;
+        for ch in item.chars() {
+            match ch {
+                '(' => {
+                    paren += 1;
+                    cur.push(ch);
+                }
+                ')' => {
+                    paren = (paren - 1).max(0);
+                    cur.push(ch);
+                }
+                c if c.is_whitespace() && paren == 0 => {
+                    if !cur.is_empty() {
+                        tokens.push(std::mem::take(&mut cur));
+                    }
+                }
+                other => cur.push(other),
+            }
+        }
+        if !cur.is_empty() {
+            tokens.push(cur);
+        }
+
+        let mut nums: Vec<i32> = Vec::new();
+        let mut color: Option<(u32, f32)> = None;
+        for tok in &tokens {
+            if tok.eq_ignore_ascii_case("inset") {
+                continue;
+            }
+            let clean = tok.trim_end_matches("!important");
+            if let Some(c) = parse_css_color_str(clean) {
+                color = Some(c);
+            } else if let Ok(n) = clean.trim_end_matches("px").parse::<i32>() {
+                nums.push(n);
+            }
+        }
+        if let Some((rgb, alpha)) = color {
+            if nums.len() >= 2 {
+                let dx = nums[0];
+                let dy = nums[1];
+                let blur = nums.get(2).copied().unwrap_or(0);
+                let spread = nums.get(3).copied().unwrap_or(0);
+                out.push(CssInsetShadow {
+                    dx,
+                    dy,
+                    blur,
+                    spread,
+                    color: rgb,
+                    alpha,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn parse_radii_val(val: &toml::Value) -> Option<[i32; 4]> {
+    if let Some(n) = val.as_integer() {
+        let r = (n as i32).max(0);
+        return Some([r, r, r, r]);
+    }
+    if let Some(arr) = val.as_array() {
+        if arr.len() == 4 {
+            return Some([
+                arr[0].as_integer().unwrap_or(0) as i32,
+                arr[1].as_integer().unwrap_or(0) as i32,
+                arr[2].as_integer().unwrap_or(0) as i32,
+                arr[3].as_integer().unwrap_or(0) as i32,
+            ]);
+        } else if arr.len() == 2 {
+            let t = arr[0].as_integer().unwrap_or(0) as i32;
+            let b = arr[1].as_integer().unwrap_or(0) as i32;
+            return Some([t, t, b, b]);
+        }
+    }
+    None
+}
+
+fn parse_border_spec(val: &toml::Value) -> Option<(u32, f32, i32)> {
+    let s = val.as_str()?.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    // Supports either `"#003c74"` or `"1px solid #003c74"`
+    if let Some((c, a)) = parse_css_color_str(s) {
+        return Some((c, a, 1));
+    }
+    let mut width = 1i32;
+    let mut color = None;
+    for tok in s.split_whitespace() {
+        if let Some(px) = tok.strip_suffix("px") {
+            if let Ok(w) = px.parse::<i32>() {
+                width = w.max(0);
+            }
+        } else if !tok.eq_ignore_ascii_case("solid") {
+            if let Some(c) = parse_css_color_str(tok) {
+                color = Some(c);
+            }
+        }
+    }
+    color.map(|(c, a)| (c, a, width))
+}
+
+fn parse_surface(
+    tbl: Option<&toml::value::Table>,
+    prefix: &str,
+    theme_dir: &Path,
+    target_size: Option<(u32, u32)>,
+) -> CssSurface {
+    let Some(tbl) = tbl else {
+        return CssSurface::default();
+    };
+    let get_key = |suffix: &str| -> Option<&toml::Value> {
+        if prefix.is_empty() {
+            tbl.get(suffix)
+        } else {
+            let full = format!("{prefix}_{suffix}");
+            tbl.get(&full).or_else(|| {
+                if suffix == "bg" {
+                    tbl.get(prefix)
+                } else {
+                    None
+                }
+            })
+        }
+    };
+    let bg = get_key("bg")
+        .or_else(|| get_key("background"))
+        .and_then(toml::Value::as_str)
+        .and_then(parse_css_background);
+    let box_shadows = get_key("box_shadow")
+        .or_else(|| get_key("shadow"))
+        .and_then(toml::Value::as_str)
+        .map(parse_css_box_shadow)
+        .unwrap_or_default();
+    let border = get_key("border").and_then(parse_border_spec);
+    let border_top = get_key("border_top")
+        .and_then(parse_border_spec)
+        .map(|(c, _, w)| (c, w));
+    let border_right = get_key("border_right")
+        .and_then(parse_border_spec)
+        .map(|(c, _, w)| (c, w));
+    let border_bottom = get_key("border_bottom")
+        .and_then(parse_border_spec)
+        .map(|(c, _, w)| (c, w));
+    let border_left = get_key("border_left")
+        .and_then(parse_border_spec)
+        .map(|(c, _, w)| (c, w));
+    let radii = get_key("radius").and_then(parse_radii_val);
+    let sprite = get_key("svg")
+        .or_else(|| get_key("image"))
+        .and_then(toml::Value::as_str)
+        .and_then(|rel| {
+            if rel.is_empty() || rel.contains("..") || rel.starts_with('/') {
+                None
+            } else {
+                icons::decode_theme_asset(&theme_dir.join(rel), target_size)
+            }
+        });
+    CssSurface {
+        bg,
+        box_shadows,
+        border,
+        border_top,
+        border_right,
+        border_bottom,
+        border_left,
+        radii,
+        sprite,
+    }
+}
+
+fn parse_custom_skin(
+    _id: &str,
+    cache_key: (String, ThemeMode, u32, u64),
+    root: &toml::value::Table,
+    theme_dir: &Path,
+) -> CustomThemeSkin {
+    let win_tbl = root.get("window").and_then(toml::Value::as_table);
+    let top_radius = win_tbl
+        .and_then(|t| t.get("top_radius"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(8) as i32;
+    let bottom_radius = win_tbl
+        .and_then(|t| t.get("bottom_radius"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(0) as i32;
+    let border_width = win_tbl
+        .and_then(|t| t.get("border_width"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(3) as i32;
+    let mut active_frame = parse_surface(win_tbl, "active", theme_dir, None);
+    if active_frame.is_empty() {
+        active_frame.bg = Some(CssBackground::Solid(0x0831d9, 1.0));
+        active_frame.box_shadows = parse_css_box_shadow(
+            "inset -1px -1px #00138c, inset 1px 1px #0831d9, inset -2px -2px #001ea0, inset 2px 2px #166aee, inset -3px -3px #003bda, inset 3px 3px #0855dd",
+        );
+    }
+    let mut inactive_frame = parse_surface(win_tbl, "inactive", theme_dir, None);
+    if inactive_frame.is_empty() {
+        inactive_frame.bg = Some(CssBackground::Solid(0x6582f5, 1.0));
+        inactive_frame.box_shadows = parse_css_box_shadow(
+            "inset -1px -1px #3953b8, inset 1px 1px #7697e7, inset -2px -2px #4c68c8, inset 2px 2px #8aa8f0, inset -3px -3px #5c79d8, inset 3px 3px #7a96df",
+        );
+    }
+    let window = WindowSkin {
+        top_radius: top_radius.clamp(0, 16),
+        bottom_radius: bottom_radius.clamp(0, 16),
+        border_width: border_width.clamp(1, 8),
+        active_frame,
+        inactive_frame,
+    };
+
+    let tb_tbl = root.get("titlebar").and_then(toml::Value::as_table);
+    let tb_height = tb_tbl
+        .and_then(|t| t.get("height"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(28) as i32;
+    let mut tb_active = parse_surface(tb_tbl, "active", theme_dir, None);
+    if tb_active.is_empty() {
+        tb_active.bg = parse_css_background(
+            "linear-gradient(to bottom, #0058ee 0%, #3593ff 4%, #288eff 6%, #127dff 8%, #036ffc 10%, #0262ee 14%, #0057e5 20%, #0054e3 24%, #0055eb 56%, #005bf5 66%, #026afe 76%, #0062ef 86%, #0052d6 92%, #0040ab 94%, #003092 100%)",
+        );
+    }
+    let mut tb_inactive = parse_surface(tb_tbl, "inactive", theme_dir, None);
+    if tb_inactive.is_empty() {
+        tb_inactive.bg = parse_css_background(
+            "linear-gradient(to bottom, #7697e7 0%, #7e9ee3 3%, #94afe8 6%, #97b4e9 8%, #82a5e4 14%, #7c9fe2 17%, #7996de 25%, #7b99e1 56%, #82a9e9 81%, #80a5e7 89%, #7b96e1 94%, #7a93df 97%, #abbae3 100%)",
+        );
+    }
+    let glow_w = tb_tbl
+        .and_then(|t| t.get("edge_glow_width"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(15) as i32;
+    let edge_glow_left = tb_tbl
+        .and_then(|t| t.get("edge_glow_left"))
+        .and_then(parse_color)
+        .map(|c| (c, glow_w));
+    let edge_glow_right = tb_tbl
+        .and_then(|t| t.get("edge_glow_right"))
+        .and_then(parse_color)
+        .map(|c| (c, glow_w));
+    let titlebar = TitlebarSkin {
+        height: tb_height.clamp(22, 44),
+        active: tb_active,
+        inactive: tb_inactive,
+        edge_glow_left,
+        edge_glow_right,
+        text_color: tb_tbl
+            .and_then(|t| t.get("text_color"))
+            .and_then(parse_color)
+            .unwrap_or(0xffffff),
+        inactive_text_color: tb_tbl
+            .and_then(|t| t.get("inactive_text_color"))
+            .and_then(parse_color)
+            .unwrap_or(0xd8e4f8),
+        text_shadow: tb_tbl
+            .and_then(|t| t.get("text_shadow"))
+            .and_then(parse_color),
+    };
+
+    let cb_tbl = root.get("caption_buttons").and_then(toml::Value::as_table);
+    let cb_w = cb_tbl
+        .and_then(|t| t.get("width"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(21) as i32;
+    let cb_h = cb_tbl
+        .and_then(|t| t.get("height"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(21) as i32;
+    let cb_sz = Some((cb_w.max(12) as u32, cb_h.max(12) as u32));
+    let default_blue_btn = || {
+        let mut s = CssSurface::default();
+        s.bg = parse_css_background(
+            "radial-gradient(circle at 90% 90%, #0054e9 0%, #2263d5 55%, #4479e4 70%, #a3bbec 90%, #ffffff 100%)",
+        );
+        s.box_shadows = parse_css_box_shadow("inset 0 -1px 2px 1px #1d3fa8");
+        s.border = Some((0xffffff, 0.92, 1));
+        s
+    };
+    let default_close_btn = || {
+        let mut s = CssSurface::default();
+        s.bg = parse_css_background(
+            "radial-gradient(circle at 90% 90%, #cc4600 0%, #dc6527 55%, #cd7546 70%, #ffccb2 90%, #ffffff 100%)",
+        );
+        s.box_shadows = parse_css_box_shadow("inset 0 -1px 2px 1px #9c2400");
+        s.border = Some((0xffffff, 0.92, 1));
+        s
+    };
+    let mut close_normal = parse_surface(cb_tbl, "close", theme_dir, cb_sz);
+    if close_normal.is_empty() {
+        close_normal = default_close_btn();
+    }
+    let mut close_hover = parse_surface(cb_tbl, "close_hover", theme_dir, cb_sz);
+    if close_hover.is_empty() {
+        close_hover = close_normal.clone();
+    }
+    let mut close_active = parse_surface(cb_tbl, "close_active", theme_dir, cb_sz);
+    if close_active.is_empty() {
+        close_active = close_normal.clone();
+    }
+    let mut min_normal = parse_surface(cb_tbl, "min", theme_dir, cb_sz);
+    if min_normal.is_empty() {
+        min_normal = default_blue_btn();
+    }
+    let mut min_hover = parse_surface(cb_tbl, "min_hover", theme_dir, cb_sz);
+    if min_hover.is_empty() {
+        min_hover = min_normal.clone();
+    }
+    let mut min_active = parse_surface(cb_tbl, "min_active", theme_dir, cb_sz);
+    if min_active.is_empty() {
+        min_active = min_normal.clone();
+    }
+    let mut max_normal = parse_surface(cb_tbl, "max", theme_dir, cb_sz);
+    if max_normal.is_empty() {
+        max_normal = min_normal.clone();
+    }
+    let mut max_hover = parse_surface(cb_tbl, "max_hover", theme_dir, cb_sz);
+    if max_hover.is_empty() {
+        max_hover = max_normal.clone();
+    }
+    let mut max_active = parse_surface(cb_tbl, "max_active", theme_dir, cb_sz);
+    if max_active.is_empty() {
+        max_active = max_normal.clone();
+    }
+    let mut restore_normal = parse_surface(cb_tbl, "restore", theme_dir, cb_sz);
+    if restore_normal.is_empty() {
+        restore_normal = max_normal.clone();
+    }
+    let mut restore_hover = parse_surface(cb_tbl, "restore_hover", theme_dir, cb_sz);
+    if restore_hover.is_empty() {
+        restore_hover = max_hover.clone();
+    }
+    let mut restore_active = parse_surface(cb_tbl, "restore_active", theme_dir, cb_sz);
+    if restore_active.is_empty() {
+        restore_active = max_active.clone();
+    }
+    let caption_buttons = CaptionButtonsSkin {
+        width: cb_w.clamp(14, 36),
+        height: cb_h.clamp(14, 32),
+        gap: cb_tbl
+            .and_then(|t| t.get("gap"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(2) as i32,
+        margin_right: cb_tbl
+            .and_then(|t| t.get("margin_right"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(5) as i32,
+        margin_top: cb_tbl
+            .and_then(|t| t.get("margin_top"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(4) as i32,
+        radius: cb_tbl
+            .and_then(|t| t.get("radius"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(3) as i32,
+        close_normal,
+        close_hover,
+        close_active,
+        min_normal,
+        min_hover,
+        min_active,
+        max_normal,
+        max_hover,
+        max_active,
+        restore_normal,
+        restore_hover,
+        restore_active,
+        glyph_color: cb_tbl
+            .and_then(|t| t.get("glyph_color"))
+            .and_then(parse_color)
+            .unwrap_or(0xffffff),
+        inactive_opacity: cb_tbl
+            .and_then(|t| t.get("inactive_opacity"))
+            .and_then(toml::Value::as_float)
+            .unwrap_or(0.68) as f32,
+    };
+
+    let task_tbl = root.get("taskbar").and_then(toml::Value::as_table);
+    let mut task_bg = parse_surface(task_tbl, "", theme_dir, None);
+    if task_bg.is_empty() {
+        task_bg.bg = parse_css_background(
+            "linear-gradient(to bottom, #1f2f86 0%, #3165c4 3%, #3682e5 6%, #4490e6 10%, #3883e5 12%, #2b71e0 15%, #2663da 18%, #235bd6 20%, #2258d5 23%, #2157d6 38%, #245ddb 54%, #2562df 86%, #245fdc 89%, #2158d4 92%, #1d4ec0 95%, #1941a5 98%)",
+        );
+    }
+    let mut btn_norm = parse_surface(task_tbl, "button_normal", theme_dir, None);
+    if btn_norm.is_empty() {
+        btn_norm.bg = parse_css_background("linear-gradient(to bottom, #4b92f7 0%, #3c81f3 45%, #2b6ee3 100%)");
+        btn_norm.box_shadows = parse_css_box_shadow("inset -1px -1px #1746a2, inset 1px 1px #7db4ff");
+    }
+    let mut btn_hov = parse_surface(task_tbl, "button_hover", theme_dir, None);
+    if btn_hov.is_empty() {
+        btn_hov.bg = parse_css_background("linear-gradient(to bottom, #68abff 0%, #53a3ff 50%, #3783eb 100%)");
+        btn_hov.box_shadows = parse_css_box_shadow("inset -1px -1px #1a50b8, inset 1px 1px #9ec9ff");
+    }
+    let mut btn_act = parse_surface(task_tbl, "button_active", theme_dir, None);
+    if btn_act.is_empty() {
+        btn_act.bg = parse_css_background("linear-gradient(to bottom, #173f94 0%, #1e52b7 55%, #1b4aa8 100%)");
+        btn_act.box_shadows = parse_css_box_shadow("inset 1px 1px #0d2358, inset -1px -1px #2e67cf, inset 2px 2px #13337c");
+    }
+    let mut btn_press = parse_surface(task_tbl, "button_pressed", theme_dir, None);
+    if btn_press.is_empty() {
+        btn_press = btn_act.clone();
+    }
+    let tray_surface = parse_surface(task_tbl, "tray", theme_dir, None);
+    let tray_bg = if tray_surface.is_empty() {
+        None
+    } else {
+        Some(tray_surface)
+    };
+    let taskbar = TaskbarSkin {
+        height: task_tbl
+            .and_then(|t| t.get("height"))
+            .and_then(toml::Value::as_integer)
+            .map(|v| (v as i32).clamp(28, 56)),
+        bg: task_bg,
+        button_normal: btn_norm,
+        button_hover: btn_hov,
+        button_active: btn_act,
+        button_pressed: btn_press,
+        button_radius: task_tbl
+            .and_then(|t| t.get("button_radius"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(3) as i32,
+        button_text: task_tbl
+            .and_then(|t| t.get("button_text"))
+            .and_then(parse_color)
+            .unwrap_or(0xffffff),
+        button_active_text: task_tbl
+            .and_then(|t| t.get("button_active_text"))
+            .and_then(parse_color)
+            .unwrap_or(0xffffff),
+        button_minimized_text: task_tbl
+            .and_then(|t| t.get("button_minimized_text"))
+            .and_then(parse_color)
+            .unwrap_or(0xd6e6ff),
+        tray_bg,
+        tray_text: task_tbl
+            .and_then(|t| t.get("tray_text"))
+            .and_then(parse_color)
+            .unwrap_or(0xffffff),
+        tray_muted_text: task_tbl
+            .and_then(|t| t.get("tray_muted_text"))
+            .and_then(parse_color)
+            .unwrap_or(0xd8eeff),
+    };
+
+    let sb_tbl = root.get("start_button").and_then(toml::Value::as_table);
+    let sb_radii = sb_tbl
+        .and_then(|t| t.get("radius"))
+        .and_then(parse_radii_val)
+        .unwrap_or([0, 13, 13, 0]);
+    let mut sb_norm = parse_surface(sb_tbl, "normal", theme_dir, None);
+    if sb_norm.is_empty() {
+        sb_norm.bg = parse_css_background(
+            "linear-gradient(to bottom, #74c56d 0%, #43a13d 12%, #379231 48%, #2e8428 54%, #257820 88%, #185814 100%)",
+        );
+        sb_norm.box_shadows =
+            parse_css_box_shadow("inset 0 1px #9ce096, inset -1px -1px #175214");
+    }
+    let mut sb_hov = parse_surface(sb_tbl, "hover", theme_dir, None);
+    if sb_hov.is_empty() {
+        sb_hov.bg = parse_css_background(
+            "linear-gradient(to bottom, #8be084 0%, #52b44b 12%, #43a23d 48%, #379531 54%, #2d8727 88%, #1e681a 100%)",
+        );
+        sb_hov.box_shadows =
+            parse_css_box_shadow("inset 0 1px #b8f2b2, inset -1px -1px #1d6419");
+    }
+    let mut sb_act = parse_surface(sb_tbl, "active", theme_dir, None);
+    if sb_act.is_empty() {
+        sb_act.bg = parse_css_background(
+            "linear-gradient(to bottom, #1e5e1a 0%, #267021 20%, #2c7c26 80%, #378e31 100%)",
+        );
+        sb_act.box_shadows =
+            parse_css_box_shadow("inset 1px 1px #113c0e, inset -1px -1px #429e3b");
+    }
+    let sb_icon = sb_tbl
+        .and_then(|t| t.get("icon_svg").or_else(|| t.get("icon")))
+        .and_then(toml::Value::as_str)
+        .and_then(|rel| {
+            if rel.is_empty() || rel.contains("..") || rel.starts_with('/') {
+                None
+            } else {
+                icons::decode_theme_asset(&theme_dir.join(rel), Some((20, 20)))
+            }
+        });
+    let start_button = StartButtonSkin {
+        width: sb_tbl
+            .and_then(|t| t.get("width"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(98) as i32,
+        full_height: sb_tbl
+            .and_then(|t| t.get("full_height"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true),
+        margin_left: sb_tbl
+            .and_then(|t| t.get("margin_left"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(0) as i32,
+        radii: sb_radii,
+        normal: sb_norm,
+        hover: sb_hov,
+        active: sb_act,
+        label: sb_tbl
+            .and_then(|t| t.get("label"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("开始")
+            .to_string(),
+        text_color: sb_tbl
+            .and_then(|t| t.get("text_color"))
+            .and_then(parse_color)
+            .unwrap_or(0xffffff),
+        text_shadow: sb_tbl
+            .and_then(|t| t.get("text_shadow"))
+            .and_then(parse_color)
+            .or(Some(0x123e10)),
+        icon: sb_icon,
+    };
+
+    let start_menu = root
+        .get("start_menu")
+        .and_then(toml::Value::as_table)
+        .map(|sm| {
+            let layout = match sm.get("layout").and_then(toml::Value::as_str).unwrap_or("two_column")
+            {
+                "compact" => StartMenuLayoutKind::Compact,
+                _ => StartMenuLayoutKind::TwoColumn,
+            };
+            let mut header_bg = parse_surface(Some(sm), "header", theme_dir, None);
+            if header_bg.is_empty() {
+                header_bg.bg = parse_css_background(
+                    "linear-gradient(to bottom, #1868ce 0%, #0e60cb 12%, #0e60cb 20%, #1164cf 32%, #1667cf 33%, #1b6cd3 47%, #1e70d9 54%, #2476dc 60%, #297ae0 65%, #3482e3 77%, #3786e5 79%, #428ee9 90%, #4791eb 100%)",
+                );
+            }
+            let mut footer_bg = parse_surface(Some(sm), "footer", theme_dir, None);
+            if footer_bg.is_empty() {
+                footer_bg.bg = parse_css_background(
+                    "linear-gradient(to bottom, #4282d6 0%, #3b85e0 3%, #418ae3 5%, #418ae3 17%, #3c87e2 21%, #3786e4 26%, #3482e3 29%, #2e7ee1 39%, #2374df 49%, #2072db 57%, #196edb 62%, #176bd8 72%, #1468d5 75%, #1165d2 83%, #0f61cb 88%)",
+                );
+            }
+            let mut logout_badge = parse_surface(Some(sm), "logout_badge", theme_dir, Some((22, 22)));
+            if logout_badge.is_empty() {
+                logout_badge.bg = parse_css_background("linear-gradient(to bottom, #f8b64c 0%, #e58716 55%, #c56606 100%)");
+                logout_badge.border = Some((0xffffff, 0.9, 1));
+            }
+            let mut reboot_badge = parse_surface(Some(sm), "reboot_badge", theme_dir, Some((22, 22)));
+            if reboot_badge.is_empty() {
+                reboot_badge.bg = parse_css_background("linear-gradient(to bottom, #64b65c 0%, #3c9635 55%, #24741e 100%)");
+                reboot_badge.border = Some((0xffffff, 0.9, 1));
+            }
+            let mut shutdown_badge =
+                parse_surface(Some(sm), "shutdown_badge", theme_dir, Some((22, 22)));
+            if shutdown_badge.is_empty() {
+                shutdown_badge.bg = parse_css_background("linear-gradient(to bottom, #f46a52 0%, #d83b22 55%, #a81c07 100%)");
+                shutdown_badge.border = Some((0xffffff, 0.9, 1));
+            }
+            StartMenuSkin {
+                layout,
+                width: sm
+                    .get("width")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(416) as i32,
+                height: sm
+                    .get("height")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(508) as i32,
+                offset_x: sm
+                    .get("offset_x")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(0) as i32,
+                gap_y: sm
+                    .get("gap_y")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(0) as i32,
+                top_radius: sm
+                    .get("top_radius")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(6) as i32,
+                bottom_radius: sm
+                    .get("bottom_radius")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(0) as i32,
+                frame_border: sm
+                    .get("frame_border")
+                    .and_then(parse_color)
+                    .unwrap_or(0x1854b8),
+                header_height: sm
+                    .get("header_height")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(58) as i32,
+                header_bg,
+                header_top_sheen: sm
+                    .get("header_top_sheen")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(true),
+                header_text: sm
+                    .get("header_text")
+                    .and_then(parse_color)
+                    .unwrap_or(0xffffff),
+                header_text_shadow: sm
+                    .get("header_text_shadow")
+                    .and_then(parse_color)
+                    .or(Some(0x0a246a)),
+                avatar_border: sm
+                    .get("avatar_border")
+                    .and_then(parse_color)
+                    .unwrap_or(0xdde8f8),
+                orange_divider: sm.get("orange_divider").and_then(parse_color),
+                left_bg: sm
+                    .get("left_bg")
+                    .and_then(parse_color)
+                    .unwrap_or(0xffffff),
+                left_text: sm
+                    .get("left_text")
+                    .and_then(parse_color)
+                    .unwrap_or(0x1a1a1a),
+                left_subtext: sm
+                    .get("left_subtext")
+                    .and_then(parse_color)
+                    .unwrap_or(0x6e6e6e),
+                right_bg: sm
+                    .get("right_bg")
+                    .and_then(parse_color)
+                    .unwrap_or(0xd3e5fa),
+                right_border_left: sm
+                    .get("right_border_left")
+                    .and_then(parse_color)
+                    .unwrap_or(0x95bdee),
+                right_text: sm
+                    .get("right_text")
+                    .and_then(parse_color)
+                    .unwrap_or(0x0a1e5e),
+                item_hover_bg: sm
+                    .get("item_hover_bg")
+                    .and_then(parse_color)
+                    .unwrap_or(0x2f71cd),
+                item_hover_text: sm
+                    .get("item_hover_text")
+                    .and_then(parse_color)
+                    .unwrap_or(0xffffff),
+                all_programs_label: sm
+                    .get("all_programs_label")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("所有程序")
+                    .to_string(),
+                all_programs_arrow: sm
+                    .get("all_programs_arrow")
+                    .and_then(parse_color)
+                    .unwrap_or(0x2ca02c),
+                footer_height: sm
+                    .get("footer_height")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(42) as i32,
+                footer_bg,
+                footer_text: sm
+                    .get("footer_text")
+                    .and_then(parse_color)
+                    .unwrap_or(0xffffff),
+                logout_badge,
+                reboot_badge,
+                shutdown_badge,
+            }
+        });
+
+    let ctrl_tbl = root.get("controls").and_then(toml::Value::as_table);
+    let mut btn_normal = parse_surface(ctrl_tbl, "button_normal", theme_dir, None);
+    if btn_normal.is_empty() {
+        btn_normal.bg = parse_css_background("linear-gradient(180deg, #ffffff 0%, #ecebe5 86%, #d8d0c4 100%)");
+        btn_normal.border = Some((0x003c74, 1.0, 1));
+    }
+    let mut btn_hover = parse_surface(ctrl_tbl, "button_hover", theme_dir, None);
+    if btn_hover.is_empty() {
+        btn_hover.bg = parse_css_background("linear-gradient(180deg, #ffffff 0%, #f5f4ef 86%, #e3ded4 100%)");
+        btn_hover.border = Some((0x003c74, 1.0, 1));
+        btn_hover.box_shadows = parse_css_box_shadow(
+            "inset -1px 1px #fff0cf, inset 1px 2px #fdd889, inset -2px 2px #fbc761, inset 2px -2px #e5a01a",
+        );
+    }
+    let mut btn_active = parse_surface(ctrl_tbl, "button_active", theme_dir, None);
+    if btn_active.is_empty() {
+        btn_active.bg = parse_css_background(
+            "linear-gradient(180deg, #cdcac3 0%, #e3e3db 8%, #e5e5de 94%, #f2f2f1 100%)",
+        );
+        btn_active.border = Some((0x003c74, 1.0, 1));
+    }
+    let mut btn_primary = parse_surface(ctrl_tbl, "button_primary", theme_dir, None);
+    if btn_primary.is_empty() {
+        btn_primary.bg = btn_normal.bg.clone();
+        btn_primary.border = Some((0x003c74, 1.0, 1));
+        btn_primary.box_shadows = parse_css_box_shadow(
+            "inset -1px 1px #cee7ff, inset 1px 2px #98b8ea, inset -2px 2px #bcd4f6, inset 1px -1px #89ade4, inset 2px -2px #89ade4",
+        );
+    }
+    let mut card_surf = parse_surface(ctrl_tbl, "card", theme_dir, None);
+    if card_surf.is_empty() {
+        card_surf.bg = parse_css_background("linear-gradient(180deg, #fcfcfe 0%, #f4f3ee 100%)");
+        card_surf.border = Some((0xd0d0bf, 1.0, 1));
+    }
+    let mut tab_normal = parse_surface(ctrl_tbl, "tab_normal", theme_dir, None);
+    if tab_normal.is_empty() {
+        tab_normal.bg = parse_css_background(
+            "linear-gradient(180deg, #ffffff 0%, #fafaf9 26%, #f0f0ea 95%, #ecebe5 100%)",
+        );
+        tab_normal.border = Some((0x91a7b4, 1.0, 1));
+    }
+    let mut tab_hover = parse_surface(ctrl_tbl, "tab_hover", theme_dir, None);
+    if tab_hover.is_empty() {
+        tab_hover.bg = tab_normal.bg.clone();
+        tab_hover.border = Some((0x919b9c, 1.0, 1));
+        tab_hover.border_top = Some((0xe68b2c, 1));
+        tab_hover.box_shadows = parse_css_box_shadow("inset 0 2px #ffc73c");
+    }
+    let mut tab_active = parse_surface(ctrl_tbl, "tab_active", theme_dir, None);
+    if tab_active.is_empty() {
+        tab_active.bg = Some(CssBackground::Solid(0xfcfcfe, 1.0));
+        tab_active.border = Some((0x919b9c, 1.0, 1));
+        tab_active.border_top = Some((0xe68b2c, 1));
+        tab_active.box_shadows = parse_css_box_shadow("inset 0 2px #ffc73c");
+    }
+    let mut sb_track = parse_surface(ctrl_tbl, "scrollbar_track", theme_dir, None);
+    if sb_track.is_empty() {
+        sb_track.bg = parse_css_background("linear-gradient(to right, #eeede5 0%, #f6f5f0 45%, #fefefb 100%)");
+    }
+    let mut sb_thumb = parse_surface(ctrl_tbl, "scrollbar_thumb", theme_dir, None);
+    if sb_thumb.is_empty() {
+        sb_thumb.bg = parse_css_background("linear-gradient(to right, #d8e6fe 0%, #c8d6fb 50%, #9bbaf8 100%)");
+        sb_thumb.border = Some((0x6b90dc, 1.0, 1));
+        sb_thumb.box_shadows = parse_css_box_shadow("inset 1px 1px #ffffff");
+    }
+    let mut sb_thumb_hov = parse_surface(ctrl_tbl, "scrollbar_thumb_hover", theme_dir, None);
+    if sb_thumb_hov.is_empty() {
+        sb_thumb_hov.bg = parse_css_background("linear-gradient(to right, #e8f1ff 0%, #d8e5ff 50%, #b0cbfb 100%)");
+        sb_thumb_hov.border = Some((0x537dd4, 1.0, 1));
+        sb_thumb_hov.box_shadows = parse_css_box_shadow("inset 1px 1px #ffffff");
+    }
+    let mut sb_thumb_act = parse_surface(ctrl_tbl, "scrollbar_thumb_active", theme_dir, None);
+    if sb_thumb_act.is_empty() {
+        sb_thumb_act.bg = parse_css_background("linear-gradient(to right, #b6cdfb 0%, #9ab8f7 50%, #7d9fe8 100%)");
+        sb_thumb_act.border = Some((0x3b63b8, 1.0, 1));
+    }
+    let mut prog_track = parse_surface(ctrl_tbl, "progress_track", theme_dir, None);
+    if prog_track.is_empty() {
+        prog_track.bg = Some(CssBackground::Solid(0xffffff, 1.0));
+        prog_track.border = Some((0x686868, 1.0, 1));
+    }
+    let mut prog_fill = parse_surface(ctrl_tbl, "progress_fill", theme_dir, None);
+    if prog_fill.is_empty() {
+        prog_fill.bg = parse_css_background(
+            "linear-gradient(180deg, #acedad 0%, #7be47d 14%, #4cda50 28%, #2ed330 42%, #42d845 57%, #76e275 71%, #8fe791 85%, #ffffff 100%)",
+        );
+    }
+
+    let controls = ControlsSkin {
+        button_normal: btn_normal,
+        button_hover: btn_hover,
+        button_active: btn_active,
+        button_primary: btn_primary,
+        button_radius: ctrl_tbl
+            .and_then(|t| t.get("button_radius"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(3) as i32,
+        button_text: ctrl_tbl
+            .and_then(|t| t.get("button_text"))
+            .and_then(parse_color)
+            .unwrap_or(0x000000),
+        button_primary_text: ctrl_tbl
+            .and_then(|t| t.get("button_primary_text"))
+            .and_then(parse_color)
+            .unwrap_or(0x000000),
+        card: card_surf,
+        card_radius: ctrl_tbl
+            .and_then(|t| t.get("card_radius"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(4) as i32,
+        tab_normal,
+        tab_hover,
+        tab_active,
+        tab_radii: ctrl_tbl
+            .and_then(|t| t.get("tab_radius"))
+            .and_then(parse_radii_val)
+            .unwrap_or([3, 3, 0, 0]),
+        tab_text: ctrl_tbl
+            .and_then(|t| t.get("tab_text"))
+            .and_then(parse_color)
+            .unwrap_or(0x222222),
+        tab_active_text: ctrl_tbl
+            .and_then(|t| t.get("tab_active_text"))
+            .and_then(parse_color)
+            .unwrap_or(0x000000),
+        input_bg: ctrl_tbl
+            .and_then(|t| t.get("input_bg"))
+            .and_then(parse_color)
+            .unwrap_or(0xffffff),
+        input_border: ctrl_tbl
+            .and_then(|t| t.get("input_border"))
+            .and_then(parse_color)
+            .unwrap_or(0x7f9db9),
+        input_focus_border: ctrl_tbl
+            .and_then(|t| t.get("input_focus_border"))
+            .and_then(parse_color)
+            .unwrap_or(0x0054e3),
+        input_radius: ctrl_tbl
+            .and_then(|t| t.get("input_radius"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(0) as i32,
+        scrollbar_width: ctrl_tbl
+            .and_then(|t| t.get("scrollbar_width"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(15) as i32,
+        scrollbar_track: sb_track,
+        scrollbar_thumb: sb_thumb,
+        scrollbar_thumb_hover: sb_thumb_hov,
+        scrollbar_thumb_active: sb_thumb_act,
+        scrollbar_grip_light: ctrl_tbl
+            .and_then(|t| t.get("scrollbar_grip_light"))
+            .and_then(parse_color)
+            .or(Some(0xeef4fe)),
+        scrollbar_grip_dark: ctrl_tbl
+            .and_then(|t| t.get("scrollbar_grip_dark"))
+            .and_then(parse_color)
+            .or(Some(0x7da4f2)),
+        progress_track: prog_track,
+        progress_fill: prog_fill,
+        progress_chunk_w: ctrl_tbl
+            .and_then(|t| t.get("progress_chunk_w"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(8) as i32,
+        progress_chunk_gap: ctrl_tbl
+            .and_then(|t| t.get("progress_chunk_gap"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(2) as i32,
+    };
+
+    CustomThemeSkin {
+        cache_key,
+        window,
+        titlebar,
+        caption_buttons,
+        taskbar,
+        start_button,
+        start_menu,
+        controls,
+    }
 }
 
 fn apply_external_colors(theme: &mut Theme, colors: &toml::value::Table) {
@@ -185,22 +2070,28 @@ pub struct Theme {
     pub danger: u32,
     pub warning: u32,
     pub success: u32,
+    pub custom_skin: Option<SkinRef>,
 }
 
 impl Theme {
     pub fn from_config(config: &DesktopConfig) -> Self {
-        let external = load_external_theme(&config.theme_id);
+        let external = load_external_theme(&config.theme_id, config.mode, config.accent);
         let style = external
             .as_ref()
             .and_then(|theme| theme.base_style)
             .unwrap_or(config.theme_style);
-        let mode = external
-            .as_ref()
-            .and_then(|theme| theme.mode)
-            .unwrap_or(config.mode);
+        let mode = config.mode;
         let accent = external
             .as_ref()
-            .and_then(|theme| theme.accent)
+            .and_then(|theme| {
+                // Use the user's configured accent unless it is still at a built-in default
+                // when loading a newly set external theme id in headless tests.
+                if config.accent == uxconf::ACCENT_PRESETS[0].0 {
+                    theme.default_accent
+                } else {
+                    Some(config.accent)
+                }
+            })
             .unwrap_or(config.accent);
         let mut theme = match (style, mode) {
             (ThemeStyle::VortexGlass, mode) => Self::vortexglass_with_accent(accent, mode),
@@ -209,10 +2100,26 @@ impl Theme {
             (ThemeStyle::Spui, ThemeMode::Light) => Self::light_with_accent(accent),
         };
         if let Some(external) = external {
+            if let Some(def_mode) = external.default_mode {
+                theme.mode = if config.mode == ThemeMode::Dark {
+                    ThemeMode::Dark
+                } else {
+                    def_mode
+                };
+            }
             apply_external_colors(&mut theme, &external.colors);
+            theme.custom_skin = external.skin;
+            let _ = external.id;
         }
         theme.font_scale = config.font_scale;
         theme
+    }
+
+    pub const fn skin(&self) -> Option<&'static CustomThemeSkin> {
+        match self.custom_skin {
+            Some(s) => Some(s.0),
+            None => None,
+        }
     }
 
     pub fn ui_scale(&self) -> f32 {
@@ -265,6 +2172,7 @@ impl Theme {
             danger: 0xe81123,
             warning: 0xf59e0b,
             success: 0x10b981,
+            custom_skin: None,
         }
     }
 
@@ -309,6 +2217,7 @@ impl Theme {
             danger: 0xdc2626,
             warning: 0xd97706,
             success: 0x059669,
+            custom_skin: None,
         }
     }
 
@@ -358,6 +2267,7 @@ impl Theme {
                 danger: 0xdc2626,
                 warning: 0xd97706,
                 success: 0x10b981,
+                custom_skin: None,
             };
         }
         Self {
@@ -398,6 +2308,7 @@ impl Theme {
             danger: 0xc80000,
             warning: 0xc87800,
             success: 0x008000,
+            custom_skin: None,
         }
     }
 
@@ -445,6 +2356,7 @@ impl Theme {
                 danger: 0xef4444,
                 warning: 0xf59e0b,
                 success: 0x22c55e,
+                custom_skin: None,
             };
         }
 
@@ -488,6 +2400,7 @@ impl Theme {
             danger: 0xd93025,
             warning: 0xd97706,
             success: 0x18a934,
+            custom_skin: None,
         }
     }
 
@@ -496,11 +2409,11 @@ impl Theme {
     }
 
     pub const fn is_win98(&self) -> bool {
-        matches!(self.style, ThemeStyle::Win98)
+        self.custom_skin.is_none() && matches!(self.style, ThemeStyle::Win98)
     }
 
     pub const fn is_vortexglass(&self) -> bool {
-        matches!(self.style, ThemeStyle::VortexGlass)
+        self.custom_skin.is_none() && matches!(self.style, ThemeStyle::VortexGlass)
     }
 
     /// Accent-tinted Aero glass colorization base & opacity for active/inactive chrome.
@@ -537,7 +2450,9 @@ impl Theme {
     }
 
     pub const fn titlebar_height(&self) -> i32 {
-        if self.is_win98() {
+        if let Some(skin) = self.skin() {
+            skin.titlebar.height
+        } else if self.is_win98() {
             26
         } else if self.is_vortexglass() {
             VORTEX_TITLEBAR_HEIGHT
@@ -547,7 +2462,9 @@ impl Theme {
     }
 
     pub const fn window_border_width(&self) -> i32 {
-        if self.is_win98() {
+        if let Some(skin) = self.skin() {
+            skin.window.border_width
+        } else if self.is_win98() {
             3
         } else if self.is_vortexglass() {
             0
@@ -557,6 +2474,11 @@ impl Theme {
     }
 
     pub fn panel_height(&self, config: &DesktopConfig) -> i32 {
+        if let Some(skin) = self.skin() {
+            if let Some(h) = skin.taskbar.height {
+                return (config.panel_size - 12).clamp(h.min(30), 48);
+            }
+        }
         if self.is_win98() {
             (config.panel_size - 12).clamp(28, 44)
         } else if self.is_vortexglass() {
@@ -568,7 +2490,23 @@ impl Theme {
 
     #[allow(dead_code)]
     pub const fn radius_window(&self) -> i32 {
-        if self.is_win98() {
+        self.radius_window_top()
+    }
+
+    pub const fn radius_window_top(&self) -> i32 {
+        if let Some(skin) = self.skin() {
+            skin.window.top_radius
+        } else if self.is_win98() {
+            0
+        } else {
+            RADIUS_WINDOW
+        }
+    }
+
+    pub const fn radius_window_bottom(&self) -> i32 {
+        if let Some(skin) = self.skin() {
+            skin.window.bottom_radius
+        } else if self.is_win98() {
             0
         } else {
             RADIUS_WINDOW
@@ -576,6 +2514,12 @@ impl Theme {
     }
 
     pub const fn radius_popup(&self) -> i32 {
+        if let Some(skin) = self.skin() {
+            if let Some(ref sm) = skin.start_menu {
+                return sm.top_radius;
+            }
+            return 4;
+        }
         if self.is_win98() {
             0
         } else if self.is_vortexglass() {
@@ -586,7 +2530,9 @@ impl Theme {
     }
 
     pub const fn radius_control(&self) -> i32 {
-        if self.is_win98() {
+        if let Some(skin) = self.skin() {
+            skin.controls.button_radius
+        } else if self.is_win98() {
             0
         } else if self.is_vortexglass() {
             3
@@ -596,7 +2542,9 @@ impl Theme {
     }
 
     pub const fn radius_card(&self) -> i32 {
-        if self.is_win98() {
+        if let Some(skin) = self.skin() {
+            skin.controls.card_radius
+        } else if self.is_win98() {
             0
         } else if self.is_vortexglass() {
             4
@@ -698,7 +2646,7 @@ mod tests {
     }
 
     #[test]
-    fn external_theme_pack_overrides_palette() {
+    fn external_theme_pack_overrides_palette_and_css_skin() {
         let base = std::env::temp_dir().join(format!(
             "spui_external_theme_{}_{}",
             std::process::id(),
@@ -709,12 +2657,34 @@ mod tests {
         std::fs::create_dir_all(&theme_dir).expect("mkdir theme");
         std::fs::write(
             theme_dir.join("theme.toml"),
-            "schema = 1\nid = \"testpack\"\nbase_style = \"spui\"\nmode = \"light\"\naccent = \"#0054e3\"\n[colors]\ntitlebar = \"#0058e6\"\npanel = \"#ece9d8\"\ntext = \"#000000\"\n",
+            concat!(
+                "schema = 2\n",
+                "id = \"testpack\"\n",
+                "name = \"Test XP Pack\"\n",
+                "base_style = \"spui\"\n",
+                "mode = \"light\"\n",
+                "accent = \"#0054e3\"\n",
+                "[colors]\n",
+                "titlebar = \"#0058e6\"\n",
+                "panel = \"#ece9d8\"\n",
+                "text = \"#000000\"\n",
+                "[window]\n",
+                "top_radius = 8\n",
+                "bottom_radius = 0\n",
+                "border_width = 3\n",
+                "active_box_shadow = \"inset -1px -1px #00138c, inset 1px 1px #0831d9\"\n",
+                "[titlebar]\n",
+                "height = 28\n",
+                "active_bg = \"linear-gradient(to bottom, #0997ff, #0053ee 8%, #06f 88%, #003dd7)\"\n",
+            ),
         )
         .expect("write theme");
 
         let previous = std::env::var_os("SPUI_THEME_DIR");
         std::env::set_var("SPUI_THEME_DIR", &base);
+        let discovered = discover_installed_themes();
+        assert!(discovered.iter().any(|t| t.id == "testpack" && t.name == "Test XP Pack"));
+
         let mut config = DesktopConfig::default();
         config.theme_id = "testpack".to_string();
         config.theme_style = ThemeStyle::Spui;
@@ -730,6 +2700,79 @@ mod tests {
         assert_eq!(theme.panel, 0xece9d8);
         assert_eq!(theme.text, 0x000000);
         assert_eq!(theme.accent, 0x0054e3);
+        assert_eq!(theme.titlebar_height(), 28);
+        assert_eq!(theme.window_border_width(), 3);
+        assert_eq!(theme.radius_window_top(), 8);
+        assert_eq!(theme.radius_window_bottom(), 0);
+        assert!(theme.skin().is_some());
+    }
+
+    #[test]
+    fn real_winxp_package_loads_luna_olive_silver_and_royale_noir_skins() {
+        let pkg_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/theme-winxp");
+        if !pkg_src.join("theme.toml").exists() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!(
+            "spui_winxp_pkg_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let winxp_dir = base.join("winxp");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&winxp_dir).expect("mkdir winxp");
+        for entry in std::fs::read_dir(&pkg_src).expect("read packages/theme-winxp") {
+            let entry = entry.expect("dir entry");
+            let p = entry.path();
+            if p.is_file() {
+                std::fs::copy(&p, winxp_dir.join(entry.file_name())).expect("copy asset");
+            }
+        }
+
+        let previous = std::env::var_os("SPUI_THEME_DIR");
+        std::env::set_var("SPUI_THEME_DIR", &base);
+        let discovered = discover_installed_themes();
+        assert!(discovered.iter().any(|t| t.id == "winxp" && t.name == "Windows XP Luna"));
+
+        // 1. Default Luna Blue
+        let mut cfg = DesktopConfig::default();
+        cfg.theme_id = "winxp".to_string();
+        cfg.theme_style = ThemeStyle::Spui;
+        cfg.mode = ThemeMode::Light;
+        cfg.accent = 0x0054e3;
+        let luna = Theme::from_config(&cfg);
+        let luna_skin = luna.skin().expect("Luna Blue skin");
+        assert_eq!(luna.panel, 0xece9d8);
+        assert!(luna_skin.caption_buttons.close_normal.sprite.is_some());
+        assert!(luna_skin.caption_buttons.close_hover.sprite.is_some());
+        assert!(luna_skin.caption_buttons.close_active.sprite.is_some());
+        assert!(luna_skin.caption_buttons.min_normal.sprite.is_some());
+        assert!(luna_skin.caption_buttons.max_normal.sprite.is_some());
+        assert!(luna_skin.caption_buttons.restore_normal.sprite.is_some());
+        assert!(luna_skin.start_button.icon.is_some());
+        assert!(luna_skin.start_menu.is_some());
+
+        // 2. Olive Green (Homestead) via #10b981 accent swatch
+        cfg.accent = 0x10b981;
+        let olive = Theme::from_config(&cfg);
+        assert_eq!(olive.accent, 0x748753);
+
+        // 3. Metallic Silver via #64748b accent swatch
+        cfg.accent = 0x64748b;
+        let silver = Theme::from_config(&cfg);
+        assert_eq!(silver.window, 0xe8e9ed);
+
+        // 4. Royale Noir / Zune Dark via Dark mode
+        cfg.mode = ThemeMode::Dark;
+        let noir = Theme::from_config(&cfg);
+        assert_eq!(noir.window, 0x20242d);
+        assert_eq!(noir.text, 0xeef1f7);
+
+        match previous {
+            Some(value) => std::env::set_var("SPUI_THEME_DIR", value),
+            None => std::env::remove_var("SPUI_THEME_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

@@ -32,7 +32,7 @@ use uxconf::{
     format_hex_rgb, BackdropStyle, ButtonLayout, CompositorQuality, ConfError, CursorStyle,
     DesktopConfig, DoubleClickAction, FocusMode, NetMode, PanelPosition, ThemeMode, ThemePreset,
     Value, WindowPlacement, ACCENT_PRESETS, RESOLUTIONS, SOLID_BG_PRESETS, THEME_PRESETS,
-    TIMEZONES, WALLPAPERS, WALLPAPER_DIR,
+    TIMEZONES, WALLPAPER_DIR,
 };
 use x11rb::protocol::xproto::ConnectionExt;
 
@@ -455,6 +455,7 @@ enum HitTarget {
     Nav(usize),
     ResetPage,
     ThemePreset(usize),
+    ExternalTheme(usize),
     ThemeMode(ThemeMode),
     Accent(usize),
     FontScale(usize),
@@ -969,18 +970,24 @@ fn scroll_viewport_in(bounds: Rect, style: SettingsRenderStyle) -> Rect {
     )
 }
 
-fn load_wallpaper_thumbnails() -> [Option<Sprite>; 4] {
-    std::array::from_fn(|i| {
-        let path = format!("{WALLPAPER_DIR}/{}", WALLPAPERS[i].file);
-        let decoded = icons::decode_jpeg(Path::new(&path))?;
-        let opaque = decoded.scale_cover_opaque(THUMB_W, THUMB_H);
-        let pixels = opaque.into_iter().map(|px| 0xff00_0000 | px).collect();
-        Some(Sprite {
-            width: THUMB_W as u32,
-            height: THUMB_H as u32,
-            pixels,
+fn load_wallpaper_thumbnails(
+    wallpapers: &[crate::theme::DiscoveredWallpaper],
+) -> Vec<Option<Sprite>> {
+    wallpapers
+        .iter()
+        .map(|wp| {
+            let path = format!("{WALLPAPER_DIR}/{}", wp.file);
+            let decoded = icons::decode_jpeg(Path::new(&path))
+                .or_else(|| icons::decode_png(Path::new(&path)))?;
+            let opaque = decoded.scale_cover_opaque(THUMB_W, THUMB_H);
+            let pixels = opaque.into_iter().map(|px| 0xff00_0000 | px).collect();
+            Some(Sprite {
+                width: THUMB_W as u32,
+                height: THUMB_H as u32,
+                pixels,
+            })
         })
-    })
+        .collect()
 }
 
 fn push_clipped_hit(hits: &mut Vec<HitBox>, viewport: Rect, rect: Rect, target: HitTarget) {
@@ -1163,7 +1170,9 @@ pub struct SettingsState {
     screen_size: (u16, u16),
     sound_card: String,
     last_clock_preview: String,
-    thumbnails: [Option<Sprite>; 4],
+    external_themes: Vec<crate::theme::InstalledThemeInfo>,
+    wallpapers: Vec<crate::theme::DiscoveredWallpaper>,
+    thumbnails: Vec<Option<Sprite>>,
     thumbnails_loaded: bool,
     sys_info: SystemInfo,
     log_state: LogViewerState,
@@ -1179,6 +1188,13 @@ impl SettingsState {
         let cfg = host.config();
         let page = parse_initial_page(initial_page);
         let thumbnails_loaded = page == Page::DesktopPanel;
+        let external_themes = crate::theme::discover_installed_themes();
+        let wallpapers = crate::theme::discover_wallpapers();
+        let thumbnails = if thumbnails_loaded {
+            load_wallpaper_thumbnails(&wallpapers)
+        } else {
+            Vec::new()
+        };
         Self {
             page,
             scroll: ui::SmoothScroll::new("settings_scroll"),
@@ -1190,11 +1206,9 @@ impl SettingsState {
             screen_size: host.root_resolution(),
             sound_card: crate::sound::detected_card_name(),
             last_clock_preview: String::new(),
-            thumbnails: if thumbnails_loaded {
-                load_wallpaper_thumbnails()
-            } else {
-                [None, None, None, None]
-            },
+            external_themes,
+            wallpapers,
+            thumbnails,
             thumbnails_loaded,
             sys_info: SystemInfo::gather(),
             log_state: LogViewerState::load(),
@@ -1212,6 +1226,17 @@ impl SettingsState {
         }
         self.net_state.focused = None;
         match next_page {
+            Page::Appearance => {
+                self.external_themes = crate::theme::discover_installed_themes();
+            }
+            Page::DesktopPanel => {
+                let wps = crate::theme::discover_wallpapers();
+                if wps != self.wallpapers || !self.thumbnails_loaded {
+                    self.thumbnails = load_wallpaper_thumbnails(&wps);
+                    self.wallpapers = wps;
+                    self.thumbnails_loaded = true;
+                }
+            }
             Page::Display => self.screen_size = host.root_resolution(),
             Page::Network => self.net_state.refresh(),
             Page::Sound => self.sound_card = crate::sound::detected_card_name(),
@@ -1243,6 +1268,7 @@ impl SettingsState {
         apply_local_timezone(&cfg.timezone);
         self.screen_size = host.root_resolution();
         self.sound_card = crate::sound::detected_card_name();
+        self.external_themes = crate::theme::discover_installed_themes();
         if self.net_state.focused.is_none() {
             self.net_state.sync_from_config(cfg);
         }
@@ -1568,6 +1594,86 @@ impl SettingsState {
                 host.apply_theme_preset(preset);
                 self.status = format!("已切换为「{}」系统主题", preset.name());
             }
+            HitTarget::ExternalTheme(i) => {
+                if let Some(pack) = self.external_themes.get(i).cloned() {
+                    host.set_config_property(
+                        "appearance",
+                        "/theme/id",
+                        Value::String(pack.id.clone()),
+                    );
+                    host.set_config_property(
+                        "appearance",
+                        "/theme/style",
+                        Value::String(pack.base_style.as_str().to_string()),
+                    );
+                    host.set_config_property(
+                        "appearance",
+                        "/theme/mode",
+                        Value::String(pack.mode.as_str().to_string()),
+                    );
+                    host.set_config_property(
+                        "appearance",
+                        "/theme/accent",
+                        Value::String(format_hex_rgb(pack.accent)),
+                    );
+                    if let Some(wp) = pack.wallpaper.as_deref().filter(|s| !s.is_empty()) {
+                        let wp_exists = std::path::Path::new(WALLPAPER_DIR).join(wp).exists();
+                        if wp_exists {
+                            host.set_config_property(
+                                "desktop",
+                                "/backdrop/wallpaper",
+                                Value::String(wp.to_string()),
+                            );
+                            host.set_config_property(
+                                "desktop",
+                                "/backdrop/style",
+                                Value::String(BackdropStyle::Cover.as_str().to_string()),
+                            );
+                        } else {
+                            host.set_config_property(
+                                "desktop",
+                                "/backdrop/style",
+                                Value::String(BackdropStyle::Solid.as_str().to_string()),
+                            );
+                        }
+                    } else if pack.solid_color.is_some() {
+                        host.set_config_property(
+                            "desktop",
+                            "/backdrop/style",
+                            Value::String(BackdropStyle::Solid.as_str().to_string()),
+                        );
+                    }
+                    if let Some(sc) = pack.solid_color {
+                        host.set_config_property(
+                            "desktop",
+                            "/backdrop/solid-color",
+                            Value::String(format_hex_rgb(sc)),
+                        );
+                    }
+                    if let Some(pos) = pack.panel_position {
+                        host.set_config_property(
+                            "panel",
+                            "/position",
+                            Value::String(pos.as_str().to_string()),
+                        );
+                    }
+                    if let Some(sz) = pack.panel_size {
+                        host.set_config_property(
+                            "panel",
+                            "/size",
+                            Value::Int(sz as i64),
+                        );
+                    }
+                    if let Some(fs) = pack.start_fullscreen {
+                        host.set_config_property(
+                            "panel",
+                            "/start-fullscreen",
+                            Value::Bool(fs),
+                        );
+                    }
+                    self.status = format!("已切换为「{}」扩展主题", pack.name);
+                }
+            }
             HitTarget::ThemeMode(mode) => {
                 host.set_config_property(
                     "appearance",
@@ -1681,17 +1787,19 @@ impl SettingsState {
                 );
             }
             HitTarget::Wallpaper(i) => {
-                host.set_config_property(
-                    "desktop",
-                    "/backdrop/wallpaper",
-                    Value::String(WALLPAPERS[i].file.to_string()),
-                );
-                if host.config().backdrop_style == BackdropStyle::Solid {
+                if let Some(wp) = self.wallpapers.get(i) {
                     host.set_config_property(
                         "desktop",
-                        "/backdrop/style",
-                        Value::String(BackdropStyle::Cover.as_str().to_string()),
+                        "/backdrop/wallpaper",
+                        Value::String(wp.file.clone()),
                     );
+                    if host.config().backdrop_style == BackdropStyle::Solid {
+                        host.set_config_property(
+                            "desktop",
+                            "/backdrop/style",
+                            Value::String(BackdropStyle::Cover.as_str().to_string()),
+                        );
+                    }
                 }
             }
             HitTarget::SolidColor(i) => {
@@ -2504,10 +2612,12 @@ impl SettingsState {
         let hover = self.hover;
         let page = self.page;
         if page == Page::DesktopPanel && !self.thumbnails_loaded {
-            self.thumbnails = load_wallpaper_thumbnails();
+            self.thumbnails = load_wallpaper_thumbnails(&self.wallpapers);
             self.thumbnails_loaded = true;
         }
         let dragging_volume = self.dragging_volume;
+        let external_themes = &self.external_themes;
+        let wallpapers = &self.wallpapers;
         let thumbnails = &self.thumbnails;
         let screen_size = self.screen_size;
         let sound_card = self.sound_card.as_str();
@@ -2575,31 +2685,60 @@ impl SettingsState {
             match page {
                 Page::Appearance => {
                     y = draw_section_heading(canvas, text, theme, content_x, y, "系统主题方案");
-                    let n_presets = THEME_PRESETS.len() as i32;
+                    let n_builtin = THEME_PRESETS.len() as i32;
+                    let n_ext = external_themes.len() as i32;
+                    let n_total = n_builtin + n_ext;
                     let cols = if card_w >= 620 { 3 } else { 2 };
-                    let rows = (n_presets + cols - 1) / cols;
+                    let rows = (n_total + cols - 1) / cols;
                     let preset_gap = 12;
                     let card_item_h = if cols == 3 { 126 } else { 86 };
                     let c_theme_h = 14 + rows * card_item_h + (rows - 1).max(0) * 10 + 30;
                     let c_theme = Rect::new(content_x, y, card_w, c_theme_h);
                     ui::card(canvas, theme, c_theme);
-                    let active_preset = THEME_PRESETS
+                    let active_ext_id = external_themes
                         .iter()
-                        .copied()
-                        .find(|p| p.id() == cfg.theme_id)
-                        .unwrap_or_else(|| ThemePreset::from_style(cfg.theme_style));
+                        .find(|p| p.id == cfg.theme_id)
+                        .map(|p| p.id.as_str());
+                    let active_preset = if active_ext_id.is_some() {
+                        None
+                    } else {
+                        Some(
+                            THEME_PRESETS
+                                .iter()
+                                .copied()
+                                .find(|p| p.id() == cfg.theme_id)
+                                .unwrap_or_else(|| ThemePreset::from_style(cfg.theme_style)),
+                        )
+                    };
                     let preset_w = (card_w - 32 - preset_gap * (cols - 1)) / cols;
-                    for (idx, preset) in THEME_PRESETS.iter().enumerate() {
-                        let col_i = idx as i32 % cols;
-                        let row_i = idx as i32 / cols;
+                    for item_idx in 0..n_total as usize {
+                        let col_i = item_idx as i32 % cols;
+                        let row_i = item_idx as i32 / cols;
                         let card_r = Rect::new(
                             content_x + 16 + col_i * (preset_w + preset_gap),
                             y + 14 + row_i * (card_item_h + 10),
                             preset_w,
                             card_item_h,
                         );
-                        let selected = *preset == active_preset;
-                        let target = HitTarget::ThemePreset(idx);
+                        let is_builtin = (item_idx as i32) < n_builtin;
+                        let (selected, target, item_name, item_subtitle) = if is_builtin {
+                            let preset = THEME_PRESETS[item_idx];
+                            (
+                                active_preset == Some(preset),
+                                HitTarget::ThemePreset(item_idx),
+                                preset.name(),
+                                preset.subtitle(),
+                            )
+                        } else {
+                            let ext_idx = item_idx - n_builtin as usize;
+                            let pack = &external_themes[ext_idx];
+                            (
+                                active_ext_id == Some(pack.id.as_str()),
+                                HitTarget::ExternalTheme(ext_idx),
+                                pack.name.as_str(),
+                                pack.subtitle.as_str(),
+                            )
+                        };
                         let hovered = hover == Some(target);
                         if is_win98 {
                             canvas.fill(
@@ -2646,86 +2785,143 @@ impl SettingsState {
                         } else {
                             Rect::new(card_r.x + 12, card_r.y + 15, 82, 56)
                         };
-                        match preset {
-                            ThemePreset::VortexGlass => {
-                                canvas.vertical_gradient(mini, 0x103b66, 0x2f88ca);
-                                canvas.line(
-                                    mini.x + 8,
-                                    mini.y + 4,
-                                    mini.right() - 24,
-                                    mini.bottom() - 10,
-                                    0xbbe4ff,
-                                    0.26,
-                                );
-                                let win_m = Rect::new(mini.x + 11, mini.y + 7, mini.w - 22, 34);
-                                canvas.rounded_drop_shadow(win_m, 4, 4, 1, 0.45);
-                                canvas.rounded_rect(win_m, 4, 0x8cc6f2, 0.88);
-                                canvas.rounded_border(win_m, 4, 0xffffff, 0.65, 1);
-                                canvas.fill(
-                                    Rect::new(win_m.x + 3, win_m.y + 9, win_m.w - 6, win_m.h - 12),
-                                    0xf4f8fc,
-                                );
-                                canvas.fill(
-                                    Rect::new(win_m.right() - 12, win_m.y + 2, 9, 4),
-                                    0xd94336,
-                                );
-                                canvas.fill_gradient_v(
-                                    Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
-                                    0x2d6699,
-                                    0x183d62,
-                                    0.92,
-                                    0.92,
-                                );
-                                canvas.circle(
-                                    (mini.x + 8) as f32,
-                                    (mini.bottom() - 5) as f32,
-                                    4.0,
-                                    0x5ecfff,
-                                    1.0,
-                                );
-                                canvas.rounded_border(mini, 4, 0xffffff, 0.55, 1);
+                        if is_builtin {
+                            match THEME_PRESETS[item_idx] {
+                                ThemePreset::VortexGlass => {
+                                    canvas.vertical_gradient(mini, 0x103b66, 0x2f88ca);
+                                    canvas.line(
+                                        mini.x + 8,
+                                        mini.y + 4,
+                                        mini.right() - 24,
+                                        mini.bottom() - 10,
+                                        0xbbe4ff,
+                                        0.26,
+                                    );
+                                    let win_m = Rect::new(mini.x + 11, mini.y + 7, mini.w - 22, 34);
+                                    canvas.rounded_drop_shadow(win_m, 4, 4, 1, 0.45);
+                                    canvas.rounded_rect(win_m, 4, 0x8cc6f2, 0.88);
+                                    canvas.rounded_border(win_m, 4, 0xffffff, 0.65, 1);
+                                    canvas.fill(
+                                        Rect::new(
+                                            win_m.x + 3,
+                                            win_m.y + 9,
+                                            win_m.w - 6,
+                                            win_m.h - 12,
+                                        ),
+                                        0xf4f8fc,
+                                    );
+                                    canvas.fill(
+                                        Rect::new(win_m.right() - 12, win_m.y + 2, 9, 4),
+                                        0xd94336,
+                                    );
+                                    canvas.fill_gradient_v(
+                                        Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
+                                        0x2d6699,
+                                        0x183d62,
+                                        0.92,
+                                        0.92,
+                                    );
+                                    canvas.circle(
+                                        (mini.x + 8) as f32,
+                                        (mini.bottom() - 5) as f32,
+                                        4.0,
+                                        0x5ecfff,
+                                        1.0,
+                                    );
+                                    canvas.rounded_border(mini, 4, 0xffffff, 0.55, 1);
+                                }
+                                ThemePreset::Spui4 => {
+                                    canvas.rounded_rect(mini, 4, 0x0f172a, 1.0);
+                                    let win_m = Rect::new(mini.x + 10, mini.y + 8, mini.w - 20, 32);
+                                    canvas.rounded_rect(win_m, 3, 0x1e293b, 1.0);
+                                    canvas.fill(
+                                        Rect::new(win_m.x + 1, win_m.y + 1, win_m.w - 2, 7),
+                                        0x2563eb,
+                                    );
+                                    canvas.fill(
+                                        Rect::new(mini.x + 2, mini.bottom() - 9, mini.w - 4, 7),
+                                        0x111827,
+                                    );
+                                    canvas.rounded_border(mini, 4, theme.panel_border, 1.0, 1);
+                                }
+                                ThemePreset::Win98 => {
+                                    canvas.fill(mini, 0x008080);
+                                    let win_m = Rect::new(mini.x + 8, mini.y + 7, mini.w - 16, 33);
+                                    canvas.fill(win_m, 0xc0c0c0);
+                                    canvas.bevel_1px(win_m, 0xffffff, 0x404040);
+                                    canvas.horizontal_gradient(
+                                        Rect::new(win_m.x + 2, win_m.y + 2, win_m.w - 4, 8),
+                                        0x000080,
+                                        0x1084d0,
+                                    );
+                                    canvas.fill(
+                                        Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
+                                        0xc0c0c0,
+                                    );
+                                    canvas.fill(
+                                        Rect::new(mini.x + 3, mini.bottom() - 7, 16, 5),
+                                        0xdfdfdf,
+                                    );
+                                    canvas.bevel_1px(mini, 0x808080, 0xffffff);
+                                }
                             }
-                            ThemePreset::Spui4 => {
-                                canvas.rounded_rect(mini, 4, 0x0f172a, 1.0);
-                                let win_m = Rect::new(mini.x + 10, mini.y + 8, mini.w - 20, 32);
-                                canvas.rounded_rect(win_m, 3, 0x1e293b, 1.0);
-                                canvas.fill(
-                                    Rect::new(win_m.x + 1, win_m.y + 1, win_m.w - 2, 7),
-                                    0x2563eb,
-                                );
-                                canvas.fill(
-                                    Rect::new(mini.x + 2, mini.bottom() - 9, mini.w - 4, 7),
-                                    0x111827,
-                                );
-                                canvas.rounded_border(mini, 4, theme.panel_border, 1.0, 1);
-                            }
-                            ThemePreset::Win98 => {
-                                canvas.fill(mini, 0x008080);
-                                let win_m = Rect::new(mini.x + 8, mini.y + 7, mini.w - 16, 33);
-                                canvas.fill(win_m, 0xc0c0c0);
-                                canvas.bevel_1px(win_m, 0xffffff, 0x404040);
-                                canvas.horizontal_gradient(
-                                    Rect::new(win_m.x + 2, win_m.y + 2, win_m.w - 4, 8),
-                                    0x000080,
-                                    0x1084d0,
-                                );
-                                canvas.fill(
-                                    Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8),
-                                    0xc0c0c0,
-                                );
-                                canvas.fill(
-                                    Rect::new(mini.x + 3, mini.bottom() - 7, 16, 5),
-                                    0xdfdfdf,
-                                );
-                                canvas.bevel_1px(mini, 0x808080, 0xffffff);
-                            }
+                        } else {
+                            let ext_idx = item_idx - n_builtin as usize;
+                            let pv = &external_themes[ext_idx].preview;
+                            canvas.vertical_gradient(mini, pv.desktop_top, pv.desktop_bottom);
+                            let win_m = Rect::new(mini.x + 9, mini.y + 6, mini.w - 18, 34);
+                            let wr = pv.window_top_radius.clamp(0, 6);
+                            canvas.rounded_rect_corners(
+                                win_m,
+                                [wr, wr, 0, 0],
+                                pv.window_border,
+                                1.0,
+                            );
+                            canvas.fill(
+                                Rect::new(win_m.x + 2, win_m.y + 9, win_m.w - 4, win_m.h - 11),
+                                pv.window_bg,
+                            );
+                            canvas.horizontal_gradient(
+                                Rect::new(win_m.x + 2, win_m.y + 2, win_m.w - 4, 7),
+                                pv.titlebar_left,
+                                pv.titlebar_right,
+                            );
+                            canvas.fill_alpha(
+                                Rect::new(win_m.x + 2, win_m.y + 1, win_m.w - 4, 1),
+                                0xffffff,
+                                0.55,
+                            );
+                            canvas.rounded_rect(
+                                Rect::new(win_m.right() - 9, win_m.y + 2, 6, 6),
+                                1,
+                                pv.close_btn,
+                                1.0,
+                            );
+                            let tb_m = Rect::new(mini.x + 1, mini.bottom() - 9, mini.w - 2, 8);
+                            canvas.vertical_gradient(tb_m, pv.taskbar_top, pv.taskbar_bottom);
+                            canvas.fill_alpha(
+                                Rect::new(tb_m.x, tb_m.y, tb_m.w, 1),
+                                0xffffff,
+                                0.40,
+                            );
+                            canvas.rounded_rect_corners(
+                                Rect::new(tb_m.x, tb_m.y, 20, tb_m.h),
+                                [0, 4, 4, 0],
+                                pv.start_btn,
+                                1.0,
+                            );
+                            canvas.fill(
+                                Rect::new(tb_m.right() - 16, tb_m.y, 16, tb_m.h),
+                                pv.tray_bg,
+                            );
+                            canvas.rounded_border(mini, 4, theme.panel_border, 1.0, 1);
                         }
 
                         if stacked {
                             let tx = card_r.x + 10;
                             text.draw(
                                 canvas,
-                                preset.name(),
+                                item_name,
                                 tx as f32,
                                 (mini.bottom() + 18) as f32,
                                 13.0,
@@ -2733,7 +2929,7 @@ impl SettingsState {
                                 Face::Bold,
                             );
                             let sub_max = (card_r.w - 20).max(40) as f32;
-                            let sub_shown = text.truncate(preset.subtitle(), sub_max, 10.5, Face::Ui);
+                            let sub_shown = text.truncate(item_subtitle, sub_max, 10.5, Face::Ui);
                             text.draw(
                                 canvas,
                                 &sub_shown,
@@ -2758,7 +2954,7 @@ impl SettingsState {
                             let tx = mini.right() + 12;
                             text.draw(
                                 canvas,
-                                preset.name(),
+                                item_name,
                                 tx as f32,
                                 (card_r.y + 28) as f32,
                                 13.5,
@@ -2766,7 +2962,7 @@ impl SettingsState {
                                 Face::Bold,
                             );
                             let sub_max = (card_r.right() - tx - 10).max(40) as f32;
-                            let sub_shown = text.truncate(preset.subtitle(), sub_max, 11.0, Face::Ui);
+                            let sub_shown = text.truncate(item_subtitle, sub_max, 11.0, Face::Ui);
                             text.draw(
                                 canvas,
                                 &sub_shown,
@@ -3305,7 +3501,10 @@ impl SettingsState {
 
                 Page::DesktopPanel => {
                     y = draw_section_heading(canvas, text, theme, content_x, y, "桌面背景");
-                    let c1 = Rect::new(content_x, y, card_w, ROW_H + 226 + ROW_H);
+                    let cell_h = 92;
+                    let wp_rows = ((wallpapers.len() as i32) + 1).max(2) / 2;
+                    let grid_total_h = 14 + wp_rows * cell_h + (wp_rows - 1).max(0) * 12 + 16;
+                    let c1 = Rect::new(content_x, y, card_w, ROW_H + grid_total_h + ROW_H);
                     ui::card(canvas, theme, c1);
                     let style_idx = match cfg.backdrop_style {
                         BackdropStyle::Cover => 0,
@@ -3334,8 +3533,7 @@ impl SettingsState {
 
                     let grid_y = y + ROW_H + 14;
                     let cell_w = (card_w - 32 - 12) / 2;
-                    let cell_h = 92;
-                    for (i, wp) in WALLPAPERS.iter().enumerate() {
+                    for (i, wp) in wallpapers.iter().enumerate() {
                         let col = (i % 2) as i32;
                         let row = (i / 2) as i32;
                         let r = Rect::new(
@@ -3367,7 +3565,7 @@ impl SettingsState {
                             if selected { 2 } else { 1 },
                         );
                         let tb = Rect::new(r.x + 10, r.y + 13, THUMB_W as i32, THUMB_H as i32);
-                        if let Some(sprite) = &thumbnails[i] {
+                        if let Some(sprite) = thumbnails.get(i).and_then(|t| t.as_ref()) {
                             canvas.blit_sprite(tb.x, tb.y, sprite);
                             canvas.border_1px(tb, theme.window_border);
                         } else {
@@ -3376,7 +3574,7 @@ impl SettingsState {
                         let tx = (tb.right() + 12) as f32;
                         text.draw(
                             canvas,
-                            wp.label,
+                            &wp.label,
                             tx,
                             (r.y + 40) as f32,
                             12.5,
@@ -3403,7 +3601,7 @@ impl SettingsState {
                         push_clipped_hit(hits, viewport, r, target);
                     }
 
-                    let solid_y = y + ROW_H + 226;
+                    let solid_y = y + ROW_H + grid_total_h;
                     draw_row_divider(canvas, theme, content_x, card_w, solid_y);
                     draw_row_labels(
                         canvas,

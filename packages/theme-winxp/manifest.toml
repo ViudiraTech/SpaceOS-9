@@ -9,7 +9,7 @@
 name = "theme-winxp"
 epoch = 0
 version = "1.0.0"
-release = 1
+release = 2
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "Windows XP Luna-inspired SPUI theme"

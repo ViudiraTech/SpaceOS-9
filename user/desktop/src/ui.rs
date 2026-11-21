@@ -365,6 +365,16 @@ pub fn list_item_bg(
     selected: bool,
     hovered: bool,
 ) -> u32 {
+    if theme.skin().is_some() {
+        let r = theme.radius_control();
+        if selected {
+            canvas.rounded_rect(rect, r, theme.selection_bg, 1.0);
+            return theme.selection_text;
+        } else if hovered {
+            canvas.rounded_rect(rect, r, theme.panel_hover, 1.0);
+        }
+        return theme.text;
+    }
     if theme.is_win98() {
         if selected {
             canvas.fill(rect, theme.selection_bg);
@@ -465,6 +475,31 @@ pub fn caption_button_rect_for(
     kind: CaptionHit,
     buttons_left: bool,
 ) -> Rect {
+    if let Some(skin) = theme.skin() {
+        let cb = &skin.caption_buttons;
+        let th = skin.titlebar.height;
+        let bw = cb.width;
+        let bh = cb.height;
+        let gap = cb.gap;
+        let mr = cb.margin_right;
+        let y = cb.margin_top.max((th - bh) / 2);
+        return if buttons_left {
+            match kind {
+                CaptionHit::Close => Rect::new(mr, y, bw, bh),
+                CaptionHit::Maximize => Rect::new(mr + bw + gap, y, bw, bh),
+                CaptionHit::Minimize => Rect::new(mr + (bw + gap) * 2, y, bw, bh),
+                CaptionHit::None => Rect::default(),
+            }
+        } else {
+            let right = (window_width - mr).max(bw * 3 + gap * 2 + 6);
+            match kind {
+                CaptionHit::Close => Rect::new(right - bw, y, bw, bh),
+                CaptionHit::Maximize => Rect::new(right - bw * 2 - gap, y, bw, bh),
+                CaptionHit::Minimize => Rect::new(right - bw * 3 - gap * 2, y, bw, bh),
+                CaptionHit::None => Rect::default(),
+            }
+        };
+    }
     if theme.is_vortexglass() {
         return if buttons_left {
             match kind {
@@ -568,6 +603,47 @@ fn draw_win98_caption_glyph(
     }
 }
 
+fn draw_custom_caption_glyph(
+    canvas: &mut Canvas,
+    rect: Rect,
+    kind: CaptionHit,
+    maximized: bool,
+    fg: u32,
+) {
+    match kind {
+        CaptionHit::Minimize => {
+            canvas.fill(Rect::new(rect.x + 5, rect.bottom() - 6, 8, 3), fg);
+        }
+        CaptionHit::Maximize => {
+            if maximized {
+                let bx = rect.x + 4;
+                let by = rect.y + 4;
+                canvas.border_1px(Rect::new(bx + 3, by, 9, 9), fg);
+                canvas.fill(Rect::new(bx + 3, by + 1, 9, 2), fg);
+                canvas.border_1px(Rect::new(bx, by + 3, 9, 9), fg);
+                canvas.fill(Rect::new(bx, by + 4, 9, 2), fg);
+            } else {
+                let sq = Rect::new(rect.x + 5, rect.y + 5, 11, 11);
+                canvas.border_1px(sq, fg);
+                canvas.fill(Rect::new(sq.x, sq.y + 1, sq.w, 2), fg);
+            }
+        }
+        CaptionHit::Close => {
+            let cx0 = rect.x + 5;
+            let cy0 = rect.y + 5;
+            let cx1 = rect.right() - 6;
+            let cy1 = rect.bottom() - 6;
+            canvas.line(cx0, cy0, cx1, cy1, fg, 1.0);
+            canvas.line(cx0 + 1, cy0, cx1, cy1 - 1, fg, 1.0);
+            canvas.line(cx0, cy0 + 1, cx1 - 1, cy1, fg, 1.0);
+            canvas.line(cx1, cy0, cx0, cy1, fg, 1.0);
+            canvas.line(cx1 - 1, cy0, cx0, cy1 - 1, fg, 1.0);
+            canvas.line(cx1, cy0 + 1, cx0 + 1, cy1, fg, 1.0);
+        }
+        CaptionHit::None => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn titlebar(
     canvas: &mut Canvas,
@@ -581,6 +657,136 @@ pub fn titlebar(
     buttons_left: bool,
     hover: CaptionHit,
 ) {
+    if let Some(skin) = theme.skin() {
+        let th = skin.titlebar.height;
+        let top_r = if maximized { 0 } else { skin.window.top_radius };
+        let bar = Rect::new(0, 0, width, th);
+        let surf = if active {
+            &skin.titlebar.active
+        } else {
+            &skin.titlebar.inactive
+        };
+        surf.paint(canvas, bar, [top_r, top_r, 0, 0]);
+
+        let glow_op = if active { 0.85 } else { 0.30 };
+        if let Some((col, gw)) = skin.titlebar.edge_glow_left {
+            let gw = gw.clamp(2, width / 2);
+            for dx in 0..gw {
+                let a = glow_op * (1.0 - dx as f32 / gw as f32);
+                canvas.fill_alpha(Rect::new(dx, 1, 1, (th - 2).max(1)), col, a);
+            }
+        }
+        if let Some((col, gw)) = skin.titlebar.edge_glow_right {
+            let gw = gw.clamp(2, width / 2);
+            for dx in 0..gw {
+                let a = glow_op * (1.0 - dx as f32 / gw as f32);
+                canvas.fill_alpha(Rect::new(width - 1 - dx, 1, 1, (th - 2).max(1)), col, a);
+            }
+        }
+
+        let cb = &skin.caption_buttons;
+        let btn_cluster_w = cb.width * 3 + cb.gap * 2 + cb.margin_right;
+        let (icon_x, title_x) = if buttons_left {
+            (btn_cluster_w + 8, (btn_cluster_w + 28) as f32)
+        } else {
+            (7, 27.0)
+        };
+        icons::draw(canvas, app_icon, icon_x, (th - 16) / 2, 16, None);
+        let max_title_w = (width - btn_cluster_w - 38).max(32) as f32;
+        let shown = text.truncate(title, max_title_w, 12.5, Face::Bold);
+        let baseline = th as f32 * 0.5 + 4.5;
+        if active {
+            if let Some(sh_col) = skin.titlebar.text_shadow {
+                text.draw(
+                    canvas,
+                    &shown,
+                    title_x + 1.0,
+                    baseline + 1.0,
+                    12.5,
+                    sh_col,
+                    Face::Bold,
+                );
+            }
+        }
+        let fg = if active {
+            skin.titlebar.text_color
+        } else {
+            skin.titlebar.inactive_text_color
+        };
+        text.draw(canvas, &shown, title_x, baseline, 12.5, fg, Face::Bold);
+
+        for kind in [
+            CaptionHit::Minimize,
+            CaptionHit::Maximize,
+            CaptionHit::Close,
+        ] {
+            let btn = caption_button_rect_for(theme, width, kind, buttons_left);
+            let is_hov = hover == kind;
+            let is_pressed = is_rect_pressed(btn);
+            let btn_surf = match kind {
+                CaptionHit::Close => {
+                    if is_pressed {
+                        &cb.close_active
+                    } else if is_hov {
+                        &cb.close_hover
+                    } else {
+                        &cb.close_normal
+                    }
+                }
+                CaptionHit::Maximize if maximized => {
+                    if is_pressed {
+                        &cb.restore_active
+                    } else if is_hov {
+                        &cb.restore_hover
+                    } else {
+                        &cb.restore_normal
+                    }
+                }
+                CaptionHit::Maximize => {
+                    if is_pressed {
+                        &cb.max_active
+                    } else if is_hov {
+                        &cb.max_hover
+                    } else {
+                        &cb.max_normal
+                    }
+                }
+                CaptionHit::Minimize => {
+                    if is_pressed {
+                        &cb.min_active
+                    } else if is_hov {
+                        &cb.min_hover
+                    } else {
+                        &cb.min_normal
+                    }
+                }
+                CaptionHit::None => continue,
+            };
+            btn_surf.paint(canvas, btn, [cb.radius; 4]);
+            if btn_surf.sprite.is_none() {
+                let shift = i32::from(is_pressed);
+                draw_custom_caption_glyph(
+                    canvas,
+                    btn.offset(shift, shift),
+                    kind,
+                    maximized,
+                    cb.glyph_color,
+                );
+            }
+            if !active && !is_hov && cb.inactive_opacity < 0.99 {
+                let fade = (1.0 - cb.inactive_opacity).clamp(0.0, 0.75);
+                let veil = skin
+                    .titlebar
+                    .inactive
+                    .bg
+                    .as_ref()
+                    .map_or(theme.titlebar_inactive, |b| b.primary_color());
+                canvas.rounded_rect(btn, cb.radius, veil, fade);
+            }
+        }
+        return;
+    }
+
     if theme.is_win98() {
         let th = theme.titlebar_height();
         canvas.fill(Rect::new(0, 0, width, th), theme.panel);
@@ -834,6 +1040,43 @@ pub fn window_border(canvas: &mut Canvas, theme: &Theme, active: bool, maximized
         return;
     }
     let bounds = canvas.bounds();
+    if let Some(skin) = theme.skin() {
+        let bw = skin.window.border_width;
+        let th = skin.titlebar.height;
+        let top_r = skin.window.top_radius;
+        let bot_r = skin.window.bottom_radius;
+        let frame = if active {
+            &skin.window.active_frame
+        } else {
+            &skin.window.inactive_frame
+        };
+        let fill_col = frame
+            .bg
+            .as_ref()
+            .map(|b| b.primary_color())
+            .unwrap_or(if active {
+                theme.window_border_active
+            } else {
+                theme.window_border
+            });
+        let body_h = (bounds.h - th).max(0);
+        if body_h > 0 && bw > 0 {
+            canvas.fill(Rect::new(0, th, bw, body_h), fill_col);
+            canvas.fill(Rect::new(bounds.w - bw, th, bw, body_h), fill_col);
+            canvas.fill(Rect::new(0, bounds.h - bw, bounds.w, bw), fill_col);
+        }
+        if !frame.box_shadows.is_empty() {
+            crate::theme::paint_css_inset_shadows(
+                canvas,
+                bounds,
+                &frame.box_shadows,
+                [top_r, top_r, bot_r, bot_r],
+            );
+        } else if let Some((col, a, w)) = frame.border {
+            canvas.rounded_border_corners(bounds, [top_r, top_r, bot_r, bot_r], col, a, w);
+        }
+        return;
+    }
     if theme.is_win98() {
         let bw = theme.window_border_width();
         let th = theme.titlebar_height();
@@ -908,6 +1151,11 @@ pub fn popup_surface(canvas: &mut Canvas, theme: &Theme, rect: Rect, radius: i32
 }
 
 pub fn card(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    if let Some(skin) = theme.skin() {
+        let r = skin.controls.card_radius;
+        skin.controls.card.paint(canvas, rect, [r; 4]);
+        return;
+    }
     if theme.is_win98() {
         canvas.fill(rect, theme.window);
         // Classic Win98 GroupBox etched border strictly inside `rect`.
@@ -1158,6 +1406,55 @@ pub fn button_anim(
     hover_t: f32,
     pressed: bool,
 ) {
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let rad = [ctrl.button_radius; 4];
+        let surf = if pressed {
+            &ctrl.button_active
+        } else if hover_t > 0.25 {
+            &ctrl.button_hover
+        } else if primary {
+            &ctrl.button_primary
+        } else {
+            &ctrl.button_normal
+        };
+        surf.paint(canvas, rect, rad);
+        let fg = if primary {
+            ctrl.button_primary_text
+        } else {
+            ctrl.button_text
+        };
+        let shift = i32::from(pressed);
+        let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.5 + shift as f32;
+        if let Some(ic) = leading_icon {
+            let label_w = text.measure(label, 12.5, Face::Ui);
+            let total_w = 16.0 + if label.is_empty() { 0.0 } else { 6.0 + label_w };
+            let start_x = rect.x as f32 + (rect.w as f32 - total_w) * 0.5 + shift as f32;
+            icons::draw(
+                canvas,
+                ic,
+                start_x.round() as i32,
+                rect.y + (rect.h - 16) / 2 + shift,
+                16,
+                Some(fg),
+            );
+            if !label.is_empty() {
+                text.draw(canvas, label, start_x + 22.0, baseline, 12.5, fg, Face::Ui);
+            }
+        } else {
+            text.draw_centered(
+                canvas,
+                label,
+                rect.x as f32 + rect.w as f32 * 0.5 + shift as f32,
+                baseline,
+                12.5,
+                fg,
+                Face::Ui,
+            );
+        }
+        return;
+    }
+
     if theme.is_win98() {
         let base = if pressed {
             mix(theme.panel, theme.bevel_shadow, 0.14)
@@ -1603,6 +1900,27 @@ fn draw_progress_bar_impl(
     color: Option<u32>,
 ) {
     let fg = color.unwrap_or(theme.accent);
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        ctrl.progress_track.paint(canvas, rect, [3; 4]);
+        let inner = rect.inset(2);
+        if inner.w > 2 && inner.h > 2 && p > 0.001 {
+            let max_w = ((inner.w as f32) * p).round() as i32;
+            let chunk_w = ctrl.progress_chunk_w.max(2);
+            let step = chunk_w + ctrl.progress_chunk_gap.max(0);
+            let mut bx = inner.x;
+            while bx < inner.x + max_w {
+                let w = chunk_w.min(inner.x + max_w - bx).min(inner.right() - bx);
+                if w <= 0 {
+                    break;
+                }
+                ctrl.progress_fill
+                    .paint(canvas, Rect::new(bx, inner.y, w, inner.h), [1; 4]);
+                bx += step.max(1);
+            }
+        }
+        return;
+    }
     if theme.is_win98() {
         canvas.fill(rect, theme.panel);
         sunken_bevel(canvas, theme, rect);
@@ -1856,6 +2174,43 @@ pub fn segmented_control_anim(
     selected: usize,
     hover_idx: Option<usize>,
 ) {
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let baseline = rect.y as f32 + rect.h as f32 * 0.5 + 4.3;
+        for (i, label) in labels.iter().enumerate() {
+            let mut seg = segmented_item_rect(rect, labels.len(), i);
+            let is_sel = i == selected;
+            if is_sel {
+                seg.y -= 1;
+                seg.h += 1;
+            }
+            let surf = if is_sel {
+                &ctrl.tab_active
+            } else if hover_idx == Some(i) {
+                &ctrl.tab_hover
+            } else {
+                &ctrl.tab_normal
+            };
+            surf.paint(canvas, seg, ctrl.tab_radii);
+            let fg = if is_sel {
+                ctrl.tab_active_text
+            } else {
+                ctrl.tab_text
+            };
+            let face = if is_sel { Face::Bold } else { Face::Ui };
+            text.draw_centered(
+                canvas,
+                label,
+                seg.x as f32 + seg.w as f32 * 0.5,
+                baseline,
+                12.0,
+                fg,
+                face,
+            );
+        }
+        return;
+    }
+
     if theme.is_win98() {
         canvas.fill(rect, theme.panel);
         sunken_bevel(canvas, theme, rect);
@@ -2218,7 +2573,17 @@ pub fn text_input_ime(
     focused: bool,
     leading_icon: Option<Icon>,
 ) -> Rect {
-    if theme.is_win98() {
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let rad = ctrl.input_radius;
+        canvas.rounded_rect(rect, rad, ctrl.input_bg, 1.0);
+        let brd = if focused {
+            ctrl.input_focus_border
+        } else {
+            ctrl.input_border
+        };
+        canvas.rounded_border(rect, rad, brd, 1.0, 1);
+    } else if theme.is_win98() {
         canvas.fill(rect, theme.input_bg);
         sunken_bevel(canvas, theme, rect);
     } else if theme.is_vortexglass() {
@@ -2601,6 +2966,39 @@ pub fn scrollbar_v_animated(
     let Some(base_thumb) = scrollbar_thumb_rect_f32(track, total, visible, offset) else {
         return;
     };
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let bar_w = track.w.clamp(11, ctrl.scrollbar_width.max(12));
+        let bar_x = track.right() - bar_w;
+        let track_r = Rect::new(bar_x, track.y, bar_w, track.h);
+        ctrl.scrollbar_track.paint(canvas, track_r, [0; 4]);
+        let thumb_r = Rect::new(
+            bar_x,
+            base_thumb.y,
+            bar_w,
+            base_thumb.h.max(20).min(track.h),
+        );
+        let thumb_surf = if dragging {
+            &ctrl.scrollbar_thumb_active
+        } else if hovered {
+            &ctrl.scrollbar_thumb_hover
+        } else {
+            &ctrl.scrollbar_thumb
+        };
+        thumb_surf.paint(canvas, thumb_r, [2; 4]);
+        if thumb_r.h >= 22 {
+            let cy = thumb_r.y + thumb_r.h / 2;
+            let gx = thumb_r.x + 3;
+            let gw = (thumb_r.w - 6).max(3);
+            let light = ctrl.scrollbar_grip_light.unwrap_or(0xeef4fe);
+            let dark = ctrl.scrollbar_grip_dark.unwrap_or(0x7da4f2);
+            for dy in [-3, 0, 3] {
+                canvas.fill(Rect::new(gx, cy + dy, gw, 1), light);
+                canvas.fill(Rect::new(gx + 1, cy + dy + 1, gw, 1), dark);
+            }
+        }
+        return;
+    }
     if theme.is_win98() {
         let bar_w = track.w.clamp(10, 14);
         let bar_x = track.right() - bar_w;

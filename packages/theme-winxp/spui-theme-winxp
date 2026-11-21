@@ -15,6 +15,7 @@ uxconf-query -c desktop -p /backdrop/wallpaper -s winxp-bliss.jpg -t string
 uxconf-query -c desktop -p /backdrop/style -s cover -t string
 uxconf-query -c desktop -p /backdrop/solid-color -s '#3a6ea5' -t string
 uxconf-query -c panel -p /position -s bottom -t string
-uxconf-query -c panel -p /size -s 44 -t int
+uxconf-query -c panel -p /size -s 36 -t int
+uxconf-query -c panel -p /start-fullscreen -s false -t bool
 
 printf 'Windows XP theme applied; sign out or restart SPUI if the shell does not refresh immediately.\n'

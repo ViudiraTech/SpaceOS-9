@@ -1398,17 +1398,20 @@ impl App {
             // Composited VortexGlass frames (`top.png`/`left.png`/`right.png`/`bottom.png`)
             // provide the outer rounded Aero border around a square client edge (like
             // Uinxed-Kernel); keep corner masking only for non-VortexGlass ARGB windows.
-            let r = if self.maximized
+            let (top_r, bot_r) = if self.maximized
                 || self.snapped
                 || self.theme.is_win98()
                 || self.is_composited_glass()
             {
-                0
+                (0, 0)
             } else {
-                self.theme.radius_window()
+                (
+                    self.theme.radius_window_top(),
+                    self.theme.radius_window_bottom(),
+                )
             };
-            if r > 0 {
-                self.canvas.mask_rounded_corners_rect(r, area);
+            if top_r > 0 || bot_r > 0 {
+                self.canvas.mask_top_bottom_corners_rect(top_r, bot_r, area);
             }
         }
         if self.backing != 0 {

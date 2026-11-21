@@ -701,6 +701,7 @@ dependencies = [
  "resvg",
  "spime",
  "spui",
+ "toml",
  "ttf-parser",
  "x11rb",
  "zune-jpeg",
