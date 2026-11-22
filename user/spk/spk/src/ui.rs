@@ -14,6 +14,23 @@ use std::time::{Duration, Instant};
 const REDRAW: Duration = Duration::from_millis(100);
 const SPINNER: [&str; 4] = ["-", "\\", "|", "/"];
 
+pub fn progress_json_enabled() -> bool {
+    std::env::var_os("SPK_PROGRESS_JSON").is_some()
+}
+
+pub fn emit_phase(phase: &str, message: &str) {
+    if !progress_json_enabled() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "event": "phase",
+        "phase": phase,
+        "message": message,
+    });
+    let _ = writeln!(std::io::stderr(), "{payload}");
+    let _ = std::io::stderr().flush();
+}
+
 pub fn enabled() -> bool {
     if std::env::var_os("SPK_NO_PROGRESS").is_some() {
         return false;
@@ -143,7 +160,7 @@ impl Bar {
 
     fn with_kind(label: impl Into<String>, total: Option<u64>, kind: BarKind) -> Self {
         Self {
-            enabled: enabled(),
+            enabled: enabled() || progress_json_enabled(),
             label: label.into(),
             kind,
             total,
@@ -154,6 +171,29 @@ impl Bar {
             last_draw: Instant::now(),
             finished: false,
         }
+    }
+
+    fn emit_json_progress(&self, rate: f64, done_final: bool) {
+        let percent = match self.total {
+            Some(total) if total > 0 => ((self.done.min(total) * 100 / total) as usize).min(100),
+            _ if done_final => 100,
+            _ => 0,
+        };
+        let kind_str = match self.kind {
+            BarKind::Bytes => "download",
+            BarKind::Count => "write",
+        };
+        let payload = serde_json::json!({
+            "event": "progress",
+            "kind": kind_str,
+            "label": self.label,
+            "done": self.done,
+            "total": self.total,
+            "percent": percent,
+            "rate_bps": rate.max(0.0) as u64,
+        });
+        let _ = writeln!(std::io::stderr(), "{payload}");
+        let _ = std::io::stderr().flush();
     }
 
     pub fn advance(&mut self, bytes: u64) {
@@ -186,6 +226,10 @@ impl Bar {
         }
         self.last_pos = self.done;
         self.last_draw = Instant::now();
+        if progress_json_enabled() {
+            self.emit_json_progress(self.rate, false);
+            return;
+        }
         let line = render(
             &self.label,
             self.done,
@@ -214,6 +258,10 @@ impl Bar {
         } else {
             0.0
         };
+        if progress_json_enabled() {
+            self.emit_json_progress(rate, true);
+            return;
+        }
         let line = render(
             &self.label,
             self.done,
@@ -229,7 +277,7 @@ impl Bar {
 
 impl Drop for Bar {
     fn drop(&mut self) {
-        if self.enabled && !self.finished {
+        if self.enabled && !self.finished && !progress_json_enabled() {
             let _ = writeln!(std::io::stderr(), "\x1b[K");
         }
     }

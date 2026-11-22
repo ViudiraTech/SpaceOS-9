@@ -39,6 +39,39 @@ const BROWSER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 </svg>
 "##;
 
+/// Built-in "check for new software" icon: an indigo shopping bag with a
+/// refresh badge. Rendered straight from this string, so no icon theme entry
+/// is needed.
+const STORE_CHECK_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <defs>
+    <linearGradient id="scbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#a5b4fc"/>
+      <stop offset="48%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#4338ca"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="40" height="40" rx="11" fill="url(#scbg)"/>
+  <path d="M15.5 20h17l-1.6 15.4a3 3 0 0 1-3 2.6h-7.9a3 3 0 0 1-3-2.6z" fill="#ffffff" opacity="0.96"/>
+  <path d="M18.6 21.5a5.4 5.4 0 0 1 10.8 0" fill="none" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round"/>
+  <circle cx="34" cy="15" r="8.4" fill="#1e1b4b" opacity="0.35"/>
+  <path d="M35.6 9.6a6 6 0 1 0 2.6 6.9" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M37.6 8.2l0.7 5.3-5.2-1.4z" fill="#ffffff"/>
+</svg>"##;
+
+const STORE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <defs>
+    <linearGradient id="stbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="52%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="40" height="40" rx="11" fill="url(#stbg)"/>
+  <path d="M24 12 L34 31 M24 12 L14 31 M11 26.5 H37" fill="none" stroke="#ffffff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="34" cy="31" r="1.4" fill="#e0f2fe"/>
+</svg>
+"##;
+
 const MINESWEEPER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
   <rect x="3" y="3" width="42" height="42" rx="4" fill="#c0c0c0"/>
   <path d="M5 5 H41 L39 7 H7 V39 L5 41 Z" fill="#ffffff"/>
@@ -68,6 +101,8 @@ pub enum Icon {
     ImageViewer,
     Music,
     Browser,
+    Store,
+    StoreCheck,
     Help,
     Login,
     Notify,
@@ -155,6 +190,8 @@ define_svg_icons! {
     ImageViewer => "image-viewer.svg",
     Music => "music.svg",
     Browser => "browser.svg",
+    Store => "store.svg",
+    StoreCheck => "store-check.svg",
     Help => "help.svg",
     Login => "login.svg",
     Notify => "notify.svg",
@@ -340,6 +377,8 @@ impl IconStore {
                 Ok(text) => text,
                 Err(_) if icon == Icon::Minesweeper => String::from(MINESWEEPER_SVG),
                 Err(_) if icon == Icon::Browser => String::from(BROWSER_SVG),
+                Err(_) if icon == Icon::Store => String::from(STORE_SVG),
+                Err(_) if icon == Icon::StoreCheck => String::from(STORE_CHECK_SVG),
                 Err(_) => return None,
             };
             self.svg_sources.insert(icon, xml);
@@ -595,6 +634,26 @@ mod tests {
         let sprite = store
             .render_svg(Icon::Browser, 48, None)
             .expect("embedded browser SVG must render");
+        assert_eq!((sprite.width, sprite.height), (48, 48));
+        assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
+    }
+
+    #[test]
+    fn store_check_builtin_svg_renders_cleanly() {
+        let mut store = IconStore::new();
+        let sprite = store
+            .render_svg(Icon::StoreCheck, 48, None)
+            .expect("embedded store-check SVG must render");
+        assert_eq!((sprite.width, sprite.height), (48, 48));
+        assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
+    }
+
+    #[test]
+    fn store_builtin_svg_renders_cleanly() {
+        let mut store = IconStore::new();
+        let sprite = store
+            .render_svg(Icon::Store, 48, None)
+            .expect("embedded store SVG must render");
         assert_eq!((sprite.width, sprite.height), (48, 48));
         assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
     }

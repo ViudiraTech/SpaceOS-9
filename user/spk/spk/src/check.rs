@@ -17,9 +17,25 @@ use crate::rootfs::{Fs, OnDiskKind};
 use crate::state::{Paths, State};
 
 pub fn check(paths: &Paths, state: &State, lang: Lang) -> Result<()> {
+    check_with_json(paths, state, false, lang)
+}
+
+pub fn check_with_json(paths: &Paths, state: &State, json: bool, lang: Lang) -> Result<()> {
     let errors = collect_errors(paths, state)?;
     if errors.is_empty() {
-        println!("{}", i18n::database_ok(lang));
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": 1,
+                    "ok": true,
+                    "packages": state.installed.packages.len(),
+                    "files": state.files.files.len(),
+                }))?
+            );
+        } else {
+            println!("{}", i18n::database_ok(lang));
+        }
         Ok(())
     } else {
         Err(SpkError::Check {

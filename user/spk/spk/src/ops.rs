@@ -58,6 +58,22 @@ fn prepare(paths: &Paths, lang: Lang) -> Result<(StateLock, State)> {
     Ok((lock, state))
 }
 
+/// Read-only dry-run previews (`--print`) inspect state and repos without
+/// requiring root or acquiring `/var/lib/spk/lock`.
+fn prepare_for_report(
+    paths: &Paths,
+    read_only: bool,
+    lang: Lang,
+) -> Result<(Option<StateLock>, State)> {
+    if read_only {
+        Ok((None, State::load(paths)?))
+    } else {
+        require_root(paths, lang)?;
+        let (lock, state) = prepare(paths, lang)?;
+        Ok((Some(lock), state))
+    }
+}
+
 fn parse_targets(targets: &[String]) -> Result<Vec<PkgSpec>> {
     targets
         .iter()
@@ -107,14 +123,16 @@ pub fn install(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
-    require_root(paths, lang)?;
     if targets.is_empty() {
         return Err(SpkError::Usage(
             "install requires at least one package".into(),
         ));
     }
     let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
-    let (_lock, state) = prepare(paths, lang)?;
+    let (_lock, state) = prepare_for_report(paths, report.print, lang)?;
+    if !report.print {
+        crate::ui::emit_phase("resolve", i18n::resolving(lang));
+    }
     let specs = parse_targets(targets)?;
     let mut repos = repo::load_repos(
         paths,
@@ -180,9 +198,11 @@ pub fn upgrade(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
-    require_root(paths, lang)?;
     let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
-    let (_lock, state) = prepare(paths, lang)?;
+    let (_lock, state) = prepare_for_report(paths, report.print, lang)?;
+    if !report.print {
+        crate::ui::emit_phase("resolve", i18n::resolving(lang));
+    }
     if !targets.is_empty() && !allow_partial {
         return Err(SpkError::General(i18n::partial_disabled(lang).to_string()));
     }
@@ -251,14 +271,16 @@ pub fn downgrade(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
-    require_root(paths, lang)?;
     if targets.is_empty() {
         return Err(SpkError::Usage(
             "downgrade requires package=<version> targets".into(),
         ));
     }
     let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
-    let (_lock, state) = prepare(paths, lang)?;
+    let (_lock, state) = prepare_for_report(paths, report.print, lang)?;
+    if !report.print {
+        crate::ui::emit_phase("resolve", i18n::resolving(lang));
+    }
     let specs = parse_targets(targets)?;
     let mut repos = repo::load_repos(
         paths,
@@ -323,14 +345,16 @@ pub fn reinstall(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
-    require_root(paths, lang)?;
     if targets.is_empty() {
         return Err(SpkError::Usage(
             "reinstall requires at least one package".into(),
         ));
     }
     let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
-    let (_lock, state) = prepare(paths, lang)?;
+    let (_lock, state) = prepare_for_report(paths, report.print, lang)?;
+    if !report.print {
+        crate::ui::emit_phase("resolve", i18n::resolving(lang));
+    }
     let mut repos = repo::load_repos(
         paths,
         urls,
@@ -393,13 +417,15 @@ pub fn remove(
     report: ReportOptions,
     lang: Lang,
 ) -> Result<()> {
-    require_root(paths, lang)?;
     if targets.is_empty() {
         return Err(SpkError::Usage(
             "remove requires at least one package".into(),
         ));
     }
-    let (_lock, state) = prepare(paths, lang)?;
+    let (_lock, state) = prepare_for_report(paths, report.print, lang)?;
+    if !report.print {
+        crate::ui::emit_phase("resolve", i18n::checking_dependencies(lang));
+    }
     let mut removal_names = BTreeSet::new();
     for name in targets {
         if !state.installed.packages.contains_key(name) {
@@ -637,10 +663,16 @@ fn report_solution(
             })
         })
         .collect();
+    let total_download_bytes: u64 = solution
+        .actions
+        .iter()
+        .filter_map(|action| action.to.repo_pkg.as_ref().map(|pkg| pkg.size))
+        .sum();
     let payload = serde_json::json!({
         "schema": 1,
         "operation": operation,
         "nothing_to_do": solution.is_empty(),
+        "total_download_bytes": total_download_bytes,
         "packages": packages,
         "removals": removals,
         "held_back": held_back,
@@ -869,6 +901,7 @@ pub fn verify(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang)
 
 pub fn sync(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang) -> Result<()> {
     let (_lock, _state) = prepare(paths, lang)?;
+    crate::ui::emit_phase("sync", i18n::tr(lang, "Synchronizing repositories...", "正在同步软件源索引..."));
     let repos = repo::load_repos(
         paths,
         urls,
@@ -912,8 +945,12 @@ pub fn sync(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang) -
 }
 
 pub fn hold(paths: &Paths, targets: &[String], lang: Lang) -> Result<()> {
+    hold_with_json(paths, targets, false, lang)
+}
+
+pub fn hold_with_json(paths: &Paths, targets: &[String], json: bool, lang: Lang) -> Result<()> {
     if targets.is_empty() {
-        return hold_list(paths);
+        return hold_list_with_json(paths, json);
     }
     require_root(paths, lang)?;
     let (_lock, state) = prepare(paths, lang)?;
@@ -940,12 +977,22 @@ pub fn hold(paths: &Paths, targets: &[String], lang: Lang) -> Result<()> {
                 release: package.release,
             },
         );
-        println!("{} {}", spec.name, version);
+        if !json {
+            println!("{} {}", spec.name, version);
+        }
     }
-    write_holds(paths, &holds)
+    write_holds(paths, &holds)?;
+    if json {
+        print_holds_json(&holds)?;
+    }
+    Ok(())
 }
 
 pub fn unhold(paths: &Paths, targets: &[String], lang: Lang) -> Result<()> {
+    unhold_with_json(paths, targets, false, lang)
+}
+
+pub fn unhold_with_json(paths: &Paths, targets: &[String], json: bool, lang: Lang) -> Result<()> {
     if targets.is_empty() {
         return Err(SpkError::Usage(
             "unhold requires at least one package".into(),
@@ -956,19 +1003,53 @@ pub fn unhold(paths: &Paths, targets: &[String], lang: Lang) -> Result<()> {
     let mut holds = state.holds.clone();
     for name in targets {
         if holds.packages.remove(name).is_none() {
-            eprintln!("{}", i18n::not_held(lang, name));
-        } else {
+            if !json {
+                eprintln!("{}", i18n::not_held(lang, name));
+            }
+        } else if !json {
             println!("{}", name);
         }
     }
-    write_holds(paths, &holds)
+    write_holds(paths, &holds)?;
+    if json {
+        print_holds_json(&holds)?;
+    }
+    Ok(())
 }
 
 pub fn hold_list(paths: &Paths) -> Result<()> {
+    hold_list_with_json(paths, false)
+}
+
+pub fn hold_list_with_json(paths: &Paths, json: bool) -> Result<()> {
     let state = State::load(paths)?;
+    if json {
+        return print_holds_json(&state.holds);
+    }
     for (name, held) in &state.holds.packages {
         println!("{} {}", name, held.version());
     }
+    Ok(())
+}
+
+fn print_holds_json(holds: &spk_core::db::HoldsDb) -> Result<()> {
+    let rows: Vec<serde_json::Value> = holds
+        .packages
+        .iter()
+        .map(|(name, held)| {
+            serde_json::json!({
+                "name": name,
+                "version": held.version().to_string(),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": 1,
+            "holds": rows,
+        }))?
+    );
     Ok(())
 }
 
@@ -1045,9 +1126,49 @@ pub fn status(paths: &Paths, json: bool, lang: Lang) -> Result<()> {
     Ok(())
 }
 
-pub fn list(paths: &Paths) -> Result<()> {
+pub fn catalog(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang) -> Result<()> {
     let state = State::load(paths)?;
-    query::list(&state)
+    let (repos, statuses) = repo::load_repos_best_effort(
+        paths,
+        urls,
+        lang,
+        crate::remote::RemoteOptions {
+            offline: report.offline,
+            allow_unsigned: report.allow_unsigned,
+            refresh: report.refresh,
+        },
+    )?;
+    query::catalog(&state, &repos, &statuses, report.json, lang)
+}
+
+pub fn search(
+    paths: &Paths,
+    urls: &[String],
+    terms: &[String],
+    report: ReportOptions,
+    lang: Lang,
+) -> Result<()> {
+    let state = State::load(paths)?;
+    let (repos, _) = repo::load_repos_best_effort(
+        paths,
+        urls,
+        lang,
+        crate::remote::RemoteOptions {
+            offline: report.offline,
+            allow_unsigned: report.allow_unsigned,
+            refresh: report.refresh,
+        },
+    )?;
+    query::search(&state, &repos, terms, report.json, lang)
+}
+
+pub fn list(paths: &Paths) -> Result<()> {
+    list_with_json(paths, false)
+}
+
+pub fn list_with_json(paths: &Paths, json: bool) -> Result<()> {
+    let state = State::load(paths)?;
+    query::list_with_json(&state, json)
 }
 
 pub fn info(paths: &Paths, name: &str, lang: Lang) -> Result<()> {
@@ -1055,34 +1176,116 @@ pub fn info(paths: &Paths, name: &str, lang: Lang) -> Result<()> {
     query::info(&state, name, lang)
 }
 
-pub fn files(paths: &Paths, name: &str, lang: Lang) -> Result<()> {
+pub fn info_with_options(
+    paths: &Paths,
+    urls: &[String],
+    name: &str,
+    report: ReportOptions,
+    lang: Lang,
+) -> Result<()> {
     let state = State::load(paths)?;
-    query::files(&state, name, lang)
+    let (repos, _) = repo::load_repos_best_effort(
+        paths,
+        urls,
+        lang,
+        crate::remote::RemoteOptions {
+            offline: report.offline,
+            allow_unsigned: report.allow_unsigned,
+            refresh: report.refresh,
+        },
+    )?;
+    query::info_with_repos(&state, &repos, name, report.json, lang)
+}
+
+pub fn files(paths: &Paths, name: &str, lang: Lang) -> Result<()> {
+    files_with_json(paths, name, false, lang)
+}
+
+pub fn files_with_json(paths: &Paths, name: &str, json: bool, lang: Lang) -> Result<()> {
+    let state = State::load(paths)?;
+    query::files_with_json(&state, name, json, lang)
 }
 
 pub fn owns(paths: &Paths, path: &str, lang: Lang) -> Result<()> {
+    owns_with_json(paths, path, false, lang)
+}
+
+pub fn owns_with_json(paths: &Paths, path: &str, json: bool, lang: Lang) -> Result<()> {
     let state = State::load(paths)?;
-    query::owns(&state, path, lang)
+    query::owns_with_json(&state, path, json, lang)
 }
 
 pub fn check_database(paths: &Paths, lang: Lang) -> Result<()> {
+    check_database_with_json(paths, false, lang)
+}
+
+pub fn check_database_with_json(paths: &Paths, json: bool, lang: Lang) -> Result<()> {
     let state = State::load(paths)?;
-    check::check(paths, &state, lang)
+    check::check_with_json(paths, &state, json, lang)
 }
 
 pub fn repair_database(paths: &Paths, lang: Lang) -> Result<()> {
-    repair::repair(paths, lang)
+    repair_database_with_json(paths, false, lang)
+}
+
+pub fn repair_database_with_json(paths: &Paths, json: bool, lang: Lang) -> Result<()> {
+    repair::repair_with_json(paths, json, lang)
 }
 
 pub fn trust_add(paths: &Paths, key: &std::path::Path, lang: Lang) -> Result<()> {
+    trust_add_with_json(paths, key, false, lang)
+}
+
+pub fn trust_add_with_json(
+    paths: &Paths,
+    key: &std::path::Path,
+    json: bool,
+    lang: Lang,
+) -> Result<()> {
     let _lock = lock_exclusive(paths)?;
     let key = repo::trust_add(paths, key)?;
-    println!("{}", i18n::trust_added(lang, &key.key_id));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "ok": true,
+                "key_id": key.key_id,
+                "comment": key.comment,
+            }))?
+        );
+    } else {
+        println!("{}", i18n::trust_added(lang, &key.key_id));
+    }
     Ok(())
 }
 
 pub fn trust_list(paths: &Paths) -> Result<()> {
-    for key in repo::trust_list(paths)? {
+    trust_list_with_json(paths, false)
+}
+
+pub fn trust_list_with_json(paths: &Paths, json: bool) -> Result<()> {
+    let keys = repo::trust_list(paths)?;
+    if json {
+        let rows: Vec<serde_json::Value> = keys
+            .iter()
+            .map(|key| {
+                serde_json::json!({
+                    "key_id": key.key_id,
+                    "comment": key.comment,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "keys": rows,
+            }))?
+        );
+        return Ok(());
+    }
+    for key in &keys {
         if key.comment.is_empty() {
             println!("{}", key.key_id);
         } else {

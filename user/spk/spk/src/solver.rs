@@ -1138,6 +1138,8 @@ mod tests {
             allow_unsigned: true,
             manifest: None,
             history: std::collections::BTreeMap::new(),
+            store: None,
+            stale: false,
         }
     }
 

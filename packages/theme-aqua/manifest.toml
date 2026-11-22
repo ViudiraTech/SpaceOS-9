@@ -9,7 +9,7 @@
 name = "theme-aqua"
 epoch = 0
 version = "1.0.0"
-release = 2
+release = 3
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "Aqua Classic SPUI theme"
@@ -27,3 +27,16 @@ replaces = []
 conffiles = []
 scripts = true
 allow_setuid = false
+
+[store]
+display_name = "Aqua Classic 晶球主题"
+subtitle = "拉丝银白顶栏 · 晶球窗口控制 · 水蓝极光波纹"
+category = "themes"
+icon = "wallpaper"
+accent = ["#38bdf8", "#0284c7"]
+featured_rank = 95
+highlights = [
+    "顶部经典菜单栏架构与左侧晶球控制按钮",
+    "支持 Graphite 石墨配色与深色模式无缝切换",
+    "内置高清波纹壁纸与 12 帧旋转辐条关机动画",
+]

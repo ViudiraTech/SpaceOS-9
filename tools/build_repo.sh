@@ -58,6 +58,13 @@ if [ -n "$SECURITY" ]; then
     SECURITY_ARGS="--security $SECURITY"
 fi
 
+# Editorial half of store.json (hero slides, sections, category labels). The
+# per-package half is generated from each manifest's [store] table.
+STORE_SOURCE=${SPK_STORE_SOURCE:-$ROOT/packages/store.in.json}
+if [ -f "$STORE_SOURCE" ]; then
+    install -m 0644 "$STORE_SOURCE" "$REPO/store.in.json"
+fi
+
 # shellcheck disable=SC2086
 "$HOST_BIN" index \
     --repo-dir "$REPO" \

@@ -28,37 +28,46 @@ struct BackupInfo {
 }
 
 pub fn repair(paths: &Paths, lang: Lang) -> Result<()> {
+    repair_with_json(paths, false, lang)
+}
+
+pub fn repair_with_json(paths: &Paths, json: bool, lang: Lang) -> Result<()> {
     if paths.root == Path::new("/") && unsafe { libc::geteuid() } != 0 {
         return Err(SpkError::Security(i18n::root_required(lang).to_string()));
     }
     let _lock = lock_exclusive(paths)?;
     if !paths.journal.exists() {
         let state = State::load(paths)?;
-        if fix_metadata(paths, &state, lang)? == 0 {
+        let fixed = fix_metadata_quiet(paths, &state, json, lang)?;
+        if fixed == 0 && !json {
             println!("{}", i18n::nothing_to_repair(lang));
         }
-        crate::check::check(paths, &state, lang)?;
+        crate::check::check_with_json(paths, &state, json, lang)?;
         return Ok(());
     }
     let (events, ended) = journal::read(&paths.journal)?;
     let txid = journal::begin_txid(&events)
         .unwrap_or("unknown")
         .to_string();
-    println!("{}", i18n::repair_start(lang, &txid));
+    if !json {
+        println!("{}", i18n::repair_start(lang, &txid));
+    }
     let db_done = events.iter().any(|event| matches!(event, Event::DbDone));
     if !ended && !db_done {
         rollback_events(paths, lang, &events, false)?;
-        println!("{}", i18n::repair_rolled_back(lang));
+        if !json {
+            println!("{}", i18n::repair_rolled_back(lang));
+        }
     }
     cleanup(paths, &txid)?;
     journal::remove(paths)?;
     let state = State::load(paths)?;
-    fix_metadata(paths, &state, lang)?;
-    crate::check::check(paths, &state, lang)?;
+    fix_metadata_quiet(paths, &state, json, lang)?;
+    crate::check::check_with_json(paths, &state, json, lang)?;
     Ok(())
 }
 
-fn fix_metadata(paths: &Paths, state: &State, lang: Lang) -> Result<usize> {
+fn fix_metadata_quiet(paths: &Paths, state: &State, json: bool, lang: Lang) -> Result<usize> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(0);
     }
@@ -85,7 +94,7 @@ fn fix_metadata(paths: &Paths, state: &State, lang: Lang) -> Result<usize> {
             }
         }
     }
-    if fixed != 0 {
+    if fixed != 0 && !json {
         println!("{}", i18n::repair_metadata(lang, fixed));
     }
     Ok(fixed)

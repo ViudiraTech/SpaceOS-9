@@ -223,6 +223,26 @@ allow_setuid = true
 
 ---
 
+### 3.7 商店展示元数据（`[store]`，可选）
+
+图形商店的展示信息随包走，写在 manifest 末尾的 `[store]` 表里，`spk-host index` 会把它汇总进仓库的 `store.json`：
+
+```toml
+[store]
+display_name = "Aqua Classic 晶球主题"      # 卡片标题（≤64 字）
+subtitle = "拉丝银白顶栏 · 晶球窗口控制"     # 一句话副标题（≤120 字）
+description = "长描述，详情页正文"           # 可省略，默认用 manifest 的 description
+category = "themes"                       # themes / system / utilities / development / multimedia
+icon = "wallpaper"                        # store/appearance/wallpaper/monitor/settings/login/terminal/applications/...
+accent = ["#38bdf8", "#0284c7"]           # 1–2 个 #rrggbb，卡片渐变
+featured_rank = 95                        # 越大越靠前
+highlights = ["顶部经典菜单栏架构", "支持深色模式"]   # ≤6 条、每条 ≤120 字
+# banner = "banners/aqua.jpg"             # 仓库相对路径，可选
+```
+
+- 全部字段可选，缺省时商店按 `theme-` 前缀 / `spui-theme` provides / summary 通用降级展示。
+- 仓库级编辑内容（Hero 轮播、精选分组、分类文案）由仓库作者维护在 `packages/store.in.json`，构建时合并进 `store.json`，不需要重打包任何软件包。
+
 ## 4. staging 与 build.sh 规范
 
 ### 4.1 基本原则

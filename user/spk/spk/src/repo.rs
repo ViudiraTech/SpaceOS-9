@@ -39,6 +39,25 @@ pub struct LoadedRepo {
     pub manifest: Option<RepoManifest>,
     /// Versions fetched from the per-package history files.
     pub history: BTreeMap<String, Vec<IndexPackage>>,
+    /// Presentation and editorial metadata published by the repository.
+    pub store: Option<spk_core::store::StoreDoc>,
+    pub stale: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RepoLoadStatus {
+    pub name: String,
+    pub arch: String,
+    pub urls: Vec<String>,
+    pub priority: i32,
+    pub enabled: bool,
+    pub last_sync: u64,
+    pub key_id: String,
+    pub synced: bool,
+    pub stale: bool,
+    pub package_count: usize,
+    pub generated_at: u64,
+    pub error: Option<String>,
 }
 
 impl LoadedRepo {
@@ -242,23 +261,55 @@ pub fn load_repos(
     lang: crate::i18n::Lang,
     remote_options: crate::remote::RemoteOptions,
 ) -> Result<Vec<LoadedRepo>> {
+    let (repos, _) = load_repos_inner(paths, urls, lang, remote_options, true)?;
+    Ok(repos)
+}
+
+pub fn load_repos_best_effort(
+    paths: &Paths,
+    urls: &[String],
+    lang: crate::i18n::Lang,
+    remote_options: crate::remote::RemoteOptions,
+) -> Result<(Vec<LoadedRepo>, Vec<RepoLoadStatus>)> {
+    load_repos_inner(paths, urls, lang, remote_options, false)
+}
+
+fn load_repos_inner(
+    paths: &Paths,
+    urls: &[String],
+    lang: crate::i18n::Lang,
+    remote_options: crate::remote::RemoteOptions,
+    strict: bool,
+) -> Result<(Vec<LoadedRepo>, Vec<RepoLoadStatus>)> {
     let mut repos = Vec::new();
+    let mut statuses = Vec::new();
     if urls.is_empty() {
         let state = crate::state::State::load(paths)?;
-        let mut configs: Vec<_> = state
-            .repos
-            .repos
-            .iter()
-            .filter(|repo| repo.enabled)
-            .enumerate()
-            .collect();
-        configs.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
-        if configs.is_empty() {
+        let mut all_configs: Vec<_> = state.repos.repos.iter().enumerate().collect();
+        all_configs.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
+        if strict && all_configs.iter().all(|(_, repo)| !repo.enabled) {
             return Err(SpkError::General(
                 "no repositories configured; pass --repo <path> or add a repository".into(),
             ));
         }
-        for (order, (_, config)) in configs.into_iter().enumerate() {
+        for (order, (_, config)) in all_configs.into_iter().enumerate() {
+            if !config.enabled {
+                statuses.push(RepoLoadStatus {
+                    name: config.name.clone(),
+                    arch: config.arch.clone(),
+                    urls: config.urls.clone(),
+                    priority: config.priority,
+                    enabled: false,
+                    last_sync: config.last_sync,
+                    key_id: config.key_id.clone(),
+                    synced: false,
+                    stale: false,
+                    package_count: 0,
+                    generated_at: 0,
+                    error: None,
+                });
+                continue;
+            }
             let remote_urls: Vec<String> = config
                 .urls
                 .iter()
@@ -275,24 +326,58 @@ pub fn load_repos(
                     remote_options,
                     lang,
                 ) {
-                    Ok(repo) => repos.push(repo),
-                    Err(error @ SpkError::Signature(_)) => return Err(error),
-                    Err(SpkError::Security(error)) => return Err(SpkError::Security(error)),
+                    Ok(repo) => {
+                        statuses.push(RepoLoadStatus {
+                            name: config.name.clone(),
+                            arch: repo.index.arch.clone(),
+                            urls: config.urls.clone(),
+                            priority: config.priority,
+                            enabled: true,
+                            last_sync: config.last_sync,
+                            key_id: repo.key_id.clone(),
+                            synced: true,
+                            stale: repo.stale,
+                            package_count: repo.index.packages.len(),
+                            generated_at: repo.index.generated_at,
+                            error: None,
+                        });
+                        repos.push(repo);
+                    }
+                    Err(error @ SpkError::Signature(_)) if strict => return Err(error),
+                    Err(SpkError::Security(error)) if strict => return Err(SpkError::Security(error)),
                     Err(error) => {
-                        eprintln!(
-                            "{}",
-                            crate::i18n::repo_mirror_unavailable(
-                                lang,
-                                &config.name,
-                                &remote_urls.join(", "),
-                                &error.to_string()
-                            )
-                        );
+                        let msg = error.to_string();
+                        if strict {
+                            eprintln!(
+                                "{}",
+                                crate::i18n::repo_mirror_unavailable(
+                                    lang,
+                                    &config.name,
+                                    &remote_urls.join(", "),
+                                    &msg
+                                )
+                            );
+                        }
+                        statuses.push(RepoLoadStatus {
+                            name: config.name.clone(),
+                            arch: config.arch.clone(),
+                            urls: config.urls.clone(),
+                            priority: config.priority,
+                            enabled: true,
+                            last_sync: config.last_sync,
+                            key_id: config.key_id.clone(),
+                            synced: false,
+                            stale: true,
+                            package_count: 0,
+                            generated_at: 0,
+                            error: Some(msg),
+                        });
                     }
                 }
                 continue;
             }
             let mut loaded = None;
+            let mut last_err = None;
             for url in &config.urls {
                 match load_repo(
                     paths,
@@ -306,28 +391,66 @@ pub fn load_repos(
                         loaded = Some(repo);
                         break;
                     }
-                    Err(SpkError::Signature(error)) => {
+                    Err(SpkError::Signature(error)) if strict => {
                         return Err(SpkError::Signature(format!(
                             "repository '{}': {error}",
                             config.name
                         )))
                     }
                     Err(error) => {
-                        eprintln!(
-                            "{}",
-                            crate::i18n::repo_mirror_unavailable(
-                                lang,
-                                &config.name,
-                                url,
-                                &error.to_string()
-                            )
-                        );
+                        let msg = error.to_string();
+                        if strict {
+                            eprintln!(
+                                "{}",
+                                crate::i18n::repo_mirror_unavailable(
+                                    lang,
+                                    &config.name,
+                                    url,
+                                    &msg
+                                )
+                            );
+                        }
+                        last_err = Some(msg);
                     }
                 }
             }
             match loaded {
-                Some(repo) => repos.push(repo),
-                None => eprintln!("{}", crate::i18n::repo_no_mirror(lang, &config.name)),
+                Some(repo) => {
+                    statuses.push(RepoLoadStatus {
+                        name: config.name.clone(),
+                        arch: repo.index.arch.clone(),
+                        urls: config.urls.clone(),
+                        priority: config.priority,
+                        enabled: true,
+                        last_sync: config.last_sync,
+                        key_id: repo.key_id.clone(),
+                        synced: true,
+                        stale: false,
+                        package_count: repo.index.packages.len(),
+                        generated_at: repo.index.generated_at,
+                        error: None,
+                    });
+                    repos.push(repo);
+                }
+                None => {
+                    if strict {
+                        eprintln!("{}", crate::i18n::repo_no_mirror(lang, &config.name));
+                    }
+                    statuses.push(RepoLoadStatus {
+                        name: config.name.clone(),
+                        arch: config.arch.clone(),
+                        urls: config.urls.clone(),
+                        priority: config.priority,
+                        enabled: true,
+                        last_sync: config.last_sync,
+                        key_id: config.key_id.clone(),
+                        synced: false,
+                        stale: true,
+                        package_count: 0,
+                        generated_at: 0,
+                        error: last_err,
+                    });
+                }
             }
         }
     } else {
@@ -346,25 +469,60 @@ pub fn load_repos(
                 load_repo(paths, url, 0, order, remote_options.allow_unsigned)
             };
             match result {
-                Ok(repo) => repos.push(repo),
-                Err(SpkError::Signature(error)) => return Err(SpkError::Signature(error)),
-                Err(SpkError::Security(error)) => return Err(SpkError::Security(error)),
+                Ok(repo) => {
+                    statuses.push(RepoLoadStatus {
+                        name: repo.name.clone(),
+                        arch: repo.index.arch.clone(),
+                        urls: vec![url.clone()],
+                        priority: 0,
+                        enabled: true,
+                        last_sync: 0,
+                        key_id: repo.key_id.clone(),
+                        synced: true,
+                        stale: repo.stale,
+                        package_count: repo.index.packages.len(),
+                        generated_at: repo.index.generated_at,
+                        error: None,
+                    });
+                    repos.push(repo);
+                }
+                Err(SpkError::Signature(error)) if strict => return Err(SpkError::Signature(error)),
+                Err(SpkError::Security(error)) if strict => return Err(SpkError::Security(error)),
                 Err(error) => {
-                    eprintln!(
-                        "{}",
-                        crate::i18n::repo_unavailable(lang, url, &error.to_string())
-                    );
+                    let msg = error.to_string();
+                    if strict {
+                        eprintln!(
+                            "{}",
+                            crate::i18n::repo_unavailable(lang, url, &msg)
+                        );
+                    }
+                    statuses.push(RepoLoadStatus {
+                        name: url.clone(),
+                        arch: target_arch().to_string(),
+                        urls: vec![url.clone()],
+                        priority: 0,
+                        enabled: true,
+                        last_sync: 0,
+                        key_id: String::new(),
+                        synced: false,
+                        stale: true,
+                        package_count: 0,
+                        generated_at: 0,
+                        error: Some(msg),
+                    });
                 }
             }
         }
-        if repos.is_empty() {
+        if strict && repos.is_empty() {
             return Err(SpkError::General(
                 "no usable repositories; check --repo paths and signatures".into(),
             ));
         }
     }
-    validate_consistency(&repos)?;
-    Ok(repos)
+    if strict {
+        validate_consistency(&repos)?;
+    }
+    Ok((repos, statuses))
 }
 
 pub fn is_remote_url(url: &str) -> bool {
@@ -399,6 +557,8 @@ fn load_remote_repo(
         allow_unsigned: options.allow_unsigned,
         manifest: None,
         history: BTreeMap::new(),
+        store: synced.store,
+        stale: synced.stale,
     })
 }
 
@@ -491,6 +651,9 @@ pub fn load_repo(
         )));
     }
     let security = SecurityState::from_index(&index);
+    let store = fs::read(dir.join("store.json"))
+        .ok()
+        .and_then(|bytes| spk_core::store::StoreDoc::from_slice(&bytes).ok());
     Ok(LoadedRepo {
         name: index.repo.clone(),
         key_id,
@@ -505,6 +668,8 @@ pub fn load_repo(
         allow_unsigned,
         manifest: None,
         history: BTreeMap::new(),
+        store,
+        stale: false,
     })
 }
 
@@ -655,7 +820,37 @@ pub fn set_priority(paths: &Paths, name: &str, priority: i32) -> Result<()> {
 }
 
 pub fn list(paths: &Paths) -> Result<()> {
+    list_with_json(paths, false)
+}
+
+pub fn list_with_json(paths: &Paths, json: bool) -> Result<()> {
     let state = crate::state::State::load(paths)?;
+    if json {
+        let rows: Vec<serde_json::Value> = state
+            .repos
+            .repos
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name,
+                    "arch": r.arch,
+                    "urls": r.urls,
+                    "priority": r.priority,
+                    "key_id": r.key_id,
+                    "last_sync": r.last_sync,
+                    "enabled": r.enabled,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "repositories": rows,
+            }))?
+        );
+        return Ok(());
+    }
     for repo in &state.repos.repos {
         println!(
             "{} priority={} arch={} enabled={}",
@@ -664,6 +859,62 @@ pub fn list(paths: &Paths) -> Result<()> {
         for url in &repo.urls {
             println!("  {url}");
         }
+    }
+    Ok(())
+}
+
+pub fn add_with_json(
+    paths: &Paths,
+    name: &str,
+    url: &str,
+    priority: Option<i32>,
+    json: bool,
+) -> Result<()> {
+    add(paths, name, url, priority)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "ok": true,
+                "action": "add",
+                "name": name,
+                "url": url,
+            }))?
+        );
+    }
+    Ok(())
+}
+
+pub fn remove_with_json(paths: &Paths, name: &str, json: bool) -> Result<()> {
+    remove(paths, name)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "ok": true,
+                "action": "remove",
+                "name": name,
+            }))?
+        );
+    }
+    Ok(())
+}
+
+pub fn set_priority_with_json(paths: &Paths, name: &str, priority: i32, json: bool) -> Result<()> {
+    set_priority(paths, name, priority)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "ok": true,
+                "action": "priority",
+                "name": name,
+                "priority": priority,
+            }))?
+        );
     }
     Ok(())
 }

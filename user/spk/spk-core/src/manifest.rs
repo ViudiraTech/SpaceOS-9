@@ -76,8 +76,122 @@ impl PackageFile {
     }
 }
 
+/// Optional presentation metadata for the graphical store. Every field is
+/// optional so packages published before the store existed keep validating,
+/// and so an older `spk` can still install a package that carries it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackageStoreMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    /// Long description shown on the store's detail page. Defaults to the
+    /// manifest's own `description` when left empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlights: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// One or two `#rrggbb` colours used for the store card gradient.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accent: Vec<String>,
+    /// Repository-relative banner or preview image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+    /// Higher sorts first in the store's featured grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub featured_rank: Option<i32>,
+}
+
+fn is_hex_color(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('#') else {
+        return false;
+    };
+    rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+impl PackageStoreMeta {
+    pub fn is_empty(&self) -> bool {
+        self.display_name.is_none()
+            && self.subtitle.is_none()
+            && self.description.is_none()
+            && self.category.is_none()
+            && self.highlights.is_empty()
+            && self.icon.is_none()
+            && self.accent.is_empty()
+            && self.banner.is_none()
+            && self.featured_rank.is_none()
+    }
+
+    pub fn validate(&self, package: &str) -> Result<()> {
+        for (name, value, limit) in [
+            ("display_name", &self.display_name, 64usize),
+            ("subtitle", &self.subtitle, 120),
+            ("icon", &self.icon, 32),
+        ] {
+            if let Some(value) = value {
+                if value.trim().is_empty() || value.chars().count() > limit {
+                    return Err(Error::Manifest(format!(
+                        "{package}: store {name} must be 1..={limit} characters"
+                    )));
+                }
+                if value.chars().any(|ch| ch.is_control()) {
+                    return Err(Error::Manifest(format!(
+                        "{package}: store {name} contains control characters"
+                    )));
+                }
+            }
+        }
+        if let Some(category) = &self.category {
+            if !matches!(
+                category.as_str(),
+                "themes" | "system" | "utilities" | "development" | "multimedia"
+            ) {
+                return Err(Error::Manifest(format!(
+                    "{package}: unknown store category '{category}'"
+                )));
+            }
+        }
+        if let Some(description) = &self.description {
+            if description.trim().is_empty() || description.chars().count() > 2000 {
+                return Err(Error::Manifest(format!(
+                    "{package}: store description must be 1..=2000 characters"
+                )));
+            }
+        }
+        if self.highlights.len() > 6
+            || self
+                .highlights
+                .iter()
+                .any(|line| line.trim().is_empty() || line.chars().count() > 120)
+        {
+            return Err(Error::Manifest(format!(
+                "{package}: store highlights must be at most 6 lines of 1..=120 characters"
+            )));
+        }
+        if self.accent.len() > 2 || self.accent.iter().any(|color| !is_hex_color(color)) {
+            return Err(Error::Manifest(format!(
+                "{package}: store accent must be one or two #rrggbb colours"
+            )));
+        }
+        if let Some(banner) = &self.banner {
+            if banner.starts_with('/') || banner.contains("..") || banner.contains('\\') {
+                return Err(Error::Manifest(format!(
+                    "{package}: store banner must be a repository-relative path"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `deny_unknown_fields` is deliberately absent: the target-side `spk` parses
+/// manifest.toml out of every package, and an older client must be able to
+/// install a package that grew a new optional section.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub name: String,
     #[serde(default)]
@@ -114,6 +228,9 @@ pub struct Manifest {
     pub triggers: Vec<String>,
     #[serde(default)]
     pub allow_setuid: bool,
+    /// Graphical store presentation, published via the repository's store.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<PackageStoreMeta>,
     #[serde(default)]
     pub files: Vec<PackageFile>,
 }
@@ -169,6 +286,9 @@ impl Manifest {
         }
         if self.license.trim().is_empty() {
             return Err(Error::Manifest("license must not be empty".into()));
+        }
+        if let Some(store) = &self.store {
+            store.validate(&self.name)?;
         }
         for list in [
             (&self.depends, "depends"),
@@ -717,9 +837,25 @@ size = 12345
     }
 
     #[test]
-    fn rejects_unknown_fields() {
+    fn tolerates_unknown_fields_but_validates_store() {
+        // An older client must be able to install a package that grew a new
+        // optional section, so unknown keys are ignored rather than rejected.
         let text = EXAMPLE.replace("summary = \"example\"", "summary = \"example\"\nbogus = 1");
-        assert!(Manifest::from_toml(&text).is_err());
+        assert!(Manifest::from_toml(&text).is_ok());
+
+        // The store section itself is validated.
+        let bad = format!(
+            "{EXAMPLE}\n[store]\ndisplay_name = \"x\"\ncategory = \"nonsense\"\n"
+        );
+        assert!(Manifest::from_toml(&bad).is_err());
+        let good = format!(
+            "{EXAMPLE}\n[store]\ndisplay_name = \"示例\"\ncategory = \"themes\"\naccent = [\"#3b82f6\"]\n"
+        );
+        let parsed = Manifest::from_toml(&good).unwrap();
+        assert_eq!(
+            parsed.store.as_ref().and_then(|s| s.display_name.as_deref()),
+            Some("示例")
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@
 name = "base-core"
 epoch = 0
 version = "1.0.0"
-release = 8
+release = 9
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "SpaceOS-9 base runtime core"
@@ -27,3 +27,15 @@ replaces = []
 conffiles = []
 scripts = false
 allow_setuid = false
+
+[store]
+display_name = "SpaceOS 核心运行时"
+subtitle = "BusyBox · musl 动态库 · systemg PID-1 · CA 证书"
+category = "system"
+icon = "monitor"
+accent = ["#475569", "#1e293b"]
+featured_rank = 70
+highlights = [
+    "完整基线系统共享库与证书信任链",
+    "集成 SPUI 主题热重载触发器钩子",
+]

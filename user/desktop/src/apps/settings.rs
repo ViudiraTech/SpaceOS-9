@@ -460,6 +460,7 @@ enum HitTarget {
     ThemeSearchInput,
     ThemeSearchClear,
     ThemeRefresh,
+    ThemeStore,
     ThemePagePrev,
     ThemePageNext,
     ThemeExpandToggle,
@@ -1887,6 +1888,23 @@ impl SettingsState {
                 self.theme_page = 0;
                 self.status = format!("已刷新，共发现 {} 套扩展主题", self.external_themes.len());
             }
+            HitTarget::ThemeStore => {
+                let mut launched = false;
+                for path in ["/usr/bin/space-store", "/bin/space-store"] {
+                    if std::path::Path::new(path).is_file() {
+                        let _ = std::process::Command::new(path)
+                            .args(["--category", "themes"])
+                            .spawn();
+                        launched = true;
+                        break;
+                    }
+                }
+                self.status = if launched {
+                    "正在打开 Space 商店的主题分类…".into()
+                } else {
+                    "Space 商店尚未安装：doas spk install space-store".into()
+                };
+            }
             HitTarget::ThemePagePrev => {
                 self.theme_page = self.theme_page.saturating_sub(1);
             }
@@ -3059,7 +3077,8 @@ impl SettingsState {
 
                     let hx = hero_mini.right() + 14;
                     let refresh_btn = Rect::new(c_hero.right() - 102, c_hero.y + 28, 86, 32);
-                    let info_max_w = (refresh_btn.x - hx - 12).max(80) as f32;
+                    let store_btn = Rect::new(refresh_btn.x - 8 - 108, c_hero.y + 28, 108, 32);
+                    let info_max_w = (store_btn.x - hx - 12).max(80) as f32;
                     let hero_title = text.truncate(active_name, (info_max_w - 92.0).max(40.0), 15.0, Face::Bold);
                     text.draw(
                         canvas,
@@ -3122,6 +3141,17 @@ impl SettingsState {
                         hover == Some(HitTarget::ThemeRefresh),
                     );
                     push_clipped_hit(hits, viewport, refresh_btn, HitTarget::ThemeRefresh);
+                    ui::button(
+                        canvas,
+                        text,
+                        theme,
+                        store_btn,
+                        "获取更多主题",
+                        None,
+                        false,
+                        hover == Some(HitTarget::ThemeStore),
+                    );
+                    push_clipped_hit(hits, viewport, store_btn, HitTarget::ThemeStore);
                     y += c_hero.h + 14;
 
                     // Section B: Scalable Theme Gallery Card (filter + search + 2-row paginated grid)

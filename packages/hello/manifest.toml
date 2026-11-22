@@ -9,7 +9,7 @@
 name = "hello"
 epoch = 0
 version = "0.1.0"
-release = 1
+release = 2
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "Hello world for SpaceOS-9"
@@ -27,3 +27,15 @@ replaces = []
 conffiles = []
 scripts = false
 allow_setuid = false
+
+[store]
+display_name = "Hello 示例应用"
+subtitle = "SpaceOS 可复现软件包与在线升级验证工具"
+category = "utilities"
+icon = "terminal"
+accent = ["#8b5cf6", "#6d28d9"]
+featured_rank = 50
+highlights = [
+    "轻量验证端到端安装、升级与回滚流程",
+    "零外部复杂依赖，可秒级完成下载测试",
+]

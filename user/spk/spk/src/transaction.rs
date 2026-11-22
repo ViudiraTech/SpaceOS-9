@@ -201,7 +201,9 @@ pub fn execute(
     let staged = if solution.actions.is_empty() {
         BTreeMap::new()
     } else {
-        println!("{}", i18n::retrieving(options.lang));
+        let msg = i18n::retrieving(options.lang);
+        println!("{msg}");
+        ui::emit_phase("download", msg);
         let staged = match stage_packages(paths, &solution, repos, &txid, options.lang) {
             Ok(staged) => staged,
             Err(error) => {
@@ -209,7 +211,9 @@ pub fn execute(
                 return Err(error);
             }
         };
-        println!("({count}/{count}) {}", i18n::loading_packages(options.lang));
+        let load_msg = i18n::loading_packages(options.lang);
+        println!("({count}/{count}) {load_msg}");
+        ui::emit_phase("verify", load_msg);
         staged
     };
 
@@ -233,12 +237,12 @@ pub fn execute(
         return Err(SpkError::General("transaction cancelled".into()));
     }
     if !solution.actions.is_empty() {
-        println!(
-            "({count}/{count}) {}",
-            i18n::checking_file_conflicts(options.lang)
-        );
+        let conflict_msg = i18n::checking_file_conflicts(options.lang);
+        println!("({count}/{count}) {conflict_msg}");
+        ui::emit_phase("conflicts", conflict_msg);
     }
-    println!("({count}/{count}) {}", i18n::checking_disk(options.lang));
+    let disk_msg = i18n::checking_disk(options.lang);
+    println!("({count}/{count}) {disk_msg}");
     check_disk(&fs, &plan)?;
 
     let hook_packages: Vec<hooks::HookPackage> = solution
@@ -270,6 +274,7 @@ pub fn execute(
         paths: plan.changed_paths(),
         operations: hook_operations,
     };
+    ui::emit_phase("hooks", "running pre-transaction hooks");
     if let Err(error) = hooks::run_pre(paths, &txid, &hooks, &hook_context, options.lang) {
         cleanup_dir(&paths.staging.join(&txid));
         cleanup_dir(&paths.backup.join(&txid));
@@ -280,6 +285,7 @@ pub fn execute(
         eprintln!("{warning}");
     }
 
+    ui::emit_phase("scripts", "running package install scripts");
     if let Err(error) = run_scripts(paths, state, &solution, &staged, options, &txid) {
         cleanup_dir(&paths.staging.join(&txid));
         cleanup_dir(&paths.backup.join(&txid));
@@ -299,7 +305,9 @@ pub fn execute(
     };
     check_disk(&fs, &plan)?;
 
-    println!("{}", i18n::processing(options.lang));
+    let proc_msg = i18n::processing(options.lang);
+    println!("{proc_msg}");
+    ui::emit_phase("write", proc_msg);
 
     let result = apply(paths, &fs, &plan, &solution, &txid, options.lang);
     if let Err(error) = result {
@@ -319,6 +327,7 @@ pub fn execute(
         }
     }
 
+    ui::emit_phase("hooks", "running post-transaction hooks");
     if let Err(error) = hooks::run_post(paths, &txid, &hooks, &hook_context, options.lang) {
         eprintln!("{error}");
     }
@@ -339,14 +348,13 @@ pub fn execute(
         .map(|action| format!("{} {}", action.to.name, action.to.version))
         .collect();
     let _ = crate::audit::record(paths, options.operation, &changed, "ok");
-    println!(
-        "{}",
-        i18n::ok_summary(
-            options.lang,
-            &human_size(plan.total_installed_size),
-            plan.final_count
-        )
+    let ok_msg = i18n::ok_summary(
+        options.lang,
+        &human_size(plan.total_installed_size),
+        plan.final_count,
     );
+    println!("{ok_msg}");
+    ui::emit_phase("done", &ok_msg);
     Ok(())
 }
 
@@ -1425,6 +1433,7 @@ fn apply(
         fs.remove_dir(path)?;
     }
 
+    ui::emit_phase("commit", "committing package database");
     commit_db(
         paths,
         &plan.installed,

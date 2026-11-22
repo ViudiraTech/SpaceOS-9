@@ -9,7 +9,7 @@
 name = "spk-runtime"
 epoch = 0
 version = "1.0.0"
-release = 4
+release = 5
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "spk package manager runtime for desktop images"
@@ -27,3 +27,16 @@ replaces = []
 conffiles = []
 scripts = false
 allow_setuid = false
+
+[store]
+display_name = "SPK 包管理运行时"
+subtitle = "原子事务引擎 · Ed25519 签名校验 · SPK 沙箱"
+category = "system"
+icon = "store"
+accent = ["#6366f1", "#4338ca"]
+featured_rank = 80
+highlights = [
+    "支持事务回滚日志、文件冲突检查与断电恢复",
+    "Ed25519 签名索引校验与内容寻址缓存去重",
+    "支持 --progress-json 实时流式进度接口",
+]
