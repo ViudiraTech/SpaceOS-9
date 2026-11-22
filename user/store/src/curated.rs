@@ -88,6 +88,7 @@ pub fn icon_from_name(name: Option<&str>, fallback: Icon) -> Icon {
         "display" => Icon::Display,
         "panel" => Icon::Panel,
         "about" => Icon::About,
+        "input" => Icon::InputDevices,
         "folder" => Icon::Folder,
         "user" => Icon::UserHome,
         "shield" => Icon::Shield,

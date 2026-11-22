@@ -9,11 +9,8 @@
  *
  */
 
-use crate::ime::popup::{CandidatePopup, PopupClick, PopupLayout};
-use crate::ime::xim::{XimAction, XimServer};
-use crate::text::TextRenderer;
-use crate::theme::Theme;
-use crate::x11::{Result, X};
+use crate::popup::{CandidatePopup, PopupClick, PopupLayout};
+use crate::xim::{XimAction, XimServer};
 use spime::decoder::{recompute, select_candidate, ComposeSession, EngineConfig};
 use spime::dict::{SpimeDict, SpimeLm};
 use spime::pinyin::FuzzyPinyin;
@@ -21,6 +18,9 @@ use spime::proto::{read_frame, socket_path, write_frame, ClientRequest, DaemonRe
 use spime::punct::PunctState;
 use spime::shuangpin::ShuangpinScheme;
 use spime::userdb::UserDb;
+use spui_ui::text::TextRenderer;
+use spui_ui::theme::Theme;
+use spui_ui::x11::{Result, X};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read};
@@ -78,6 +78,8 @@ struct Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.userdb.flush();
+        self.x.set_spime_status(false, false);
+        let _ = self.x.flush();
         let _ = fs::remove_file(&self.sock_path);
     }
 }
@@ -110,6 +112,32 @@ impl Daemon {
         };
         let layout = PopupLayout::from_config(&cfg.ime_layout);
         (eng, layout)
+    }
+
+    fn poll_uxconf(&mut self) {
+        if self.watch.is_none() {
+            return;
+        }
+        let mut next_cfg = self.config.clone();
+        let (changed, _) = self
+            .watch
+            .as_mut()
+            .map_or((false, Vec::new()), |w| w.poll_into(&mut next_cfg));
+        if changed {
+            self.apply_config(next_cfg);
+        }
+    }
+
+    fn sync_ime_enabled_from_uxconf(&mut self) {
+        self.poll_uxconf();
+        if !self.config.ime_enabled {
+            if let Ok(mut client) = UxConfClient::connect() {
+                let latest = client.load_desktop_config();
+                if latest != self.config {
+                    self.apply_config(latest);
+                }
+            }
+        }
     }
 
     fn apply_config(&mut self, cfg: DesktopConfig) {
@@ -279,8 +307,9 @@ impl Daemon {
     }
 
     fn toggle_cn_mode_with_commit(&mut self, flush_raw: bool) -> DaemonReply {
+        let had_active = self.sess.is_active();
         let mut commit = String::new();
-        if self.sess.is_active() {
+        if had_active {
             if flush_raw {
                 commit = format!("{}{}", self.sess.committed_prefix, self.sess.raw);
             }
@@ -291,6 +320,49 @@ impl Daemon {
         self.publish_status();
         let consumed = !commit.is_empty();
         self.reply_snapshot(consumed, commit)
+    }
+
+    fn notify_active_target_of_external_toggle(
+        &mut self,
+        requester_client_id: u32,
+        had_compose: bool,
+        rep: &DaemonReply,
+    ) {
+        if !had_compose && rep.commit_text.is_empty() {
+            return;
+        }
+        match self.active {
+            ActiveTarget::Xim {
+                server_comm,
+                im_id,
+                ic_id,
+            } => {
+                if !rep.commit_text.is_empty() {
+                    self.punct.note_committed(&rep.commit_text);
+                    self.xim
+                        .commit_text(&self.x, server_comm, im_id, ic_id, 0, &rep.commit_text);
+                }
+            }
+            ActiveTarget::Socket {
+                client_id,
+                window_id,
+            } if client_id != requester_client_id => {
+                if !rep.commit_text.is_empty() {
+                    self.punct.note_committed(&rep.commit_text);
+                }
+                let mut notify_rep = rep.clone();
+                notify_rep.consumed = true;
+                self.pending_notify_replies
+                    .entry(client_id)
+                    .or_default()
+                    .push_back(notify_rep);
+                if window_id != 0 {
+                    self.x.send_spime_notify(window_id);
+                    let _ = self.x.flush();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn delete_page_candidate(&mut self, idx_in_page: usize) {
@@ -640,14 +712,35 @@ impl Daemon {
                 }
                 self.reply_snapshot(true, String::new())
             }
-            ClientRequest::ToggleMode { .. } => self.toggle_cn_mode_with_commit(true),
-            ClientRequest::SetChineseMode { chinese, .. } => {
-                if self.chinese_mode != chinese {
-                    return self.toggle_cn_mode_with_commit(true);
+            ClientRequest::ToggleMode { client_id } => {
+                self.poll_uxconf();
+                if !self.config.ime_enabled {
+                    return self.reply_snapshot(false, String::new());
                 }
+                let had_compose = self.sess.is_active();
+                let rep = self.toggle_cn_mode_with_commit(true);
+                self.notify_active_target_of_external_toggle(client_id, had_compose, &rep);
+                rep
+            }
+            ClientRequest::SetChineseMode { client_id, chinese } => {
+                if chinese {
+                    self.sync_ime_enabled_from_uxconf();
+                } else {
+                    self.poll_uxconf();
+                }
+                if self.chinese_mode != chinese {
+                    let had_compose = self.sess.is_active();
+                    let rep = self.toggle_cn_mode_with_commit(true);
+                    self.notify_active_target_of_external_toggle(client_id, had_compose, &rep);
+                    return rep;
+                }
+                self.publish_status();
                 self.reply_snapshot(false, String::new())
             }
-            ClientRequest::QueryStatus => self.reply_snapshot(false, String::new()),
+            ClientRequest::QueryStatus => {
+                self.poll_uxconf();
+                self.reply_snapshot(false, String::new())
+            }
             ClientRequest::PollPending { client_id } => {
                 if let Some(rep) = self
                     .pending_notify_replies
@@ -893,16 +986,7 @@ impl Daemon {
         }
 
         // 3. Poll live uxconf updates.
-        if ux_fd.is_some() {
-            let mut next_cfg = self.config.clone();
-            let (changed, _) = self
-                .watch
-                .as_mut()
-                .map_or((false, Vec::new()), |w| w.poll_into(&mut next_cfg));
-            if changed {
-                self.apply_config(next_cfg);
-            }
-        }
+        self.poll_uxconf();
 
         // 4. Service connected socket clients cleanly.
         let mut idx = 0usize;

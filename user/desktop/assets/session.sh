@@ -15,8 +15,14 @@ export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export XDG_CURRENT_DESKTOP=SPUI
 export XMODIFIERS="@im=spime"
 
-if [ -x /usr/bin/spimed ]; then
-    /usr/bin/spimed >/tmp/spimed.log 2>&1 &
-fi
+# Start every XDG autostart entry. Session helpers (input methods, tray
+# agents) ship their own .desktop file instead of being named here.
+for entry in /etc/xdg/autostart/*.desktop; do
+    [ -f "$entry" ] || continue
+    exec_line=$(sed -n 's/^Exec=//p' "$entry" | head -n 1)
+    if [ -n "$exec_line" ]; then
+        sh -c "$exec_line" >/dev/null 2>&1 &
+    fi
+done
 
 exec /usr/bin/spui shell

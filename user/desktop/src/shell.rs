@@ -265,6 +265,7 @@ pub struct Shell {
     ctx_is_ime: bool,
     ctx_pos: (i16, i16),
     ime_client: SpimeClient,
+    ime_service: bool,
     ime_chinese: bool,
     ime_active: bool,
     comp_shm_pending_sync: bool,
@@ -827,14 +828,24 @@ fn infer_window_icon(title: &str) -> Icon {
     }
 }
 
-fn next_ime_scheme(cur: &str) -> &'static str {
-    match cur {
-        "full" => "xiaohe",
-        "xiaohe" => "ziranma",
-        "ziranma" => "microsoft",
-        "microsoft" => "sogou",
-        "sogou" => "abc",
-        _ => "full",
+/// The shell never starts or names an input method: an IME announces itself by
+/// publishing `_SPIME_STATUS` on the root window (or by answering on the ime
+/// socket), and that is the only thing the tray reacts to.
+fn resolve_initial_ime_state(
+    x_status: Option<(bool, bool)>,
+    queried_cn: Option<bool>,
+    enabled: bool,
+    service_present: bool,
+) -> (bool, bool) {
+    if !service_present {
+        return (false, false);
+    }
+    if let Some((cn, en)) = x_status {
+        (cn, en)
+    } else if let Some(cn) = queried_cn {
+        (cn, enabled)
+    } else {
+        (false, false)
     }
 }
 
@@ -1236,8 +1247,16 @@ impl Shell {
         let apps_fp = applications_fingerprint();
         let mut start_screen = StartScreenState::new();
         start_screen.set_apps(apps.clone());
-        let ime_chinese = x.get_spime_status().map(|(c, _)| c).unwrap_or(true);
-        let ime_active = config.ime_enabled;
+        let mut ime_client = SpimeClient::new(menu);
+        let x_status = x.get_spime_status();
+        let queried_cn = if x_status.is_none() {
+            ime_client.query_chinese_mode()
+        } else {
+            None
+        };
+        let ime_service = x_status.is_some() || queried_cn.is_some();
+        let (ime_chinese, ime_active) =
+            resolve_initial_ime_state(x_status, queried_cn, config.ime_enabled, ime_service);
         let mut shell = Self {
             x,
             text,
@@ -1277,7 +1296,8 @@ impl Shell {
             ctx_open: false,
             ctx_is_ime: false,
             ctx_pos: (0, 0),
-            ime_client: SpimeClient::new(menu),
+            ime_client,
+            ime_service,
             ime_chinese,
             ime_active,
             comp_shm_pending_sync: false,
@@ -1750,6 +1770,18 @@ impl Shell {
             self.clock_tick = (-1, -1, -1);
         }
 
+        if !prev.ime_enabled && self.config.ime_enabled {
+            // Enabling the IME only publishes intent; the running IME service
+            // picks it up and the tray follows the protocol state.
+            if self.ime_service {
+                if let Some(cn) = self.ime_client.set_chinese_mode(true) {
+                    self.ime_active = true;
+                    self.ime_chinese = cn;
+                }
+            }
+        } else if prev.ime_enabled && !self.config.ime_enabled {
+            self.ime_active = false;
+        }
         self.apply_x11_settings(Some(&prev));
 
         let prev_panel_h = Theme::from_config(&prev).panel_height(&prev);
@@ -2190,6 +2222,31 @@ impl Shell {
                 let next_apps_fp = applications_fingerprint();
                 if next_apps_fp != self.apps_fp {
                     self.reload_applications()?;
+                }
+                let status = self.x.get_spime_status();
+                let now_service = status.is_some()
+                    || (self.ime_service && self.ime_client.query_chinese_mode().is_some());
+                if now_service != self.ime_service {
+                    self.ime_service = now_service;
+                    match status {
+                        Some((cn, en)) => {
+                            self.ime_chinese = cn;
+                            self.ime_active = en;
+                        }
+                        None => {
+                            self.ime_active = false;
+                            self.ime_chinese = false;
+                        }
+                    }
+                    self.draw_taskbar();
+                    self.present_taskbar()?;
+                } else if let Some((cn, en)) = status {
+                    if (cn, en) != (self.ime_chinese, self.ime_active) {
+                        self.ime_chinese = cn;
+                        self.ime_active = en;
+                        self.draw_taskbar();
+                        self.present_taskbar()?;
+                    }
                 }
             }
 
@@ -3133,17 +3190,30 @@ impl Shell {
                         let (mw, mh) = self.menu_dims();
                         !popup_contains_point(mw, mh, x, y)
                     } {
-                        self.close_menu()?;
                         if e.detail == 1 {
                             if let Some((tx, ty)) = self.taskbar_local_coords(e.root_x, e.root_y) {
-                                if self.taskbar_hit(tx, ty) != Hit::Start {
+                                let hit = self.taskbar_hit(tx, ty);
+                                if hit == Hit::ImeTray {
+                                    crate::sound::play(
+                                        &self.config,
+                                        crate::sound::SystemSound::Click,
+                                    );
+                                    self.toggle_ime_from_tray();
+                                    self.draw_taskbar();
+                                    self.present_taskbar()?;
+                                    return Ok(());
+                                }
+                                self.close_menu()?;
+                                if hit != Hit::Start {
                                     ui::notify_pointer_button(tx, ty, 1, true);
                                     self.taskbar_click(tx, ty)?;
                                     self.draw_taskbar();
                                     self.present_taskbar()?;
                                 }
+                                return Ok(());
                             }
                         }
+                        self.close_menu()?;
                     } else if e.detail == 4 || e.detail == 5 {
                         if self.menu_max_scroll > 0 && self.menu_list_viewport.contains(x, y) {
                             let raw = if e.detail == 4 { -44 } else { 44 };
@@ -4715,14 +4785,21 @@ impl Shell {
     }
 
     fn toggle_ime_from_tray(&mut self) {
-        if !self.config.ime_enabled {
-            self.persist_config_prop("input", "/ime/enabled", uxconf::Value::Bool(true));
-            self.ime_active = true;
-            self.ime_chinese = self.ime_client.set_chinese_mode(true).unwrap_or(true);
+        if !self.ime_service {
             return;
         }
-        let next = self.ime_client.toggle_mode().unwrap_or(!self.ime_chinese);
-        self.ime_chinese = next;
+        if !self.config.ime_enabled {
+            self.persist_config_prop("input", "/ime/enabled", uxconf::Value::Bool(true));
+            if let Some(cn) = self.ime_client.set_chinese_mode(true) {
+                self.ime_active = true;
+                self.ime_chinese = cn;
+            }
+            return;
+        }
+        if let Some(next) = self.ime_client.toggle_mode() {
+            self.ime_active = true;
+            self.ime_chinese = next;
+        }
     }
 
     fn sync_menu_ime_spot(&mut self, caret: Rect) {
@@ -5138,14 +5215,6 @@ impl Shell {
                     self.present_taskbar()?;
                 }
                 Hit::ContextRow(1) => {
-                    let next = next_ime_scheme(&self.config.ime_scheme);
-                    self.persist_config_prop(
-                        "input",
-                        "/ime/scheme",
-                        uxconf::Value::String(next.to_string()),
-                    );
-                }
-                Hit::ContextRow(2) => {
                     let next = if self.config.ime_layout == "vertical" {
                         "horizontal"
                     } else {
@@ -5157,7 +5226,7 @@ impl Shell {
                         uxconf::Value::String(next.to_string()),
                     );
                 }
-                Hit::ContextRow(3) => self.launch_arg("settings", "input"),
+                Hit::ContextRow(2) => self.launch_arg("settings", "input"),
                 _ => {}
             }
             return Ok(());
@@ -5879,8 +5948,10 @@ impl Shell {
         let ime_pressed = (self.ctx_open && self.ctx_is_ime) || ui::is_rect_pressed(ime);
         let ime_shift = i32::from(is_win98 && ime_pressed);
         let ime_hov = ui::animate_bool(ime, self.hover == Hit::ImeTray, ui::MOTION_HOVER);
-        let ime_on = self.config.ime_enabled && self.ime_active;
-        let ime_lbl = if !ime_on {
+        let ime_on = self.ime_service && self.config.ime_enabled && self.ime_active;
+        let ime_lbl = if !self.ime_service {
+            ""
+        } else if !ime_on {
             "--"
         } else if self.ime_chinese {
             "中"
@@ -7040,27 +7111,18 @@ impl Shell {
             } else {
                 "切换为 中文模式"
             };
-            let scheme_lbl = match self.config.ime_scheme.as_str() {
-                "xiaohe" => "方案: 小鹤双拼",
-                "ziranma" => "方案: 自然码",
-                "microsoft" => "方案: 微软双拼",
-                "sogou" => "方案: 搜狗双拼",
-                "abc" => "方案: 智能ABC",
-                _ => "方案: 全拼",
-            };
             let layout_lbl = if self.config.ime_layout == "vertical" {
                 "候选栏: 竖排 -> 横排"
             } else {
                 "候选栏: 横排 -> 竖排"
             };
-            [
+            vec![
                 (mode_lbl, Icon::InputDevices),
-                (scheme_lbl, Icon::Editor),
                 (layout_lbl, Icon::Panel),
                 ("输入法设置...", Icon::Settings),
             ]
         } else {
-            [
+            vec![
                 ("在此打开终端", Icon::Terminal),
                 ("打开文件管理器", Icon::Files),
                 ("刷新桌面", Icon::Refresh),
@@ -9154,5 +9216,25 @@ mod tests {
         // Very top-left corner pixel of bounding rect stays untouched background; center copied.
         assert_eq!(dst.pixels()[5 * 40 + 5], 0x111111);
         assert_eq!(dst.pixels()[20 * 40 + 20], 0xabcdef);
+    }
+
+    #[test]
+    fn initial_ime_state_respects_spime_availability_and_daemon_status() {
+        assert_eq!(
+            resolve_initial_ime_state(Some((true, true)), None, true, false),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_initial_ime_state(None, None, true, true),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_initial_ime_state(Some((false, true)), None, true, true),
+            (false, true)
+        );
+        assert_eq!(
+            resolve_initial_ime_state(None, Some(true), true, true),
+            (true, true)
+        );
     }
 }

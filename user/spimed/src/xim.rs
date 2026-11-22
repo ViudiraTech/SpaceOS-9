@@ -10,7 +10,7 @@
  *
  */
 
-use crate::x11::X;
+use spui_ui::x11::X;
 use std::collections::HashMap;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,

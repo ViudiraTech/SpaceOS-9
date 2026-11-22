@@ -11,6 +11,8 @@
 /user/sudo/target/
 /user/askpass/target/
 /user/store/target/
+/user/spimed/target/
+/user/spime/target/
 /build/
 
 # Locally generated spk repository artifacts and signing keys.

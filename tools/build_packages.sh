@@ -45,6 +45,7 @@ fi
     --target-dir "$ROOT/target" )
 
 "$ROOT/packages/space-store/build.sh" "$BUILD/packages/space-store"
+"$ROOT/packages/spime/build.sh" "$BUILD/packages/spime"
 "$ROOT/packages/font-hack/build.sh" "$BUILD/packages/font-hack"
 "$ROOT/packages/font-carlito/build.sh" "$BUILD/packages/font-carlito"
 "$ROOT/packages/font-croscore/build.sh" "$BUILD/packages/font-croscore"
@@ -101,6 +102,7 @@ pack_one space-editor 1.0.0-3 "$ROOT/packages/space-editor/manifest.toml" "$BUIL
 pack_one font-hack 1.0.0-1 "$ROOT/packages/font-hack/manifest.toml" "$BUILD/packages/font-hack"
 pack_one font-carlito 1.0.0-1 "$ROOT/packages/font-carlito/manifest.toml" "$BUILD/packages/font-carlito"
 pack_one font-croscore 1.0.0-1 "$ROOT/packages/font-croscore/manifest.toml" "$BUILD/packages/font-croscore"
+pack_one spime 1.0.0-1 "$ROOT/packages/spime/manifest.toml" "$BUILD/packages/spime"
 pack_one hello 0.1.0-2 "$ROOT/packages/hello/manifest.toml" "$BUILD/packages/hello-0.1.0"
 pack_one hello 0.2.0-2 "$ROOT/packages/hello/manifest-0.2.0.toml" "$BUILD/packages/hello-0.2.0"
 pack_one sudo 0.1.0-5 "$ROOT/packages/sudo/manifest.toml" "$BUILD/packages/sudo"

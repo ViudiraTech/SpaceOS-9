@@ -1,0 +1,42 @@
+#
+#       packages/spime/manifest.toml
+#       SPIME Chinese input method (spimed daemon)
+#
+#       2026/11/22 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "spime"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "SPIME 中文输入法"
+description = "SpaceOS 原生中文输入法：拼音与双拼方案、候选窗、XIM 与 spime socket 双协议，随会话自动启动。"
+license = "LicenseRef-Proprietary AND Apache-2.0"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = ["spime", "ime"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false
+
+[store]
+display_name = "SPIME 中文输入法"
+subtitle = "拼音 / 双拼 · 候选窗 · 随会话自动启动"
+category = "system"
+icon = "input"
+accent = ["#0ea5e9", "#0369a1"]
+featured_rank = 76
+highlights = [
+    "安装后重新登录即可在任意应用中输入中文",
+    "支持全拼与多种双拼方案、横竖候选栏",
+    "同时提供 XIM 与原生 socket 协议",
+]
