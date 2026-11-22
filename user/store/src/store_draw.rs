@@ -126,20 +126,10 @@ fn draw_sidebar(
         canvas,
         "Space 商店",
         rect.x + 56,
-        rect.y + 30,
-        15.0,
+        rect.y + 36,
+        15.5,
         theme.text,
         Face::Bold,
-    );
-    ui_cards::draw_text(
-        text,
-        canvas,
-        "SPK 软件中心",
-        rect.x + 56,
-        rect.y + 46,
-        11.0,
-        theme.text_muted,
-        Face::Ui,
     );
 
     let search = Rect::new(rect.x + 12, rect.y + brand_h, rect.w - 24, 32);
@@ -282,7 +272,6 @@ fn draw_topbar(
     prev_hits: &Hits,
     hits: &mut Hits,
 ) {
-    // High-contrast elevated headerbar without Aero diagonal glass sheen obscuring text.
     canvas.fill(rect, theme.window_high);
     canvas.fill(
         Rect::new(rect.x, rect.bottom() - 1, rect.w, 1),
@@ -290,25 +279,27 @@ fn draw_topbar(
     );
     let pointer = state.last_pointer;
     let mut x = rect.x + 22;
+    let btn_y = rect.y + (rect.h - 30) / 2;
 
     if state.detail.is_some() {
-        let back = Rect::new(x, rect.y + 13, 30, 30);
+        let back = Rect::new(x, btn_y, 30, 30);
         let hovered = prev_hits.hover_rect(pointer.0, pointer.1, back);
         ui::icon_button(canvas, theme, back, Icon::GoBack, true, hovered);
         hits.push(back, Action::Back);
-        x += 40;
+        x += 38;
     }
 
-    let mut right = rect.right() - 22;
+    let mut right = rect.right() - 20;
     let active_jobs = state.jobs.iter().filter(|j| j.status.is_active()).count();
     let queue_label = if state.queue_open {
-        "隐藏任务".to_string()
+        "收起任务".to_string()
     } else if active_jobs > 0 {
-        format!("任务 ({active_jobs})")
+        format!("任务 · {active_jobs}")
     } else {
-        "任务队列".to_string()
+        "任务".to_string()
     };
-    let queue = Rect::new(right - 96, rect.y + 13, 96, 30);
+    let queue_w = (text.measure(&queue_label, 12.0, Face::Bold) as i32 + 28).max(64);
+    let queue = Rect::new(right - queue_w, btn_y, queue_w, 30);
     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, queue);
     ui_cards::cta_pill(
         canvas,
@@ -322,99 +313,58 @@ fn draw_topbar(
         None,
     );
     hits.push(queue, Action::ToggleQueue);
-    right -= 106;
+    right = queue.x - 8;
 
-    let sync = Rect::new(right - 104, rect.y + 13, 104, 30);
-    let hovered = prev_hits.hover_rect(pointer.0, pointer.1, sync);
-    ui_cards::cta_pill(
+    let refresh = Rect::new(right - 32, btn_y, 32, 30);
+    let hovered = prev_hits.hover_rect(pointer.0, pointer.1, refresh);
+    ui_cards::toolbar_icon_button(
         canvas,
-        text,
         theme,
-        sync,
-        "同步软件源",
-        false,
+        refresh,
+        Icon::Refresh,
+        state.loading,
         hovered,
-        false,
-        None,
+        !state.loading,
     );
-    hits.push(sync, Action::RefreshCatalog);
-    right -= 116;
+    if !state.loading {
+        hits.push(refresh, Action::RefreshCatalog);
+    }
+    right = refresh.x - 8;
 
-    let status = if state.offline {
-        "离线缓存模式".to_string()
-    } else if state.loading {
-        "正在同步软件源…".to_string()
-    } else if let Some(repo) = state.repos.first() {
-        format!(
-            "{} · {} 个包 · {}",
-            repo.name,
-            repo.package_count,
-            format_timestamp(repo.last_sync)
-        )
+    let status_chip: Option<(&str, u32, Option<Action>)> = if state.loading {
+        Some(("同步中", theme.accent, None))
+    } else if state.offline {
+        Some(("离线", theme.warning, Some(Action::RefreshCatalog)))
+    } else if !state.repos.is_empty() {
+        Some(("在线", theme.success, Some(Action::Nav(NavSection::Maintenance))))
     } else {
-        String::new()
+        None
     };
 
-    let min_title_w = 180;
-    let max_status_w = (right - x - min_title_w - 16).max(0);
-    if !status.is_empty() && max_status_w >= 96 {
-        let width = (text.measure(&status, 11.0, Face::Bold) as i32 + 24).min(max_status_w);
-        let pill = Rect::new(right - width, rect.y + 16, width, 24);
-        ui_cards::badge(
-            canvas,
-            text,
-            theme,
-            pill,
-            &status,
-            if state.offline {
-                theme.warning
-            } else {
-                theme.success
-            },
-        );
-        right = pill.x - 16;
+    if let Some((label, color, action)) = status_chip {
+        let chip_w = (text.measure(label, 11.5, Face::Bold) as i32 + 32).max(56);
+        let min_title_w = 140;
+        if right - chip_w - x >= min_title_w {
+            let chip = Rect::new(right - chip_w, btn_y + 2, chip_w, 26);
+            let hovered = action.is_some() && prev_hits.hover_rect(pointer.0, pointer.1, chip);
+            ui_cards::status_dot_chip(canvas, text, theme, chip, label, color, hovered);
+            if let Some(act) = action {
+                hits.push(chip, act);
+            }
+            right = chip.x - 12;
+        }
     }
 
-    let (title, subtitle) = match (state.detail.as_deref(), state.view) {
-        (Some(name), _) => {
-            let pkg = state.package(name);
-            let disp = pkg
-                .map(|p| state.presentation(p).display_name)
-                .unwrap_or_else(|| name.to_string());
-            let sub = pkg
-                .map(|p| format!("软件包详情 · {}", p.name))
-                .unwrap_or_default();
-            (disp, sub)
-        }
-        (None, NavSection::Discover) => (
-            "探索精选".to_string(),
-            "精选桌面应用、主题扩展与核心系统工具".to_string(),
-        ),
-        (None, NavSection::Browse) => (
-            "分类浏览".to_string(),
-            format!("共收录 {} 个签名软件包", state.packages.len()),
-        ),
-        (None, NavSection::Updates) => (
-            "软件更新".to_string(),
-            if state.updates.is_empty() {
-                "所有已安装软件包均为最新版本".to_string()
-            } else {
-                format!("有 {} 个软件包可升级到新版本", state.updates.len())
-            },
-        ),
-        (None, NavSection::Installed) => (
-            "已安装".to_string(),
-            format!(
-                "已安装 {} 个软件包（手动 {} · 依赖 {}）",
-                state.installed_count(),
-                state.explicit_count(),
-                state.dependency_count()
-            ),
-        ),
-        (None, NavSection::Maintenance) => (
-            "仓库与维护".to_string(),
-            "管理软件源优先级、Ed25519 信任密钥与事务缓存".to_string(),
-        ),
+    let title = match (state.detail.as_deref(), state.view) {
+        (Some(name), _) => state
+            .package(name)
+            .map(|p| state.presentation(p).display_name)
+            .unwrap_or_else(|| name.to_string()),
+        (None, NavSection::Discover) => "探索精选".to_string(),
+        (None, NavSection::Browse) => "分类浏览".to_string(),
+        (None, NavSection::Updates) => "软件更新".to_string(),
+        (None, NavSection::Installed) => "已安装".to_string(),
+        (None, NavSection::Maintenance) => "仓库与维护".to_string(),
     };
     let avail_w = (right - x).max(60);
     ui_cards::draw_text_clipped(
@@ -422,22 +372,11 @@ fn draw_topbar(
         canvas,
         &title,
         x,
-        rect.y + 25,
+        rect.y + 34,
         avail_w,
         16.5,
         theme.text,
         Face::Bold,
-    );
-    ui_cards::draw_text_clipped(
-        text,
-        canvas,
-        &subtitle,
-        x,
-        rect.y + 44,
-        avail_w,
-        11.0,
-        theme.text_muted,
-        Face::Ui,
     );
 }
 
@@ -524,45 +463,34 @@ fn draw_discover(
             }
 
             if !state_ref.updates.is_empty() {
-                let banner = Rect::new(area.x, y, inner_w, 62);
+                let banner = Rect::new(area.x, y, inner_w, 54);
                 if banner.bottom() >= area.y && banner.y <= area.bottom() {
                     ui_cards::elevated_card(canvas, theme, banner, false);
                     ui_cards::icon_badge(
                         canvas,
                         Icon::Refresh,
-                        Rect::new(banner.x + 14, banner.y + 13, 36, 36),
+                        Rect::new(banner.x + 12, banner.y + 11, 32, 32),
                         [theme.accent, ui_cards::mix(theme.accent, 0x0284c7, 0.45)],
                     );
                     ui_cards::draw_text_clipped(
                         text,
                         canvas,
-                        &format!("{} 个软件包有新版本可升级", state_ref.updates.len()),
-                        banner.x + 62,
-                        banner.y + 26,
-                        banner.w - 200,
+                        &format!("{} 个软件包有新版本可用", state_ref.updates.len()),
+                        banner.x + 56,
+                        banner.y + 32,
+                        banner.w - 190,
                         13.5,
                         theme.text,
                         Face::Bold,
                     );
-                    ui_cards::draw_text_clipped(
-                        text,
-                        canvas,
-                        "前往软件更新中心可一键升级并享受事务级回滚保护",
-                        banner.x + 62,
-                        banner.y + 44,
-                        banner.w - 200,
-                        11.5,
-                        theme.text_muted,
-                        Face::Ui,
-                    );
-                    let cta = Rect::new(banner.right() - 122, banner.y + 17, 106, 28);
+                    let cta = Rect::new(banner.right() - 118, banner.y + 13, 104, 28);
                     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, cta);
                     ui_cards::cta_pill(
                         canvas, text, theme, cta, "查看更新", true, hovered, false, None,
                     );
                     hits.push_clipped(cta, area, Action::Nav(NavSection::Updates));
                 }
-                y += 76;
+                y += 66;
             }
 
             let columns = if inner_w >= 820 {
@@ -575,7 +503,7 @@ fn draw_discover(
             let card_w = (inner_w - (columns - 1) * 16) / columns;
 
             for section in &sections {
-                let header = Rect::new(area.x, y, inner_w, 42);
+                let header = Rect::new(area.x, y, inner_w, 28);
                 if header.bottom() >= area.y && header.y <= area.bottom() {
                     ui_cards::section_header(
                         canvas,
@@ -583,10 +511,10 @@ fn draw_discover(
                         theme,
                         header,
                         &section.title,
-                        &section.subtitle,
+                        "",
                     );
                 }
-                y += 46;
+                y += 32;
 
                 let mut visible_count = 0i32;
                 for name in &section.packages {
@@ -754,7 +682,7 @@ fn draw_browse(
             } else {
                 "没有匹配的软件包"
             },
-            "试试更换分类、清空搜索词，或点右上角「同步软件源」刷新索引。",
+            "试试更换分类、清空搜索词，或点击右上角刷新按钮。",
         );
         return;
     }
@@ -839,7 +767,7 @@ fn draw_updates(
     let count = state.updates.len();
 
     // Elevated overview status card
-    let banner = Rect::new(area.x, y, inner_w, 68);
+    let banner = Rect::new(area.x, y, inner_w, 58);
     ui_cards::elevated_card(canvas, theme, banner, false);
     let status_accent = if count == 0 {
         [theme.success, ui_cards::mix(theme.success, 0x059669, 0.40)]
@@ -849,37 +777,26 @@ fn draw_updates(
     ui_cards::icon_badge(
         canvas,
         Icon::Refresh,
-        Rect::new(banner.x + 16, banner.y + 14, 40, 40),
+        Rect::new(banner.x + 14, banner.y + 11, 36, 36),
         status_accent,
     );
     ui_cards::draw_text_clipped(
         text,
         canvas,
         &if count == 0 {
-            "系统所有软件包均已是最新版本".to_string()
+            "所有软件包均为最新版本".to_string()
         } else {
-            format!("发现 {count} 个软件包可以升级")
+            format!("发现 {count} 个可升级软件包")
         },
-        banner.x + 68,
-        banner.y + 28,
-        (banner.w - 320).max(80),
+        banner.x + 62,
+        banner.y + 34,
+        (banner.w - 300).max(80),
         14.5,
         theme.text,
         Face::Bold,
     );
-    ui_cards::draw_text_clipped(
-        text,
-        canvas,
-        "所有更新包均经由 Ed25519 数字签名校验，支持事务快照与失败自动回滚",
-        banner.x + 68,
-        banner.y + 48,
-        (banner.w - 320).max(80),
-        11.5,
-        theme.text_muted,
-        Face::Ui,
-    );
 
-    let all = Rect::new(banner.right() - 116, banner.y + 19, 100, 30);
+    let all = Rect::new(banner.right() - 114, banner.y + 14, 100, 30);
     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, all);
     ui_cards::cta_pill(
         canvas,
@@ -895,7 +812,7 @@ fn draw_updates(
     if count > 0 {
         hits.push(all, Action::UpdateAll);
     }
-    let check = Rect::new(banner.right() - 224, banner.y + 19, 98, 30);
+    let check = Rect::new(banner.right() - 220, banner.y + 14, 96, 30);
     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, check);
     ui_cards::cta_pill(
         canvas,
@@ -909,7 +826,7 @@ fn draw_updates(
         None,
     );
     hits.push(check, Action::RefreshCatalog);
-    y += 82;
+    y += 72;
 
     let viewport = Rect::new(area.x, y, area.w, (area.bottom() - y).max(40));
     if count == 0 {
@@ -922,7 +839,7 @@ fn draw_updates(
             empty_card,
             Icon::Refresh,
             "没有待处理的软件更新",
-            "点击右上角「检查更新」或「同步软件源」可获取最新仓库索引。",
+            "点击右上角刷新按钮或「检查更新」获取最新仓库索引。",
         );
         return;
     }
@@ -1202,18 +1119,10 @@ fn draw_installed(
 
     let mut groups: Vec<(&str, &str, Vec<StorePackage>)> = Vec::new();
     if !app_group.is_empty() {
-        groups.push((
-            "桌面应用与外观主题",
-            "图形应用程序、授权前端与桌面视觉主题",
-            app_group,
-        ));
+        groups.push(("桌面应用与外观主题", "", app_group));
     }
     if !sys_group.is_empty() {
-        groups.push((
-            "系统核心与运行库",
-            "底层包管理引擎、权限工具、字体与系统基础元包",
-            sys_group,
-        ));
+        groups.push(("系统核心与运行库", "", sys_group));
     }
 
     let row_h = 64;
@@ -1597,7 +1506,7 @@ fn draw_detail(
     canvas.fill(main, theme.window);
     let pres = state.presentation(&pkg);
     let area = content_scroll_area(main);
-    let header_h = 136;
+    let header_h = 122;
     let header = Rect::new(area.x, area.y, area.w, header_h);
     ui_cards::elevated_card(canvas, theme, header, false);
 
@@ -1605,7 +1514,7 @@ fn draw_detail(
         pres.screenshots.is_empty() && (pres.banner.is_some() || pres.is_theme) && header.w >= 720;
     let preview_w = if show_preview { 220 } else { 0 };
     if show_preview {
-        let pr = Rect::new(header.right() - preview_w - 16, header.y + 12, preview_w, 112);
+        let pr = Rect::new(header.right() - preview_w - 16, header.y + 10, preview_w, 102);
         let banner = state.banner_sprite(pres.banner.as_deref());
         ui_cards::draw_preview_artwork(
             canvas,
@@ -1631,7 +1540,7 @@ fn draw_detail(
         canvas,
         &pres.display_name,
         info_x,
-        header.y + 34,
+        header.y + 36,
         info_w,
         19.0,
         theme.text,
@@ -1642,32 +1551,16 @@ fn draw_detail(
         canvas,
         &pres.subtitle,
         info_x,
-        header.y + 56,
+        header.y + 58,
         info_w,
         12.5,
-        theme.text_muted,
-        Face::Ui,
-    );
-    ui_cards::draw_text_clipped(
-        text,
-        canvas,
-        &format!(
-            "{} · {} · {}",
-            pkg.display_version(),
-            pkg.arch,
-            format_bytes(pkg.size)
-        ),
-        info_x,
-        header.y + 74,
-        info_w,
-        11.5,
         theme.text_muted,
         Face::Ui,
     );
 
     let pointer = state.last_pointer;
     let mut button_x = info_x;
-    let btn_y = header.y + 92;
+    let btn_y = header.y + 76;
     let primary_rect = Rect::new(button_x, btn_y, 114, 32);
     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, primary_rect);
     if let Some(job) = state.job_for(&name) {
@@ -2214,11 +2107,11 @@ fn draw_maintenance(
                 canvas,
                 text,
                 theme,
-                Rect::new(viewport.x, y, inner_w, 40),
+                Rect::new(viewport.x, y, inner_w, 28),
                 "软件源",
-                "优先级越高越先被采用；至少保留一个启用的软件源。",
+                "",
             );
-            y += 46;
+            y += 32;
 
             for repo in &state_ref.repos {
                 let row = Rect::new(viewport.x, y, inner_w, 56);
@@ -2229,27 +2122,47 @@ fn draw_maintenance(
                     &repo.name,
                     row.x + 14,
                     row.y + 22,
-                    row.w - 220,
+                    row.w - 300,
                     13.0,
                     theme.text,
                     Face::Bold,
                 );
+                let sync_ts = state_ref
+                    .last_sync_at
+                    .unwrap_or(0)
+                    .max(repo.last_sync)
+                    .max(repo.generated_at);
                 ui_cards::draw_text_clipped(
                     text,
                     canvas,
                     &format!(
-                        "优先级 {} · 架构 {} · {} 个软件包 · {}",
+                        "优先级 {} · {} · {} 个包 · {}",
                         repo.priority,
                         repo.arch,
                         repo.package_count,
-                        format_timestamp(repo.last_sync)
+                        format_timestamp(sync_ts)
                     ),
                     row.x + 14,
                     row.y + 42,
-                    row.w - 220,
+                    row.w - 300,
                     11.0,
                     theme.text_muted,
                     Face::Ui,
+                );
+                let (st_label, st_color) = if !repo.enabled {
+                    ("已禁用", theme.text_muted)
+                } else if state_ref.offline || repo.stale || !repo.synced {
+                    ("离线缓存", theme.warning)
+                } else {
+                    ("在线", theme.success)
+                };
+                ui_cards::badge(
+                    canvas,
+                    text,
+                    theme,
+                    Rect::new(row.right() - 270, row.y + 17, 70, 22),
+                    st_label,
+                    st_color,
                 );
                 let up = Rect::new(row.right() - 188, row.y + 14, 28, 28);
                 let hovered = prev_hits.hover_rect(pointer.0, pointer.1, up);
@@ -2268,7 +2181,7 @@ fn draw_maintenance(
                 y += 64;
             }
 
-            let form = Rect::new(viewport.x, y, inner_w, 82);
+            let form = Rect::new(viewport.x, y, inner_w, 60);
             ui_cards::elevated_card(canvas, theme, form, false);
             let name_rect = Rect::new(form.x + 14, form.y + 14, 176, 32);
             let name_focus = focus == FocusedInput::RepoName;
@@ -2312,28 +2225,17 @@ fn draw_maintenance(
                 canvas, text, theme, add, "添加软件源", true, hovered, false, None,
             );
             hits.push_clipped(add, viewport, Action::RepoAddSubmit);
-            ui_cards::draw_text_clipped(
-                text,
-                canvas,
-                "点击输入框即可键入名称与地址（Tab 切换焦点，Enter 提交）。",
-                form.x + 14,
-                form.y + 66,
-                form.w - 28,
-                11.0,
-                theme.text_muted,
-                Face::Ui,
-            );
-            y += 96;
+            y += 74;
 
             ui_cards::section_header(
                 canvas,
                 text,
                 theme,
-                Rect::new(viewport.x, y, inner_w, 40),
+                Rect::new(viewport.x, y, inner_w, 28),
                 "信任密钥",
-                "Ed25519 公钥，用于校验仓库索引与 store.json 签名。",
+                "",
             );
-            y += 46;
+            y += 32;
             for key in &state_ref.trust_keys {
                 let row = Rect::new(viewport.x, y, inner_w, 44);
                 ui_cards::elevated_card(canvas, theme, row, false);
@@ -2410,11 +2312,11 @@ fn draw_maintenance(
                 canvas,
                 text,
                 theme,
-                Rect::new(viewport.x, y, inner_w, 40),
+                Rect::new(viewport.x, y, inner_w, 28),
                 "缓存与一致性",
-                "缓存只保存已下载的软件包，可随时清理并重新校验。",
+                "",
             );
-            y += 46;
+            y += 32;
             let stats = Rect::new(viewport.x, y, inner_w, 64);
             let cache_items: Vec<(&str, String)> = vec![
                 ("仓库索引", format_bytes(state_ref.cache.repository_bytes)),

@@ -167,7 +167,7 @@ def rootfs_skeleton(
                     {
                         "name": "spaceos-main",
                         "arch": "x86_64",
-                        "urls": [remote_url],
+                        "urls": [u.strip() for u in remote_url.split(",") if u.strip()],
                         "priority": 10,
                         "key_id": key_id,
                         "last_sync": 0,
@@ -257,7 +257,7 @@ def main() -> int:
     parser.add_argument(
         "--remote-repo",
         default=DEFAULT_REMOTE_REPO,
-        help="remote repository the image syncs from; outranks the embedded copy",
+        help="remote repository URL(s), comma separated; the first one that answers wins",
     )
     parser.add_argument(
         "--driver",

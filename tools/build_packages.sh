@@ -95,7 +95,7 @@ pack_one() {
         --level 19
 }
 
-pack_one space-store 1.0.0-4 "$ROOT/packages/space-store/manifest.toml" "$BUILD/packages/space-store"
+pack_one space-store 1.0.0-5 "$ROOT/packages/space-store/manifest.toml" "$BUILD/packages/space-store"
 pack_one spui-askpass 1.0.0-1 "$ROOT/packages/spui-askpass/manifest.toml" "$BUILD/packages/spui-askpass"
 pack_one space-editor 1.0.0-3 "$ROOT/packages/space-editor/manifest.toml" "$BUILD/packages/space-editor"
 pack_one font-hack 1.0.0-1 "$ROOT/packages/font-hack/manifest.toml" "$BUILD/packages/font-hack"

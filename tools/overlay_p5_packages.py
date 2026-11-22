@@ -199,7 +199,7 @@ def main() -> int:
                     {
                         "name": arguments.repo_name,
                         "arch": "x86_64",
-                        "urls": [arguments.repo_url],
+                        "urls": [u.strip() for u in arguments.repo_url.split(",") if u.strip()],
                         "priority": 10,
                         "key_id": key["key_id"],
                         "last_sync": arguments.epoch,
