@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Space 商店
+GenericName=软件中心
+Comment=浏览、安装与更新 SpaceOS 软件包
+Exec=/usr/bin/space-store
+TryExec=/usr/bin/space-store
+Icon=space-store
+Terminal=false
+Categories=System;Utility;
+Keywords=store;shop;spk;package;软件;商店;主题;安装;更新;
+StartupNotify=false
+X-SpaceOS-DesktopShortcut=true

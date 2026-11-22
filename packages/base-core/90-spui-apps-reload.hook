@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Path
+Target = usr/share/applications/*.desktop
+
+[Action]
+Description = Reload SPUI desktop applications
+When = PostTransaction
+Exec = /usr/bin/spui-apps-kick

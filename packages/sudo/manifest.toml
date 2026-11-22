@@ -9,11 +9,11 @@
 name = "sudo"
 epoch = 0
 version = "0.1.0"
-release = 4
+release = 5
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "SpaceOS-9 sudo and doas"
-description = "Setuid sudo/doas with shadow authentication, tickets, sudoers/doas.conf, lecture and audit."
+description = "Setuid sudo/doas with shadow authentication, tickets, sudoers/doas.conf, askpass, lecture and audit."
 license = "LicenseRef-Proprietary"
 url = "https://github.com/ViudiraTech/SpaceOS-9"
 packager = "SpaceOS Build <build@spaceos>"
@@ -24,18 +24,18 @@ provides = ["sudo"]
 conflicts = []
 replaces = []
 
-conffiles = []
+conffiles = ["/etc/sudoers"]
 scripts = false
 allow_setuid = true
 
 [store]
 display_name = "sudo / doas 权限管理工具"
-subtitle = "管理员授权 · 时间戳票据缓存 · 密码策略校验"
+subtitle = "管理员授权 · 时间戳票据缓存 · Askpass 图形验证"
 category = "system"
-icon = "login"
+icon = "shield"
 accent = ["#10b981", "#047857"]
 featured_rank = 75
 highlights = [
-    "支持 -S 标准输入授权与 -n 非交互票据检查",
+    "支持 -A 系统级图形授权弹窗与 -S 标准输入授权",
     "保留独立 suid 位并受 spk 白名单安全保护",
 ]

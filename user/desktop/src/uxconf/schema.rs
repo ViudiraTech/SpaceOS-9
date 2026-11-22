@@ -54,7 +54,10 @@ pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {
                 Value::String("#14385c".to_string()),
             ),
             ("/icons/visible", Value::Bool(true)),
+            ("/icons/shortcuts", Value::String("files,term,browser".to_string())),
+            ("/icons/hidden-shortcuts", Value::String(String::new())),
             ("/icons/size", Value::Int(40)),
+            ("/apps/reload-gen", Value::String(String::new())),
         ],
         "panel" => vec![
             ("/position", Value::String("bottom".to_string())),

@@ -8,6 +8,8 @@
 /user/browser/target/
 /user/spui_ui/target/
 /user/spk/target/
+/user/sudo/target/
+/user/askpass/target/
 /build/
 
 # Locally generated spk repository artifacts and signing keys.

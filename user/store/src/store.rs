@@ -6,21 +6,21 @@
 //       Copyright (C) 2026 ViudiraTech.
 //
 // The store is a pure spk front end: every read goes through `spk ... --json`
-// and every change goes through a queued `spk` transaction, authorised with an
-// in-app sudo prompt. Nothing here touches /var/lib/spk directly, and nothing
-// inspects which theme skin is active.
+// and every change goes through a queued `spk` transaction. Nothing here
+// touches /var/lib/spk directly, and nothing inspects which theme skin is active.
 //
 
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use spui_ui::app::{App, UiEvent};
-use spui_ui::icons;
-use spui_ui::x11::Key;
-use spui_ui::draw::{Canvas, Rect};
-use spui_ui::icons::Icon;
+use spui_ui::draw::{Canvas, Rect, Sprite};
+use spui_ui::icons::{self, Icon};
 use spui_ui::text::{Face, TextRenderer};
 use spui_ui::theme::Theme;
 use spui_ui::ui;
+use spui_ui::x11::Key;
 
 use crate::backend::{BackendEvent, StoreBackend};
 use crate::curated::{
@@ -32,10 +32,11 @@ use crate::model::{
     LogLevel, NavSection, PackageFileEntry, RepoStatusEntry, SortMode, StoreCategory,
     StorePackage, TxJob, TxJobKind, TxJobStatus, TxPlanJson,
 };
-use crate::ui_cards::{self, SIDEBAR_W, TOPBAR_H};
+use crate::ui_cards::{self, FEATURED_CARD_H, SIDEBAR_W, TOPBAR_H};
 
-const HERO_H: i32 = 172;
-const QUEUE_H: i32 = 190;
+const HERO_H: i32 = 212;
+const QUEUE_H: i32 = 196;
+const SCROLLBAR_GUTTER: i32 = 14;
 const AUTO_ADVANCE: Duration = Duration::from_secs(7);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,8 +56,19 @@ pub struct StoreOptions {
     pub search: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusedInput {
+    None,
+    Search,
+    RepoName,
+    RepoUrl,
+    TrustPath,
+    AuthPassword,
+}
+
 #[derive(Clone, Debug)]
 enum Action {
+    Noop,
     Nav(NavSection),
     Category(StoreCategory),
     Sort(SortMode),
@@ -68,6 +80,8 @@ enum Action {
     RefreshCatalog,
     HeroCta(usize),
     HeroDot(usize),
+    HeroPrev,
+    HeroNext,
     Back,
     SetTab(crate::model::DetailTab),
     Reinstall(String),
@@ -86,11 +100,13 @@ enum Action {
     RepoPriority(String, i32),
     RepoAddSubmit,
     TrustAdd,
-    FocusSearch,
+    FocusInput(FocusedInput),
+    ClearSearch,
     PreviewConfirm,
     PreviewCancel,
     ToggleRecursive,
     TogglePurge,
+    ToggleAuthReveal,
     AuthSubmit,
     AuthCancel,
     DismissToast,
@@ -98,6 +114,7 @@ enum Action {
 
 struct Hit {
     rect: Rect,
+    raw_rect: Rect,
     action: Action,
 }
 
@@ -112,7 +129,22 @@ impl Hits {
 
     fn push(&mut self, rect: Rect, action: Action) {
         if !rect.is_empty() {
-            self.list.push(Hit { rect, action });
+            self.list.push(Hit {
+                rect,
+                raw_rect: rect,
+                action,
+            });
+        }
+    }
+
+    fn push_clipped(&mut self, rect: Rect, clip: Rect, action: Action) {
+        let visible = rect.intersect(clip);
+        if !visible.is_empty() {
+            self.list.push(Hit {
+                rect: visible,
+                raw_rect: rect,
+                action,
+            });
         }
     }
 
@@ -124,13 +156,16 @@ impl Hits {
             .map(|hit| &hit.action)
     }
 
-    /// True when the topmost hit under the pointer is exactly `rect`.
+    /// True when the topmost hit under the pointer was registered for `rect`.
     fn hover_rect(&self, x: i32, y: i32, rect: Rect) -> bool {
+        if rect.is_empty() || !rect.contains(x, y) {
+            return false;
+        }
         self.list
             .iter()
             .rev()
             .find(|hit| hit.rect.contains(x, y))
-            .is_some_and(|hit| hit.rect == rect)
+            .is_some_and(|hit| hit.raw_rect == rect)
     }
 }
 
@@ -148,6 +183,17 @@ struct AuthPrompt {
     command: String,
     error: Option<String>,
     input: String,
+    reveal: bool,
+}
+
+impl Drop for AuthPrompt {
+    fn drop(&mut self) {
+        // SAFETY: wipe UTF-8 password buffer before releasing memory.
+        unsafe {
+            self.input.as_mut_vec().fill(0);
+        }
+        self.input.clear();
+    }
 }
 
 #[derive(Clone)]
@@ -171,10 +217,11 @@ struct StoreState {
     installed_filter: InstalledFilter,
     search: String,
     preedit: String,
-    search_focus: bool,
+    focused: FocusedInput,
     detail: Option<String>,
     detail_tab: crate::model::DetailTab,
     detail_files: Vec<PackageFileEntry>,
+    discover_scroll: ui::SmoothScroll,
     detail_scroll: ui::SmoothScroll,
     grid_scroll: ui::SmoothScroll,
     maint_scroll: ui::SmoothScroll,
@@ -193,8 +240,35 @@ struct StoreState {
     cache: crate::model::CacheInfoJson,
     repo_name: String,
     repo_url: String,
+    trust_path: String,
     toast: Option<(String, Instant)>,
     last_pointer: (i32, i32),
+    banners: HashMap<String, Sprite>,
+    banner_requested: HashSet<String>,
+    banner_cache_dir: PathBuf,
+}
+
+fn default_banner_cache_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var("XDG_CACHE_HOME").ok().filter(|s| !s.is_empty()) {
+        return PathBuf::from(xdg).join("space-store/previews");
+    }
+    if let Some(home) = std::env::var("HOME").ok().filter(|s| !s.is_empty()) {
+        return PathBuf::from(home).join(".cache/space-store/previews");
+    }
+    std::env::temp_dir().join("space-store-previews")
+}
+
+fn sanitize_cache_name(rel_path: &str) -> String {
+    rel_path
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 impl StoreState {
@@ -212,10 +286,11 @@ impl StoreState {
             installed_filter: InstalledFilter::All,
             search: String::new(),
             preedit: String::new(),
-            search_focus: false,
+            focused: FocusedInput::None,
             detail: None,
             detail_tab: crate::model::DetailTab::Overview,
             detail_files: Vec::new(),
+            discover_scroll: ui::SmoothScroll::new("store_discover_scroll"),
             detail_scroll: ui::SmoothScroll::new("store_detail_scroll"),
             grid_scroll: ui::SmoothScroll::new("store_grid_scroll"),
             maint_scroll: ui::SmoothScroll::new("store_maint_scroll"),
@@ -234,12 +309,16 @@ impl StoreState {
             cache: crate::model::CacheInfoJson::default(),
             repo_name: String::new(),
             repo_url: String::new(),
+            trust_path: "/etc/spk/trusted.d/".into(),
             toast: None,
             last_pointer: (0, 0),
+            banners: HashMap::new(),
+            banner_requested: HashSet::new(),
+            banner_cache_dir: default_banner_cache_dir(),
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: FullSnapshot) {
+    fn apply_snapshot(&mut self, snapshot: FullSnapshot, backend: Option<&StoreBackend>) {
         self.catalog = snapshot.catalog;
         self.repos = self.catalog.repositories.clone();
         self.packages = self.catalog.packages.clone();
@@ -248,8 +327,33 @@ impl StoreState {
         self.cache = snapshot.cache;
         self.offline = snapshot.offline;
         self.loading = false;
-        if self.hero_index >= self.hero_slides().len() {
+        let len = self.hero_slides().len();
+        if len > 0 && self.hero_index >= len {
             self.hero_index = 0;
+        }
+        if let Some(backend) = backend {
+            self.request_missing_banners(backend);
+        }
+    }
+
+    fn request_missing_banners(&mut self, backend: &StoreBackend) {
+        let mut rels: Vec<String> = Vec::new();
+        for slide in self.hero_slides() {
+            if let Some(banner) = slide.banner {
+                rels.push(banner);
+            }
+        }
+        for pkg in &self.packages {
+            if let Some(banner) = self.meta(&pkg.name).and_then(|m| m.banner.clone()) {
+                rels.push(banner);
+            }
+        }
+        for rel in rels {
+            if self.banners.contains_key(&rel) || !self.banner_requested.insert(rel.clone()) {
+                continue;
+            }
+            let dest = self.banner_cache_dir.join(sanitize_cache_name(&rel));
+            backend.fetch_banner(rel, dest, self.offline);
         }
     }
 
@@ -267,6 +371,10 @@ impl StoreState {
 
     fn hero_slides(&self) -> Vec<HeroSlide> {
         build_hero_slides(&self.catalog)
+    }
+
+    fn banner_sprite(&self, rel: Option<&str>) -> Option<&Sprite> {
+        rel.and_then(|r| self.banners.get(r))
     }
 
     fn installed_count(&self) -> usize {
@@ -363,6 +471,27 @@ impl StoreState {
         list
     }
 
+    fn active_focus(&self) -> FocusedInput {
+        if self.auth.is_some() {
+            FocusedInput::AuthPassword
+        } else if self.preview.is_some() {
+            FocusedInput::None
+        } else {
+            self.focused
+        }
+    }
+
+    fn active_input_mut(&mut self) -> Option<&mut String> {
+        match self.active_focus() {
+            FocusedInput::None => None,
+            FocusedInput::Search => Some(&mut self.search),
+            FocusedInput::RepoName => Some(&mut self.repo_name),
+            FocusedInput::RepoUrl => Some(&mut self.repo_url),
+            FocusedInput::TrustPath => Some(&mut self.trust_path),
+            FocusedInput::AuthPassword => self.auth.as_mut().map(|a| &mut a.input),
+        }
+    }
+
     fn toast(&mut self, text: impl Into<String>) {
         self.toast = Some((text.into(), Instant::now()));
     }
@@ -392,7 +521,7 @@ pub fn run_store(options: StoreOptions) -> Result<(), String> {
     }
     if let Some(search) = options.search {
         state.search = search;
-        state.search_focus = true;
+        state.focused = FocusedInput::Search;
         state.view = NavSection::Browse;
     }
     if let Some(package) = options.package.clone() {
@@ -400,7 +529,7 @@ pub fn run_store(options: StoreOptions) -> Result<(), String> {
     }
 
     backend.refresh_catalog(false);
-    let mut hits = Hits::new();
+    let mut prev_hits = Hits::new();
 
     loop {
         if app.close {
@@ -417,13 +546,19 @@ pub fn run_store(options: StoreOptions) -> Result<(), String> {
             app.needs_redraw = true;
         }
 
+        let ime_active = !matches!(
+            state.active_focus(),
+            FocusedInput::None | FocusedInput::AuthPassword
+        );
+        app.set_ime_focus(ime_active);
+
         if app.needs_redraw {
-            hits = Hits::new();
+            let mut hits = Hits::new();
             let ime = {
                 let App {
                     canvas, text, theme, ..
                 } = &mut app;
-                draw_store(canvas, text, theme, &mut state, content, &mut hits)
+                draw_store(canvas, text, theme, &mut state, content, &prev_hits, &mut hits)
             };
             if let Some(spot) = ime {
                 app.set_ime_spot(spot);
@@ -432,6 +567,7 @@ pub fn run_store(options: StoreOptions) -> Result<(), String> {
             app.present().map_err(|e| e.to_string())?;
             state.hero_hover = hero_rect(content, state.queue_open)
                 .contains(state.last_pointer.0, state.last_pointer.1);
+            prev_hits = hits;
         }
 
         let timeout = if ui::has_active_animations() { 16 } else { 120 };
@@ -440,20 +576,22 @@ pub fn run_store(options: StoreOptions) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
         for event in events {
-            handle_event(&mut app, &mut state, &backend, &hits, event);
+            handle_event(&mut app, &mut state, &backend, &prev_hits, event);
         }
         let backend_events = backend.poll_events();
         if !backend_events.is_empty() {
             app.needs_redraw = true;
         }
         for event in backend_events {
-            apply_backend_event(&mut state, event);
+            apply_backend_event(&mut state, &backend, event);
         }
 
         if state.hero_slides().len() > 1
             && !state.hero_hover
             && state.view == NavSection::Discover
             && state.detail.is_none()
+            && state.preview.is_none()
+            && state.auth.is_none()
             && state.hero_last.elapsed() >= AUTO_ADVANCE
         {
             state.hero_index = (state.hero_index + 1) % state.hero_slides().len();
@@ -472,8 +610,8 @@ fn hero_rect(content: Rect, queue_open: bool) -> Rect {
         content.w - SIDEBAR_W,
         main_h.max(1),
     );
-    let area = Rect::new(main.x + 20, main.y + 12, main.w - 40, main.h - 24);
-    Rect::new(area.x, area.y, area.w, HERO_H)
+    let area = Rect::new(main.x + 22, main.y + 14, main.w - 44, main.h - 28);
+    Rect::new(area.x, area.y, area.w - SCROLLBAR_GUTTER, HERO_H)
 }
 
 fn handle_event(
@@ -494,8 +632,9 @@ fn handle_event(
             app.needs_redraw = true;
         }
         UiEvent::Wheel { x, y, delta } => {
-            handle_wheel(state, x, y, delta, app.content());
-            app.needs_redraw = true;
+            if handle_wheel(state, x, y, delta, app.content()) {
+                app.needs_redraw = true;
+            }
         }
         UiEvent::Button {
             x,
@@ -509,16 +648,16 @@ fn handle_event(
             if button == 1 && !down {
                 if let Some(action) = hits.at(x, y).cloned() {
                     perform_action(app, state, backend, action);
+                } else {
+                    state.focused = FocusedInput::None;
                 }
             }
             app.needs_redraw = true;
         }
         UiEvent::CommitText(text) => {
-            if state.search_focus {
-                state.search.push_str(&text);
-                app.needs_redraw = true;
-            } else if let Some(auth) = state.auth.as_mut() {
-                auth.input.push_str(&text);
+            state.preedit.clear();
+            if let Some(target) = state.active_input_mut() {
+                target.push_str(&text);
                 app.needs_redraw = true;
             }
         }
@@ -526,72 +665,123 @@ fn handle_event(
             state.preedit = text;
             app.needs_redraw = true;
         }
-        UiEvent::Key(key) => handle_key(app, state, backend, key),
+        UiEvent::Key(key) => {
+            if let Some(action) = handle_key_state(state, key) {
+                perform_action(app, state, backend, action);
+            }
+            app.needs_redraw = true;
+        }
     }
 }
 
-fn handle_key(app: &mut App, state: &mut StoreState, backend: &StoreBackend, key: Key) {
+fn handle_key_state(state: &mut StoreState, key: Key) -> Option<Action> {
     if key.is_escape() {
         if state.auth.is_some() {
-            perform_action(app, state, backend, Action::AuthCancel);
+            return Some(Action::AuthCancel);
         } else if state.preview.is_some() {
-            perform_action(app, state, backend, Action::PreviewCancel);
-        } else if state.search_focus {
-            state.search_focus = false;
+            return Some(Action::PreviewCancel);
+        } else if state.focused != FocusedInput::None {
+            state.focused = FocusedInput::None;
+            state.preedit.clear();
         } else if state.detail.is_some() {
             state.detail = None;
         } else if state.queue_open {
             state.queue_open = false;
         }
-        app.needs_redraw = true;
-        return;
+        return None;
     }
     if key.is_enter() {
         if state.auth.is_some() {
-            perform_action(app, state, backend, Action::AuthSubmit);
-        } else if state.preview.is_some() {
-            perform_action(app, state, backend, Action::PreviewConfirm);
+            return Some(Action::AuthSubmit);
         }
-        app.needs_redraw = true;
-        return;
+        if state.preview.is_some() {
+            return Some(Action::PreviewConfirm);
+        }
+        match state.active_focus() {
+            FocusedInput::RepoName | FocusedInput::RepoUrl => return Some(Action::RepoAddSubmit),
+            FocusedInput::TrustPath => return Some(Action::TrustAdd),
+            FocusedInput::Search => {
+                if state.view == NavSection::Discover || state.detail.is_some() {
+                    state.detail = None;
+                    state.view = NavSection::Browse;
+                    state.grid_scroll.snap_to(0.0);
+                }
+            }
+            FocusedInput::None | FocusedInput::AuthPassword => {}
+        }
+        return None;
     }
     if key.control() && key.text() == Some('f') {
-        state.search_focus = true;
+        state.detail = None;
         state.view = NavSection::Browse;
-        app.needs_redraw = true;
-        return;
+        state.focused = FocusedInput::Search;
+        state.grid_scroll.snap_to(0.0);
+        return None;
     }
-    if key.sym == 0xff08 {
-        if let Some(auth) = state.auth.as_mut() {
-            auth.input.pop();
-        } else if state.search_focus {
-            state.search.pop();
+    if key.control() && key.text() == Some('u') {
+        if let Some(buf) = state.active_input_mut() {
+            buf.clear();
         }
-        app.needs_redraw = true;
+        return None;
     }
+    if key.sym == 0xff09 && state.view == NavSection::Maintenance && state.preview.is_none() && state.auth.is_none() {
+        state.focused = match state.focused {
+            FocusedInput::RepoName => FocusedInput::RepoUrl,
+            FocusedInput::RepoUrl => FocusedInput::TrustPath,
+            _ => FocusedInput::RepoName,
+        };
+        return None;
+    }
+    if key.is_backspace() || key.sym == 0xff08 {
+        if let Some(buf) = state.active_input_mut() {
+            buf.pop();
+        }
+        return None;
+    }
+    if !key.control() && !key.alt() {
+        if let Some(ch) = key.text() {
+            if !ch.is_control() {
+                if let Some(buf) = state.active_input_mut() {
+                    buf.push_str(&ch.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
-fn handle_wheel(state: &mut StoreState, x: i32, y: i32, delta: i32, content: Rect) {
-    let _ = content;
-    let step = -(delta as f32) * 48.0;
-    if state.queue_open && y > content.y + content.h - QUEUE_H {
-        state.queue_scroll.wheel(step);
-    } else if state.view == NavSection::Maintenance {
-        state.maint_scroll.wheel(step);
-    } else if state.detail.is_some() {
-        state.detail_scroll.wheel(step);
-    } else {
-        state.grid_scroll.wheel(step);
+fn handle_wheel(state: &mut StoreState, _x: i32, y: i32, delta: i32, content: Rect) -> bool {
+    if state.auth.is_some() || state.preview.is_some() {
+        return false;
     }
-    let _ = x;
+    let step = (delta as f32) * 36.0;
+    if state.queue_open && y > content.y + content.h - QUEUE_H {
+        state.queue_scroll.wheel(step)
+    } else if state.detail.is_some() {
+        state.detail_scroll.wheel(step)
+    } else {
+        match state.view {
+            NavSection::Discover => state.discover_scroll.wheel(step),
+            NavSection::Maintenance => state.maint_scroll.wheel(step),
+            NavSection::Browse | NavSection::Updates | NavSection::Installed => {
+                state.grid_scroll.wheel(step)
+            }
+        }
+    }
 }
 
 fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend, action: Action) {
     match action {
+        Action::Noop => {}
         Action::Nav(view) => {
             state.view = view;
             state.detail = None;
+            if state.focused != FocusedInput::Search {
+                state.focused = FocusedInput::None;
+            }
             state.grid_scroll.snap_to(0.0);
+            state.discover_scroll.snap_to(0.0);
+            state.maint_scroll.snap_to(0.0);
             app.needs_redraw = true;
         }
         Action::Category(category) => {
@@ -601,10 +791,12 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
         }
         Action::Sort(sort) => {
             state.sort = sort;
+            state.grid_scroll.snap_to(0.0);
             app.needs_redraw = true;
         }
         Action::InstalledFilter(filter) => {
             state.installed_filter = filter;
+            state.grid_scroll.snap_to(0.0);
             app.needs_redraw = true;
         }
         Action::OpenDetail(name) => {
@@ -621,16 +813,17 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
         }
         Action::SetTab(tab) => {
             state.detail_tab = tab;
+            state.detail_scroll.snap_to(0.0);
             app.needs_redraw = true;
         }
         Action::Install(name) => {
-            enqueue_or_preview(app, state, backend, TxJobKind::Install(vec![name]), false);
+            enqueue_or_preview(app, state, backend, TxJobKind::Install(vec![name]));
         }
         Action::Update(name) => {
-            enqueue_or_preview(app, state, backend, TxJobKind::UpgradeOne(name), false);
+            enqueue_or_preview(app, state, backend, TxJobKind::UpgradeOne(name));
         }
         Action::UpdateAll => {
-            enqueue_or_preview(app, state, backend, TxJobKind::UpgradeAll, false);
+            enqueue_or_preview(app, state, backend, TxJobKind::UpgradeAll);
         }
         Action::RefreshCatalog => {
             state.loading = true;
@@ -641,6 +834,7 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
             if let Some(slide) = state.hero_slides().get(index).cloned() {
                 if slide.go_updates {
                     state.view = NavSection::Updates;
+                    state.detail = None;
                 } else if let Some(package) = slide.target_package {
                     perform_action(app, state, backend, Action::OpenDetail(package));
                 } else {
@@ -654,8 +848,20 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
             state.hero_last = Instant::now();
             app.needs_redraw = true;
         }
+        Action::HeroPrev => {
+            let len = state.hero_slides().len().max(1);
+            state.hero_index = (state.hero_index + len - 1) % len;
+            state.hero_last = Instant::now();
+            app.needs_redraw = true;
+        }
+        Action::HeroNext => {
+            let len = state.hero_slides().len().max(1);
+            state.hero_index = (state.hero_index + 1) % len;
+            state.hero_last = Instant::now();
+            app.needs_redraw = true;
+        }
         Action::Reinstall(name) => {
-            enqueue_or_preview(app, state, backend, TxJobKind::Reinstall(name), false);
+            enqueue_or_preview(app, state, backend, TxJobKind::Reinstall(name));
         }
         Action::Hold(name) => {
             backend.enqueue_job(TxJobKind::Hold(name), "锁定软件包");
@@ -673,11 +879,10 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
                     recursive: false,
                     purge: false,
                 },
-                false,
             );
         }
         Action::OpenAppearance => {
-            spawn_sibling("spui-settings", &["--page", "appearance"]);
+            spawn_sibling("spui", &["settings", "appearance"]);
             state.toast("正在打开系统设置的外观页…");
             app.needs_redraw = true;
         }
@@ -687,6 +892,7 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
         }
         Action::QueueTab(tab) => {
             state.queue_tab = tab;
+            state.queue_scroll.snap_to(0.0);
             app.needs_redraw = true;
         }
         Action::CancelJob(id) => {
@@ -707,7 +913,7 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
             backend.enqueue_job(TxJobKind::CacheClean, "清理软件包缓存");
         }
         Action::RepoRemove(name) => {
-            enqueue_or_preview(app, state, backend, TxJobKind::RepoRemove(name), false);
+            enqueue_or_preview(app, state, backend, TxJobKind::RepoRemove(name));
         }
         Action::RepoPriority(name, delta) => {
             let current = state
@@ -728,7 +934,7 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
             let name = state.repo_name.trim().to_string();
             let url = state.repo_url.trim().to_string();
             if name.is_empty() || url.is_empty() {
-                state.toast("请填写软件源名称与地址");
+                state.toast("请先点击输入框填写软件源名称与地址");
             } else {
                 backend.enqueue_job(
                     TxJobKind::RepoAdd {
@@ -744,21 +950,32 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
             app.needs_redraw = true;
         }
         Action::TrustAdd => {
-            let path = "/etc/spk/trusted.d".to_string();
-            backend.enqueue_job(TxJobKind::TrustAdd(path), "导入信任密钥");
+            let path = state.trust_path.trim().to_string();
+            if path.is_empty() {
+                state.toast("请输入要导入的公钥文件路径");
+            } else {
+                backend.enqueue_job(TxJobKind::TrustAdd(path), "导入信任密钥");
+            }
+            app.needs_redraw = true;
         }
-        Action::FocusSearch => {
-            state.search_focus = true;
+        Action::FocusInput(target) => {
+            state.focused = target;
+            state.preedit.clear();
+            if target == FocusedInput::Search && state.view == NavSection::Discover && state.detail.is_none() {
+                state.view = NavSection::Browse;
+            }
+            app.needs_redraw = true;
+        }
+        Action::ClearSearch => {
+            state.search.clear();
+            state.preedit.clear();
+            state.grid_scroll.snap_to(0.0);
             app.needs_redraw = true;
         }
         Action::PreviewConfirm => {
             if let Some(preview) = state.preview.take() {
                 let mut kind = preview.job.clone();
-                if let TxJobKind::Remove {
-                    name,
-                    ..
-                } = &kind
-                {
+                if let TxJobKind::Remove { name, .. } = &kind {
                     kind = TxJobKind::Remove {
                         name: name.clone(),
                         recursive: preview.recursive,
@@ -786,12 +1003,24 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
             }
             app.needs_redraw = true;
         }
-        Action::AuthSubmit => {
-            if let Some(auth) = state.auth.as_ref() {
-                backend.submit_auth(auth.input.clone());
-            }
+        Action::ToggleAuthReveal => {
             if let Some(auth) = state.auth.as_mut() {
+                auth.reveal = !auth.reveal;
+            }
+            app.needs_redraw = true;
+        }
+        Action::AuthSubmit => {
+            let secret = state.auth.as_mut().map(|auth| {
+                let s = auth.input.clone();
+                // SAFETY: overwrite input bytes immediately after handing secret to backend.
+                unsafe {
+                    auth.input.as_mut_vec().fill(0);
+                }
                 auth.input.clear();
+                s
+            });
+            if let Some(s) = secret {
+                backend.submit_auth(s);
             }
             app.needs_redraw = true;
         }
@@ -812,7 +1041,6 @@ fn enqueue_or_preview(
     state: &mut StoreState,
     backend: &StoreBackend,
     kind: TxJobKind,
-    _direct: bool,
 ) {
     if kind.needs_preview() && !state.offline {
         let title = kind.command_summary();
@@ -824,10 +1052,10 @@ fn enqueue_or_preview(
     app.needs_redraw = true;
 }
 
-fn apply_backend_event(state: &mut StoreState, event: BackendEvent) {
+fn apply_backend_event(state: &mut StoreState, backend: &StoreBackend, event: BackendEvent) {
     match event {
         BackendEvent::CatalogLoaded(Ok(snapshot)) => {
-            state.apply_snapshot(snapshot);
+            state.apply_snapshot(snapshot, Some(backend));
         }
         BackendEvent::CatalogLoaded(Err(error)) => {
             state.loading = false;
@@ -847,6 +1075,11 @@ fn apply_backend_event(state: &mut StoreState, event: BackendEvent) {
                 purge: false,
             });
         }
+        BackendEvent::BannerReady { rel_path, path } => {
+            if let Some(sprite) = icons::decode_theme_asset(&path, Some((720, 360))) {
+                state.banners.insert(rel_path, sprite);
+            }
+        }
         BackendEvent::MaintenanceCheckResult {
             title,
             result,
@@ -864,6 +1097,16 @@ fn apply_backend_event(state: &mut StoreState, event: BackendEvent) {
             state.jobs.push(job);
         }
         BackendEvent::JobUpdated(job) => {
+            if !matches!(job.status, TxJobStatus::WaitingAuth)
+                && state.auth.as_ref().is_some_and(|a| a.job_id == job.id)
+            {
+                state.auth = None;
+            }
+            if let TxJobStatus::Failed(ref err) = job.status {
+                state.toast(format!("任务 #{} 失败：{err}", job.id));
+            } else if matches!(job.status, TxJobStatus::Succeeded) {
+                state.toast(format!("{} 已完成", job.title));
+            }
             match state.jobs.iter_mut().find(|j| j.id == job.id) {
                 Some(existing) => *existing = job,
                 None => state.jobs.push(job),
@@ -887,6 +1130,7 @@ fn apply_backend_event(state: &mut StoreState, event: BackendEvent) {
                 command: command_preview,
                 error: error_msg,
                 input: String::new(),
+                reveal: false,
             });
         }
     }
@@ -985,5 +1229,91 @@ mod tests {
         assert!(hits.at(200, 200).is_none());
         assert!(hits.hover_rect(25, 25, inner));
         assert!(!hits.hover_rect(25, 25, outer));
+    }
+
+    #[test]
+    fn wheel_scroll_down_increases_offset() {
+        let mut state = StoreState::new();
+        state
+            .discover_scroll
+            .set_bounds(400.0, 1200.0, Rect::new(0, 0, 8, 400));
+        // At offset 0, wheel UP (delta < 0) cannot scroll further up; wheel DOWN (delta > 0) scrolls down.
+        assert!(!handle_wheel(&mut state, 400, 300, -3, Rect::new(0, 0, 1000, 700)));
+        assert!(handle_wheel(&mut state, 400, 300, 3, Rect::new(0, 0, 1000, 700)));
+
+        state.view = NavSection::Browse;
+        state
+            .grid_scroll
+            .set_bounds(400.0, 1200.0, Rect::new(0, 0, 8, 400));
+        state.grid_scroll.snap_to(200.0);
+        assert!(handle_wheel(&mut state, 400, 300, -3, Rect::new(0, 0, 1000, 700)));
+    }
+
+    #[test]
+    fn handle_key_updates_focused_inputs() {
+        let mut state = StoreState::new();
+        state.focused = FocusedInput::RepoName;
+        for ch in ['m', 'y', '-', 'r'] {
+            handle_key_state(
+                &mut state,
+                Key {
+                    code: 0,
+                    state: 0,
+                    sym: ch as u32,
+                },
+            );
+        }
+        assert_eq!(state.repo_name, "my-r");
+        handle_key_state(
+            &mut state,
+            Key {
+                code: 0,
+                state: 0,
+                sym: 0xff08,
+            },
+        );
+        assert_eq!(state.repo_name, "my-");
+        state.view = NavSection::Maintenance;
+        handle_key_state(
+            &mut state,
+            Key {
+                code: 0,
+                state: 0,
+                sym: 0xff09,
+            },
+        );
+        assert_eq!(state.focused, FocusedInput::RepoUrl);
+
+        state.auth = Some(AuthPrompt {
+            job_id: 1,
+            title: "t".into(),
+            command: "c".into(),
+            error: None,
+            input: String::new(),
+            reveal: false,
+        });
+        handle_key_state(
+            &mut state,
+            Key {
+                code: 0,
+                state: 0,
+                sym: 'p' as u32,
+            },
+        );
+        assert_eq!(state.auth.as_ref().unwrap().input, "p");
+    }
+
+    #[test]
+    fn modal_backdrop_blocks_underlying_hits() {
+        let mut hits = Hits::new();
+        let screen = Rect::new(0, 0, 1060, 700);
+        let underlying_btn = Rect::new(40, 40, 120, 30);
+        let cancel_btn = Rect::new(500, 420, 92, 30);
+        hits.push(underlying_btn, Action::RefreshCatalog);
+        hits.push(screen, Action::Noop);
+        hits.push(cancel_btn, Action::PreviewCancel);
+
+        assert!(matches!(hits.at(50, 50), Some(Action::Noop)));
+        assert!(matches!(hits.at(520, 430), Some(Action::PreviewCancel)));
     }
 }

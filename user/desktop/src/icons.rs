@@ -58,6 +58,22 @@ const STORE_CHECK_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBo
   <path d="M37.6 8.2l0.7 5.3-5.2-1.4z" fill="#ffffff"/>
 </svg>"##;
 
+const SHIELD_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <defs>
+    <linearGradient id="shbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="52%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1e3a8a"/>
+    </linearGradient>
+  </defs>
+  <path d="M24 4 L40 10.5 V23 C40 33.5 32.8 41.2 24 44.5 C15.2 41.2 8 33.5 8 23 V10.5 Z" fill="url(#shbg)"/>
+  <path d="M24 6.5 L37.5 12 V23 C37.5 31.8 31.4 38.4 24 41.5 C16.6 38.4 10.5 31.8 10.5 23 V12 Z" fill="none" stroke="#bae6fd" stroke-width="1.2" opacity="0.55"/>
+  <rect x="17.5" y="21.5" width="13" height="10.5" rx="2.4" fill="#ffffff" opacity="0.96"/>
+  <path d="M20 21.5 V18.5 a4 4 0 0 1 8 0 V21.5" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round"/>
+  <circle cx="24" cy="26.5" r="1.6" fill="#1d4ed8"/>
+</svg>
+"##;
+
 const STORE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
   <defs>
     <linearGradient id="stbg" x1="0" y1="0" x2="1" y2="1">
@@ -105,6 +121,7 @@ pub enum Icon {
     StoreCheck,
     Help,
     Login,
+    Shield,
     Notify,
     Appearance,
     Wallpaper,
@@ -194,6 +211,7 @@ define_svg_icons! {
     StoreCheck => "store-check.svg",
     Help => "help.svg",
     Login => "login.svg",
+    Shield => "shield.svg",
     Notify => "notify.svg",
     Appearance => "appearance.svg",
     Wallpaper => "wallpaper.svg",
@@ -379,6 +397,7 @@ impl IconStore {
                 Err(_) if icon == Icon::Browser => String::from(BROWSER_SVG),
                 Err(_) if icon == Icon::Store => String::from(STORE_SVG),
                 Err(_) if icon == Icon::StoreCheck => String::from(STORE_CHECK_SVG),
+                Err(_) if icon == Icon::Shield => String::from(SHIELD_SVG),
                 Err(_) => return None,
             };
             self.svg_sources.insert(icon, xml);
@@ -654,6 +673,16 @@ mod tests {
         let sprite = store
             .render_svg(Icon::Store, 48, None)
             .expect("embedded store SVG must render");
+        assert_eq!((sprite.width, sprite.height), (48, 48));
+        assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
+    }
+
+    #[test]
+    fn shield_builtin_svg_renders_cleanly() {
+        let mut store = IconStore::new();
+        let sprite = store
+            .render_svg(Icon::Shield, 48, None)
+            .expect("embedded shield SVG must render");
         assert_eq!((sprite.width, sprite.height), (48, 48));
         assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
     }

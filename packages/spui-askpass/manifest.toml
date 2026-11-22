@@ -1,0 +1,42 @@
+#
+#       packages/spui-askpass/manifest.toml
+#       SpaceOS graphical authentication helper for sudo -A
+#
+#       2026/11/22 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "spui-askpass"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "SpaceOS 图形管理员授权弹窗（spui-askpass）"
+description = "面向 sudo -A 与桌面管理工具的独立图形认证助手，提供账号识别、权限命令预览与安全密码输入。"
+license = "LicenseRef-Proprietary"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = ["sudo>=0.1.0-5"]
+provides = ["spui-askpass", "sudo-askpass"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false
+
+[store]
+display_name = "Space 图形授权助手"
+subtitle = "sudo -A 图形密码验证 · 账号与命令安全预览"
+category = "system"
+icon = "shield"
+accent = ["#2563eb", "#1e3a8a"]
+featured_rank = 78
+highlights = [
+    "面向 sudo -A 的系统级非特权图形密码验证弹窗",
+    "支持密码显示切换、错误重试提示与退出后内存清零",
+    "独立软件包分发，可被 Space 商店及所有桌面管理工具复用",
+]

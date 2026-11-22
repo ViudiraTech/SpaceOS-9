@@ -21,6 +21,13 @@ rm -rf "$STAGE"
 install -d -m 0755 "$STAGE/usr/bin" "$STAGE/etc"
 install -m 4755 "$BIN/sudo" "$STAGE/usr/bin/sudo"
 install -m 4755 "$BIN/doas" "$STAGE/usr/bin/doas"
+cat > "$STAGE/etc/sudoers" <<'POLICY'
+# SpaceOS-9 default sudoers policy
+Defaults lecture=once,timestamp_timeout=5,secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+root ALL=(ALL) ALL
+%wheel ALL=(ALL) ALL
+%sudo ALL=(ALL) ALL
+POLICY
 cat > "$STAGE/etc/sudoers.example" <<'POLICY'
 # SpaceOS-9 sudoers example. Install as /etc/sudoers mode 0440 root.
 Defaults lecture=once,timestamp_timeout=15,secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -30,5 +37,5 @@ cat > "$STAGE/etc/doas.conf.example" <<'POLICY'
 # SpaceOS-9 doas example. Install as /etc/doas.conf mode 0440 root.
 permit :wheel
 POLICY
-chmod 0440 "$STAGE/etc/sudoers.example" "$STAGE/etc/doas.conf.example"
+chmod 0440 "$STAGE/etc/sudoers" "$STAGE/etc/sudoers.example" "$STAGE/etc/doas.conf.example"
 printf 'staged sudo in %s\n' "$STAGE"

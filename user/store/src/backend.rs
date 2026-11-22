@@ -7,7 +7,7 @@ use crate::model::{
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::RawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -46,6 +46,11 @@ pub enum BackendCmd {
     RefreshCatalog { offline: bool },
     LoadPackageDetails { name: String },
     PreviewTx { kind: TxJobKind, title: String },
+    FetchBanner {
+        rel_path: String,
+        dest: PathBuf,
+        offline: bool,
+    },
     RunCheck,
     RunVerify,
     EnqueueJob { kind: TxJobKind, title: String },
@@ -67,6 +72,10 @@ pub enum BackendEvent {
         kind: TxJobKind,
         title: String,
         plan: Result<TxPlanJson, String>,
+    },
+    BannerReady {
+        rel_path: String,
+        path: PathBuf,
     },
     MaintenanceCheckResult {
         title: String,
@@ -213,6 +222,14 @@ impl StoreBackend {
         let _ = self.query_tx.send(BackendCmd::PreviewTx {
             kind,
             title: title.into(),
+        });
+    }
+
+    pub fn fetch_banner(&self, rel_path: impl Into<String>, dest: PathBuf, offline: bool) {
+        let _ = self.query_tx.send(BackendCmd::FetchBanner {
+            rel_path: rel_path.into(),
+            dest,
+            offline,
         });
     }
 
@@ -412,6 +429,46 @@ fn query_worker(
                     BackendEvent::PreviewReady { kind, title, plan },
                 );
             }
+            BackendCmd::FetchBanner {
+                rel_path,
+                dest,
+                offline,
+            } => {
+                if dest.is_file() {
+                    emit(
+                        &ev_tx,
+                        &wake,
+                        BackendEvent::BannerReady {
+                            rel_path,
+                            path: dest,
+                        },
+                    );
+                } else {
+                    let spk = resolve_spk_bin();
+                    let mut cmd = Command::new(spk);
+                    cmd.env("LC_ALL", "C.UTF-8").env("NO_COLOR", "1");
+                    if offline {
+                        cmd.arg("--offline");
+                    }
+                    cmd.arg("fetch-asset")
+                        .arg(&rel_path)
+                        .arg("--out")
+                        .arg(&dest)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                    if cmd.status().is_ok_and(|s| s.success()) && dest.is_file() {
+                        emit(
+                            &ev_tx,
+                            &wake,
+                            BackendEvent::BannerReady {
+                                rel_path,
+                                path: dest,
+                            },
+                        );
+                    }
+                }
+            }
             BackendCmd::RunCheck => {
                 let res = run_spk_json_cmd(&["--json", "--lang", "zh_CN", "check"]);
                 let event = match res {
@@ -532,6 +589,50 @@ fn tx_worker(
     }
 }
 
+pub fn summarize_sudo_error(stderr: &str) -> String {
+    let meaningful: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with("warning:")
+                && !l.starts_with("We trust you")
+                && !l.starts_with("usually boils down")
+                && !l.starts_with("#1)")
+                && !l.starts_with("#2)")
+                && !l.starts_with("#3)")
+                && !l.starts_with("[sudo]")
+        })
+        .collect();
+    if meaningful.is_empty() {
+        return String::new();
+    }
+    let joined = meaningful.join(" ");
+    let lower = joined.to_ascii_lowercase();
+    if lower.contains("authentication cancelled")
+        || lower.contains("canceled")
+        || lower.contains("cancelled")
+    {
+        return String::new();
+    }
+    if lower.contains("too many") || lower.contains("locked") || joined.contains("锁定") {
+        return "错误次数过多，账户已暂时锁定，请稍后再试。".into();
+    }
+    if lower.contains("incorrect password")
+        || lower.contains("try again")
+        || joined.contains("密码错误")
+    {
+        return "密码错误，请重试。".into();
+    }
+    if lower.contains("not in the sudoers")
+        || lower.contains("not allowed")
+        || joined.contains("无权限")
+    {
+        return "当前用户无管理员授权权限。".into();
+    }
+    meaningful.last().unwrap_or(&"").to_string()
+}
+
 fn ensure_privilege_for_job(
     job: &mut TxJob,
     auth_rx: &mpsc::Receiver<AuthReply>,
@@ -552,6 +653,59 @@ fn ensure_privilege_for_job(
         .is_ok_and(|s| s.success())
     {
         return Some(true);
+    }
+
+    let askpass_path = Path::new("/usr/bin/spui-askpass");
+    if askpass_path.is_file() {
+        job.status = TxJobStatus::WaitingAuth;
+        job.phase = "auth".into();
+        job.phase_msg = "等待系统管理员授权…".into();
+        emit(ev_tx, wake, BackendEvent::JobUpdated(job.clone()));
+
+        let cmd_preview = format!("sudo {}", job.kind.command_summary());
+        match Command::new(sudo)
+            .args(["-A", "-v"])
+            .env("SUDO_ASKPASS", askpass_path)
+            .env("SPUI_AUTH_TITLE", format!("Space 商店 · {}", job.title))
+            .env("SPUI_AUTH_CMD", &cmd_preview)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            Ok(out) if out.status.success() => return Some(true),
+            Ok(out) => {
+                let msg = summarize_sudo_error(&String::from_utf8_lossy(&out.stderr));
+                if !msg.is_empty() {
+                    emit(
+                        ev_tx,
+                        wake,
+                        BackendEvent::JobLog {
+                            job_id: job.id,
+                            entry: LogEntry {
+                                text: format!("授权失败：{msg}"),
+                                level: LogLevel::Error,
+                            },
+                        },
+                    );
+                }
+                return None;
+            }
+            Err(e) => {
+                emit(
+                    ev_tx,
+                    wake,
+                    BackendEvent::JobLog {
+                        job_id: job.id,
+                        entry: LogEntry {
+                            text: format!("无法启动 sudo askpass：{e}"),
+                            level: LogLevel::Error,
+                        },
+                    },
+                );
+                return None;
+            }
+        }
     }
 
     let mut error_msg: Option<String> = None;
@@ -596,11 +750,11 @@ fn ensure_privilege_for_job(
                 match child.wait_with_output() {
                     Ok(out) if out.status.success() => return Some(true),
                     Ok(out) => {
-                        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                        error_msg = Some(if msg.is_empty() {
+                        let summary = summarize_sudo_error(&String::from_utf8_lossy(&out.stderr));
+                        error_msg = Some(if summary.is_empty() {
                             "密码验证失败或无 sudo 权限，请重试。".into()
                         } else {
-                            format!("验证失败：{msg}")
+                            summary
                         });
                     }
                     Err(e) => {
@@ -941,5 +1095,28 @@ mod tests {
         let msg = extract_spk_error(json_out, "stderr noise", Some(1));
         assert!(msg.contains("目标未找到"));
         assert!(msg.contains("missing foo"));
+    }
+
+    #[test]
+    fn summarize_sudo_error_strips_warnings_and_lecture() {
+        let raw = "\
+warning: /etc/sudoers not found; using built-in %wheel/%sudo rule
+We trust you have received the usual lecture from the local System
+Administrator. It usually boils down to these three things:
+#1) Respect the privacy of others.
+#2) Think before you type.
+#3) With great power comes great responsibility.
+[sudo] password for alice:
+sudo: incorrect password
+";
+        assert_eq!(summarize_sudo_error(raw), "密码错误，请重试。");
+        assert_eq!(
+            summarize_sudo_error("warning: minor\nsudo: authentication cancelled\n"),
+            ""
+        );
+        assert_eq!(
+            summarize_sudo_error("sudo: too many failed authentication attempts; try again later\n"),
+            "错误次数过多，账户已暂时锁定，请稍后再试。"
+        );
     }
 }

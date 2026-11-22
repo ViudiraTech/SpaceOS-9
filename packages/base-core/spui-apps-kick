@@ -1,0 +1,31 @@
+#!/bin/sh
+# Bump the SPUI application reload stamp after a package transaction and broadcast
+# a monotonic generation token over uxconfd so live desktop & start screen reload cleanly.
+set -eu
+
+mkdir -p /run
+prev=0
+if [ -r /run/spui-apps.stamp ]; then
+    prev_raw=$(cat /run/spui-apps.stamp 2>/dev/null || true)
+    case "$prev_raw" in
+        *[!0-9]*|"") prev=0 ;;
+        *) prev=$prev_raw ;;
+    esac
+fi
+
+now=$(date +%s 2>/dev/null || echo 0)
+gen=$((prev + 1))
+if [ "$now" -gt "$gen" ] 2>/dev/null; then
+    gen=$now
+fi
+
+tmp="/run/spui-apps.stamp.tmp.$$"
+printf '%s\n' "$gen" > "$tmp"
+chmod 0644 "$tmp"
+mv -f "$tmp" /run/spui-apps.stamp
+
+if [ -S /run/uxconfd.sock ] || [ -S /tmp/uxconfd.sock ]; then
+    if command -v uxconf-query >/dev/null 2>&1; then
+        uxconf-query -c desktop -p /apps/reload-gen -s "$gen" -t string >/dev/null 2>&1 || true
+    fi
+fi

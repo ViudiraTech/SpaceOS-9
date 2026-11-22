@@ -16,6 +16,7 @@ mod app;
 mod apps;
 mod compositor;
 mod ddm;
+mod desktop_entries;
 mod draw;
 mod icons;
 mod ime;
@@ -41,6 +42,23 @@ fn main() -> ExitCode {
         "shell"
     };
     let mode = arguments.get(1).map(String::as_str).unwrap_or(default_mode);
+    if matches!(mode, "auth" | "askpass") {
+        let helper = "/usr/bin/spui-askpass";
+        if !std::path::Path::new(helper).is_file() {
+            eprintln!("spui: {helper} 未安装，请先安装 spui-askpass 软件包");
+            return ExitCode::FAILURE;
+        }
+        return match std::process::Command::new(helper)
+            .args(arguments.get(2..).unwrap_or(&[]))
+            .status()
+        {
+            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+            Err(error) => {
+                eprintln!("spui: 无法启动 {helper}: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let result = match mode {
         "shell" => shell::Shell::run(),
         "imed" => ime::run(),

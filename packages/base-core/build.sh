@@ -46,6 +46,8 @@ install -d -m 0755 "$STAGE/usr/share/doc/base-core"
 install -m 0644 "$ROOT/packages/base-core/THIRD_PARTY_NOTICES.md" "$STAGE/usr/share/doc/base-core/THIRD_PARTY_NOTICES.md"
 install -m 0755 "$ROOT/packages/base-core/spui-theme-kick" "$STAGE/usr/bin/spui-theme-kick"
 install -m 0644 "$ROOT/packages/base-core/90-spui-theme-reload.hook" "$STAGE/etc/spk/hooks.d/90-spui-theme-reload.hook"
+install -m 0755 "$ROOT/packages/base-core/spui-apps-kick" "$STAGE/usr/bin/spui-apps-kick"
+install -m 0644 "$ROOT/packages/base-core/90-spui-apps-reload.hook" "$STAGE/etc/spk/hooks.d/90-spui-apps-reload.hook"
 if [ -f "$SYSTEMG" ]; then
     install -m 0755 "$SYSTEMG" "$STAGE/sbin/systemg"
 fi

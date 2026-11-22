@@ -30,6 +30,7 @@ pub struct HeroSlide {
     pub grad_right: u32,
     pub accent_pill: u32,
     pub icon: Icon,
+    pub banner: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +88,7 @@ pub fn icon_from_name(name: Option<&str>, fallback: Icon) -> Icon {
         "about" => Icon::About,
         "folder" => Icon::Folder,
         "user" => Icon::UserHome,
+        "shield" => Icon::Shield,
         _ => fallback,
     }
 }
@@ -123,12 +125,12 @@ pub fn accent_colors(meta: Option<&StoreMeta>, category: StoreCategory) -> [u32;
     colors
 }
 
-/// Darken a colour by `factor` (0..1) for the gradient's lower stop.
+/// Scale a colour's brightness by `factor`, clamping each RGB channel to 0..=255.
 fn shade(color: u32, factor: f32) -> u32 {
-    let r = ((color >> 16) & 0xff) as f32 * factor;
-    let g = ((color >> 8) & 0xff) as f32 * factor;
-    let b = (color & 0xff) as f32 * factor;
-    ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+    let r = (((color >> 16) & 0xff) as f32 * factor).clamp(0.0, 255.0).round() as u32;
+    let g = (((color >> 8) & 0xff) as f32 * factor).clamp(0.0, 255.0).round() as u32;
+    let b = ((color & 0xff) as f32 * factor).clamp(0.0, 255.0).round() as u32;
+    (r << 16) | (g << 8) | b
 }
 
 pub fn present_package(pkg: &StorePackage, meta: Option<&StoreMeta>) -> PackagePresentation {
@@ -208,6 +210,7 @@ pub fn build_hero_slides(catalog: &CatalogJson) -> Vec<HeroSlide> {
             grad_right: 0x1d4ed8,
             accent_pill: 0x38bdf8,
             icon: Icon::Refresh,
+            banner: None,
         });
     }
 
@@ -236,6 +239,12 @@ pub fn build_hero_slides(catalog: &CatalogJson) -> Vec<HeroSlide> {
                     .and_then(|c| parse_hex_color(c))
                     .unwrap_or_else(|| shade(top, 0.72));
             }
+            let banner = slide.banner.clone().or_else(|| {
+                package
+                    .as_deref()
+                    .and_then(|name| catalog.meta_for(name))
+                    .and_then(|m| m.banner.clone())
+            });
             slides.push(HeroSlide {
                 overline: slide.overline.clone(),
                 title: slide.title.clone(),
@@ -251,6 +260,7 @@ pub fn build_hero_slides(catalog: &CatalogJson) -> Vec<HeroSlide> {
                 grad_right: accent[1],
                 accent_pill: shade(accent[0], 1.25),
                 icon: icon_from_name(slide.icon.as_deref(), Icon::Store),
+                banner,
             });
         }
     }
@@ -267,6 +277,7 @@ pub fn build_hero_slides(catalog: &CatalogJson) -> Vec<HeroSlide> {
             grad_right: 0x2563eb,
             accent_pill: 0x38bdf8,
             icon: Icon::Store,
+            banner: None,
         });
     }
 

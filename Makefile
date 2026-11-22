@@ -158,7 +158,7 @@ export SPK_REPO_KEY
 export SPK_REPO_PUBLIC
 export SPK_SECURITY
 
-.PHONY: bench desktop desktop-iso desktop-spui desktop-store desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all all-packages kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
+.PHONY: bench desktop desktop-iso desktop-spui desktop-store desktop-askpass desktop-browser musl-sysroot desktop-rootfs desktop-run release-try all all-packages kernel modules iso rootfs-image busybox run debug test test-single test-modules test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help packages repo image p5-isos
 all: release-try
 
 # Packaging needs the musl target, BusyBox/musl sources and a CA bundle.
@@ -227,7 +227,7 @@ rootfs-image: modules
 busybox:
 	tools/build_busybox.sh
 
-packages: desktop-store
+packages: desktop-store desktop-askpass
 	SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" tools/build_packages.sh
 
 repo: packages
@@ -268,9 +268,12 @@ desktop-iso:
 desktop-spui:
 	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/desktop/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
 
-# The store ships as its own package (space-store), not inside the base image.
+# The store and askpass helper ship as their own packages, not inside the base image.
 desktop-store:
 	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/store/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
+
+desktop-askpass:
+	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/askpass/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
 
 musl-sysroot:
 	python3 tools/ensure_musl_sysroot.py

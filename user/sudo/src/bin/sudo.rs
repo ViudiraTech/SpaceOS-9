@@ -44,6 +44,9 @@ struct Cli {
     /// Read the password from standard input
     #[arg(short = 'S', long)]
     stdin_password: bool,
+    /// Use an external GUI askpass helper for password input
+    #[arg(short = 'A', long = "askpass")]
+    askpass: bool,
     /// Edit files instead of running a command
     #[arg(short = 'e', long)]
     edit: bool,
@@ -66,6 +69,7 @@ fn options(cli: &Cli, doas: bool) -> Options {
         preserve_env: cli.preserve_env,
         non_interactive: cli.non_interactive,
         stdin_password: cli.stdin_password,
+        askpass: cli.askpass,
         doas,
         command: cli.command.clone(),
     }

@@ -30,6 +30,7 @@ pub struct Options {
     pub preserve_env: bool,
     pub non_interactive: bool,
     pub stdin_password: bool,
+    pub askpass: bool,
     pub doas: bool,
     pub command: Vec<String>,
 }
@@ -54,15 +55,19 @@ fn tty_name() -> String {
     }
 }
 
-fn read_password(stdin_password: bool) -> Result<String, String> {
+fn read_password_from_reader(reader: &mut dyn BufRead) -> Result<Option<String>, String> {
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).map_err(|error| error.to_string())?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+}
+
+fn read_password(stdin_password: bool) -> Result<Option<String>, String> {
     if stdin_password {
-        eprint!("{}", lecture::password_prompt());
-        let _ = io::stderr().flush();
-        let mut line = String::new();
-        io::stdin()
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
-        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+        let mut stdin = io::stdin().lock();
+        return read_password_from_reader(&mut stdin);
     }
     let mut tty = fs::OpenOptions::new()
         .read(true)
@@ -88,8 +93,192 @@ fn read_password(stdin_password: bool) -> Result<String, String> {
         libc::tcsetattr(fd, libc::TCSANOW, &original);
     }
     writeln!(tty).ok();
-    read.map_err(|error| error.to_string())?;
-    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    let n = read.map_err(|error| error.to_string())?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+}
+
+fn resolve_askpass_program(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    let candidate = if let Some(path) = explicit {
+        path.to_path_buf()
+    } else if let Some(env) = std::env::var_os("SUDO_ASKPASS").filter(|v| !v.is_empty()) {
+        PathBuf::from(env)
+    } else {
+        let default = PathBuf::from("/usr/bin/spui-askpass");
+        if default.is_file() {
+            default
+        } else {
+            return Err(
+                "no askpass program specified (set SUDO_ASKPASS or install /usr/bin/spui-askpass)"
+                    .into(),
+            );
+        }
+    };
+    if !candidate.is_absolute() {
+        return Err(format!(
+            "askpass program '{}' must be an absolute path",
+            candidate.display()
+        ));
+    }
+    let meta = fs::metadata(&candidate)
+        .map_err(|error| format!("cannot run askpass '{}': {error}", candidate.display()))?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "askpass program '{}' is not executable",
+            candidate.display()
+        ));
+    }
+    Ok(candidate)
+}
+
+fn read_password_askpass(
+    explicit_helper: Option<&Path>,
+    prompt: &str,
+    user: &User,
+    uid: u32,
+    euid: u32,
+    attempt: u32,
+    max_attempts: u32,
+    last_error: Option<&str>,
+) -> Result<Option<String>, String> {
+    let helper = resolve_askpass_program(explicit_helper)?;
+    let mut cmd = Command::new(&helper);
+    cmd.arg(prompt)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    for var in [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "DISPLAY",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "LANG",
+        "LC_ALL",
+        "LANGUAGE",
+        "SPK_LANG",
+        "TZ",
+        "SPUI_AUTH_TITLE",
+        "SPUI_AUTH_CMD",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+    cmd.env("SPUI_AUTH_ATTEMPT", (attempt + 1).to_string());
+    cmd.env("SPUI_AUTH_MAX_ATTEMPTS", max_attempts.to_string());
+    if let Some(err) = last_error {
+        cmd.env("SPUI_AUTH_ERROR", err);
+    }
+    // Always run the graphical askpass dialog under the invoking user's UID/GID.
+    if euid == 0 && uid != 0 {
+        cmd.uid(user.uid).gid(user.gid);
+    }
+    let output = cmd
+        .output()
+        .map_err(|error| format!("cannot run askpass '{}': {error}", helper.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let pw = text.lines().next().unwrap_or("").trim_end_matches('\r');
+    Ok(Some(pw.to_string()))
+}
+
+fn authenticate_with<F>(
+    paths: &Paths,
+    defaults: &Defaults,
+    user: &User,
+    uid: u32,
+    options: &Options,
+    lecture_mode: bool,
+    mut read_next: F,
+) -> Result<bool, String>
+where
+    F: FnMut(u32, u32, Option<&str>) -> Result<Option<String>, String>,
+{
+    if options.non_interactive {
+        return Err("a password is required and --non-interactive was given".into());
+    }
+    let lock_window = defaults.timestamp_timeout.max(300);
+    if ticket::locked(paths, uid, defaults.passwd_tries, lock_window) {
+        return Err("too many failed authentication attempts; try again later".into());
+    }
+    if lecture_mode
+        && !options.stdin_password
+        && !options.askpass
+        && lecture::needs_lecture(paths, uid, defaults.lecture)
+    {
+        let text = lecture::lecture_text(defaults).map_err(|error| error.to_string())?;
+        eprint!("{text}");
+        eprintln!();
+    }
+    let max_attempts = if options.stdin_password {
+        1
+    } else {
+        defaults.passwd_tries.max(1)
+    };
+    let mut last_error: Option<String> = None;
+    for attempt in 0..max_attempts {
+        let Some(mut password) = read_next(attempt, max_attempts, last_error.as_deref())? else {
+            return Err(if options.askpass {
+                "authentication cancelled"
+            } else if attempt == 0 {
+                "no password provided"
+            } else {
+                "incorrect password"
+            }
+            .into());
+        };
+        let verify = auth::verify_password(paths, &user.name, &password);
+        let is_empty = password.is_empty();
+        // Zero plaintext password immediately after verification.
+        unsafe {
+            password.as_mut_vec().fill(0);
+        }
+        password.clear();
+        match verify {
+            Ok(()) => {
+                ticket::clear_failures(paths, uid).map_err(|error| error.to_string())?;
+                if lecture_mode
+                    && !options.stdin_password
+                    && !options.askpass
+                    && lecture::needs_lecture(paths, uid, defaults.lecture)
+                {
+                    lecture::mark_lectured(paths, uid).map_err(|error| error.to_string())?;
+                }
+                return Ok(is_empty);
+            }
+            Err(auth::AuthError::BadPassword) => {
+                ticket::record_failure(paths, uid).map_err(|error| error.to_string())?;
+                if attempt + 1 >= max_attempts {
+                    return Err("incorrect password".into());
+                }
+                let remaining = max_attempts - attempt - 1;
+                last_error = Some(if lecture::lang_is_zh() || options.askpass {
+                    format!("密码错误，请重试（还可尝试 {remaining} 次）")
+                } else {
+                    "Sorry, try again.".into()
+                });
+                if !options.askpass {
+                    if lecture::lang_is_zh() {
+                        eprintln!("密码错误，请重试。");
+                    } else {
+                        eprintln!("Sorry, try again.");
+                    }
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("incorrect password".into())
 }
 
 fn authenticate(
@@ -100,47 +289,31 @@ fn authenticate(
     options: &Options,
     lecture_mode: bool,
 ) -> Result<bool, String> {
-    if options.non_interactive {
-        return Err("a password is required and --non-interactive was given".into());
-    }
-    if ticket::locked(
+    let euid = effective_uid();
+    authenticate_with(
         paths,
+        defaults,
+        user,
         uid,
-        defaults.passwd_tries,
-        defaults.timestamp_timeout.max(300),
-    ) {
-        return Err("too many failed authentication attempts; try again later".into());
-    }
-    if lecture_mode && lecture::needs_lecture(paths, uid, defaults.lecture) {
-        let text = lecture::lecture_text(defaults).map_err(|error| error.to_string())?;
-        eprint!("{text}");
-        eprintln!();
-    }
-    for attempt in 0..defaults.passwd_tries.max(1) {
-        let password = read_password(options.stdin_password)?;
-        match auth::verify_password(paths, &user.name, &password) {
-            Ok(()) => {
-                ticket::clear_failures(paths, uid).map_err(|error| error.to_string())?;
-                if lecture_mode && lecture::needs_lecture(paths, uid, defaults.lecture) {
-                    lecture::mark_lectured(paths, uid).map_err(|error| error.to_string())?;
-                }
-                return Ok(password.is_empty());
+        options,
+        lecture_mode,
+        |attempt, max_attempts, last_error| {
+            if options.askpass {
+                read_password_askpass(
+                    None,
+                    &lecture::password_prompt(),
+                    user,
+                    uid,
+                    euid,
+                    attempt,
+                    max_attempts,
+                    last_error,
+                )
+            } else {
+                read_password(options.stdin_password)
             }
-            Err(auth::AuthError::BadPassword) => {
-                ticket::record_failure(paths, uid).map_err(|error| error.to_string())?;
-                if attempt + 1 >= defaults.passwd_tries.max(1) {
-                    return Err("incorrect password".into());
-                }
-                if lecture::lang_is_zh() {
-                    eprintln!("密码错误，请重试。");
-                } else {
-                    eprintln!("Sorry, try again.");
-                }
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Err("incorrect password".into())
+        },
+    )
 }
 
 fn announce_first_auth(paths: &Paths, uid: u32, empty_password: bool) {
@@ -660,9 +833,43 @@ mod tests {
             preserve_env: false,
             non_interactive: false,
             stdin_password: false,
+            askpass: false,
             doas: false,
             command: command.iter().map(|value| value.to_string()).collect(),
         }
+    }
+
+    fn test_paths(password: &str) -> (tempfile::TempDir, Paths, User) {
+        use sha_crypt::password_hash::PasswordHasher;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        fs::create_dir_all(&paths.etc).unwrap();
+        let hash = if password.is_empty() {
+            String::new()
+        } else {
+            sha_crypt::ShaCrypt::SHA512
+                .hash_password_with_salt(password.as_bytes(), b"testsalt")
+                .unwrap()
+                .to_string()
+        };
+        fs::write(
+            paths.passwd(),
+            "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000:Alice:/home/alice:/bin/sh\n",
+        )
+        .unwrap();
+        fs::write(
+            paths.shadow(),
+            format!("root:!::0:::::\nalice:{hash}:20000:0:99999:7:::\n"),
+        )
+        .unwrap();
+        let user = User {
+            name: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            home: "/home/alice".into(),
+            shell: "/bin/sh".into(),
+        };
+        (dir, paths, user)
     }
 
     #[test]
@@ -680,5 +887,72 @@ mod tests {
             vec!["spk".to_string(), "sync".to_string()]
         );
         assert!(command_for_shell(&options(&[], true, false)).is_empty());
+    }
+
+    #[test]
+    fn stdin_eof_stops_without_locking_account() {
+        let mut cursor = std::io::Cursor::new(b"" as &[u8]);
+        assert_eq!(read_password_from_reader(&mut cursor).unwrap(), None);
+
+        let (_dir, paths, user) = test_paths("secret");
+        let defaults = Defaults::default();
+        let mut opts = options(&["spk", "sync"], false, false);
+        opts.stdin_password = true;
+
+        // First wrong stdin password should fail cleanly after 1 attempt without triggering faillock.
+        let mut calls = 0u32;
+        let err = authenticate_with(&paths, &defaults, &user, 1000, &opts, false, |_, _, _| {
+            calls += 1;
+            Ok(Some("wrong".into()))
+        })
+        .unwrap_err();
+        assert_eq!(err, "incorrect password");
+        assert_eq!(calls, 1);
+        assert!(!ticket::locked(&paths, 1000, defaults.passwd_tries, 300));
+
+        // Second attempt with the real password must still succeed (not locked out).
+        let ok = authenticate_with(&paths, &defaults, &user, 1000, &opts, false, |_, _, _| {
+            Ok(Some("secret".into()))
+        })
+        .unwrap();
+        assert!(!ok);
+    }
+
+    #[test]
+    fn askpass_retries_propagate_error_and_cancel_does_not_lock() {
+        let (_dir, paths, user) = test_paths("secret");
+        let defaults = Defaults::default();
+        let mut opts = options(&["spk", "sync"], false, false);
+        opts.askpass = true;
+
+        let mut seen_errors = Vec::new();
+        let ok = authenticate_with(
+            &paths,
+            &defaults,
+            &user,
+            1000,
+            &opts,
+            false,
+            |attempt, _, last_err| {
+                seen_errors.push(last_err.map(str::to_string));
+                Ok(Some(if attempt == 0 {
+                    "wrong".into()
+                } else {
+                    "secret".into()
+                }))
+            },
+        )
+        .unwrap();
+        assert!(!ok);
+        assert_eq!(seen_errors.len(), 2);
+        assert!(seen_errors[0].is_none());
+        assert!(seen_errors[1].is_some());
+
+        let err = authenticate_with(&paths, &defaults, &user, 1000, &opts, false, |_, _, _| {
+            Ok(None)
+        })
+        .unwrap_err();
+        assert_eq!(err, "authentication cancelled");
+        assert!(!ticket::locked(&paths, 1000, defaults.passwd_tries, 300));
     }
 }

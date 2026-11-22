@@ -1000,12 +1000,12 @@ pub fn sanitize_shortcuts(value: &str) -> String {
     let mut seen = Vec::new();
     for part in value.split(',') {
         let mode = part.trim();
-        if mode.is_empty() || mode.len() > 24 {
+        if mode.is_empty() || mode.len() > 48 {
             continue;
         }
         if !mode
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'))
         {
             continue;
         }
@@ -1041,9 +1041,12 @@ pub struct DesktopConfig {
     pub backdrop_style: BackdropStyle,
     pub solid_color: u32,
     pub desktop_icons_visible: bool,
-    /// Comma separated app modes shown on the desktop, in display order.
+    /// Comma separated app IDs shown on the desktop, in display order.
     pub desktop_shortcuts: String,
+    /// Comma separated auto-shortcut app IDs explicitly removed from the desktop by the user.
+    pub desktop_hidden_shortcuts: String,
     pub desktop_icon_size: i32,
+    pub apps_reload_gen: String,
     // panel
     pub panel_position: PanelPosition,
     pub panel_size: i32,
@@ -1127,8 +1130,10 @@ impl Default for DesktopConfig {
             backdrop_style: BackdropStyle::Cover,
             solid_color: 0x14385c,
             desktop_icons_visible: true,
-            desktop_shortcuts: "files,term,browser,store".to_string(),
+            desktop_shortcuts: "files,term,browser".to_string(),
+            desktop_hidden_shortcuts: String::new(),
             desktop_icon_size: 40,
+            apps_reload_gen: String::new(),
             panel_position: PanelPosition::Bottom,
             panel_size: 44,
             panel_show_pinned: true,
@@ -1281,6 +1286,16 @@ impl DesktopConfig {
             ("desktop", "/icons/shortcuts") => {
                 if let Some(s) = value.as_str() {
                     self.desktop_shortcuts = sanitize_shortcuts(s);
+                }
+            }
+            ("desktop", "/icons/hidden-shortcuts") => {
+                if let Some(s) = value.as_str() {
+                    self.desktop_hidden_shortcuts = sanitize_shortcuts(s);
+                }
+            }
+            ("desktop", "/apps/reload-gen") => {
+                if let Some(s) = value.as_str() {
+                    self.apps_reload_gen = s.to_string();
                 }
             }
             ("panel", "/position") => {

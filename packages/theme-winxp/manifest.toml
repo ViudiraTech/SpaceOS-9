@@ -9,7 +9,7 @@
 name = "theme-winxp"
 epoch = 0
 version = "1.0.0"
-release = 6
+release = 7
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "XP Luna SPUI theme"
@@ -34,6 +34,7 @@ subtitle = "蓝银经典质感 · 双栏开始菜单 · Bliss 草原壁纸"
 category = "themes"
 icon = "appearance"
 accent = ["#3b82f6", "#1d4ed8"]
+banner = "previews/theme-winxp.jpg"
 featured_rank = 100
 highlights = [
     "支持深色 Royale Noir 与橄榄绿/金属银变体",

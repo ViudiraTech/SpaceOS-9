@@ -1036,3 +1036,4 @@ sudo -e file...
 - [x] P3a 内核：openat2/O_NOFOLLOW/O_PATH、chroot、mount namespace/bind/RO/pivot_root、proc hidepid、seccomp cBPF 与内核/QEMU 测试。
 - [x] P3b：.INSTALL/hooks.d/triggers、非 root 沙箱、sudoers/doas 校验、setuid 包升级/降级、QEMU 矩阵与 CI。
 - [x] P4：HTTP(S) 仓库、镜像优先级、防降级、密钥轮换/吊销格式；seccomp USER_NOTIF/TRACE 与完整 shared mount propagation 仍留待后续。
+- [x] Space 商店体验重构与生态拆分：`user/store` 无皮肤耦合全面改版（全不透明模态层、动态对比度、Hero 轮播 + `720x360` 混合预览图与 `spk fetch-asset`、各视图裁剪与滚轮修复）；系统级 `sudo -A` 图形认证独立打包为 `spui-askpass`（[user/askpass](file:///home/jitianyu/Project/SpaceKernel/user/askpass/src/main.rs) / [packages/spui-askpass](file:///home/jitianyu/Project/SpaceKernel/packages/spui-askpass/manifest.toml)）并由 `space-store` 声明依赖；默认安装 `/etc/sudoers` 并支持 `spk` 同事务暂存 `sudo --check-config` 校验；Freedesktop `.desktop` 应用动态发现与事务后热重载钩子（`spui-apps-kick`），以及经典非全屏开始菜单动态命中区与滚动裁剪修复。
