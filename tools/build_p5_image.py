@@ -74,7 +74,16 @@ def install_base(stage: pathlib.Path, repo: pathlib.Path, spk: pathlib.Path) -> 
     )
 
 
-def rootfs_skeleton(stage: pathlib.Path, epoch: int, repo: pathlib.Path, key_id: str) -> None:
+DEFAULT_REMOTE_REPO = "https://goutoustdio.top/spaceos/repo/x86_64"
+
+
+def rootfs_skeleton(
+    stage: pathlib.Path,
+    epoch: int,
+    repo: pathlib.Path,
+    key_id: str,
+    remote_url: str = DEFAULT_REMOTE_REPO,
+) -> None:
     for directory in (
         "bin",
         "sbin",
@@ -150,16 +159,29 @@ def rootfs_skeleton(stage: pathlib.Path, epoch: int, repo: pathlib.Path, key_id:
         json.dumps(
             {
                 "schema": 1,
+                # The remote repository outranks the frozen copy baked into
+                # the image: updates only ever arrive from the network, and
+                # the local copy is kept as an offline fallback for the
+                # packages that were already present at build time.
                 "repos": [
+                    {
+                        "name": "spaceos-main",
+                        "arch": "x86_64",
+                        "urls": [remote_url],
+                        "priority": 10,
+                        "key_id": key_id,
+                        "last_sync": 0,
+                        "enabled": True,
+                    },
                     {
                         "name": "local",
                         "arch": "x86_64",
                         "urls": ["/var/lib/spk/repo/x86_64"],
-                        "priority": 10,
+                        "priority": 1,
                         "key_id": key_id,
                         "last_sync": epoch,
                         "enabled": True,
-                    }
+                    },
                 ],
             },
             indent=2,
@@ -233,6 +255,11 @@ def main() -> int:
     parser.add_argument("--spk", type=pathlib.Path, default=ROOT / "target/release/spk")
     parser.add_argument("--trust-key", type=pathlib.Path, default=ROOT / "build/keys/repo.pub")
     parser.add_argument(
+        "--remote-repo",
+        default=DEFAULT_REMOTE_REPO,
+        help="remote repository the image syncs from; outranks the embedded copy",
+    )
+    parser.add_argument(
         "--driver",
         type=pathlib.Path,
         default=ROOT / "target/x86_64-unknown-linux-musl/release/spk-p5-test",
@@ -246,7 +273,9 @@ def main() -> int:
     if arguments.stage.exists():
         shutil.rmtree(arguments.stage)
     arguments.stage.mkdir(parents=True)
-    rootfs_skeleton(arguments.stage, epoch, arguments.repo, key_id)
+    rootfs_skeleton(
+        arguments.stage, epoch, arguments.repo, key_id, arguments.remote_repo
+    )
     install_base(arguments.stage, arguments.repo, arguments.spk)
     # Build-time metadata embeds wall-clock time and a random transaction id;
     # normalize it so the generated image is reproducible.
