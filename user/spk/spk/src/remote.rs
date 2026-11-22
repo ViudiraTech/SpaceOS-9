@@ -18,7 +18,7 @@ use spk_core::index::{Index, IndexPackage, RepoManifest};
 use spk_core::keys::{read_signature, SignatureFile};
 
 use crate::error::{Result, SpkError};
-use crate::http::{self, HttpClient};
+use crate::http::{self, HttpClient, HttpResponse};
 use crate::i18n::{self, Lang};
 use crate::repo;
 use crate::security::SecurityState;
@@ -27,6 +27,7 @@ use crate::state::Paths;
 const MAX_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 256 * 1024;
 const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const RETRIES: usize = 3;
 const RETENTION_DAYS: u64 = 30;
 const CACHE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -198,38 +199,103 @@ fn load_current(
 /// Fetch and verify the repository manifest and, when it publishes one, the
 /// store document. Both are cached inside the index snapshot so that
 /// `spk catalog` can expose them to the graphical store offline.
-fn sync_store(
+/// The five metadata files of a repository. They are small and independent,
+/// so fetching them concurrently turns five round trips into one on a
+/// high-latency link. The store document is speculative: it is discarded when
+/// the manifest does not list it or its digest does not match.
+struct Prefetched {
+    index: Result<HttpResponse>,
+    signature: Result<HttpResponse>,
+    manifest: Result<HttpResponse>,
+    manifest_signature: Result<HttpResponse>,
+    store: Result<HttpResponse>,
+}
+
+fn prefetch_metadata(base: &str, index_headers: &[(&str, String)]) -> Prefetched {
+    let no_cache = [("Cache-Control", "no-cache".to_string())];
+    std::thread::scope(|scope| {
+        let index = scope.spawn(|| {
+            let client = HttpClient::new()?;
+            get(&client, &mirror_index_url(base), index_headers, MAX_INDEX_BYTES)
+        });
+        let signature = scope.spawn(|| {
+            let client = HttpClient::new()?;
+            get(
+                &client,
+                &mirror_signature_url(base),
+                &no_cache,
+                MAX_SIGNATURE_BYTES,
+            )
+        });
+        let manifest = scope.spawn(|| {
+            let client = HttpClient::new()?;
+            get(
+                &client,
+                &http::join_url(base, "repo.json"),
+                &no_cache,
+                MAX_MANIFEST_BYTES,
+            )
+        });
+        let manifest_signature = scope.spawn(|| {
+            let client = HttpClient::new()?;
+            get(
+                &client,
+                &http::join_url(base, "repo.json.sig"),
+                &no_cache,
+                MAX_SIGNATURE_BYTES,
+            )
+        });
+        let store = scope.spawn(|| {
+            let client = HttpClient::new()?;
+            get(
+                &client,
+                &http::join_url(base, "store.json"),
+                &no_cache,
+                MAX_STORE_BYTES,
+            )
+        });
+        let join = |handle: std::thread::ScopedJoinHandle<'_, Result<HttpResponse>>| {
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(SpkError::Network("metadata request panicked".into())))
+        };
+        Prefetched {
+            index: join(index),
+            signature: join(signature),
+            manifest: join(manifest),
+            manifest_signature: join(manifest_signature),
+            store: join(store),
+        }
+    })
+}
+
+/// Cache the signed repository manifest and, when it lists one, the store
+/// document inside the snapshot directory. `None` means the repository
+/// predates schema 2.
+fn apply_store_metadata(
     paths: &Paths,
-    client: &HttpClient,
     base: &str,
     dir: &Path,
     index_bytes: &[u8],
+    manifest: Result<HttpResponse>,
+    manifest_signature: Result<HttpResponse>,
+    store: Result<HttpResponse>,
     options: RemoteOptions,
 ) -> Result<Option<spk_core::store::StoreDoc>> {
-    let response = match get(
-        client,
-        &http::join_url(base, "repo.json"),
-        &[("Cache-Control", "no-cache".to_string())],
-        MAX_STORE_BYTES,
-    ) {
+    let manifest_response = match manifest {
         Ok(response) => response,
         Err(_) => return Ok(None),
     };
-    if response.status == 404 {
+    if manifest_response.status == 404 {
         return Ok(None);
     }
-    if !(200..=299).contains(&response.status) {
+    if !(200..=299).contains(&manifest_response.status) {
         return Err(SpkError::Network(format!(
             "HTTP {} fetching repo.json",
-            response.status
+            manifest_response.status
         )));
     }
-    let signature = match get(
-        client,
-        &http::join_url(base, "repo.json.sig"),
-        &[("Cache-Control", "no-cache".to_string())],
-        MAX_SIGNATURE_BYTES,
-    ) {
+    let signature = match manifest_signature {
         Ok(response) if (200..=299).contains(&response.status) => Some(
             serde_json::from_slice::<SignatureFile>(&response.body).map_err(|error| {
                 SpkError::Signature(format!("{base}: malformed repo.json.sig: {error}"))
@@ -237,8 +303,13 @@ fn sync_store(
         ),
         _ => None,
     };
-    repo::verify_index_bytes(paths, &response.body, signature.as_ref(), options.allow_unsigned)?;
-    let manifest = RepoManifest::from_slice(&response.body)
+    repo::verify_index_bytes(
+        paths,
+        &manifest_response.body,
+        signature.as_ref(),
+        options.allow_unsigned,
+    )?;
+    let manifest = RepoManifest::from_slice(&manifest_response.body)
         .map_err(|error| SpkError::Security(format!("{base}: invalid repo.json: {error}")))?;
     if manifest.catalog.sha256 != sha256_bytes(index_bytes)
         || manifest.catalog.size != index_bytes.len() as u64
@@ -247,7 +318,7 @@ fn sync_store(
             "{base}: repo.json catalog digest does not match the index"
         )));
     }
-    spk_core::fsutil::atomic_write(&dir.join("repo.json"), &response.body, 0o644)?;
+    spk_core::fsutil::atomic_write(&dir.join("repo.json"), &manifest_response.body, 0o644)?;
     if let Some(signature) = &signature {
         let mut json = serde_json::to_vec_pretty(signature)?;
         json.push(b'\n');
@@ -256,12 +327,14 @@ fn sync_store(
     let Some(digest) = &manifest.store else {
         return Ok(None);
     };
-    let response = get(
-        client,
-        &http::join_url(base, "store.json"),
-        &[("Cache-Control", "no-cache".to_string())],
-        MAX_STORE_BYTES,
-    )?;
+    let response = match store {
+        Ok(response) => response,
+        Err(_) => {
+            return Err(SpkError::Security(format!(
+                "{base}: repo.json lists store.json but the mirror did not serve it"
+            )))
+        }
+    };
     if !(200..=299).contains(&response.status) {
         return Err(SpkError::Security(format!(
             "{base}: repo.json lists store.json but the mirror returned HTTP {}",
@@ -354,6 +427,7 @@ fn prune_snapshots(root: &Path, current: &str) -> Result<()> {
     Ok(())
 }
 
+
 fn sync_mirror(
     paths: &Paths,
     root: &Path,
@@ -363,14 +437,20 @@ fn sync_mirror(
     security: &SecurityState,
     options: RemoteOptions,
 ) -> Result<CachedSnapshot> {
-    let client = HttpClient::new()?;
     let mut headers = vec![("Cache-Control", "no-cache".to_string())];
     if let Some(old) = old {
         if !old.meta.etag.is_empty() {
             headers.push(("If-None-Match", old.meta.etag.clone()));
         }
     }
-    let response = get(&client, &mirror_index_url(base), &headers, MAX_INDEX_BYTES)?;
+    let Prefetched {
+        index,
+        signature,
+        manifest,
+        manifest_signature,
+        store,
+    } = prefetch_metadata(base, &headers);
+    let response = index?;
     match response.status {
         304 => {
             let old = old.ok_or_else(|| {
@@ -378,10 +458,19 @@ fn sync_mirror(
             })?;
             let mut cached = old.clone();
             // A 304 only says the index is unchanged; the manifest and store
-            // document next to it may still be missing from an earlier
-            // partial sync, so re-check them rather than trusting the cache.
+            // document may still be stale or missing, so refresh them from the
+            // fetches made alongside the index request.
             let index_bytes = fs::read(cached.dir.join("index.json")).unwrap_or_default();
-            match sync_store(paths, &client, base, &cached.dir, &index_bytes, options) {
+            match apply_store_metadata(
+                paths,
+                base,
+                &cached.dir,
+                &index_bytes,
+                manifest,
+                manifest_signature,
+                store,
+                options,
+            ) {
                 Ok(store) => {
                     if store.is_some() {
                         cached.store = store;
@@ -399,12 +488,7 @@ fn sync_mirror(
             Ok(cached)
         }
         200..=299 => {
-            let signature = match get(
-                &client,
-                &mirror_signature_url(base),
-                &[("Cache-Control", "no-cache".to_string())],
-                MAX_SIGNATURE_BYTES,
-            ) {
+            let signature = match signature {
                 Ok(response) if (200..=299).contains(&response.status) => Some(
                     serde_json::from_slice::<SignatureFile>(&response.body).map_err(|error| {
                         SpkError::Signature(format!("{}: malformed signature JSON: {error}", base))
@@ -466,7 +550,16 @@ fn sync_mirror(
                 &meta,
                 &merged,
             )?;
-            let store = match sync_store(paths, &client, base, &dir, &response.body, options) {
+            let store = match apply_store_metadata(
+                paths,
+                base,
+                &dir,
+                &response.body,
+                manifest,
+                manifest_signature,
+                store,
+                options,
+            ) {
                 Ok(store) => store,
                 Err(error @ (SpkError::Security(_) | SpkError::Signature(_))) => {
                     return Err(error)

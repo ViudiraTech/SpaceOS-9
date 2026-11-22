@@ -652,9 +652,8 @@ fn stage_packages(
     txid: &str,
     lang: Lang,
 ) -> Result<BTreeMap<String, Staged>> {
-    let mut staged = BTreeMap::new();
-    let total = solution.actions.len().max(1);
-    for (position, action) in solution.actions.iter().enumerate() {
+    let mut targets = Vec::with_capacity(solution.actions.len());
+    for action in &solution.actions {
         let (repo_index, index) = match (&action.to.origin, &action.to.repo_pkg) {
             (crate::solver::Origin::Repo(index), Some(package)) => (*index, package),
             _ => {
@@ -667,14 +666,13 @@ fn stage_packages(
         let repo = repos.get(repo_index).ok_or_else(|| {
             SpkError::General(format!("repository index {repo_index} disappeared"))
         })?;
-        let label = format!("({}/{total}) {}", position + 1, index.filename);
-        let mut bar = ui::Bar::new(label, Some(index.size));
-        let package_path = repo.ensure_package_with_progress(
-            index,
-            &mut |written| bar.advance(written),
-            lang,
-        )?;
-        bar.finish();
+        targets.push((repo, index));
+    }
+
+    let downloaded = download_packages(&targets, lang)?;
+
+    let mut staged = BTreeMap::new();
+    for ((_repo, index), package_path) in targets.iter().zip(downloaded) {
         let metadata = fs::metadata(&package_path)
             .map_err(|error| SpkError::General(format!("{}: {error}", package_path.display())))?;
         if metadata.len() != index.size {
@@ -713,7 +711,6 @@ fn stage_packages(
             })?),
             None => None,
         };
-        let _ = lang;
         check_setuid_policy(paths, &scanned.manifest, lang)?;
         let conffiles = scanned.manifest.conffiles.iter().cloned().collect();
         staged.insert(
@@ -727,6 +724,87 @@ fn stage_packages(
         );
     }
     Ok(staged)
+}
+
+/// Fetch every package first, up to a handful at a time. Each download is a
+/// full round trip, so a transaction with several small packages used to pay
+/// the link latency once per package; running them together hides it.
+fn download_packages(
+    targets: &[(&LoadedRepo, &spk_core::index::IndexPackage)],
+    lang: Lang,
+) -> Result<Vec<PathBuf>> {
+    const WORKERS: usize = 4;
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    if targets.len() == 1 {
+        let (repo, index) = targets[0];
+        let mut bar = ui::Bar::new(index.filename.clone(), Some(index.size));
+        let path =
+            repo.ensure_package_with_progress(index, &mut |written| bar.advance(written), lang)?;
+        bar.finish();
+        return Ok(vec![path]);
+    }
+
+    let total_bytes: u64 = targets.iter().map(|(_, package)| package.size).sum();
+    let mut bar = ui::Bar::new(
+        format!("{} 个软件包", targets.len()),
+        Some(total_bytes.max(1)),
+    );
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<Option<Result<PathBuf>>>> =
+        std::sync::Mutex::new((0..targets.len()).map(|_| None).collect());
+    {
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, u64)>();
+        let workers = WORKERS.min(targets.len());
+        std::thread::scope(|scope| {
+            let next = &next;
+            let results = &results;
+            for _ in 0..workers {
+                let tx = tx.clone();
+                scope.spawn(move || loop {
+                    let slot = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if slot >= targets.len() {
+                        break;
+                    }
+                    let (repo, index) = targets[slot];
+                    let path = repo.ensure_package_with_progress(
+                        index,
+                        &mut |written| {
+                            let _ = tx.send((slot, written));
+                        },
+                        lang,
+                    );
+                    if let Ok(mut guard) = results.lock() {
+                        guard[slot] = Some(path);
+                    }
+                });
+            }
+            drop(tx);
+            let mut last = vec![0u64; targets.len()];
+            for (slot, written) in rx {
+                let delta = written.saturating_sub(last[slot]);
+                last[slot] = written;
+                bar.advance(delta);
+            }
+        });
+    }
+    bar.finish();
+    let guard = results
+        .into_inner()
+        .map_err(|_| SpkError::General("download results poisoned".into()))?;
+    guard
+        .into_iter()
+        .enumerate()
+        .map(|(slot, entry)| {
+            entry.unwrap_or_else(|| {
+                Err(SpkError::General(format!(
+                    "package {} was not downloaded",
+                    targets[slot].1.filename
+                )))
+            })
+        })
+        .collect()
 }
 
 fn check_setuid_policy(paths: &Paths, manifest: &Manifest, lang: Lang) -> Result<()> {
