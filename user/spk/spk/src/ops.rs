@@ -33,6 +33,7 @@ pub struct ReportOptions {
     pub no_sandbox_scripts: bool,
     pub offline: bool,
     pub allow_unsigned: bool,
+    pub refresh: bool,
 }
 
 impl ReportOptions {
@@ -64,6 +65,36 @@ fn parse_targets(targets: &[String]) -> Result<Vec<PkgSpec>> {
         .collect()
 }
 
+/// The published catalog only lists the newest release of every package, so
+/// an explicitly pinned version such as `foo=1.0.0-3` needs its history file
+/// fetched before the solver can see it.
+fn load_pinned_histories(
+    paths: &Paths,
+    repos: &mut [repo::LoadedRepo],
+    specs: &[PkgSpec],
+) -> Result<()> {
+    let names: BTreeSet<String> = specs
+        .iter()
+        .filter(|spec| spec.version.is_some())
+        .map(|spec| spec.name.clone())
+        .collect();
+    load_histories(paths, repos, &names)
+}
+
+fn load_histories(
+    paths: &Paths,
+    repos: &mut [repo::LoadedRepo],
+    names: &BTreeSet<String>,
+) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    for loaded in repos.iter_mut() {
+        loaded.ensure_history(paths, names)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn install(
     paths: &Paths,
@@ -85,15 +116,17 @@ pub fn install(
     let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
-    let repos = repo::load_repos(
+    let mut repos = repo::load_repos(
         paths,
         urls,
         lang,
         crate::remote::RemoteOptions {
             offline: report.offline,
             allow_unsigned: report.allow_unsigned,
+            refresh: report.refresh,
         },
     )?;
+    load_pinned_histories(paths, &mut repos, &specs)?;
     if !report.json {
         println!("{}", i18n::resolving(lang));
         println!("{}", i18n::looking_for_conflicts(lang));
@@ -160,6 +193,7 @@ pub fn upgrade(
         crate::remote::RemoteOptions {
             offline: report.offline,
             allow_unsigned: report.allow_unsigned,
+            refresh: report.refresh,
         },
     )?;
     if !report.json {
@@ -226,15 +260,17 @@ pub fn downgrade(
     let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
     let specs = parse_targets(targets)?;
-    let repos = repo::load_repos(
+    let mut repos = repo::load_repos(
         paths,
         urls,
         lang,
         crate::remote::RemoteOptions {
             offline: report.offline,
             allow_unsigned: report.allow_unsigned,
+            refresh: report.refresh,
         },
     )?;
+    load_pinned_histories(paths, &mut repos, &specs)?;
     if !report.json {
         println!("{}", i18n::resolving(lang));
         println!("{}", i18n::looking_for_conflicts(lang));
@@ -295,15 +331,18 @@ pub fn reinstall(
     }
     let overwrite = crate::overwrite::Overwrite::parse(overwrite)?;
     let (_lock, state) = prepare(paths, lang)?;
-    let repos = repo::load_repos(
+    let mut repos = repo::load_repos(
         paths,
         urls,
         lang,
         crate::remote::RemoteOptions {
             offline: report.offline,
             allow_unsigned: report.allow_unsigned,
+            refresh: report.refresh,
         },
     )?;
+    let names: BTreeSet<String> = targets.iter().cloned().collect();
+    load_histories(paths, &mut repos, &names)?;
     if !report.json {
         println!("{}", i18n::resolving(lang));
         println!("{}", i18n::looking_for_conflicts(lang));
@@ -762,6 +801,7 @@ pub fn verify(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang)
         crate::remote::RemoteOptions {
             offline: report.offline,
             allow_unsigned: report.allow_unsigned,
+            refresh: report.refresh,
         },
     )?;
     if repos.is_empty() {
@@ -836,6 +876,7 @@ pub fn sync(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang) -
         crate::remote::RemoteOptions {
             offline: report.offline,
             allow_unsigned: report.allow_unsigned,
+            refresh: report.refresh,
         },
     )?;
     if repos.is_empty() {

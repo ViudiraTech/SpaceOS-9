@@ -237,11 +237,13 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "index": result.index_path,
+                        "manifest": result.manifest_path,
                         "repo": result.index.repo,
                         "arch": result.index.arch,
                         "generated_at": result.index.generated_at,
                         "key_id": result.index.key_id,
                         "signed": result.signed,
+                        "history_files": result.history_files,
                         "packages": packages,
                     }))?
                 );
@@ -250,8 +252,16 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 for package in &result.index.packages {
                     println!("   {} {}", package.name, package.version());
                 }
+                println!(
+                    ":: {} packages in the catalog, {} history files",
+                    result.index.packages.len(),
+                    result.history_files
+                );
                 if result.signed {
-                    println!(":: Signing index.json ({})", result.index.key_id);
+                    println!(
+                        ":: Signing index.json and repo.json ({})",
+                        result.index.key_id
+                    );
                 } else {
                     println!("warning: index.json written without a signature");
                 }

@@ -6,12 +6,12 @@
 //       Copyright (C) 2026 ViudiraTech.
 //
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::error::{Result, SpkError};
@@ -20,9 +20,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
 
-type OpenResponse = (u16, BTreeMap<String, String>, Box<dyn Read>, String);
+type OpenResponse = (u16, BTreeMap<String, String>, Body, String);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const DEFAULT_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+/// Idle keep-alive connections kept per process. Package downloads are
+/// sequential, so a handful is enough to cover index + signature + packages.
+const MAX_IDLE_CONNECTIONS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scheme {
@@ -169,11 +172,74 @@ pub struct DownloadResponse {
     pub final_url: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpClient {
     ca_bundle: PathBuf,
     connect_timeout: Duration,
     io_timeout: Duration,
+    pool: Arc<Mutex<Pool>>,
+}
+
+#[derive(Default)]
+struct Pool {
+    idle: Vec<(String, BufReader<Box<dyn ReadWrite + Send>>)>,
+}
+
+impl Pool {
+    fn take(&mut self, origin: &str) -> Option<BufReader<Box<dyn ReadWrite + Send>>> {
+        let index = self
+            .idle
+            .iter()
+            .rposition(|(key, _)| key == origin)?;
+        Some(self.idle.swap_remove(index).1)
+    }
+
+    fn put(&mut self, origin: String, reader: BufReader<Box<dyn ReadWrite + Send>>) {
+        if self.idle.len() < MAX_IDLE_CONNECTIONS {
+            self.idle.push((origin, reader));
+        }
+    }
+}
+
+/// Response body plus the connection it was read from. `finish` decides
+/// whether the socket goes back into the keep-alive pool or is closed.
+pub struct Body {
+    reader: Option<BufReader<Box<dyn ReadWrite + Send>>>,
+    pool: Arc<Mutex<Pool>>,
+    origin: String,
+    keep_alive: bool,
+    finished: bool,
+}
+
+impl Read for Body {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.reader.as_mut() {
+            Some(reader) => reader.read(buf),
+            None => Ok(0),
+        }
+    }
+}
+
+impl Body {
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if self.keep_alive {
+            if let Some(reader) = self.reader.take() {
+                if let Ok(mut pool) = self.pool.lock() {
+                    pool.put(self.origin.clone(), reader);
+                }
+            }
+        }
+        self.reader = None;
+    }
+
+    fn discard(&mut self) {
+        self.keep_alive = false;
+        self.finish();
+    }
 }
 
 impl HttpClient {
@@ -195,6 +261,7 @@ impl HttpClient {
             ca_bundle,
             connect_timeout,
             io_timeout,
+            pool: Arc::new(Mutex::new(Pool::default())),
         })
     }
 
@@ -205,6 +272,7 @@ impl HttpClient {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_CA_BUNDLE)),
             connect_timeout: connect,
             io_timeout: io,
+            pool: Arc::new(Mutex::new(Pool::default())),
         })
     }
 
@@ -246,6 +314,20 @@ impl HttpClient {
         resume_from: u64,
         max_body: u64,
     ) -> Result<DownloadResponse> {
+        self.download_file_with_progress(url, headers, path, resume_from, max_body, &mut |_| {})
+    }
+
+    /// Download a response body into `path`, reporting the number of bytes
+    /// written so far after every chunk.
+    pub fn download_file_with_progress(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        path: &std::path::Path,
+        resume_from: u64,
+        max_body: u64,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<DownloadResponse> {
         let mut current = Url::parse(url)?;
         let mut request_headers: Vec<(&str, String)> = headers.to_vec();
         if resume_from > 0
@@ -259,6 +341,7 @@ impl HttpClient {
             let (status, response_headers, mut reader, final_url) =
                 self.open(&current, &request_headers)?;
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                reader.discard();
                 let location = response_headers.get("location").ok_or_else(|| {
                     SpkError::Network(format!("HTTP {status} without Location from {final_url}"))
                 })?;
@@ -307,7 +390,14 @@ impl HttpClient {
             }
             .map_err(|error| SpkError::Network(format!("open {}: {error}", path.display())))?;
             let mut file = std::io::BufWriter::new(file);
-            let bytes = copy_body(&mut reader, &response_headers, status, &mut file, max_body)?;
+            let bytes = copy_body(
+                &mut reader,
+                &response_headers,
+                status,
+                &mut file,
+                max_body,
+                progress,
+            )?;
             file.flush()
                 .map_err(|error| SpkError::Network(format!("flush {}: {error}", path.display())))?;
             let file = file.into_inner().map_err(|error| {
@@ -315,6 +405,7 @@ impl HttpClient {
             })?;
             file.sync_all()
                 .map_err(|error| SpkError::Network(format!("sync {}: {error}", path.display())))?;
+            reader.finish();
             return Ok(DownloadResponse {
                 status,
                 headers: response_headers,
@@ -338,6 +429,7 @@ impl HttpClient {
         for redirects in 0..=MAX_REDIRECTS {
             let (status, response_headers, mut reader, final_url) = self.open(&current, headers)?;
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                reader.discard();
                 let location = response_headers.get("location").ok_or_else(|| {
                     SpkError::Network(format!("HTTP {status} without Location from {final_url}"))
                 })?;
@@ -356,7 +448,15 @@ impl HttpClient {
                 current = next;
                 continue;
             }
-            let bytes = copy_body(&mut reader, &response_headers, status, sink, max_body)?;
+            let bytes = copy_body(
+                &mut reader,
+                &response_headers,
+                status,
+                sink,
+                max_body,
+                &mut |_| {},
+            )?;
+            reader.finish();
             return Ok(DownloadResponse {
                 status,
                 headers: response_headers,
@@ -370,6 +470,55 @@ impl HttpClient {
     }
 
     fn open(&self, url: &Url, headers: &[(&str, String)]) -> Result<OpenResponse> {
+        let origin = url.origin();
+        let request = build_request(url, headers);
+        let pooled = self
+            .pool
+            .lock()
+            .ok()
+            .and_then(|mut pool| pool.take(&origin));
+        let mut reused = pooled.is_some();
+        let mut reader = match pooled {
+            Some(reader) => reader,
+            None => BufReader::new(self.connect(url)?),
+        };
+        if let Err(error) = write_request(&mut reader, &request) {
+            if !reused {
+                return Err(error);
+            }
+            // The server closed the idle connection while it sat in the pool.
+            reader = BufReader::new(self.connect(url)?);
+            write_request(&mut reader, &request)?;
+            reused = false;
+        }
+        let (status, response_headers) = match read_headers(&mut reader, &origin) {
+            Ok(value) => value,
+            Err(_) if reused => {
+                let mut fresh = BufReader::new(self.connect(url)?);
+                write_request(&mut fresh, &request)?;
+                let value = read_headers(&mut fresh, &origin)?;
+                reader = fresh;
+                value
+            }
+            Err(error) => return Err(error),
+        };
+        let keep_alive = response_is_reusable(status, &response_headers);
+        let final_url = format!("{}{}", origin, url.path);
+        Ok((
+            status,
+            response_headers,
+            Body {
+                reader: Some(reader),
+                pool: self.pool.clone(),
+                origin,
+                keep_alive,
+                finished: false,
+            },
+            final_url,
+        ))
+    }
+
+    fn connect(&self, url: &Url) -> Result<Box<dyn ReadWrite + Send>> {
         let address = if url.host.contains(':') {
             format!("[{}]:{}", url.host, url.port)
         } else {
@@ -414,52 +563,100 @@ impl HttpClient {
         stream
             .set_write_timeout(Some(self.io_timeout))
             .map_err(|error| SpkError::Network(format!("set write timeout: {error}")))?;
-        let mut transport: Box<dyn ReadWrite> = match url.scheme {
-            Scheme::Http => Box::new(stream),
-            Scheme::Https => Box::new(tls_stream(&self.ca_bundle, &url.host, stream)?),
-        };
-        let mut request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: spk/0.1\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
-            url.path,
-            url.host_header()
-        );
-        for (name, value) in headers {
-            request.push_str(name);
-            request.push_str(": ");
-            request.push_str(value);
-            request.push_str("\r\n");
+        match url.scheme {
+            Scheme::Http => Ok(Box::new(stream)),
+            Scheme::Https => Ok(Box::new(tls_stream(&self.ca_bundle, &url.host, stream)?)),
         }
-        request.push_str("\r\n");
-        transport
-            .write_all(request.as_bytes())
-            .map_err(|error| SpkError::Network(format!("send request: {error}")))?;
-        transport
-            .flush()
-            .map_err(|error| SpkError::Network(format!("flush request: {error}")))?;
-        let reader: Box<dyn Read> = Box::new(transport);
-        let mut reader = BufReader::new(reader);
-        let (status, response_headers) = read_headers(&mut reader, &url.origin())?;
-        let final_url = format!("{}{}", url.origin(), url.path);
-        Ok((status, response_headers, Box::new(reader), final_url))
     }
 }
 
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
+fn build_request(url: &Url, headers: &[(&str, String)]) -> String {
+    let mut request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: spk/0.1\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n",
+        url.path,
+        url.host_header()
+    );
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    request
+}
+
+fn write_request(
+    reader: &mut BufReader<Box<dyn ReadWrite + Send>>,
+    request: &str,
+) -> Result<()> {
+    reader
+        .get_mut()
+        .write_all(request.as_bytes())
+        .map_err(|error| SpkError::Network(format!("send request: {error}")))?;
+    reader
+        .get_mut()
+        .flush()
+        .map_err(|error| SpkError::Network(format!("flush request: {error}")))
+}
+
+/// A response is reusable only when the body is explicitly delimited and the
+/// server did not ask to close the connection.
+fn response_is_reusable(status: u16, headers: &BTreeMap<String, String>) -> bool {
+    if let Some(connection) = headers.get("connection") {
+        if connection.to_ascii_lowercase().contains("close") {
+            return false;
+        }
+    }
+    if headers.contains_key("content-length") {
+        return true;
+    }
+    let chunked = headers.get("transfer-encoding").is_some_and(|value| {
+        value
+            .to_ascii_lowercase()
+            .split(',')
+            .any(|item| item.trim() == "chunked")
+    });
+    if chunked {
+        return true;
+    }
+    matches!(status, 204 | 304) || (100..200).contains(&status)
+}
+
+trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send> ReadWrite for T {}
 
 fn tls_stream(
     ca_bundle: &PathBuf,
     host: &str,
     stream: TcpStream,
 ) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
-    let roots = load_roots(ca_bundle).map_err(SpkError::Network)?;
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    // Parsing the trust store costs a PEM read and ~120 X.509 parses; build
+    // the ClientConfig once per bundle instead of once per connection.
+    static CONFIGS: OnceLock<Mutex<HashMap<PathBuf, Arc<rustls::ClientConfig>>>> = OnceLock::new();
+    let configs = CONFIGS.get_or_init(|| Mutex::new(HashMap::new()));
+    let config = {
+        let mut guard = configs
+            .lock()
+            .map_err(|_| SpkError::Network("TLS config cache poisoned".into()))?;
+        match guard.get(ca_bundle) {
+            Some(config) => config.clone(),
+            None => {
+                let roots = load_roots(ca_bundle).map_err(SpkError::Network)?;
+                let config = Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth(),
+                );
+                guard.insert(ca_bundle.clone(), config.clone());
+                config
+            }
+        }
+    };
     let name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|error| SpkError::Network(format!("invalid TLS server name {host}: {error}")))?;
-    let connection = rustls::ClientConnection::new(Arc::new(config), name)
+    let connection = rustls::ClientConnection::new(config, name)
         .map_err(|error| SpkError::Network(format!("TLS setup for {host}: {error}")))?;
     Ok(rustls::StreamOwned::new(connection, stream))
 }
@@ -487,7 +684,7 @@ fn load_roots(path: &PathBuf) -> std::result::Result<rustls::RootCertStore, Stri
 }
 
 fn read_headers(
-    reader: &mut BufReader<Box<dyn Read>>,
+    reader: &mut BufReader<Box<dyn ReadWrite + Send>>,
     origin: &str,
 ) -> Result<(u16, BTreeMap<String, String>)> {
     let mut total = 0usize;
@@ -548,6 +745,7 @@ fn copy_body(
     status: u16,
     sink: &mut dyn Write,
     max_body: u64,
+    progress: &mut dyn FnMut(u64),
 ) -> Result<u64> {
     if status == 204 || status == 304 || (100..200).contains(&status) {
         return Ok(0);
@@ -593,6 +791,7 @@ fn copy_body(
                     return Err(SpkError::Network("truncated chunk".into()));
                 }
                 written += read as u64;
+                progress(written);
                 if written > max_body {
                     return Err(SpkError::Network("HTTP body exceeds limit".into()));
                 }
@@ -620,6 +819,7 @@ fn copy_body(
                 )));
             }
             written += read as u64;
+            progress(written);
             sink.write_all(&buffer[..read])
                 .map_err(|error| SpkError::Network(format!("write response body: {error}")))?;
             remaining -= read as u64;
@@ -634,6 +834,7 @@ fn copy_body(
             break;
         }
         written += read as u64;
+        progress(written);
         if written > max_body {
             return Err(SpkError::Network(format!(
                 "HTTP body exceeds limit {max_body}"

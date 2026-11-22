@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use spk_core::fsutil::atomic_write;
-use spk_core::index::Index;
+use spk_core::index::{history_path, FileDigest, Index, IndexPackage, RepoManifest};
 use spk_core::keys::{read_signature, verify_any, PublicKey, PublicKeyFile, SignatureFile};
 
 use crate::error::{Result, SpkError};
@@ -34,6 +34,11 @@ pub struct LoadedRepo {
     /// Content-addressed package cache, present for remote repositories.
     pub package_cache: Option<PathBuf>,
     pub offline: bool,
+    pub allow_unsigned: bool,
+    /// Schema 2 repository manifest, loaded on demand.
+    pub manifest: Option<RepoManifest>,
+    /// Versions fetched from the per-package history files.
+    pub history: BTreeMap<String, Vec<IndexPackage>>,
 }
 
 impl LoadedRepo {
@@ -53,10 +58,22 @@ impl LoadedRepo {
     }
 
     pub fn ensure_package(&self, package: &spk_core::index::IndexPackage) -> Result<PathBuf> {
+        self.ensure_package_with_progress(package, &mut |_| {})
+    }
+
+    pub fn ensure_package_with_progress(
+        &self,
+        package: &spk_core::index::IndexPackage,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<PathBuf> {
         match &self.package_cache {
-            Some(cache) => {
-                crate::remote::ensure_package(cache, &self.mirrors, package, self.offline)
-            }
+            Some(cache) => crate::remote::ensure_package_with_progress(
+                cache,
+                &self.mirrors,
+                package,
+                self.offline,
+                progress,
+            ),
             None => {
                 let path = self.dir.join(&package.filename);
                 if !path.is_file() {
@@ -65,9 +82,93 @@ impl LoadedRepo {
                         path.display()
                     )));
                 }
+                progress(package.size);
                 Ok(path)
             }
         }
+    }
+
+    /// Load the full version history of the named packages. Only explicitly
+    /// pinned versions (and older installed versions) need this: the catalog
+    /// already carries the newest release of every package.
+    pub fn ensure_history(&mut self, paths: &Paths, names: &BTreeSet<String>) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let manifest = match self.manifest.clone() {
+            Some(manifest) => manifest,
+            None => {
+                let loaded = crate::remote::load_manifest(paths, self)?;
+                self.manifest = loaded.clone();
+                match loaded {
+                    Some(manifest) => manifest,
+                    // Schema 1 repository: every version is already in the index.
+                    None => return Ok(()),
+                }
+            }
+        };
+        let mut changed = false;
+        for name in names {
+            if self.history.contains_key(name) {
+                continue;
+            }
+            let Some(digest) = manifest.history.get(name).cloned() else {
+                continue;
+            };
+            let versions = self.read_history(name, &digest)?;
+            for package in versions.clone() {
+                if !self
+                    .index
+                    .packages
+                    .iter()
+                    .any(|known| known.identity() == package.identity())
+                {
+                    self.index.packages.push(package);
+                    changed = true;
+                }
+            }
+            self.history.insert(name.clone(), versions);
+        }
+        if changed {
+            self.index.packages.sort_by(|a, b| {
+                a.name
+                    .cmp(&b.name)
+                    .then_with(|| a.version().cmp(&b.version()))
+            });
+        }
+        Ok(())
+    }
+
+    fn read_history(&self, name: &str, digest: &FileDigest) -> Result<Vec<IndexPackage>> {
+        let relative = history_path(name);
+        let cached = self.dir.join(&relative);
+        let bytes = match fs::read(&cached) {
+            Ok(bytes)
+                if bytes.len() as u64 == digest.size
+                    && spk_core::fsutil::sha256_bytes(&bytes) == digest.sha256 =>
+            {
+                bytes
+            }
+            _ => {
+                let bytes = crate::remote::fetch_history(self, &relative)?;
+                if bytes.len() as u64 != digest.size
+                    || spk_core::fsutil::sha256_bytes(&bytes) != digest.sha256
+                {
+                    return Err(SpkError::Security(format!(
+                        "{name}: history file does not match the signed repository manifest"
+                    )));
+                }
+                if let Some(parent) = cached.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                atomic_write(&cached, &bytes, 0o644)?;
+                bytes
+            }
+        };
+        Ok(spk_core::index::history_from_slice(
+            &bytes,
+            &self.index.arch,
+        )?)
     }
 }
 
@@ -293,6 +394,9 @@ fn load_remote_repo(
         mirrors: synced.mirrors,
         package_cache: Some(paths.package_cache.clone()),
         offline: options.offline,
+        allow_unsigned: options.allow_unsigned,
+        manifest: None,
+        history: BTreeMap::new(),
     })
 }
 
@@ -396,6 +500,9 @@ pub fn load_repo(
         mirrors: Vec::new(),
         package_cache: None,
         offline: false,
+        allow_unsigned,
+        manifest: None,
+        history: BTreeMap::new(),
     })
 }
 

@@ -39,6 +39,12 @@ struct Cli {
     /// Use cached indexes/packages without network access
     #[arg(long, global = true)]
     offline: bool,
+    /// Revalidate repository indexes now instead of using the cached copy
+    #[arg(long, global = true)]
+    refresh: bool,
+    /// Disable progress bars and spinners
+    #[arg(long = "noprogressbar", global = true)]
+    no_progress_bar: bool,
     /// Accept an unsigned index (debug only)
     #[arg(long = "allow-unsigned", global = true)]
     allow_unsigned: bool,
@@ -510,6 +516,9 @@ fn main() -> ExitCode {
         Err(error) => localize_clap_error(lang_hint, error),
     };
     let json = cli.json;
+    if cli.no_progress_bar || cli.json {
+        std::env::set_var("SPK_NO_PROGRESS", "1");
+    }
     let lang = Lang::detect_for(&cli.root, cli.lang.as_deref());
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -567,6 +576,7 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 no_sandbox_scripts: cli.no_sandbox_scripts,
                 offline: cli.offline,
                 allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
             },
             lang,
         ),
@@ -592,6 +602,7 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 no_sandbox_scripts: cli.no_sandbox_scripts,
                 offline: cli.offline,
                 allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
             },
             lang,
         ),
@@ -615,6 +626,7 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 no_sandbox_scripts: cli.no_sandbox_scripts,
                 offline: cli.offline,
                 allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
             },
             lang,
         ),
@@ -638,6 +650,7 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 no_sandbox_scripts: cli.no_sandbox_scripts,
                 offline: cli.offline,
                 allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
             },
             lang,
         ),
@@ -658,6 +671,7 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 no_sandbox_scripts: cli.no_sandbox_scripts,
                 offline: cli.offline,
                 allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
             },
             lang,
         ),
@@ -671,6 +685,7 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 no_sandbox_scripts: cli.no_sandbox_scripts,
                 offline: cli.offline,
                 allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
             },
             lang,
         ),
@@ -695,6 +710,7 @@ fn run(cli: Cli) -> Result<(), SpkError> {
                 no_sandbox_scripts: cli.no_sandbox_scripts,
                 offline: cli.offline,
                 allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
             },
             lang,
         ),

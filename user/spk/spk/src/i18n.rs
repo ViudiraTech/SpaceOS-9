@@ -137,12 +137,20 @@ pub fn checking_keys(lang: Lang) -> &'static str {
     tr(lang, "checking keys in keyring", "正在检查密钥环中的密钥")
 }
 
+pub fn retrieving(lang: Lang) -> &'static str {
+    tr(lang, ":: Retrieving packages...", ":: 正在下载软件包...")
+}
+
 pub fn checking_integrity(lang: Lang) -> &'static str {
     tr(lang, "checking package integrity", "正在检查软件包完整性")
 }
 
 pub fn loading_packages(lang: Lang) -> &'static str {
     tr(lang, "loading package files", "正在加载软件包文件")
+}
+
+pub fn writing_files(lang: Lang) -> &'static str {
+    tr(lang, "writing files", "正在写入文件")
 }
 
 pub fn checking_file_conflicts(lang: Lang) -> &'static str {

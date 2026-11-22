@@ -270,6 +270,9 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    // These tests assert exact request counts, so the sync TTL must never
+    // short-circuit a second sync.
+    std::env::set_var("SPK_SYNC_TTL_SECONDS", "0");
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::new(dir.path()).unwrap();
     paths.ensure_state().unwrap();
@@ -803,6 +806,7 @@ fn allow_unsigned_only_for_missing_signature() {
         RemoteOptions {
             offline: false,
             allow_unsigned: true,
+            refresh: true,
         },
         spk_ops::i18n::Lang::En,
     )
@@ -821,6 +825,7 @@ fn allow_unsigned_only_for_missing_signature() {
         RemoteOptions {
             offline: false,
             allow_unsigned: true,
+            refresh: true,
         },
         spk_ops::i18n::Lang::En,
     )

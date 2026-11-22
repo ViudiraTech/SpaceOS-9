@@ -59,6 +59,9 @@ fn repo(packages: Vec<IndexPackage>) -> LoadedRepo {
         mirrors: Vec::new(),
         package_cache: None,
         offline: false,
+        allow_unsigned: true,
+        manifest: None,
+        history: std::collections::BTreeMap::new(),
     }
 }
 

@@ -6,7 +6,7 @@
 
 - 包管理器二进制：`spk`（目标端）、`spk-host`（构建端）。
 - 包文件：`.spk`，tar + zstd。
-- 仓库：`index.json` + `index.json.sig` + 包文件，按架构分目录。
+- 仓库：`repo.json` + `index.json` + 每包历史文件 + 包文件，按架构分目录；只有 `repo.json` 需要分离签名。
 - 当前 ABI：`spaceos-1`；当前架构：`x86_64`，索引也支持 `aarch64` / `riscv64`。
 - 源码树根目录：`SpaceKernel/`（也就是 SpaceOS-9 仓库）。
 
@@ -621,14 +621,16 @@ cp build/repo/x86_64/foo-1.0.0-1-x86_64.spk build/repo-prod/x86_64/
 ### 9.2 上传顺序
 
 1. 先上传新的 `.spk`；
-2. 再上传 `index.json.sig`；
-3. **最后**上传 `index.json`（原子 `mv`）。
+2. 再上传新增或变化的 `pkg/<xx>/<yy>/<name>` 历史文件；
+3. 上传 `repo.json.sig`、`index.json.sig`；
+4. **最后**上传 `index.json` 和 `repo.json`（原子 `mv`）。
 
 这样客户端不会看到“新索引指向不存在的包”。
 
 缓存规则：
 
-- `index.json`、`index.json.sig`：`Cache-Control: no-cache`；
+- `repo.json`、`index.json`、两者的 `.sig`：`Cache-Control: no-cache`；
+- `pkg/…` 历史文件：内容随新版本变化，用短缓存（`max-age=60`）；
 - `.spk`：长期 immutable；
 - 保留 Range/206，支持断点续传。
 

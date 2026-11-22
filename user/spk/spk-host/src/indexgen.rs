@@ -12,8 +12,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use spk_core::archive::inspect_spk;
-use spk_core::fsutil::{atomic_write, sha256_file};
-use spk_core::index::{validate_repo_name, Index, IndexPackage, RevokedVersion};
+use spk_core::fsutil::{atomic_write, sha256_bytes, sha256_file};
+use spk_core::index::{
+    history_path, history_to_bytes, validate_repo_name, FileDigest, Index, IndexPackage,
+    RepoManifest, RevokedVersion, REPO_SCHEMA,
+};
 use spk_core::keys::{read_signature, signature_path, write_signature, PublicKey, SignatureEntry};
 use spk_core::manifest::validate_arch;
 use spk_core::{Error, Result};
@@ -21,8 +24,45 @@ use spk_core::{Error, Result};
 pub struct IndexResult {
     pub index: Index,
     pub index_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub history_files: usize,
     pub signed: bool,
     pub warnings: Vec<String>,
+}
+
+/// Per-package inspection cache. Rebuilding an index used to decompress every
+/// archive in the repository; with the cache only new or replaced packages are
+/// inspected, so adding one package costs one package.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct IndexCache {
+    #[serde(default)]
+    schema: u32,
+    #[serde(default)]
+    entries: BTreeMap<String, CacheEntry>,
+}
+
+const CACHE_SCHEMA: u32 = 1;
+const CACHE_FILE: &str = ".spk-index-cache.json";
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CacheEntry {
+    size: u64,
+    mtime: u64,
+    package: IndexPackage,
+}
+
+impl IndexCache {
+    fn load(repo_dir: &Path) -> Self {
+        let Ok(bytes) = fs::read(repo_dir.join(CACHE_FILE)) else {
+            return Self::default();
+        };
+        match serde_json::from_slice::<IndexCache>(&bytes) {
+            Ok(cache) if cache.schema == CACHE_SCHEMA => cache,
+            _ => Self::default(),
+        }
+    }
 }
 
 pub struct VerifyReport {
@@ -128,26 +168,59 @@ pub fn generate_with_keys_and_security(
         index.revoked_versions = security.revoked_versions.clone();
         index.revoked_keys = security.revoked_keys.clone();
     }
+
+    let cache = IndexCache::load(repo_dir);
+    let mut next_cache = IndexCache {
+        schema: CACHE_SCHEMA,
+        entries: BTreeMap::new(),
+    };
     let mut identities = BTreeSet::new();
+    let mut all = Vec::new();
     for (name, path) in paths {
-        let inspected = inspect_spk(&path)?;
-        if inspected.manifest.arch != arch {
-            return Err(Error::Index(format!(
-                "{name}: package architecture {} does not match index architecture {arch}",
-                inspected.manifest.arch
-            )));
-        }
-        let expected = inspected.manifest.package_filename();
-        if name != expected {
-            return Err(Error::Index(format!(
-                "{name}: expected package filename '{expected}'"
-            )));
-        }
-        let package = IndexPackage::from_manifest(
-            &inspected.manifest,
+        let metadata = fs::metadata(&path)?;
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|age| age.as_secs())
+            .unwrap_or(0);
+        let cached = cache.entries.get(&name).filter(|entry| {
+            entry.size == metadata.len()
+                && entry.mtime == mtime
+                && entry.package.filename == name
+                && entry.package.arch == arch
+        });
+        let package = match cached {
+            Some(entry) => entry.package.clone(),
+            None => {
+                let inspected = inspect_spk(&path)?;
+                if inspected.manifest.arch != arch {
+                    return Err(Error::Index(format!(
+                        "{name}: package architecture {} does not match index architecture {arch}",
+                        inspected.manifest.arch
+                    )));
+                }
+                let expected = inspected.manifest.package_filename();
+                if name != expected {
+                    return Err(Error::Index(format!(
+                        "{name}: expected package filename '{expected}'"
+                    )));
+                }
+                IndexPackage::from_manifest(
+                    &inspected.manifest,
+                    name.clone(),
+                    inspected.package_size,
+                    inspected.package_sha256,
+                )
+            }
+        };
+        next_cache.entries.insert(
             name,
-            inspected.package_size,
-            inspected.package_sha256,
+            CacheEntry {
+                size: metadata.len(),
+                mtime,
+                package: package.clone(),
+            },
         );
         if !identities.insert(package.identity()) {
             return Err(Error::Index(format!(
@@ -157,48 +230,110 @@ pub fn generate_with_keys_and_security(
                 package.release
             )));
         }
-        index.packages.push(package);
+        all.push(package);
     }
-    index.packages.sort_by(|a, b| {
-        a.name
-            .cmp(&b.name)
-            .then_with(|| a.version().cmp(&b.version()))
-    });
+
+    // The published catalog keeps the newest release of every package; older
+    // releases live in the per-package history files.
+    let mut latest: BTreeMap<String, IndexPackage> = BTreeMap::new();
+    for package in &all {
+        match latest.get(&package.name) {
+            Some(current) if current.version() >= package.version() => {}
+            _ => {
+                latest.insert(package.name.clone(), package.clone());
+            }
+        }
+    }
+    index.packages = latest.into_values().collect();
     index.validate()?;
 
     let bytes = index.to_bytes()?;
     let index_path = repo_dir.join("index.json");
     atomic_write(&index_path, &bytes, 0o644)?;
 
-    let mut warnings = Vec::new();
-    if let Some(keys) = signing {
-        let mut signature = keys[0].sign(&bytes);
-        if keys.len() > 1 {
-            signature.signatures = keys
-                .iter()
-                .map(|key| {
-                    let signed = key.sign(&bytes);
-                    SignatureEntry {
-                        key_id: signed.key_id,
-                        signature: signed.signature,
-                    }
-                })
-                .collect();
+    let mut by_name: BTreeMap<String, Vec<IndexPackage>> = BTreeMap::new();
+    for package in &all {
+        by_name
+            .entry(package.name.clone())
+            .or_default()
+            .push(package.clone());
+    }
+    let mut history = BTreeMap::new();
+    let mut history_files = 0usize;
+    for (name, versions) in &by_name {
+        let history_bytes = history_to_bytes(versions)?;
+        let path = repo_dir.join(history_path(name));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
-        write_signature(&signature_path(&index_path), &signature)?;
-    } else {
-        let stale = signature_path(&index_path);
-        if stale.exists() {
-            warnings.push(format!(
-                "{} was not regenerated and no longer matches index.json",
-                stale.display()
-            ));
+        atomic_write(&path, &history_bytes, 0o644)?;
+        history.insert(
+            name.clone(),
+            FileDigest {
+                sha256: sha256_bytes(&history_bytes),
+                size: history_bytes.len() as u64,
+            },
+        );
+        history_files += 1;
+    }
+
+    let cache_bytes = serde_json::to_vec(&next_cache)?;
+    atomic_write(&repo_dir.join(CACHE_FILE), &cache_bytes, 0o644)?;
+
+    let manifest = RepoManifest {
+        schema: REPO_SCHEMA,
+        repo: repo.to_string(),
+        arch: arch.to_string(),
+        generated_at,
+        key_id: public.key_id.clone(),
+        catalog: FileDigest {
+            sha256: sha256_bytes(&bytes),
+            size: bytes.len() as u64,
+        },
+        history,
+    };
+    let manifest_bytes = manifest.to_bytes()?;
+    let manifest_path = repo_dir.join("repo.json");
+    atomic_write(&manifest_path, &manifest_bytes, 0o644)?;
+
+    let mut warnings = Vec::new();
+    match signing {
+        Some(keys) => {
+            for (path, payload) in [(&index_path, &bytes), (&manifest_path, &manifest_bytes)] {
+                let mut signature = keys[0].sign(payload);
+                if keys.len() > 1 {
+                    signature.signatures = keys
+                        .iter()
+                        .map(|key| {
+                            let signed = key.sign(payload);
+                            SignatureEntry {
+                                key_id: signed.key_id,
+                                signature: signed.signature,
+                            }
+                        })
+                        .collect();
+                }
+                write_signature(&signature_path(path), &signature)?;
+            }
+        }
+        None => {
+            for path in [&index_path, &manifest_path] {
+                let stale = signature_path(path);
+                if stale.exists() {
+                    warnings.push(format!(
+                        "{} was not regenerated and no longer matches the index",
+                        stale.display()
+                    ));
+                }
+            }
         }
     }
 
     Ok(IndexResult {
         index,
         index_path,
+        manifest_path,
+        history_files,
         signed: sign,
         warnings,
     })
@@ -238,6 +373,7 @@ pub fn verify_index(index_path: &Path, sig_path: Option<&Path>, key_path: &Path)
 pub fn verify_repo(repo_dir: &Path, key_path: &Path) -> Result<VerifyReport> {
     let index_path = repo_dir.join("index.json");
     let index = verify_index(&index_path, None, key_path)?;
+    verify_manifest(repo_dir, &index, key_path)?;
     let mut verified = Vec::new();
     for package in &index.packages {
         let path = repo_dir.join(&package.filename);
@@ -270,6 +406,72 @@ pub fn verify_repo(repo_dir: &Path, key_path: &Path) -> Result<VerifyReport> {
         index,
         packages: verified,
     })
+}
+
+/// Check the schema 2 hash chain: the signed repo.json pins the catalog, and
+/// the catalog pins every per-package history file. Repositories generated
+/// before schema 2 have no repo.json and are accepted unchanged.
+fn verify_manifest(repo_dir: &Path, index: &Index, key_path: &Path) -> Result<()> {
+    let manifest_path = repo_dir.join("repo.json");
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let public = PublicKey::from_file(key_path)?;
+    let bytes = fs::read(&manifest_path)?;
+    let signature = read_signature(&signature_path(&manifest_path))?;
+    public.verify(&bytes, &signature)?;
+    let manifest = RepoManifest::from_slice(&bytes)?;
+    if manifest.key_id != public.key_id {
+        return Err(Error::Signature(format!(
+            "repository manifest is signed by {}, key is {}",
+            manifest.key_id, public.key_id
+        )));
+    }
+    if manifest.repo != index.repo || manifest.arch != index.arch {
+        return Err(Error::Index(
+            "repo.json and index.json describe different repositories".into(),
+        ));
+    }
+    let catalog = fs::read(repo_dir.join("index.json"))?;
+    if catalog.len() as u64 != manifest.catalog.size
+        || sha256_bytes(&catalog) != manifest.catalog.sha256
+    {
+        return Err(Error::Index(
+            "repo.json catalog digest does not match index.json".into(),
+        ));
+    }
+    for (name, digest) in &manifest.history {
+        let path = repo_dir.join(history_path(name));
+        let bytes = fs::read(&path)
+            .map_err(|e| Error::Index(format!("{name}: history file missing: {e}")))?;
+        if bytes.len() as u64 != digest.size || sha256_bytes(&bytes) != digest.sha256 {
+            return Err(Error::Index(format!(
+                "{name}: history file does not match repo.json"
+            )));
+        }
+        let versions = spk_core::index::history_from_slice(&bytes, &index.arch)?;
+        if versions.iter().any(|package| package.name != *name) {
+            return Err(Error::Index(format!(
+                "{name}: history file describes another package"
+            )));
+        }
+        for package in index.packages.iter().filter(|package| package.name == *name) {
+            if !versions.iter().any(|entry| entry.identity() == package.identity()) {
+                return Err(Error::Index(format!(
+                    "{name}: catalog entry missing from its history file"
+                )));
+            }
+        }
+    }
+    for package in &index.packages {
+        if !manifest.history.contains_key(&package.name) {
+            return Err(Error::Index(format!(
+                "{}: no history file recorded in repo.json",
+                package.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn index_matches_manifest(package: &IndexPackage, manifest: &spk_core::manifest::Manifest) -> bool {
