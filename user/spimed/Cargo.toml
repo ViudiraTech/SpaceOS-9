@@ -1,0 +1,32 @@
+#
+#       user/spimed/Cargo.toml
+#       Standalone SPIME Chinese IME daemon (spimed) for SpaceOS-9
+#
+#       2026/11/22 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+[package]
+name = "spimed"
+version = "1.0.0"
+edition = "2021"
+description = "SpaceOS-9 standalone SPIME Chinese Pinyin & Shuangpin IME daemon"
+license = "LicenseRef-Proprietary"
+
+[[bin]]
+name = "spimed"
+path = "src/main.rs"
+
+[dependencies]
+spime = { path = "../spime" }
+spui_ui = { path = "../spui_ui" }
+uxconf = { package = "spui", path = "../desktop" }
+x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "render", "shape", "randr", "composite", "damage", "xfixes"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

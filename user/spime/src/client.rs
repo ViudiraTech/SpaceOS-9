@@ -13,7 +13,14 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
-const IO_TIMEOUT: Duration = Duration::from_millis(45);
+const IO_TIMEOUT: Duration = Duration::from_millis(150);
+
+fn is_idempotent_after_write(req: &ClientRequest) -> bool {
+    !matches!(
+        req,
+        ClientRequest::KeyEvent { .. } | ClientRequest::ToggleMode { .. }
+    )
+}
 
 /// Reconnecting IPC client embedded in SPUI `App`, `space-browser`, and `Shell`.
 pub struct SpimeClient {
@@ -76,9 +83,18 @@ impl SpimeClient {
                         return Some(reply);
                     }
                 }
+                // Drop the socket after a read timeout/EOF so future calls reconnect cleanly,
+                // and never resend non-idempotent requests (e.g. ToggleMode) that the daemon
+                // may have already processed.
+                self.stream = None;
+                self.last_spot = None;
+                if !is_idempotent_after_write(req) {
+                    return None;
+                }
+            } else {
+                self.stream = None;
+                self.last_spot = None;
             }
-            self.stream = None;
-            self.last_spot = None;
             if attempt == 0 {
                 self.last_connect_attempt = None;
                 let _ = self.ensure_connected();
@@ -167,5 +183,48 @@ impl SpimeClient {
         self.roundtrip(&ClientRequest::PollPending {
             client_id: self.client_id,
         })
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.stream.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn toggle_mode_is_not_retried_after_write_when_read_fails() {
+        let sock = std::env::temp_dir().join(format!("spime-client-test-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = Arc::clone(&hits);
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let _ = read_frame(&mut s);
+                    hits_bg.fetch_add(1, Ordering::SeqCst);
+                    // Close immediately without replying to simulate EOF after write.
+                    drop(s);
+                    break;
+                }
+            }
+        });
+
+        let mut client = SpimeClient::new(1);
+        let stream = UnixStream::connect(&sock).unwrap();
+        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        client.stream = Some(stream);
+        assert_eq!(client.toggle_mode(), None);
+        assert!(!client.is_connected());
+        let _ = handle.join();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(&sock);
     }
 }
