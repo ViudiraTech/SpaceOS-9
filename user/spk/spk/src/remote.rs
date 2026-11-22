@@ -491,6 +491,7 @@ fn download_one(
     package: &IndexPackage,
     part: &Path,
     progress: &mut dyn FnMut(u64),
+    lang: Lang,
 ) -> Result<()> {
     let mut last_error = None;
     for attempt in 0..RETRIES {
@@ -504,17 +505,21 @@ fn download_one(
             &[],
             part,
             resume,
-            package.size,
+            // One byte of slack: a stale index must surface as a size
+            // mismatch with the expected/actual values, not as an opaque
+            // "body exceeds limit" transport error.
+            package.size.saturating_add(1),
             &mut |written| progress(resume + written),
         ) {
-            Ok(response) => {
-                let state = response.status;
+            Ok(_) => {
                 let part_size = fs::metadata(part).map(|meta| meta.len()).unwrap_or(0);
                 if part_size != package.size {
                     let _ = fs::remove_file(part);
-                    last_error = Some(SpkError::Network(format!(
-                        "{mirror}: size {} does not match index {} (HTTP {state})",
-                        part_size, package.size
+                    last_error = Some(SpkError::Network(i18n::package_size_mismatch(
+                        lang,
+                        mirror,
+                        part_size,
+                        package.size,
                     )));
                 } else if sha256_file(part)? == package.sha256 {
                     return Ok(());
@@ -643,7 +648,7 @@ pub fn ensure_package(
     package: &IndexPackage,
     offline: bool,
 ) -> Result<PathBuf> {
-    ensure_package_with_progress(cache, mirrors, package, offline, &mut |_| {})
+    ensure_package_with_progress(cache, mirrors, package, offline, &mut |_| {}, Lang::En)
 }
 
 pub fn ensure_package_with_progress(
@@ -652,6 +657,7 @@ pub fn ensure_package_with_progress(
     package: &IndexPackage,
     offline: bool,
     progress: &mut dyn FnMut(u64),
+    lang: Lang,
 ) -> Result<PathBuf> {
     fs::create_dir_all(cache)?;
     let destination = cache.join(format!("{}.spk", package.sha256));
@@ -669,7 +675,7 @@ pub fn ensure_package_with_progress(
     let client = HttpClient::new()?;
     let mut last_error = None;
     for mirror in mirrors {
-        match download_one(&client, mirror, package, &part, &mut *progress) {
+        match download_one(&client, mirror, package, &part, &mut *progress, lang) {
             Ok(()) => {
                 if verify_cached_package(&part, package)? {
                     fs::rename(&part, &destination)?;

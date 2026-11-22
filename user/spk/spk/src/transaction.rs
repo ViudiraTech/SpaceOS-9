@@ -640,17 +640,20 @@ fn stage_packages(
         })?;
         let label = format!("({}/{total}) {}", position + 1, index.filename);
         let mut bar = ui::Bar::new(label, Some(index.size));
-        let package_path =
-            repo.ensure_package_with_progress(index, &mut |written| bar.advance(written))?;
+        let package_path = repo.ensure_package_with_progress(
+            index,
+            &mut |written| bar.advance(written),
+            lang,
+        )?;
         bar.finish();
         let metadata = fs::metadata(&package_path)
             .map_err(|error| SpkError::General(format!("{}: {error}", package_path.display())))?;
         if metadata.len() != index.size {
-            return Err(SpkError::General(format!(
-                "{}: size is {}, repository says {}",
-                index.filename,
+            return Err(SpkError::General(i18n::package_size_mismatch(
+                lang,
+                &index.filename,
                 metadata.len(),
-                index.size
+                index.size,
             )));
         }
         if sha256_file(&package_path)? != index.sha256 {
