@@ -145,6 +145,7 @@ const TAB_WIDTHS: [(i64, &str); 3] = [(2, "2 空格"), (4, "4 空格"), (8, "8 �
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Page {
     Appearance,
+    Fonts,
     Network,
     DesktopPanel,
     Windows,
@@ -161,6 +162,7 @@ impl Page {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Appearance => "外观",
+            Self::Fonts => "字体",
             Self::Network => "网络",
             Self::DesktopPanel => "桌面与面板",
             Self::Windows => "窗口",
@@ -177,6 +179,7 @@ impl Page {
     pub const fn channels(self) -> &'static [&'static str] {
         match self {
             Self::Appearance => &["appearance"],
+            Self::Fonts => &["font"],
             Self::Network => &["network"],
             Self::DesktopPanel => &["desktop", "panel"],
             Self::Windows => &["wm"],
@@ -230,6 +233,13 @@ pub const SETTING_ITEMS: &[SettingSearchItem] = &[
         title: "界面字体缩放",
         subtitle: "紧凑 (90%) / 标准 (100%) / 大号 (115%)",
         keywords: "font scale dpi 缩放 字体大小",
+    },
+    SettingSearchItem {
+        page: Page::Fonts,
+        category: "外观",
+        title: "系统字体",
+        subtitle: "分别设置界面、文档与等宽字体，随 uxconf 实时生效",
+        keywords: "font typeface family 字体 字号 界面 文档 等宽 monospace",
     },
     // 网络
     SettingSearchItem {
@@ -450,6 +460,37 @@ const NAV: [(Page, &str, Icon); 11] = [
     (Page::About, "关于", Icon::About),
 ];
 
+/// Installed families, scanned once per settings process.
+fn font_family_choices() -> &'static [String] {
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        crate::fonts::scan(std::path::Path::new("/"))
+            .into_iter()
+            .map(|family| family.name)
+            .collect()
+    })
+}
+
+/// Next family in the cycle, starting at "system default".
+fn next_font_family(current: &str) -> String {
+    let families = font_family_choices();
+    if families.is_empty() {
+        return String::new();
+    }
+    let mut index = 0usize;
+    if !current.is_empty() {
+        match families.iter().position(|name| name == current) {
+            Some(pos) => index = pos + 1,
+            None => index = 0,
+        }
+    }
+    if index >= families.len() {
+        String::new()
+    } else {
+        families[index].clone()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum HitTarget {
     Nav(usize),
@@ -461,6 +502,8 @@ enum HitTarget {
     ThemeSearchClear,
     ThemeRefresh,
     ThemeStore,
+    FontRole(u8),
+    FontReset,
     ThemePagePrev,
     ThemePageNext,
     ThemeExpandToggle,
@@ -1888,6 +1931,26 @@ impl SettingsState {
                 self.last_themes_check = Instant::now();
                 self.theme_page = 0;
                 self.status = format!("已刷新，共发现 {} 套扩展主题", self.external_themes.len());
+            }
+            HitTarget::FontRole(role) => {
+                let (property, current) = match role {
+                    0 => ("/ui-family", host.config().font_ui_family.clone()),
+                    1 => ("/document-family", host.config().font_document_family.clone()),
+                    _ => ("/monospace-family", host.config().font_mono_family.clone()),
+                };
+                let next = next_font_family(&current);
+                host.set_config_property("font", property, Value::String(next.clone()));
+                self.status = if next.is_empty() {
+                    "已恢复系统默认字体".to_string()
+                } else {
+                    format!("已切换字体：{next}")
+                };
+            }
+            HitTarget::FontReset => {
+                for property in ["/ui-family", "/document-family", "/monospace-family"] {
+                    host.set_config_property("font", property, Value::String(String::new()));
+                }
+                self.status = "已恢复默认字体".to_string();
             }
             HitTarget::ThemeStore => {
                 let mut launched = false;
@@ -5258,6 +5321,153 @@ impl SettingsState {
                         push_clipped_hit(hits, viewport, row_r, target);
                     }
                     y += c2.h + 18;
+                }
+
+                Page::Fonts => {
+                    let hero = Rect::new(content_x, y + 4, card_w, 92);
+                    ui::card(canvas, theme, hero);
+                    text.draw(
+                        canvas,
+                        "字体",
+                        (content_x + 20) as f32,
+                        (hero.y + 34) as f32,
+                        18.0,
+                        theme.text,
+                        Face::Bold,
+                    );
+                    text.draw(
+                        canvas,
+                        "分别指定界面、文档与等宽三类字体；留空即使用系统内置字体。所选字体缺少汉字时自动回退到内置中文字体。",
+                        (content_x + 20) as f32,
+                        (hero.y + 60) as f32,
+                        12.0,
+                        theme.text_dim,
+                        Face::Ui,
+                    );
+                    y += hero.h + 18;
+
+                    let rows = [
+                        ("界面字体", "窗口、菜单、对话框与开始菜单", &cfg.font_ui_family),
+                        ("文档字体", "SpaceEditor 等文档应用的正文", &cfg.font_document_family),
+                        ("等宽字体", "终端、代码与监视器数值", &cfg.font_mono_family),
+                    ];
+                    for (index, (label, hint, value)) in rows.iter().enumerate() {
+                        let row = Rect::new(content_x, y, card_w, 66);
+                        ui::card(canvas, theme, row);
+                        text.draw(
+                            canvas,
+                            label,
+                            (row.x + 18) as f32,
+                            (row.y + 28) as f32,
+                            13.5,
+                            theme.text,
+                            Face::Bold,
+                        );
+                        let shown = if value.trim().is_empty() {
+                            "系统默认"
+                        } else {
+                            value.as_str()
+                        };
+                        text.draw(
+                            canvas,
+                            shown,
+                            (row.x + 18) as f32,
+                            (row.y + 48) as f32,
+                            12.0,
+                            theme.accent,
+                            Face::Ui,
+                        );
+                        text.draw(
+                            canvas,
+                            hint,
+                            (row.x + 200) as f32,
+                            (row.y + 28) as f32,
+                            11.5,
+                            theme.text_muted,
+                            Face::Ui,
+                        );
+                        let target = HitTarget::FontRole(index as u8);
+                        let button = Rect::new(row.right() - 100, row.y + 18, 84, 30);
+                        ui::button(
+                            canvas,
+                            text,
+                            theme,
+                            button,
+                            "更改",
+                            None,
+                            false,
+                            hover == Some(target),
+                        );
+                        push_clipped_hit(hits, viewport, button, target);
+                        push_clipped_hit(hits, viewport, row, target);
+                        y += 74;
+                    }
+
+                    let preview = Rect::new(content_x, y, card_w, 96);
+                    ui::card(canvas, theme, preview);
+                    text.draw(
+                        canvas,
+                        "预览",
+                        (preview.x + 18) as f32,
+                        (preview.y + 26) as f32,
+                        12.0,
+                        theme.text_muted,
+                        Face::Bold,
+                    );
+                    text.draw(
+                        canvas,
+                        "汉字渲染示例 ABCabc 0123456789",
+                        (preview.x + 18) as f32,
+                        (preview.y + 50) as f32,
+                        14.0,
+                        theme.text,
+                        Face::Ui,
+                    );
+                    text.draw(
+                        canvas,
+                        "衬线正文示例 The quick brown fox",
+                        (preview.x + 18) as f32,
+                        (preview.y + 72) as f32,
+                        13.0,
+                        theme.text,
+                        Face::Serif,
+                    );
+                    text.draw(
+                        canvas,
+                        "monospace 0123456789",
+                        (preview.x + 18) as f32,
+                        (preview.y + 90) as f32,
+                        12.0,
+                        theme.text_muted,
+                        Face::Mono,
+                    );
+                    y += preview.h + 16;
+
+                    let reset = Rect::new(content_x, y, 132, 30);
+                    ui::button(
+                        canvas,
+                        text,
+                        theme,
+                        reset,
+                        "恢复默认",
+                        None,
+                        false,
+                        hover == Some(HitTarget::FontReset),
+                    );
+                    push_clipped_hit(hits, viewport, reset, HitTarget::FontReset);
+                    text.draw(
+                        canvas,
+                        &format!(
+                            "已发现 {} 套可用字体（安装字体软件包后会自动出现在循环列表中）",
+                            font_family_choices().len()
+                        ),
+                        (content_x + 144) as f32,
+                        (y + 20) as f32,
+                        11.5,
+                        theme.text_muted,
+                        Face::Ui,
+                    );
+                    y += 44;
                 }
 
                 Page::Logs => {

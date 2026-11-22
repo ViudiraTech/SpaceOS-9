@@ -139,6 +139,7 @@ impl FontData {
 }
 
 /// Retain the original collection without preprocessing its glyph outlines.
+#[derive(Clone)]
 struct Font {
     data: Arc<FontData>,
     index: u32,
@@ -275,6 +276,8 @@ struct CachedGlow {
 
 pub struct TextRenderer {
     ui: Font,
+    /// Default CJK face, used when a configured family lacks a glyph.
+    fallback: Font,
     bold: Font,
     serif: Option<Font>,
     serif_bold: Option<Font>,
@@ -506,21 +509,133 @@ fn load(
     Ok(Font { data, index })
 }
 
+/// Font families chosen in `uxconf` (`font:/ui-family`, `/document-family`,
+/// `/monospace-family`). Empty means "use the bundled defaults".
+#[derive(Clone, Debug, Default)]
+pub struct FontPrefs {
+    pub ui: Option<String>,
+    pub document: Option<String>,
+    pub monospace: Option<String>,
+}
+
+impl FontPrefs {
+    pub fn is_default(&self) -> bool {
+        [&self.ui, &self.document, &self.monospace]
+            .iter()
+            .all(|value| value.as_deref().map(str::trim).unwrap_or("").is_empty())
+    }
+
+    /// Build preferences from raw `uxconf` values (empty means default).
+    pub fn from_values(ui: &str, document: &str, monospace: &str) -> Self {
+        let clean = |value: &str| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        Self {
+            ui: clean(ui),
+            document: clean(document),
+            monospace: clean(monospace),
+        }
+    }
+}
+
+fn sysroot_path() -> std::path::PathBuf {
+    std::env::var("SPUI_SYSROOT")
+        .ok()
+        .map(|root| std::path::PathBuf::from(root.trim()))
+        .filter(|root| !root.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
+fn load_at(
+    reference: &crate::fonts::FaceRef,
+    files: &mut HashMap<String, Arc<FontData>>,
+) -> Result<Font, String> {
+    let resolved = reference.path.to_string_lossy().into_owned();
+    let data = if let Some(data) = files.get(&resolved) {
+        data.clone()
+    } else {
+        let data = Arc::new(FontData::open(&resolved)?);
+        files.insert(resolved.clone(), data.clone());
+        data
+    };
+    ParsedFace::parse(&data, reference.index).map_err(|e| format!("font {resolved}: {e:?}"))?;
+    Ok(Font {
+        data,
+        index: reference.index,
+    })
+}
+
 impl TextRenderer {
     pub fn load() -> Result<Self, String> {
+        Self::load_with(&FontPrefs::default())
+    }
+
+    /// Load the role faces, honouring the configured families. A family that
+    /// cannot be resolved (removed package, unknown name) falls back to the
+    /// bundled default per role.
+    pub fn load_with(prefs: &FontPrefs) -> Result<Self, String> {
         let mut files = HashMap::new();
         let ui = load(theme::FONT_UI, "CJK SC", &mut files)
             .or_else(|_| load(theme::FONT_FALLBACK, "", &mut files))?;
-        let bold = load(theme::FONT_UI_BOLD, "CJK SC", &mut files)
+        let mut bold = load(theme::FONT_UI_BOLD, "CJK SC", &mut files)
             .or_else(|_| load(theme::FONT_UI, "CJK SC", &mut files))?;
-        let serif = load(theme::FONT_SERIF, "CJK SC", &mut files).ok();
-        let serif_bold = load(theme::FONT_SERIF_BOLD, "CJK SC", &mut files).ok();
-        let mono = load(theme::FONT_MONO, "Mono CJK SC", &mut files)
+        let mut serif = load(theme::FONT_SERIF, "CJK SC", &mut files).ok();
+        let mut serif_bold = load(theme::FONT_SERIF_BOLD, "CJK SC", &mut files).ok();
+        let mut mono = load(theme::FONT_MONO, "Mono CJK SC", &mut files)
             .or_else(|_| load(theme::FONT_MONO, "CJK SC", &mut files))?;
         let cyber_display = load(theme::FONT_CYBER_DISPLAY, "", &mut files).ok();
         let cyber_mono = load(theme::FONT_CYBER_MONO, "", &mut files).ok();
+        let fallback = ui.clone();
+
+        let mut ui = ui;
+        if !prefs.is_default() {
+            let families = crate::fonts::scan(&sysroot_path());
+            if let Some(family) = prefs
+                .ui
+                .as_deref()
+                .and_then(|name| crate::fonts::resolve(&families, name))
+            {
+                if let Ok(face) = load_at(&family.regular, &mut files) {
+                    bold = family
+                        .bold
+                        .as_ref()
+                        .and_then(|index| load_at(index, &mut files).ok())
+                        .unwrap_or_else(|| face.clone());
+                    ui = face;
+                }
+            }
+            if let Some(family) = prefs
+                .document
+                .as_deref()
+                .and_then(|name| crate::fonts::resolve(&families, name))
+            {
+                if let Ok(face) = load_at(&family.regular, &mut files) {
+                    let bold_face = family
+                        .bold
+                        .as_ref()
+                        .and_then(|index| load_at(index, &mut files).ok());
+                    serif_bold = bold_face.clone().or_else(|| Some(face.clone()));
+                    serif = Some(face);
+                }
+            }
+            if let Some(family) = prefs
+                .monospace
+                .as_deref()
+                .and_then(|name| crate::fonts::resolve(&families, name))
+            {
+                if let Ok(face) = load_at(&family.regular, &mut files) {
+                    mono = face;
+                }
+            }
+        }
         Ok(Self {
             ui,
+            fallback,
             bold,
             serif,
             serif_bold,
@@ -567,6 +682,15 @@ impl TextRenderer {
                 .as_ref()
                 .filter(|f| f.has_glyph(ch))
                 .unwrap_or(&self.mono),
+        };
+        // A configured Latin family usually has no CJK coverage; borrow the
+        // glyph from the bundled CJK face instead of rendering tofu.
+        let font = if font.has_glyph(ch) {
+            font
+        } else if self.fallback.has_glyph(ch) {
+            &self.fallback
+        } else {
+            font
         };
         (font, slant)
     }
@@ -1038,8 +1162,10 @@ mod tests {
             index: ui.index,
         };
         let mono = load(path, "Mono CJK SC", &mut files).unwrap();
+        let fallback = ui.clone();
         let mut renderer = TextRenderer {
             ui,
+            fallback,
             bold,
             serif: None,
             serif_bold: None,
