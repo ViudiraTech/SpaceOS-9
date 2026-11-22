@@ -265,6 +265,15 @@ doas spk sync
 - Cloudflare（当前站点已在用）：免费版默认不缓存无已知后缀的文件，需要一条 Cache Rule：路径匹配 `^/spaceos/repo/.*\.spk$` → Eligible，Edge TTL 跟随源站；其余路径不缓存。
 - Bunny.net（无 KYC、邮箱即可注册、支持信用卡、14 天免卡试用）：亚洲 $0.03/GB，账号每月最低 $1。建 Pull Zone，源站填 `https://goutoustdio.top`，加 Edge Rule 让 `*.json`、`*.sig`、`/pkg/*`、`/previews/*` 绕过缓存，其余（`.spk`）长缓存；再绑一个 `cdn.goutoustdio.top` 并写进 `urls` 作为首选镜像。
 
+### 4.5 输入法作为独立软件包
+
+`spime`（`spimed` 守护进程 + 词库 + 语言模型）与 `spui-askpass`、`space-store` 一样独立打包，基础镜像不再包含 `/usr/bin/spimed`、词库或任何 IME 路径：
+
+- 包内提供 `/etc/xdg/autostart/spimed.desktop`，`session.sh` 按 XDG autostart 规范逐个执行，不在会话脚本里点名任何输入法；
+- Shell 只在根窗口属性 `_SPIME_STATUS`（或 ime socket 应答）出现时显示托盘状态，没有运行中的输入法时不显示伪造的「中」，也不尝试启动任何二进制；
+- 右键菜单只保留通用的「切换中/英文」「候选栏方向」「输入法设置…」，不枚举具体方案；
+- 卸载后桌面、终端、编辑器均正常退化，无报错。
+
 ## 5. 依赖与求解
 
 ### 5.1 版本比较

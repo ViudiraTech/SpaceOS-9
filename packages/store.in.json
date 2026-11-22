@@ -90,6 +90,7 @@
       "subtitle": "SpaceOS 的基石组件",
       "packages": [
         "base-core",
+        "spime",
         "spk-runtime",
         "sudo",
         "spui-askpass",

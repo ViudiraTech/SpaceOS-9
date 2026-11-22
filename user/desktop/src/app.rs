@@ -933,6 +933,7 @@ impl App {
                     if is_active != self.active {
                         self.active = is_active;
                         self.needs_redraw = true;
+                        self.sync_ime_focus();
                     }
                 } else if e.atom == self.x.atoms.spui_compositor {
                     let active = self.x.is_compositor_active();

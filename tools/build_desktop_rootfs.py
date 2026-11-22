@@ -861,30 +861,17 @@ EndSection
             ):
                 install_binary(path, f"/usr/bin/{path.name}")
         if (STAGE / "usr/bin/spui").exists():
-            spimed = STAGE / "usr/bin/spimed"
-            if spimed.is_symlink() or spimed.exists():
-                spimed.unlink()
-            spimed.symlink_to("/usr/bin/spui")
-            # spui-askpass ships as its own spk package; drop any legacy symlink.
-            askpass = STAGE / "usr/bin/spui-askpass"
-            if askpass.is_symlink():
-                askpass.unlink()
+            # spimed and spui-askpass ship as their own packages; remove any
+            # legacy symlinks baked into older images.
+            for legacy in ("spimed", "spui-askpass"):
+                path = STAGE / "usr/bin" / legacy
+                if path.is_symlink():
+                    path.unlink()
         if (STAGE / "usr/bin/NetworkManager").exists():
             nm_sbin = STAGE / "usr/sbin/NetworkManager"
             if nm_sbin.is_symlink() or nm_sbin.exists():
                 nm_sbin.unlink()
             nm_sbin.symlink_to("/usr/bin/NetworkManager")
-    spime_build = ROOT / "build" / "spime"
-    if not (spime_build / "spime.dict").is_file() or not (spime_build / "spime.lm").is_file():
-        log("compiling SPIME Chinese IME dictionary and language model")
-        subprocess.run(
-            [sys.executable, str(ROOT / "tools" / "build_spime_dict.py"), "--out-dir", str(spime_build)],
-            check=True,
-        )
-    for fname in ("spime.dict", "spime.lm", "NOTICE.txt"):
-        src = spime_build / fname
-        if src.is_file():
-            install_binary(src, f"/usr/share/spime/{fname}", 0o644)
     music_dir = ROOT / "user" / "assets" / "music"
     if music_dir.is_dir():
         for track in sorted(music_dir.glob("*.mp3")):

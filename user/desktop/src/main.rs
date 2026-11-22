@@ -20,7 +20,6 @@ mod desktop_entries;
 mod draw;
 mod fonts;
 mod icons;
-mod ime;
 mod netmgr;
 mod shell;
 mod sound;
@@ -34,35 +33,35 @@ mod xprobe;
 
 use std::process::ExitCode;
 
+fn run_external_helper(helper: &str, pkg: &str, args: &[String]) -> ExitCode {
+    if !std::path::Path::new(helper).is_file() {
+        eprintln!("spui: {helper} 未安装，请先安装 {pkg} 软件包");
+        return ExitCode::FAILURE;
+    }
+    match std::process::Command::new(helper).args(args).status() {
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(error) => {
+            eprintln!("spui: 无法启动 {helper}: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().collect();
-    let prog = arguments.first().map(String::as_str).unwrap_or("");
-    let default_mode = if prog.ends_with("spimed") {
-        "imed"
-    } else {
-        "shell"
-    };
-    let mode = arguments.get(1).map(String::as_str).unwrap_or(default_mode);
+    let mode = arguments
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("shell");
     if matches!(mode, "auth" | "askpass") {
-        let helper = "/usr/bin/spui-askpass";
-        if !std::path::Path::new(helper).is_file() {
-            eprintln!("spui: {helper} 未安装，请先安装 spui-askpass 软件包");
-            return ExitCode::FAILURE;
-        }
-        return match std::process::Command::new(helper)
-            .args(arguments.get(2..).unwrap_or(&[]))
-            .status()
-        {
-            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
-            Err(error) => {
-                eprintln!("spui: 无法启动 {helper}: {error}");
-                ExitCode::FAILURE
-            }
-        };
+        return run_external_helper(
+            "/usr/bin/spui-askpass",
+            "spui-askpass",
+            arguments.get(2..).unwrap_or(&[]),
+        );
     }
     let result = match mode {
         "shell" => shell::Shell::run(),
-        "imed" => ime::run(),
         "term" => apps::term::run(arguments.get(2).map(String::as_str)),
         "files" => apps::files::run(arguments.get(2).map(String::as_str)),
         "edit" => apps::edit::run(arguments.get(2).map(String::as_str)),
