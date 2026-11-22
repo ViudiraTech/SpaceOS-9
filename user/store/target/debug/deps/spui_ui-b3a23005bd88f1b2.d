@@ -1,0 +1,16 @@
+/home/jitianyu/Project/SpaceKernel/user/store/target/debug/deps/spui_ui-b3a23005bd88f1b2.d: /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/lib.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/app.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/draw.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/fonts.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/icons.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/text.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/theme.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/ui.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/vortex.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/x11.rs
+
+/home/jitianyu/Project/SpaceKernel/user/store/target/debug/deps/libspui_ui-b3a23005bd88f1b2.rlib: /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/lib.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/app.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/draw.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/fonts.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/icons.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/text.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/theme.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/ui.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/vortex.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/x11.rs
+
+/home/jitianyu/Project/SpaceKernel/user/store/target/debug/deps/libspui_ui-b3a23005bd88f1b2.rmeta: /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/lib.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/app.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/draw.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/fonts.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/icons.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/text.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/theme.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/ui.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/vortex.rs /home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/x11.rs
+
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/lib.rs:
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/app.rs:
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/draw.rs:
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/fonts.rs:
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/icons.rs:
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/text.rs:
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/theme.rs:
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/ui.rs:
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/vortex.rs:
+/home/jitianyu/Project/SpaceKernel/user/spui_ui/src/../../desktop/src/x11.rs:

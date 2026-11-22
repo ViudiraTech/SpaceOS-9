@@ -397,7 +397,7 @@ fn draw_discover(
     let inner_w = (area.w - SCROLLBAR_GUTTER).max(160);
     let offset = state.discover_scroll.offset_i32();
     let slides = state.hero_slides();
-    let sections = build_sections(&state.catalog);
+    let sections = &state.sections;
     let pointer = state.last_pointer;
     let total_h: i32;
 
@@ -502,7 +502,7 @@ fn draw_discover(
             };
             let card_w = (inner_w - (columns - 1) * 16) / columns;
 
-            for section in &sections {
+            for section in sections {
                 let header = Rect::new(area.x, y, inner_w, 28);
                 if header.bottom() >= area.y && header.y <= area.bottom() {
                     ui_cards::section_header(

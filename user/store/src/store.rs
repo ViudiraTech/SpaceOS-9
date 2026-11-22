@@ -235,6 +235,8 @@ struct StoreState {
     maint_scroll: ui::SmoothScroll,
     queue_scroll: ui::SmoothScroll,
     hero_index: usize,
+    hero_slides: Vec<HeroSlide>,
+    sections: Vec<crate::curated::FeaturedSection>,
     hero_hover: bool,
     hero_last: Instant,
     jobs: Vec<TxJob>,
@@ -308,6 +310,8 @@ impl StoreState {
             maint_scroll: ui::SmoothScroll::new("store_maint_scroll"),
             queue_scroll: ui::SmoothScroll::new("store_queue_scroll"),
             hero_index: 0,
+            hero_slides: Vec::new(),
+            sections: Vec::new(),
             hero_hover: false,
             hero_last: Instant::now(),
             jobs: Vec::new(),
@@ -338,6 +342,13 @@ impl StoreState {
         self.updates = self.catalog.updates.clone();
         self.trust_keys = snapshot.trust_keys;
         self.cache = snapshot.cache;
+        // Editorial slides come from the catalog; build them once per snapshot
+        // instead of on every frame.
+        self.hero_slides = build_hero_slides(&self.catalog);
+        self.sections = build_sections(&self.catalog);
+        if self.hero_index >= self.hero_slides.len() {
+            self.hero_index = 0;
+        }
 
         if snapshot.mode == CatalogSyncMode::LocalReload {
             // Post-transaction local reloads run with `--offline` purely to avoid extra network
@@ -408,8 +419,8 @@ impl StoreState {
     fn request_missing_banners(&mut self, backend: &StoreBackend) {
         let mut rels: Vec<String> = Vec::new();
         for slide in self.hero_slides() {
-            if let Some(banner) = slide.banner {
-                rels.push(banner);
+            if let Some(banner) = &slide.banner {
+                rels.push(banner.clone());
             }
         }
         for pkg in &self.packages {
@@ -443,8 +454,8 @@ impl StoreState {
         present_package(pkg, self.meta(&pkg.name))
     }
 
-    fn hero_slides(&self) -> Vec<HeroSlide> {
-        build_hero_slides(&self.catalog)
+    fn hero_slides(&self) -> &[HeroSlide] {
+        &self.hero_slides
     }
 
     fn banner_sprite(&self, rel: Option<&str>) -> Option<&Sprite> {
@@ -644,10 +655,16 @@ pub fn run_store(options: StoreOptions) -> Result<(), String> {
             prev_hits = hits;
         }
 
-        let timeout = if ui::has_active_animations() { 16 } else { 120 };
-        let (events, _changed) = app
+        let timeout = if ui::has_active_animations() { 16 } else { 250 };
+        let (events, changed) = app
             .pump_with_fd(Some(backend.wakeup_fd()), timeout)
             .map_err(|e| e.to_string())?;
+        // The wake pipe stays readable until it is drained; poll() would then
+        // return immediately on every iteration and spin a core for nothing.
+        backend.drain_wakeup();
+        if changed {
+            app.needs_redraw = true;
+        }
 
         for event in events {
             handle_event(&mut app, &mut state, &backend, &prev_hits, event);
