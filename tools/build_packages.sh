@@ -96,21 +96,21 @@ pack_one() {
         --level 19
 }
 
-pack_one space-store 1.0.0-6 "$ROOT/packages/space-store/manifest.toml" "$BUILD/packages/space-store"
+pack_one space-store 1.0.0-7 "$ROOT/packages/space-store/manifest.toml" "$BUILD/packages/space-store"
 pack_one spui-askpass 1.0.0-1 "$ROOT/packages/spui-askpass/manifest.toml" "$BUILD/packages/spui-askpass"
-pack_one space-editor 1.0.0-3 "$ROOT/packages/space-editor/manifest.toml" "$BUILD/packages/space-editor"
+pack_one space-editor 1.0.0-4 "$ROOT/packages/space-editor/manifest.toml" "$BUILD/packages/space-editor"
 pack_one font-hack 1.0.0-1 "$ROOT/packages/font-hack/manifest.toml" "$BUILD/packages/font-hack"
 pack_one font-carlito 1.0.0-1 "$ROOT/packages/font-carlito/manifest.toml" "$BUILD/packages/font-carlito"
-pack_one font-croscore 1.0.0-1 "$ROOT/packages/font-croscore/manifest.toml" "$BUILD/packages/font-croscore"
+pack_one font-croscore 1.0.0-2 "$ROOT/packages/font-croscore/manifest.toml" "$BUILD/packages/font-croscore"
 pack_one spime 1.0.0-1 "$ROOT/packages/spime/manifest.toml" "$BUILD/packages/spime"
 pack_one hello 0.1.0-2 "$ROOT/packages/hello/manifest.toml" "$BUILD/packages/hello-0.1.0"
 pack_one hello 0.2.0-2 "$ROOT/packages/hello/manifest-0.2.0.toml" "$BUILD/packages/hello-0.2.0"
 pack_one sudo 0.1.0-5 "$ROOT/packages/sudo/manifest.toml" "$BUILD/packages/sudo"
-pack_one base-core 1.0.0-11 "$ROOT/packages/base-core/manifest.toml" "$BUILD/packages/base-core"
+pack_one base-core 1.0.0-12 "$ROOT/packages/base-core/manifest.toml" "$BUILD/packages/base-core"
 pack_one base 1.0.0-7 "$ROOT/packages/base/manifest.toml" "$BUILD/packages/base"
 pack_one theme-winxp 1.0.0-8 "$ROOT/packages/theme-winxp/manifest.toml" "$BUILD/packages/theme-winxp"
 pack_one theme-aqua 1.0.0-5 "$ROOT/packages/theme-aqua/manifest.toml" "$BUILD/packages/theme-aqua"
 pack_one theme-ambiance 1.0.0-5 "$ROOT/packages/theme-ambiance/manifest.toml" "$BUILD/packages/theme-ambiance"
-pack_one spk-runtime 1.0.0-9 "$ROOT/packages/spk-runtime/manifest.toml" "$BUILD/packages/spk-runtime"
+pack_one spk-runtime 1.0.0-10 "$ROOT/packages/spk-runtime/manifest.toml" "$BUILD/packages/spk-runtime"
 
 printf 'reproducible packages in %s\n' "$REPO"

@@ -654,7 +654,24 @@ cp build/repo/x86_64/foo-1.0.0-1-x86_64.spk build/repo-prod/x86_64/
   把这些标成 `immutable` 会让客户端长期拿着与索引不匹配的清单/历史文件，`spk sync` 也救不回来；
 - 保留 Range/206，支持断点续传。
 
-### 9.3 上线验收
+### 9.3 发布前的一致性检查（重要）
+
+`.spk` 一旦发布就是**不可变**的：文件名带版本号，CDN 会按 `immutable` 缓存一年。因此：
+
+- **同一版本号下的字节发生任何变化，必须先递增 `release`**。包的 `.BUILDINFO` 里带了 `SOURCE_DATE_EPOCH`（跟随最后一次提交），所以只要重新构建，字节通常就会变；沿用旧版本号重新上传会让边缘继续提供旧字节，客户端报 `下载到 X 字节，仓库索引记录 Y 字节`。
+- 发布前逐个比对（`?v=` 用来绕过缓存取源站字节）：
+
+  ```sh
+  for f in *.spk; do
+    local=$(sha256sum "$f" | cut -d' ' -f1)
+    live=$(curl -sS "https://<站点>/spaceos/repo/x86_64/$f?v=$RANDOM" | sha256sum | cut -d' ' -f1)
+    [ "$local" = "$live" ] || echo "需要递增版本：$f"
+  done
+  ```
+
+- **上传 .spk 要原子**：先写 `<name>.new` 再 `mv`，否则 CDN 可能在拷贝中途回源，缓存到半截文件。
+
+### 9.4 上线验收
 
 ```sh
 spk-host verify --repo-dir <下载目录> --key spaceos-main.pub
@@ -668,7 +685,7 @@ doas spk sync
 doas spk install foo
 ```
 
-### 9.4 安全
+### 9.5 安全
 
 - 私钥永不进入 Git、镜像、构建产物或日志。
 - 只发布公钥；私钥只放在受控机器的 `~/.config/spaceos/spk/keys/`。
