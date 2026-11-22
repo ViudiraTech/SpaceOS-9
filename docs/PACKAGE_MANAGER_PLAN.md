@@ -165,13 +165,18 @@ size = 11
 ```
 /spaceos/repo/
 ├── x86_64/
-│   ├── index.json
-│   ├── index.json.sig
+│   ├── repo.json          # 仓库根清单（schema 2），只签这一个
+│   ├── repo.json.sig
+│   ├── index.json         # 目录：每个包一行，只放最新版本
+│   ├── index.json.sig     # 兼容旧客户端
+│   ├── pkg/<xx>/<yy>/<name>   # 该包的全部历史版本，NDJSON，一行一版
 │   ├── foo-1.2.3-1-x86_64.spk
 │   └── ...
 ├── aarch64/
 └── riscv64/
 ```
+
+`pkg/` 路径沿用 cargo sparse index 的分桶规则：1 字符 `pkg/1/x`，2 字符 `pkg/2/xy`，3 字符 `pkg/3/x/xyz`，4 字符及以上 `pkg/ab/cd/abcd…`。
 
 可选的 per-repo 元数据：
 
@@ -180,40 +185,38 @@ size = 11
 /deltas/<from>-<to>.spkdelta  # 可选增量
 ```
 
-### 4.2 index.json
+### 4.2 索引与签名链
+
+三个文件，一条哈希链（Debian `Release` 模型 + repod 的每包状态文件）：
 
 ```json
-{
-  "schema": 1,
-  "repo": "spaceos-main",
-  "arch": "x86_64",
-  "generated_at": 1760000000,
-  "key_id": "ed25519:...",
-  "packages": [
-    {
-      "name": "foo",
-      "epoch": 0,
-      "version": "1.2.3",
-      "release": 1,
-      "arch": "x86_64",
-      "abi": "spaceos-1",
-      "filename": "foo-1.2.3-1-x86_64.spk",
-      "size": 12345,
-      "sha256": "...",
-      "depends": ["bar>=2.0"],
-      "provides": ["foo-abi=1"],
-      "conflicts": [],
-      "replaces": [],
-      "summary": "..."
-    }
-  ]
-}
+// repo.json
+{"schema":2,"repo":"spaceos-main","arch":"x86_64","generated_at":…,"key_id":"ed25519:…",
+ "catalog":{"sha256":"…","size":2799},
+ "history":{"hello":{"sha256":"…","size":627}, …}}
 ```
 
-- `index.json.sig` 为分离签名，覆盖 index 原文；客户端按 `key_id` 查信任库。
-- 仓库可提供 `index.json.zst` 压缩版，客户端优先取压缩版。
-- 镜像：同一仓库可有多个 URL；客户端按优先级/延迟切换，签名保证一致性。
-- 保留策略：每个包保留最近 N 个版本（默认 3），`.spk` 内容不可变，长缓存。
+```json
+// index.json —— 一行一个包
+{"schema":1,"repo":"spaceos-main","arch":"x86_64","generated_at":…,"key_id":"ed25519:…","packages":[
+{"name":"hello","epoch":0,"version":"0.2.0","release":1,…},
+{"name":"sudo",…}
+]}
+```
+
+```
+// pkg/he/ll/hello —— 一行一个版本
+{"name":"hello","version":"0.1.0",…}
+{"name":"hello","version":"0.2.0",…}
+```
+
+- 只签 `repo.json`；`index.json` 与 `pkg/` 下所有文件由 `repo.json` 的 sha256 覆盖。
+  旧客户端仍只读 `index.json` + `index.json.sig`，`index.json` 保持 schema 1 语义，只是只含最新版本。
+- 安装/升级只需要 `index.json`；`downgrade` 或 `pkg=version` 才按需拉 `pkg/…`，由 `repo.json` 校验哈希。
+- 仓库可提供 `.zst` 压缩版；客户端按 ETag/304 缓存索引，默认 15 分钟内不重新联网（`--refresh` 强制，`SPK_SYNC_TTL_SECONDS` 可调）。
+- 镜像：同一仓库可有多个 URL；客户端按优先级切换，签名保证一致性。
+- 保留策略：`.spk` 内容不可变，长缓存；历史文件随版本数增长，旧版本可按策略清理。
+- `spk-host index` 维护 `.spk-index-cache.json`（文件名 + size + mtime），只重新检查变化的包，新增一个包只多花一个包的时间。
 
 ## 5. 依赖与求解
 

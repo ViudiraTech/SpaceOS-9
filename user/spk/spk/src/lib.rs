@@ -27,4 +27,5 @@ pub mod solver;
 pub mod state;
 pub mod transaction;
 pub mod triggers;
+pub mod ui;
 pub mod util;

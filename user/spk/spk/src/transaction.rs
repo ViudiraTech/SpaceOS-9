@@ -32,6 +32,7 @@ use crate::sandbox;
 use crate::solver::{Solution, TargetKind};
 use crate::state::{write_temp_json, Paths, State};
 use crate::triggers;
+use crate::ui;
 use crate::util::{copy_file, human_size, now, txid as new_txid};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,11 +201,7 @@ pub fn execute(
     let staged = if solution.actions.is_empty() {
         BTreeMap::new()
     } else {
-        println!("({count}/{count}) {}", i18n::checking_keys(options.lang));
-        println!(
-            "({count}/{count}) {}",
-            i18n::checking_integrity(options.lang)
-        );
+        println!("{}", i18n::retrieving(options.lang));
         let staged = match stage_packages(paths, &solution, repos, &txid, options.lang) {
             Ok(staged) => staged,
             Err(error) => {
@@ -627,7 +624,8 @@ fn stage_packages(
     lang: Lang,
 ) -> Result<BTreeMap<String, Staged>> {
     let mut staged = BTreeMap::new();
-    for action in &solution.actions {
+    let total = solution.actions.len().max(1);
+    for (position, action) in solution.actions.iter().enumerate() {
         let (repo_index, index) = match (&action.to.origin, &action.to.repo_pkg) {
             (crate::solver::Origin::Repo(index), Some(package)) => (*index, package),
             _ => {
@@ -640,7 +638,11 @@ fn stage_packages(
         let repo = repos.get(repo_index).ok_or_else(|| {
             SpkError::General(format!("repository index {repo_index} disappeared"))
         })?;
-        let package_path = repo.ensure_package(index)?;
+        let label = format!("({}/{total}) {}", position + 1, index.filename);
+        let mut bar = ui::Bar::new(label, Some(index.size));
+        let package_path =
+            repo.ensure_package_with_progress(index, &mut |written| bar.advance(written))?;
+        bar.finish();
         let metadata = fs::metadata(&package_path)
             .map_err(|error| SpkError::General(format!("{}: {error}", package_path.display())))?;
         if metadata.len() != index.size {
@@ -1328,6 +1330,7 @@ fn apply(
         );
     }
 
+    let mut bar = ui::Bar::counter(i18n::writing_files(lang), plan.writes.len() as u64);
     for write in &plan.writes {
         let old = fs.on_disk(&write.logical)?;
         if let Some(old) = &old {
@@ -1363,7 +1366,9 @@ fn apply(
             first_write = false;
             crash::point("after-first-write");
         }
+        bar.advance(1);
     }
+    bar.finish();
 
     for save in &plan.saves {
         journal.append(&Event::Write {

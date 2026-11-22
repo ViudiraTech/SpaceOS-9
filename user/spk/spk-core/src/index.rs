@@ -171,6 +171,113 @@ pub struct RevokedVersion {
     pub reason: String,
 }
 
+/// Repository root manifest (schema 2). It carries the hash chain: the signed
+/// manifest pins the catalog, and the catalog pins the per-package history
+/// files, so only this one file needs a detached signature.
+pub const REPO_SCHEMA: u32 = 2;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileDigest {
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct RepoManifest {
+    pub schema: u32,
+    pub repo: String,
+    pub arch: String,
+    pub generated_at: u64,
+    pub key_id: String,
+    pub catalog: FileDigest,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub history: BTreeMap<String, FileDigest>,
+}
+
+impl RepoManifest {
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = serde_json::to_vec(self)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let manifest: RepoManifest = serde_json::from_slice(bytes)?;
+        if manifest.schema != REPO_SCHEMA {
+            return Err(Error::Index(format!(
+                "unsupported repository manifest schema {}",
+                manifest.schema
+            )));
+        }
+        validate_repo_name(&manifest.repo)?;
+        validate_arch(&manifest.arch)?;
+        if !is_valid_key_id(&manifest.key_id) {
+            return Err(Error::Index(format!(
+                "malformed repository manifest key id '{}'",
+                manifest.key_id
+            )));
+        }
+        if !is_sha256_hex(&manifest.catalog.sha256) {
+            return Err(Error::Index("malformed catalog sha256".into()));
+        }
+        for (name, digest) in &manifest.history {
+            validate_package_name(name)?;
+            if !is_sha256_hex(&digest.sha256) {
+                return Err(Error::Index(format!(
+                    "{name}: malformed history sha256"
+                )));
+            }
+        }
+        Ok(manifest)
+    }
+}
+
+/// Relative path of a package's version history, laid out like the cargo
+/// sparse registry: short names get their own top-level bucket, longer names
+/// are split by their first four characters.
+pub fn history_path(name: &str) -> String {
+    if name.len() == 1 {
+        format!("pkg/1/{name}")
+    } else if name.len() == 2 {
+        format!("pkg/2/{name}")
+    } else if name.len() == 3 {
+        format!("pkg/3/{}/{name}", &name[..1])
+    } else {
+        // Package names are ASCII by construction, so byte slicing is safe.
+        format!("pkg/{}/{}/{name}", &name[..2], &name[2..4])
+    }
+}
+
+/// Serialise every known version of one package as newline-delimited JSON,
+/// oldest first.
+pub fn history_to_bytes(packages: &[IndexPackage]) -> Result<Vec<u8>> {
+    let mut sorted: Vec<&IndexPackage> = packages.iter().collect();
+    sorted.sort_by(|a, b| a.version().cmp(&b.version()));
+    let mut out = Vec::with_capacity(sorted.len() * 320);
+    for package in sorted {
+        out.extend_from_slice(&serde_json::to_vec(package)?);
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+pub fn history_from_slice(bytes: &[u8], arch: &str) -> Result<Vec<IndexPackage>> {
+    let mut packages = Vec::new();
+    for (line_no, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        let package: IndexPackage = serde_json::from_slice(line).map_err(|error| {
+            Error::Index(format!("history line {}: {error}", line_no + 1))
+        })?;
+        package.validate(arch)?;
+        packages.push(package);
+    }
+    Ok(packages)
+}
+
 impl Index {
     pub fn new(repo: &str, arch: &str, generated_at: u64, key_id: &str) -> Self {
         Self {
@@ -186,10 +293,45 @@ impl Index {
         }
     }
 
+    /// Compact catalog serialisation: one package per line so that adding or
+    /// updating a package shows up as a single changed line in version
+    /// control instead of a multi-hundred-line block.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = serde_json::to_vec_pretty(self)?;
-        bytes.push(b'\n');
-        Ok(bytes)
+        let mut out = String::with_capacity(self.packages.len() * 320 + 256);
+        out.push('{');
+        out.push_str(&format!("\"schema\":{},", self.schema));
+        out.push_str("\"repo\":");
+        out.push_str(&serde_json::to_string(&self.repo)?);
+        out.push_str(",\"arch\":");
+        out.push_str(&serde_json::to_string(&self.arch)?);
+        out.push_str(&format!(",\"generated_at\":{},", self.generated_at));
+        out.push_str("\"key_id\":");
+        out.push_str(&serde_json::to_string(&self.key_id)?);
+        if !self.min_version.is_empty() {
+            out.push_str(",\"min_version\":");
+            out.push_str(&serde_json::to_string(&self.min_version)?);
+        }
+        if !self.revoked_versions.is_empty() {
+            out.push_str(",\"revoked_versions\":");
+            out.push_str(&serde_json::to_string(&self.revoked_versions)?);
+        }
+        if !self.revoked_keys.is_empty() {
+            out.push_str(",\"revoked_keys\":");
+            out.push_str(&serde_json::to_string(&self.revoked_keys)?);
+        }
+        out.push_str(",\"packages\":[");
+        for (index, package) in self.packages.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push('\n');
+            out.push_str(&serde_json::to_string(package)?);
+        }
+        if !self.packages.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("]}\n");
+        Ok(out.into_bytes())
     }
 
     pub fn from_slice(bytes: &[u8]) -> Result<Self> {

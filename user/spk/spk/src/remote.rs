@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use spk_core::fsutil::{sha256_bytes, sha256_file};
-use spk_core::index::{Index, IndexPackage};
+use spk_core::index::{Index, IndexPackage, RepoManifest};
 use spk_core::keys::{read_signature, SignatureFile};
 
 use crate::error::{Result, SpkError};
@@ -34,6 +34,20 @@ const CACHE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub struct RemoteOptions {
     pub offline: bool,
     pub allow_unsigned: bool,
+    /// Ignore the sync TTL and revalidate every repository now.
+    pub refresh: bool,
+}
+
+/// How long a downloaded index stays authoritative. pacman makes the user ask
+/// for a refresh with `-y`; apk caches for a few minutes. Fifteen minutes
+/// keeps `spk install` instant without letting a repository go stale.
+const DEFAULT_SYNC_TTL_SECONDS: u64 = 15 * 60;
+
+fn sync_ttl() -> u64 {
+    std::env::var("SPK_SYNC_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SYNC_TTL_SECONDS)
 }
 
 #[derive(Clone, Debug)]
@@ -375,6 +389,21 @@ pub fn sync_repo(
     fs::create_dir_all(&paths.package_cache)?;
     let old = load_current(paths, &root, options)?;
     let security = SecurityState::load(&root.join("security.json"))?;
+    if !options.offline && !options.refresh {
+        if let Some(old) = &old {
+            let ttl = sync_ttl();
+            if ttl > 0 && now().saturating_sub(old.meta.fetched_at) < ttl {
+                return Ok(RemoteSync {
+                    dir: old.dir.clone(),
+                    key_id: old.key_id.clone(),
+                    index: old.index.clone(),
+                    security: security.merge(&old.index),
+                    mirrors,
+                    stale: false,
+                });
+            }
+        }
+    }
     if options.offline {
         return match old {
             Some(old) => Ok(RemoteSync {
@@ -461,6 +490,7 @@ fn download_one(
     mirror: &str,
     package: &IndexPackage,
     part: &Path,
+    progress: &mut dyn FnMut(u64),
 ) -> Result<()> {
     let mut last_error = None;
     for attempt in 0..RETRIES {
@@ -469,12 +499,13 @@ fn download_one(
             let _ = fs::remove_file(part);
             continue;
         }
-        match client.download_file(
+        match client.download_file_with_progress(
             &http::join_url(mirror, &package.filename),
             &[],
             part,
             resume,
             package.size,
+            &mut |written| progress(resume + written),
         ) {
             Ok(response) => {
                 let state = response.status;
@@ -511,11 +542,116 @@ fn download_one(
     }))
 }
 
+/// Load the schema 2 repository manifest, from the cached snapshot first and
+/// from a mirror otherwise. Repositories published before schema 2 simply have
+/// no repo.json, in which case `None` means "every version is in the index".
+pub fn load_manifest(
+    paths: &Paths,
+    repo: &crate::repo::LoadedRepo,
+) -> Result<Option<RepoManifest>> {
+    let path = repo.dir.join("repo.json");
+    let sig_path = spk_core::keys::signature_path(&path);
+    if path.is_file() {
+        let bytes = fs::read(&path)?;
+        let signature = if sig_path.is_file() {
+            Some(read_signature(&sig_path)?)
+        } else {
+            None
+        };
+        repo::verify_index_bytes(paths, &bytes, signature.as_ref(), repo.allow_unsigned)?;
+        return Ok(Some(RepoManifest::from_slice(&bytes)?));
+    }
+    if repo.offline || repo.mirrors.is_empty() {
+        return Ok(None);
+    }
+    let client = HttpClient::new()?;
+    for mirror in &repo.mirrors {
+        let url = http::join_url(mirror, "repo.json");
+        let response = match get(&client, &url, &[], 1024 * 1024) {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if !(200..=299).contains(&response.status) {
+            continue;
+        }
+        let signature = match get(
+            &client,
+            &http::join_url(mirror, "repo.json.sig"),
+            &[],
+            MAX_SIGNATURE_BYTES,
+        ) {
+            Ok(response) if (200..=299).contains(&response.status) => Some(
+                serde_json::from_slice::<SignatureFile>(&response.body).map_err(|error| {
+                    SpkError::Signature(format!("{mirror}: malformed repo.json.sig: {error}"))
+                })?,
+            ),
+            _ => None,
+        };
+        repo::verify_index_bytes(paths, &response.body, signature.as_ref(), repo.allow_unsigned)?;
+        let manifest = RepoManifest::from_slice(&response.body).map_err(|error| {
+            SpkError::Security(format!("repository {}: invalid repo.json: {error}", repo.name))
+        })?;
+        spk_core::fsutil::atomic_write(&path, &response.body, 0o644)?;
+        if let Some(signature) = &signature {
+            let mut json = serde_json::to_vec_pretty(signature)?;
+            json.push(b'\n');
+            spk_core::fsutil::atomic_write(&sig_path, &json, 0o644)?;
+        }
+        return Ok(Some(manifest));
+    }
+    Ok(None)
+}
+
+/// Fetch one per-package history file from the first reachable mirror.
+pub fn fetch_history(repo: &crate::repo::LoadedRepo, relative: &str) -> Result<Vec<u8>> {
+    if repo.mirrors.is_empty() {
+        return Err(SpkError::General(format!(
+            "{}: {relative} is missing from the local repository",
+            repo.name
+        )));
+    }
+    if repo.offline {
+        return Err(SpkError::Network(format!(
+            "{}: {relative} is not cached and --offline was given",
+            repo.name
+        )));
+    }
+    let client = HttpClient::new()?;
+    let mut last = None;
+    for mirror in &repo.mirrors {
+        let url = http::join_url(mirror, relative);
+        match get(&client, &url, &[], 4 * 1024 * 1024) {
+            Ok(response) if (200..=299).contains(&response.status) => return Ok(response.body),
+            Ok(response) => {
+                last = Some(SpkError::Network(format!(
+                    "HTTP {} fetching {url}",
+                    response.status
+                )))
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| SpkError::Network(format!("no mirror provided {relative}"))))
+}
+
 pub fn ensure_package(
     cache: &Path,
     mirrors: &[String],
     package: &IndexPackage,
     offline: bool,
+) -> Result<PathBuf> {
+    ensure_package_with_progress(cache, mirrors, package, offline, &mut |_| {})
+}
+
+pub fn ensure_package_with_progress(
+    cache: &Path,
+    mirrors: &[String],
+    package: &IndexPackage,
+    offline: bool,
+    progress: &mut dyn FnMut(u64),
 ) -> Result<PathBuf> {
     fs::create_dir_all(cache)?;
     let destination = cache.join(format!("{}.spk", package.sha256));
@@ -533,7 +669,7 @@ pub fn ensure_package(
     let client = HttpClient::new()?;
     let mut last_error = None;
     for mirror in mirrors {
-        match download_one(&client, mirror, package, &part) {
+        match download_one(&client, mirror, package, &part, &mut *progress) {
             Ok(()) => {
                 if verify_cached_package(&part, package)? {
                     fs::rename(&part, &destination)?;

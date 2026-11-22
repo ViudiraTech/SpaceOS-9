@@ -328,3 +328,96 @@ fn index_rejects_foreign_arch_and_wrong_key() {
     ));
     verify_index(&repo_dir.join("index.json"), None, &public).unwrap();
 }
+
+#[test]
+fn catalog_lists_latest_and_history_keeps_every_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = repo(tmp.path());
+    let key_dir = tmp.path().join("keys");
+    let (secret, public, _key) =
+        write_keypair(&key_dir, "spaceos-main", DEFAULT_COMMENT, false).unwrap();
+
+    for version in ["0.1.0", "0.2.0"] {
+        let staging = tmp.path().join(format!("staging-{version}"));
+        stage_hello(&staging);
+        let manifest_path = tmp.path().join(format!("manifest-{version}.toml"));
+        fs::write(
+            &manifest_path,
+            manifest("hello", version, 1, "x86_64", false, ""),
+        )
+        .unwrap();
+        pack(
+            &manifest_path,
+            &staging,
+            &repo_dir.join(format!("hello-{version}-1-x86_64.spk")),
+            19,
+        )
+        .unwrap();
+    }
+
+    let generated = generate(
+        &repo_dir,
+        "spaceos-main",
+        "x86_64",
+        &secret,
+        Some(1_760_000_000),
+        true,
+    )
+    .unwrap();
+    // The catalog carries one entry per package: the newest release.
+    assert_eq!(generated.index.packages.len(), 1);
+    assert_eq!(generated.index.packages[0].version, "0.2.0");
+    assert_eq!(generated.history_files, 1);
+    assert!(repo_dir.join("repo.json").is_file());
+    assert!(repo_dir.join("repo.json.sig").is_file());
+
+    let history = fs::read(repo_dir.join("pkg/he/ll/hello")).unwrap();
+    let lines = history.iter().filter(|byte| **byte == b'\n').count();
+    assert_eq!(lines, 2, "history file must list both versions");
+    verify_repo(&repo_dir, &public).unwrap();
+
+    // Every line of the catalog is a package, not a pretty-printed block.
+    let index = fs::read_to_string(repo_dir.join("index.json")).unwrap();
+    assert_eq!(index.lines().count(), 3, "header, one package, closing");
+
+    // A tampered history file must fail the manifest hash chain.
+    let path = repo_dir.join("pkg/he/ll/hello");
+    let mut tampered = history.clone();
+    tampered.push(b' ');
+    fs::write(&path, &tampered).unwrap();
+    assert!(verify_repo(&repo_dir, &public).is_err());
+    fs::write(&path, &history).unwrap();
+    verify_repo(&repo_dir, &public).unwrap();
+
+    // Adding a release after indexing invalidates only that package's cache
+    // entry and moves the catalog forward.
+    let staging = tmp.path().join("staging-0.3.0");
+    stage_hello(&staging);
+    let manifest_path = tmp.path().join("manifest-0.3.0.toml");
+    fs::write(
+        &manifest_path,
+        manifest("hello", "0.3.0", 1, "x86_64", false, ""),
+    )
+    .unwrap();
+    pack(
+        &manifest_path,
+        &staging,
+        &repo_dir.join("hello-0.3.0-1-x86_64.spk"),
+        19,
+    )
+    .unwrap();
+    let regenerated = generate(
+        &repo_dir,
+        "spaceos-main",
+        "x86_64",
+        &secret,
+        Some(1_760_000_001),
+        true,
+    )
+    .unwrap();
+    assert_eq!(regenerated.index.packages.len(), 1);
+    assert_eq!(regenerated.index.packages[0].version, "0.3.0");
+    let history = fs::read(repo_dir.join("pkg/he/ll/hello")).unwrap();
+    assert_eq!(history.iter().filter(|byte| **byte == b'\n').count(), 3);
+    verify_repo(&repo_dir, &public).unwrap();
+}

@@ -1135,6 +1135,9 @@ mod tests {
             mirrors: Vec::new(),
             package_cache: None,
             offline: false,
+            allow_unsigned: true,
+            manifest: None,
+            history: std::collections::BTreeMap::new(),
         }
     }
 
