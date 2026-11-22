@@ -649,9 +649,9 @@ cp build/repo/x86_64/foo-1.0.0-1-x86_64.spk build/repo-prod/x86_64/
 
 缓存规则：
 
-- `repo.json`、`index.json`、两者的 `.sig`：`Cache-Control: no-cache`；
-- `pkg/…` 历史文件：内容随新版本变化，用短缓存（`max-age=60`）；
-- `.spk`：长期 immutable；
+- **只有 `.spk` 是真正不可变的**（版本号在文件名里，发布后永不覆写）：`Cache-Control: public, max-age=31536000, immutable`；
+- 其余每次发布都会原地重写的文件一律 `Cache-Control: no-cache`：`index.json`、`repo.json`、`store.json`、`store.in.json`、所有 `*.sig`，以及 `pkg/…` 历史文件和 `previews/…` 预览图。
+  把这些标成 `immutable` 会让客户端长期拿着与索引不匹配的清单/历史文件，`spk sync` 也救不回来；
 - 保留 Range/206，支持断点续传。
 
 ### 9.3 上线验收

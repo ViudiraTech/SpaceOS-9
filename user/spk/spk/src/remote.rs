@@ -376,7 +376,27 @@ fn sync_mirror(
             let old = old.ok_or_else(|| {
                 SpkError::Network(format!("{} returned 304 without a cached index", base))
             })?;
-            Ok(old.clone())
+            let mut cached = old.clone();
+            // A 304 only says the index is unchanged; the manifest and store
+            // document next to it may still be missing from an earlier
+            // partial sync, so re-check them rather than trusting the cache.
+            let index_bytes = fs::read(cached.dir.join("index.json")).unwrap_or_default();
+            match sync_store(paths, &client, base, &cached.dir, &index_bytes, options) {
+                Ok(store) => {
+                    if store.is_some() {
+                        cached.store = store;
+                    }
+                }
+                Err(error @ (SpkError::Security(_) | SpkError::Signature(_))) => {
+                    return Err(error)
+                }
+                Err(_) => {}
+            }
+            cached.meta.fetched_at = now();
+            let mut meta_bytes = serde_json::to_vec_pretty(&cached.meta)?;
+            meta_bytes.push(b'\n');
+            spk_core::fsutil::atomic_write(&cached.dir.join("meta.json"), &meta_bytes, 0o644)?;
+            Ok(cached)
         }
         200..=299 => {
             let signature = match get(
@@ -671,23 +691,41 @@ pub fn load_manifest(
 ) -> Result<Option<RepoManifest>> {
     let path = repo.dir.join("repo.json");
     let sig_path = spk_core::keys::signature_path(&path);
+    let index_bytes = fs::read(repo.dir.join("index.json")).unwrap_or_default();
     if path.is_file() {
-        let bytes = fs::read(&path)?;
-        let signature = if sig_path.is_file() {
-            Some(read_signature(&sig_path)?)
-        } else {
-            None
-        };
-        repo::verify_index_bytes(paths, &bytes, signature.as_ref(), repo.allow_unsigned)?;
-        return Ok(Some(RepoManifest::from_slice(&bytes)?));
+        let cached = (|| -> Result<RepoManifest> {
+            let bytes = fs::read(&path)?;
+            let signature = if sig_path.is_file() {
+                Some(read_signature(&sig_path)?)
+            } else {
+                None
+            };
+            repo::verify_index_bytes(paths, &bytes, signature.as_ref(), repo.allow_unsigned)?;
+            Ok(RepoManifest::from_slice(&bytes)?)
+        })();
+        // A manifest cached next to a *different* index is worse than no
+        // manifest: it pins history digests that no longer apply. Anything
+        // unreadable or unverifiable is dropped and fetched again.
+        if let Ok(manifest) = cached {
+            if manifest.catalog.sha256 == spk_core::fsutil::sha256_bytes(&index_bytes)
+                && manifest.catalog.size == index_bytes.len() as u64
+            {
+                return Ok(Some(manifest));
+            }
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&sig_path);
     }
     if repo.offline || repo.mirrors.is_empty() {
         return Ok(None);
     }
     let client = HttpClient::new()?;
+    // repo.json is rewritten in place on every publish, so it must never be
+    // served from a cache.
+    let no_cache = [("Cache-Control", "no-cache".to_string())];
     for mirror in &repo.mirrors {
         let url = http::join_url(mirror, "repo.json");
-        let response = match get(&client, &url, &[], 1024 * 1024) {
+        let response = match get(&client, &url, &no_cache, 1024 * 1024) {
             Ok(response) => response,
             Err(_) => continue,
         };
@@ -700,7 +738,7 @@ pub fn load_manifest(
         let signature = match get(
             &client,
             &http::join_url(mirror, "repo.json.sig"),
-            &[],
+            &no_cache,
             MAX_SIGNATURE_BYTES,
         ) {
             Ok(response) if (200..=299).contains(&response.status) => Some(
@@ -714,6 +752,14 @@ pub fn load_manifest(
         let manifest = RepoManifest::from_slice(&response.body).map_err(|error| {
             SpkError::Security(format!("repository {}: invalid repo.json: {error}", repo.name))
         })?;
+        if manifest.catalog.sha256 != spk_core::fsutil::sha256_bytes(&index_bytes)
+            || manifest.catalog.size != index_bytes.len() as u64
+        {
+            return Err(SpkError::Security(format!(
+                "{}: repo.json does not describe the index in use; run spk sync",
+                repo.name
+            )));
+        }
         spk_core::fsutil::atomic_write(&path, &response.body, 0o644)?;
         if let Some(signature) = &signature {
             let mut json = serde_json::to_vec_pretty(signature)?;
@@ -760,7 +806,11 @@ pub fn fetch_asset_bytes(mirrors: &[String], relative: &str, max_bytes: u64) -> 
 }
 
 /// Fetch one per-package history file from the first reachable mirror.
-pub fn fetch_history(repo: &crate::repo::LoadedRepo, relative: &str) -> Result<Vec<u8>> {
+pub fn fetch_history(
+    repo: &crate::repo::LoadedRepo,
+    relative: &str,
+    expected: &spk_core::index::FileDigest,
+) -> Result<Vec<u8>> {
     if repo.mirrors.is_empty() {
         return Err(SpkError::General(format!(
             "{}: {relative} is missing from the local repository",
@@ -777,8 +827,20 @@ pub fn fetch_history(repo: &crate::repo::LoadedRepo, relative: &str) -> Result<V
     let mut last = None;
     for mirror in &repo.mirrors {
         let url = http::join_url(mirror, relative);
-        match get(&client, &url, &[], 4 * 1024 * 1024) {
-            Ok(response) if (200..=299).contains(&response.status) => return Ok(response.body),
+        // History files are rewritten on every publish; a cached copy would
+        // fail the signed digest check below.
+        let headers = [("Cache-Control", "no-cache".to_string())];
+        match get(&client, &url, &headers, 4 * 1024 * 1024) {
+            Ok(response) if (200..=299).contains(&response.status) => {
+                if response.body.len() as u64 == expected.size
+                    && spk_core::fsutil::sha256_bytes(&response.body) == expected.sha256
+                {
+                    return Ok(response.body);
+                }
+                last = Some(SpkError::Security(format!(
+                    "{url}: history file does not match the signed manifest (stale mirror cache?)"
+                )));
+            }
             Ok(response) => {
                 last = Some(SpkError::Network(format!(
                     "HTTP {} fetching {url}",

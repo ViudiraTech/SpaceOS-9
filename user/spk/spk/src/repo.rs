@@ -171,14 +171,8 @@ impl LoadedRepo {
                 bytes
             }
             _ => {
-                let bytes = crate::remote::fetch_history(self, &relative)?;
-                if bytes.len() as u64 != digest.size
-                    || spk_core::fsutil::sha256_bytes(&bytes) != digest.sha256
-                {
-                    return Err(SpkError::Security(format!(
-                        "{name}: history file does not match the signed repository manifest"
-                    )));
-                }
+                // fetch_history verifies the digest against every mirror.
+                let bytes = crate::remote::fetch_history(self, &relative, digest)?;
                 if let Some(parent) = cached.parent() {
                     fs::create_dir_all(parent)?;
                 }
