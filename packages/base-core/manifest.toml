@@ -9,7 +9,7 @@
 name = "base-core"
 epoch = 0
 version = "1.0.0"
-release = 11
+release = 12
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "SpaceOS-9 base runtime core"

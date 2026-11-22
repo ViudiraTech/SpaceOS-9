@@ -662,3 +662,102 @@ X-SpaceOS-DesktopShortcut=true
         assert!(!apps.iter().any(|a| a.id == "store" || a.id == "store-check"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// XDG autostart
+// ---------------------------------------------------------------------------
+
+pub const SYSTEM_AUTOSTART_DIR: &str = "/etc/xdg/autostart";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutostartEntry {
+    pub id: String,
+    pub exec: String,
+}
+
+fn autostart_dirs() -> Vec<PathBuf> {
+    let system = std::env::var("SPUI_SYSROOT")
+        .ok()
+        .map(|root| root.trim().trim_end_matches('/').to_string())
+        .filter(|root| !root.is_empty())
+        .map(|root| PathBuf::from(root).join(SYSTEM_AUTOSTART_DIR.trim_start_matches('/')))
+        .unwrap_or_else(|| PathBuf::from(SYSTEM_AUTOSTART_DIR));
+    let mut dirs = vec![system];
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        dirs.push(PathBuf::from(home).join(".config/autostart"));
+    }
+    dirs
+}
+
+/// Autostart entries that should run in this session.
+///
+/// `Hidden=true`, `X-GNOME-Autostart-enabled=false` and an unavailable
+/// `TryExec` are honoured; `OnlyShowIn`/`NotShowIn` are not, because the
+/// session has exactly one desktop name and every entry is meant for it.
+/// A user entry overrides a system entry with the same file name.
+pub fn discover_autostart() -> Vec<AutostartEntry> {
+    let mut by_name: BTreeMap<String, AutostartEntry> = BTreeMap::new();
+    for dir in autostart_dirs() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "desktop"))
+            .collect();
+        files.sort();
+        for path in files {
+            let Some(id) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut exec = None;
+            let mut hidden = false;
+            let mut try_exec_ok = true;
+            for line in text.lines() {
+                let line = line.trim();
+                if let Some(value) = line.strip_prefix("Exec=") {
+                    exec.get_or_insert_with(|| value.trim().to_string());
+                } else if line == "Hidden=true" {
+                    hidden = true;
+                } else if line == "X-GNOME-Autostart-enabled=false" {
+                    hidden = true;
+                } else if let Some(value) = line.strip_prefix("TryExec=") {
+                    try_exec_ok = Path::new(value.trim()).is_file();
+                }
+            }
+            let Some(exec) = exec else {
+                continue;
+            };
+            if hidden || !try_exec_ok || exec.is_empty() {
+                continue;
+            }
+            by_name.insert(id.clone(), AutostartEntry { id, exec });
+        }
+    }
+    by_name.into_values().collect()
+}
+
+/// Start one entry. Field codes (`%f`, `%U`, …) are dropped and the command
+/// runs through the shell so quoting in `Exec=` keeps working.
+pub fn spawn_autostart(entry: &AutostartEntry) -> bool {
+    let cleaned: Vec<&str> = entry
+        .exec
+        .split_whitespace()
+        .filter(|word| !word.starts_with('%'))
+        .collect();
+    if cleaned.is_empty() {
+        return false;
+    }
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{} >/dev/null 2>&1 &", cleaned.join(" ")))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}

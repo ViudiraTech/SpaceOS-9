@@ -173,7 +173,96 @@ PALETTES: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], tuple[int,
     "theme-ambiance": ((52, 26, 48), (118, 46, 36), (251, 146, 60), (236, 72, 153), (24, 10, 22)),
     "space-editor": ((12, 19, 36), (24, 48, 118), (96, 165, 250), (56, 189, 248), (8, 16, 42)),
     "space-store": ((13, 18, 38), (38, 36, 104), (129, 140, 248), (56, 189, 248), (12, 14, 44)),
+    "spime": ((8, 30, 48), (10, 82, 122), (125, 211, 252), (45, 212, 191), (6, 20, 34)),
 }
+
+
+def _xlib() -> tuple[ctypes.CDLL, ctypes.CDLL, ctypes.c_void_p]:
+    import ctypes as _c
+
+    x11 = _c.CDLL("libX11.so.6")
+    xtst = _c.CDLL("libXtst.so.6")
+    x11.XOpenDisplay.restype = _c.c_void_p
+    x11.XStringToKeysym.restype = _c.c_ulong
+    x11.XKeysymToKeycode.restype = _c.c_ubyte
+    display = os.environ.get("DISPLAY", ":95").encode()
+    dpy = x11.XOpenDisplay(display)
+    if not dpy:
+        raise SystemExit(f"cannot open display {display!r}")
+    return x11, xtst, dpy
+
+
+def xfocus_top() -> None:
+    """Give the most recently mapped top-level window the input focus.
+
+    The capture runs without a window manager, so nothing focuses the app
+    window and XTEST keystrokes would go to the root window.
+    """
+    import ctypes as _c
+
+    x11, _xtst, dpy = _xlib()
+    root = x11.XDefaultRootWindow(_c.c_void_p(dpy))
+    root_ret = _c.c_ulong()
+    parent_ret = _c.c_ulong()
+    children = _c.POINTER(_c.c_ulong)()
+    count = _c.c_uint()
+    if not x11.XQueryTree(
+        _c.c_void_p(dpy), _c.c_ulong(root), _c.byref(root_ret),
+        _c.byref(parent_ret), _c.byref(children), _c.byref(count),
+    ):
+        return
+    if count.value:
+        x11.XSetInputFocus(_c.c_void_p(dpy), _c.c_ulong(children[count.value - 1]), 2, 0)
+        x11.XFlush(_c.c_void_p(dpy))
+    time.sleep(0.2)
+
+
+def xtype(text: str) -> None:
+    """Type ASCII into the focused window through the XTEST extension."""
+    import ctypes as _c
+
+    x11, xtst, dpy = _xlib()
+    for ch in text:
+        keysym = x11.XStringToKeysym(ch.encode())
+        if keysym == 0:
+            continue
+        keycode = x11.XKeysymToKeycode(_c.c_void_p(dpy), keysym)
+        xtst.XTestFakeKeyEvent(_c.c_void_p(dpy), keycode, 1, 0)
+        xtst.XTestFakeKeyEvent(_c.c_void_p(dpy), keycode, 0, 0)
+        x11.XFlush(_c.c_void_p(dpy))
+        time.sleep(0.06)
+    time.sleep(0.5)
+
+
+def xclick(x: int, y: int) -> None:
+    import ctypes as _c
+
+    x11, xtst, dpy = _xlib()
+    xtst.XTestFakeMotionEvent(_c.c_void_p(dpy), -1, x, y, 0)
+    x11.XFlush(_c.c_void_p(dpy))
+    time.sleep(0.15)
+    xtst.XTestFakeButtonEvent(_c.c_void_p(dpy), 1, 1, 0)
+    xtst.XTestFakeButtonEvent(_c.c_void_p(dpy), 1, 0, 0)
+    x11.XFlush(_c.c_void_p(dpy))
+    time.sleep(0.2)
+
+
+def start_spimed(tmp: pathlib.Path, base_env: dict[str, str]) -> subprocess.Popen[bytes]:
+    spimed = BUILD / "packages/spime/usr/bin/spimed"
+    staged = BUILD / "packages/spime/usr/share/spime"
+    if not spimed.is_file() or not (staged / "spime.dict").is_file():
+        raise SystemExit(f"missing staged spimed under {BUILD}/packages/spime; run `make packages` first")
+    env = dict(base_env)
+    env["SPIME_DICT_PATH"] = str(staged / "spime.dict")
+    env["SPIME_LM_PATH"] = str(staged / "spime.lm")
+    proc = subprocess.Popen(
+        [str(spimed)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.7)
+    return proc
 
 
 def capture_raw(
@@ -185,6 +274,9 @@ def capture_raw(
     app_cmd: list[str],
     raw_name: str,
     wait_sec: float = 1.8,
+    ime: bool = False,
+    type_text: str | None = None,
+    click_at: tuple[int, int] | None = None,
 ) -> pathlib.Path:
     set_conf(bins, base_env, THEMES[theme_key])
     shell_proc = subprocess.Popen(
@@ -194,10 +286,13 @@ def capture_raw(
         stderr=subprocess.PIPE,
     )
     app_proc = None
+    ime_proc = None
     out_png = tmp / raw_name
     try:
         wait_for_ready(shell_proc, b"spui: desktop ready", timeout=6.0)
         time.sleep(0.4)
+        if ime:
+            ime_proc = start_spimed(tmp, base_env)
         app_proc = subprocess.Popen(
             app_cmd,
             env=base_env,
@@ -205,6 +300,13 @@ def capture_raw(
             stderr=subprocess.PIPE,
         )
         time.sleep(wait_sec)
+        if ime:
+            xfocus_top()
+        if click_at is not None:
+            xclick(*click_at)
+        if type_text:
+            xtype(type_text)
+            time.sleep(0.4)
         if shell_proc.poll() is not None:
             err = shell_proc.stderr.read().decode(errors="replace") if shell_proc.stderr else ""
             raise SystemExit(f"spui shell exited during {raw_name} (rc={shell_proc.returncode}):\n{err}")
@@ -218,6 +320,8 @@ def capture_raw(
         return out_png
     finally:
         stop_proc(app_proc)
+        if ime_proc is not None:
+            stop_proc(ime_proc)
         stop_proc(shell_proc)
         time.sleep(0.2)
 
@@ -595,6 +699,8 @@ def main() -> int:
                 "UXCONF_USER_DIR": str(ux_user),
                 "UXCONF_SYSTEM_DIR": str(ux_sys),
                 "SPIME_NO_AUTOSPAWN": "1",
+                "SPIME_SOCKET": str(tmp / "spimed.sock"),
+                "XMODIFIERS": "@im=spime",
             }
         )
 

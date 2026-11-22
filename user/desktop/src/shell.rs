@@ -296,6 +296,7 @@ pub struct Shell {
     apps: Vec<ResolvedApp>,
     apps_fp: u64,
     last_apps_fp_check: Instant,
+    autostart_started: std::collections::BTreeSet<String>,
     dirty_rects_buf: Vec<Rect>,
     comp_plan_buf: Vec<WinCompPlan>,
     capture_keep_buf: Vec<Window>,
@@ -1328,6 +1329,7 @@ impl Shell {
             apps,
             apps_fp,
             last_apps_fp_check: Instant::now(),
+            autostart_started: std::collections::BTreeSet::new(),
             dirty_rects_buf: Vec::with_capacity(16),
             comp_plan_buf: Vec::with_capacity(8),
             capture_keep_buf: Vec::with_capacity(16),
@@ -1532,6 +1534,14 @@ impl Shell {
     fn pinned_app_entry(&self, slot: usize) -> Option<&ResolvedApp> {
         let mode = *PINNED_MODES.get(slot)?;
         self.apps.iter().find(|app| app.id == mode)
+    }
+
+    fn start_pending_autostart(&mut self) {
+        for entry in crate::desktop_entries::discover_autostart() {
+            if self.autostart_started.insert(entry.id.clone()) {
+                crate::desktop_entries::spawn_autostart(&entry);
+            }
+        }
     }
 
     fn reload_applications(&mut self) -> Result<()> {
@@ -2223,6 +2233,10 @@ impl Shell {
                 if next_apps_fp != self.apps_fp {
                     self.reload_applications()?;
                 }
+                // XDG autostart only covers login; an entry installed later
+                // (an input method, a tray agent) is started once when it
+                // appears, which is the session manager's job.
+                self.start_pending_autostart();
                 let status = self.x.get_spime_status();
                 let now_service = status.is_some()
                     || (self.ime_service && self.ime_client.query_chinese_mode().is_some());

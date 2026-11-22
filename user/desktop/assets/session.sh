@@ -15,14 +15,7 @@ export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export XDG_CURRENT_DESKTOP=SPUI
 export XMODIFIERS="@im=spime"
 
-# Start every XDG autostart entry. Session helpers (input methods, tray
-# agents) ship their own .desktop file instead of being named here.
-for entry in /etc/xdg/autostart/*.desktop; do
-    [ -f "$entry" ] || continue
-    exec_line=$(sed -n 's/^Exec=//p' "$entry" | head -n 1)
-    if [ -n "$exec_line" ]; then
-        sh -c "$exec_line" >/dev/null 2>&1 &
-    fi
-done
+# XDG autostart entries are started by the shell (SPUI), which also picks up
+# entries that a package installs while the session is running.
 
 exec /usr/bin/spui shell
