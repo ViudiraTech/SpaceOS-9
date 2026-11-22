@@ -14,6 +14,8 @@
 pub mod app;
 #[path = "../../desktop/src/draw.rs"]
 pub mod draw;
+#[path = "../../desktop/src/fonts.rs"]
+pub mod fonts;
 #[path = "../../desktop/src/icons.rs"]
 pub mod icons;
 #[path = "../../desktop/src/text.rs"]

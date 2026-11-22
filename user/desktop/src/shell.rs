@@ -1730,6 +1730,19 @@ impl Shell {
             }
         }
         self.theme = Theme::from_config(&self.config);
+        if prev.font_ui_family != self.config.font_ui_family
+            || prev.font_document_family != self.config.font_document_family
+            || prev.font_mono_family != self.config.font_mono_family
+        {
+            let prefs = crate::text::FontPrefs::from_values(
+                &self.config.font_ui_family,
+                &self.config.font_document_family,
+                &self.config.font_mono_family,
+            );
+            if let Ok(text) = crate::text::TextRenderer::load_with(&prefs) {
+                self.text = text;
+            }
+        }
         self.text.set_ui_scale(self.theme.ui_scale());
 
         if prev.timezone != self.config.timezone {

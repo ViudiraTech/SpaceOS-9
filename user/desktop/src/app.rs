@@ -16,7 +16,7 @@
 
 use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
-use crate::text::TextRenderer;
+use crate::text::{FontPrefs, TextRenderer};
 use crate::theme::{self, Theme};
 use crate::ui::{self, CaptionHit};
 use crate::x11::{CursorKind, Key, Result, X};
@@ -150,6 +150,7 @@ pub struct App {
     composited: bool,
     glass_top_extra: i32,
     pub text: TextRenderer,
+    fonts_key: String,
     pub config: DesktopConfig,
     pub uxconf: Option<UxConfClient>,
     watch: Option<UxConfWatch>,
@@ -271,8 +272,13 @@ impl App {
         x.map(win)?;
         x.flush()?;
 
-        let mut text =
-            TextRenderer::load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let font_prefs = FontPrefs::from_values(
+            &config.font_ui_family,
+            &config.font_document_family,
+            &config.font_mono_family,
+        );
+        let mut text = TextRenderer::load_with(&font_prefs)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         text.set_ui_scale(theme.ui_scale());
         let mut canvas = x.create_canvas(width as usize, height as usize, theme.window);
         canvas.set_argb(is_argb && composited && theme.is_vortexglass());
@@ -310,6 +316,10 @@ impl App {
             composited,
             glass_top_extra: 0,
             text,
+            fonts_key: format!(
+                "{}|{}|{}",
+                config.font_ui_family, config.font_document_family, config.font_mono_family
+            ),
             config,
             uxconf,
             watch,
@@ -478,6 +488,23 @@ impl App {
         self.theme_fp = theme::installed_themes_fingerprint();
         self.last_theme_fp_check = Instant::now();
         self.theme = Theme::from_config(&self.config);
+        let fonts_key = format!(
+            "{}|{}|{}",
+            self.config.font_ui_family,
+            self.config.font_document_family,
+            self.config.font_mono_family,
+        );
+        if fonts_key != self.fonts_key {
+            self.fonts_key = fonts_key;
+            let prefs = FontPrefs::from_values(
+                &self.config.font_ui_family,
+                &self.config.font_document_family,
+                &self.config.font_mono_family,
+            );
+            if let Ok(text) = TextRenderer::load_with(&prefs) {
+                self.text = text;
+            }
+        }
         self.text.set_ui_scale(self.theme.ui_scale());
         if self.maximized {
             if let Ok(cookie) = self.x.conn.get_geometry(self.x.root) {

@@ -1061,6 +1061,10 @@ pub struct DesktopConfig {
     pub desktop_icons_visible: bool,
     /// Comma separated app IDs shown on the desktop, in display order.
     pub desktop_shortcuts: String,
+    // fonts (empty means the bundled defaults)
+    pub font_ui_family: String,
+    pub font_document_family: String,
+    pub font_mono_family: String,
     /// Comma separated auto-shortcut app IDs explicitly removed from the desktop by the user.
     pub desktop_hidden_shortcuts: String,
     pub desktop_icon_size: i32,
@@ -1149,6 +1153,9 @@ impl Default for DesktopConfig {
             solid_color: 0x14385c,
             desktop_icons_visible: true,
             desktop_shortcuts: "files,term,browser".to_string(),
+            font_ui_family: String::new(),
+            font_document_family: String::new(),
+            font_mono_family: String::new(),
             desktop_hidden_shortcuts: String::new(),
             desktop_icon_size: 40,
             apps_reload_gen: String::new(),
@@ -1299,6 +1306,21 @@ impl DesktopConfig {
             ("desktop", "/icons/size") => {
                 if let Some(v) = value.as_int() {
                     self.desktop_icon_size = (v as i32).clamp(28, 56);
+                }
+            }
+            ("font", "/ui-family") => {
+                if let Some(s) = value.as_str() {
+                    self.font_ui_family = s.trim().to_string();
+                }
+            }
+            ("font", "/document-family") => {
+                if let Some(s) = value.as_str() {
+                    self.font_document_family = s.trim().to_string();
+                }
+            }
+            ("font", "/monospace-family") => {
+                if let Some(s) = value.as_str() {
+                    self.font_mono_family = s.trim().to_string();
                 }
             }
             ("desktop", "/icons/shortcuts") => {

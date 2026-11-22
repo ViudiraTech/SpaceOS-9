@@ -18,6 +18,7 @@ mod compositor;
 mod ddm;
 mod desktop_entries;
 mod draw;
+mod fonts;
 mod icons;
 mod ime;
 mod netmgr;

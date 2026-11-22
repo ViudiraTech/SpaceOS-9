@@ -242,7 +242,9 @@ impl Default for TextStyle {
             italic: false,
             underline: false,
             strikethrough: false,
-            font: FontFamily::Sans,
+            // Body text follows `font:/document-family` (the Serif role), so
+            // the configured document font applies without extra plumbing.
+            font: FontFamily::Serif,
             size_pt: 11.5,
             color: 0x1e293b,
             highlight: None,
