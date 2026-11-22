@@ -91,6 +91,8 @@ enum Action {
     Hold(String),
     Unhold(String),
     Remove(String),
+    TogglePkgMenu(String, Rect),
+    ClosePkgMenu,
     OpenAppearance,
     ToggleQueue,
     QueueTab(crate::model::QueueTab),
@@ -246,6 +248,7 @@ struct StoreState {
     repo_url: String,
     trust_path: String,
     toast: Option<(String, Instant)>,
+    open_menu: Option<(String, Rect)>,
     last_pointer: (i32, i32),
     banners: HashMap<String, Sprite>,
     banner_requested: HashSet<String>,
@@ -316,6 +319,7 @@ impl StoreState {
             repo_url: String::new(),
             trust_path: "/etc/spk/trusted.d/".into(),
             toast: None,
+            open_menu: None,
             last_pointer: (0, 0),
             banners: HashMap::new(),
             banner_requested: HashSet::new(),
@@ -712,6 +716,8 @@ fn handle_key_state(state: &mut StoreState, key: Key) -> Option<Action> {
             return Some(Action::AuthCancel);
         } else if state.preview.is_some() {
             return Some(Action::PreviewCancel);
+        } else if state.open_menu.is_some() {
+            state.open_menu = None;
         } else if state.focused != FocusedInput::None {
             state.focused = FocusedInput::None;
             state.preedit.clear();
@@ -786,6 +792,7 @@ fn handle_wheel(state: &mut StoreState, _x: i32, y: i32, delta: i32, content: Re
     if state.auth.is_some() || state.preview.is_some() {
         return false;
     }
+    state.open_menu = None;
     let step = (delta as f32) * 36.0;
     if state.queue_open && y > content.y + content.h - QUEUE_H {
         state.queue_scroll.wheel(step)
@@ -803,8 +810,27 @@ fn handle_wheel(state: &mut StoreState, _x: i32, y: i32, delta: i32, content: Re
 }
 
 fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend, action: Action) {
+    if !matches!(action, Action::TogglePkgMenu(_, _) | Action::Noop) {
+        state.open_menu = None;
+    }
     match action {
         Action::Noop => {}
+        Action::TogglePkgMenu(name, anchor) => {
+            if state
+                .open_menu
+                .as_ref()
+                .is_some_and(|(cur, _)| cur == &name)
+            {
+                state.open_menu = None;
+            } else {
+                state.open_menu = Some((name, anchor));
+            }
+            app.needs_redraw = true;
+        }
+        Action::ClosePkgMenu => {
+            state.open_menu = None;
+            app.needs_redraw = true;
+        }
         Action::Nav(view) => {
             state.view = view;
             state.detail = None;
@@ -1367,5 +1393,27 @@ mod tests {
 
         assert!(matches!(hits.at(50, 50), Some(Action::Noop)));
         assert!(matches!(hits.at(520, 430), Some(Action::PreviewCancel)));
+    }
+
+    #[test]
+    fn overflow_menu_closes_on_escape_and_wheel() {
+        let mut state = StoreState::new();
+        state.open_menu = Some(("space-editor".into(), Rect::new(800, 120, 34, 28)));
+        handle_key_state(
+            &mut state,
+            Key {
+                code: 0,
+                state: 0,
+                sym: 0xff1b,
+            },
+        );
+        assert!(state.open_menu.is_none());
+
+        state.open_menu = Some(("space-store".into(), Rect::new(800, 180, 34, 28)));
+        state
+            .discover_scroll
+            .set_bounds(400.0, 1200.0, Rect::new(0, 0, 8, 400));
+        let _ = handle_wheel(&mut state, 400, 300, 3, Rect::new(0, 0, 1000, 700));
+        assert!(state.open_menu.is_none());
     }
 }

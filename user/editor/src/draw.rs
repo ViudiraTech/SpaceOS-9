@@ -96,7 +96,7 @@ pub fn draw_editor(
     prev_hits: &Hits,
     hits: &mut Hits,
 ) -> Option<Rect> {
-    canvas.fill(content, theme.bg_bottom);
+    canvas.fill(content, mix(theme.window_alt, theme.panel_border, 0.22));
 
     let quick_rect = Rect::new(content.x, content.y, content.w, QUICK_TAB_H);
     let ribbon_rect = Rect::new(content.x, quick_rect.bottom(), content.w, RIBBON_H);
@@ -161,6 +161,10 @@ pub fn draw_editor(
     let status_rect = Rect::new(content.x, content.bottom() - STATUS_H, content.w, STATUS_H);
     draw_status_bar(canvas, text, theme, state, status_rect, prev_hits, hits);
 
+    if state.font_menu_open {
+        draw_font_dropdown_menu(canvas, text, theme, state, content, prev_hits, hits);
+    }
+
     if state.modal.is_some() {
         if let Some(spot) = draw_modal(canvas, text, theme, state, content, prev_hits, hits) {
             ime_spot = Some(spot);
@@ -179,7 +183,8 @@ fn draw_quick_and_tabs(
     prev_hits: &Hits,
     hits: &mut Hits,
 ) {
-    ui::toolbar_surface(canvas, theme, rect, false, true);
+    canvas.fill(rect, theme.window_alt);
+    canvas.fill(Rect::new(rect.x, rect.bottom() - 1, rect.w, 1), theme.panel_border);
     let ptr = state.last_pointer;
     let mut x = rect.x + 10;
 
@@ -317,20 +322,47 @@ fn draw_ribbon_strip(
             canvas.fill(Rect::new(x, rect.y + 10, 1, rect.h - 20), theme.panel_border);
             x += 8;
 
-            // Font family switcher + font size +/-
-            let font_r = Rect::new(x, y, 74, bh);
-            chip_button(
+            // Dynamic uxconfd font family picker dropdown + font size +/-
+            let font_r = Rect::new(x, y, 136, bh);
+            let font_hov = prev_hits.hover_rect(ptr.0, ptr.1, font_r);
+            let font_bg = if state.font_menu_open {
+                mix(theme.window_high, theme.accent, 0.14)
+            } else if font_hov {
+                theme.panel_hover
+            } else {
+                theme.window_high
+            };
+            let font_brd = if state.font_menu_open || font_hov {
+                theme.accent
+            } else {
+                theme.panel_border
+            };
+            let r = theme.radius_control();
+            canvas.rounded_rect(font_r, r, font_bg, 1.0);
+            canvas.rounded_border(font_r, r, font_brd, 0.85, 1);
+            let active_font = state.active_font_display_name();
+            let shown_font = text.truncate(&active_font, (font_r.w - 24) as f32, 11.5, Face::Ui);
+            text.draw(
                 canvas,
-                text,
-                theme,
-                font_r,
-                state.doc.active_style.font.label(),
-                false,
-                prev_hits.hover_rect(ptr.0, ptr.1, font_r),
+                &shown_font,
+                (font_r.x + 8) as f32,
+                (font_r.y + 18) as f32,
+                11.5,
+                theme.text,
                 Face::Ui,
             );
-            hits.push(font_r, Action::CycleFont);
-            x += 78;
+            let arrow_c = if state.font_menu_open {
+                theme.accent
+            } else {
+                theme.text_muted
+            };
+            let ax = font_r.right() - 12;
+            let ay = font_r.y + font_r.h / 2 - 1;
+            for d in 0..=3 {
+                canvas.fill(Rect::new(ax - d, ay + 2 - d, d * 2 + 1, 1), arrow_c);
+            }
+            hits.push(font_r, Action::ToggleFontMenu(font_r));
+            x += 140;
 
             let sz_down = Rect::new(x, y, 22, bh);
             chip_button(canvas, text, theme, sz_down, "A-", false, prev_hits.hover_rect(ptr.0, ptr.1, sz_down), Face::Ui);
@@ -1011,12 +1043,12 @@ fn draw_status_bar(
         .map_or(1, |l| l.caret_geom(&state.doc, state.doc.caret(), text).page_index + 1);
     let kind_lbl = state.doc.current_block_kind().label();
 
+    let active_font = state.active_font_display_name();
     let info = format!(
-        "第 {cur_page} / {pages} 页  ·  {} 词  ·  {} 字符  ·  {kind_lbl} ({:.0}pt {})",
+        "第 {cur_page} / {pages} 页  ·  {} 词  ·  {} 字符  ·  {kind_lbl} ({:.0}pt {active_font})",
         stats.words,
         stats.chars_no_spaces,
         state.doc.active_style.size_pt,
-        state.doc.active_style.font.label(),
     );
     text.draw(canvas, &info, (rect.x + 14) as f32, (rect.y + 17) as f32, 11.0, theme.text_muted, Face::Ui);
 
@@ -1036,6 +1068,147 @@ fn draw_status_bar(
     if info_end + 80 < zoom_out.x {
         let shown = text.truncate(&state.status, (zoom_out.x - info_end - 16) as f32, 11.0, Face::Ui);
         text.draw(canvas, &shown, info_end as f32, (rect.y + 17) as f32, 11.0, theme.text, Face::Ui);
+    }
+}
+
+fn draw_font_dropdown_menu(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    state: &EditorState,
+    content: Rect,
+    prev_hits: &Hits,
+    hits: &mut Hits,
+) {
+    use crate::doc::FontFamily;
+
+    // Click anywhere outside to close the font dropdown menu.
+    hits.push(content, Action::CloseFontMenu);
+
+    let ptr = state.last_pointer;
+    let anchor = state.font_menu_anchor;
+    let max_visible_fonts = state.available_fonts.len().clamp(1, 8);
+    let menu_w = 248;
+    let menu_h = 104 + (max_visible_fonts as i32 + 1) * 28;
+    let mx = anchor.x.clamp(content.x + 8, (content.right() - menu_w - 8).max(content.x + 8));
+    let my = (anchor.bottom() + 4).min((content.bottom() - menu_h - 8).max(content.y + 8));
+    let menu = Rect::new(mx, my, menu_w, menu_h);
+
+    let rad = theme.radius_control().max(8);
+    canvas.rounded_drop_shadow(menu, rad, 16, 4, 0.24);
+    canvas.rounded_rect(menu, rad, theme.window_high, 1.0);
+    canvas.rounded_border(menu, rad, theme.window_border, 0.95, 1);
+    hits.push(menu, Action::FocusField(state.focused));
+
+    text.draw(
+        canvas,
+        "字体角色 (uxconfd 通道)",
+        (menu.x + 12) as f32,
+        (menu.y + 20) as f32,
+        10.5,
+        theme.text_muted,
+        Face::Bold,
+    );
+
+    let roles = [
+        (FontFamily::Serif, "文档正文"),
+        (FontFamily::Sans, "无衬线"),
+        (FontFamily::Mono, "等宽代码"),
+    ];
+    let pill_w = (menu.w - 24 - 8) / 3;
+    for (idx, (role, label)) in roles.into_iter().enumerate() {
+        let rx = menu.x + 12 + idx as i32 * (pill_w + 4);
+        let r = Rect::new(rx, menu.y + 26, pill_w, 24);
+        let active = state.doc.active_style.font == role;
+        let hov = prev_hits.hover_rect(ptr.0, ptr.1, r);
+        chip_button(canvas, text, theme, r, label, active, hov, Face::Bold);
+        hits.push(r, Action::SelectFontRole(role));
+    }
+
+    canvas.fill(
+        Rect::new(menu.x + 10, menu.y + 58, menu.w - 20, 1),
+        mix(theme.panel_border, theme.window_high, 0.35),
+    );
+
+    let prop_name = match state.doc.active_style.font {
+        FontFamily::Serif => "font:/document-family",
+        FontFamily::Sans => "font:/ui-family",
+        FontFamily::Mono => "font:/monospace-family",
+    };
+    text.draw(
+        canvas,
+        &format!("系统已安装字体 ({prop_name})"),
+        (menu.x + 12) as f32,
+        (menu.y + 75) as f32,
+        10.5,
+        theme.text_muted,
+        Face::Bold,
+    );
+
+    let current_cfg = state.uxconf_font_for_role(state.doc.active_style.font);
+    let mut iy = menu.y + 82;
+
+    // Row 0: System default ("")
+    let def_label = match state.default_scanned_family_for_role(state.doc.active_style.font) {
+        Some(name) => format!("系统默认 ({name})"),
+        None => "系统默认".to_string(),
+    };
+    let def_row = Rect::new(menu.x + 6, iy, menu.w - 12, 26);
+    let def_selected = current_cfg.is_empty();
+    let def_hov = prev_hits.hover_rect(ptr.0, ptr.1, def_row);
+    if def_selected || def_hov {
+        canvas.rounded_rect(
+            def_row,
+            6,
+            if def_selected {
+                mix(theme.window_high, theme.accent, 0.16)
+            } else {
+                theme.panel_hover
+            },
+            1.0,
+        );
+    }
+    let shown_def = text.truncate(&def_label, (def_row.w - 24) as f32, 11.5, Face::Ui);
+    text.draw(
+        canvas,
+        &shown_def,
+        (def_row.x + 10) as f32,
+        (def_row.y + 17) as f32,
+        11.5,
+        if def_selected { theme.accent } else { theme.text },
+        if def_selected { Face::Bold } else { Face::Ui },
+    );
+    hits.push(def_row, Action::SelectSystemFont(String::new()));
+    iy += 28;
+
+    for family in state.available_fonts.iter().take(max_visible_fonts) {
+        let row = Rect::new(menu.x + 6, iy, menu.w - 12, 26);
+        let selected = current_cfg == family.as_str();
+        let hov = prev_hits.hover_rect(ptr.0, ptr.1, row);
+        if selected || hov {
+            canvas.rounded_rect(
+                row,
+                6,
+                if selected {
+                    mix(theme.window_high, theme.accent, 0.16)
+                } else {
+                    theme.panel_hover
+                },
+                1.0,
+            );
+        }
+        let shown = text.truncate(family, (row.w - 24) as f32, 11.5, Face::Ui);
+        text.draw(
+            canvas,
+            &shown,
+            (row.x + 10) as f32,
+            (row.y + 17) as f32,
+            11.5,
+            if selected { theme.accent } else { theme.text },
+            if selected { Face::Bold } else { Face::Ui },
+        );
+        hits.push(row, Action::SelectSystemFont(family.clone()));
+        iy += 28;
     }
 }
 

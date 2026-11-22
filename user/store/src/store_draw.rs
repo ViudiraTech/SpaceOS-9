@@ -10,7 +10,7 @@ fn draw_store(
     prev_hits: &Hits,
     hits: &mut Hits,
 ) -> Option<Rect> {
-    canvas.clear(theme.bg_bottom);
+    canvas.clear(theme.window);
     let sidebar = Rect::new(content.x, content.y, SIDEBAR_W, content.h);
     let topbar = Rect::new(
         content.x + SIDEBAR_W,
@@ -58,6 +58,20 @@ fn draw_store(
         draw_queue(canvas, text, theme, state, queue, prev_hits, hits);
     }
 
+    if let Some((pkg_name, anchor)) = state.open_menu.clone() {
+        draw_pkg_menu_overlay(
+            canvas,
+            text,
+            theme,
+            state,
+            content,
+            &pkg_name,
+            anchor,
+            prev_hits,
+            hits,
+        );
+    }
+
     if let Some(preview) = state.preview.as_ref() {
         draw_preview(
             canvas,
@@ -100,24 +114,32 @@ fn draw_sidebar(
     ui::sidebar_surface(canvas, theme, rect);
     let pointer = state.last_pointer;
 
-    let brand_h = 58;
-    icons::draw(
+    let brand_h = 64;
+    ui_cards::icon_badge(
         canvas,
         Icon::Store,
-        rect.x + 16,
-        rect.y + 16,
-        24,
-        Some(theme.accent),
+        Rect::new(rect.x + 14, rect.y + 14, 34, 34),
+        [theme.accent, ui_cards::mix(theme.accent, 0x1d4ed8, 0.35)],
     );
     ui_cards::draw_text(
         text,
         canvas,
         "Space 商店",
-        rect.x + 48,
-        rect.y + 34,
-        15.5,
+        rect.x + 56,
+        rect.y + 30,
+        15.0,
         theme.text,
         Face::Bold,
+    );
+    ui_cards::draw_text(
+        text,
+        canvas,
+        "SPK 软件中心",
+        rect.x + 56,
+        rect.y + 46,
+        11.0,
+        theme.text_muted,
+        Face::Ui,
     );
 
     let search = Rect::new(rect.x + 12, rect.y + brand_h, rect.w - 24, 32);
@@ -166,7 +188,32 @@ fn draw_sidebar(
         (NavSection::Maintenance, Icon::Settings, "仓库与维护", 0),
     ];
     let mut y = rect.y + brand_h + 44;
-    for (view, icon, label, count) in entries {
+    ui_cards::draw_text(
+        text,
+        canvas,
+        "浏览与发现",
+        rect.x + 18,
+        y + 12,
+        10.5,
+        theme.text_muted,
+        Face::Bold,
+    );
+    y += 20;
+    for (idx, (view, icon, label, count)) in entries.into_iter().enumerate() {
+        if idx == 2 {
+            y += 10;
+            ui_cards::draw_text(
+                text,
+                canvas,
+                "管理与维护",
+                rect.x + 18,
+                y + 12,
+                10.5,
+                theme.text_muted,
+                Face::Bold,
+            );
+            y += 20;
+        }
         let item = Rect::new(rect.x + 10, y, rect.w - 20, 36);
         let active = state.view == view && state.detail.is_none();
         let hovered = prev_hits.hover_rect(pointer.0, pointer.1, item);
@@ -187,9 +234,9 @@ fn draw_sidebar(
 
     // Running jobs mini card at the bottom
     let running: Vec<&TxJob> = state.jobs.iter().filter(|j| j.status.is_active()).collect();
-    let card = Rect::new(rect.x + 12, rect.y + rect.h - 78, rect.w - 24, 62);
+    let card = Rect::new(rect.x + 12, rect.y + rect.h - 78, rect.w - 24, 64);
     if !running.is_empty() {
-        ui::card(canvas, theme, card);
+        ui_cards::elevated_card(canvas, theme, card, false);
         let job = running[0];
         ui_cards::draw_text_clipped(
             text,
@@ -216,7 +263,7 @@ fn draw_sidebar(
         ui::progress_bar(
             canvas,
             theme,
-            Rect::new(card.x + 10, card.y + 45, card.w - 20, 6),
+            Rect::new(card.x + 10, card.y + 46, card.w - 20, 6),
             job.percent as f32 / 100.0,
             Some(theme.accent),
         );
@@ -235,27 +282,49 @@ fn draw_topbar(
     prev_hits: &Hits,
     hits: &mut Hits,
 ) {
-    ui::toolbar_surface(canvas, theme, rect, false, true);
+    // High-contrast elevated headerbar without Aero diagonal glass sheen obscuring text.
+    canvas.fill(rect, theme.window_high);
+    canvas.fill(
+        Rect::new(rect.x, rect.bottom() - 1, rect.w, 1),
+        ui_cards::soft_border(theme),
+    );
     let pointer = state.last_pointer;
-    let mut x = rect.x + 18;
+    let mut x = rect.x + 22;
 
     if state.detail.is_some() {
-        let back = Rect::new(x, rect.y + 11, 30, 30);
+        let back = Rect::new(x, rect.y + 13, 30, 30);
         let hovered = prev_hits.hover_rect(pointer.0, pointer.1, back);
         ui::icon_button(canvas, theme, back, Icon::GoBack, true, hovered);
         hits.push(back, Action::Back);
-        x += 38;
+        x += 40;
     }
 
-    let mut right = rect.right() - 18;
-    let queue = Rect::new(right - 96, rect.y + 11, 96, 30);
+    let mut right = rect.right() - 22;
+    let active_jobs = state.jobs.iter().filter(|j| j.status.is_active()).count();
+    let queue_label = if state.queue_open {
+        "隐藏任务".to_string()
+    } else if active_jobs > 0 {
+        format!("任务 ({active_jobs})")
+    } else {
+        "任务队列".to_string()
+    };
+    let queue = Rect::new(right - 96, rect.y + 13, 96, 30);
     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, queue);
-    let label = if state.queue_open { "隐藏任务" } else { "任务队列" };
-    ui_cards::cta_pill(canvas, text, theme, queue, label, false, hovered, false, None);
+    ui_cards::cta_pill(
+        canvas,
+        text,
+        theme,
+        queue,
+        &queue_label,
+        state.queue_open || active_jobs > 0,
+        hovered,
+        false,
+        None,
+    );
     hits.push(queue, Action::ToggleQueue);
     right -= 106;
 
-    let sync = Rect::new(right - 104, rect.y + 11, 104, 30);
+    let sync = Rect::new(right - 104, rect.y + 13, 104, 30);
     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, sync);
     ui_cards::cta_pill(
         canvas,
@@ -269,15 +338,15 @@ fn draw_topbar(
         None,
     );
     hits.push(sync, Action::RefreshCatalog);
-    right -= 114;
+    right -= 116;
 
     let status = if state.offline {
-        "离线模式".to_string()
+        "离线缓存模式".to_string()
     } else if state.loading {
-        "正在读取软件源…".to_string()
+        "正在同步软件源…".to_string()
     } else if let Some(repo) = state.repos.first() {
         format!(
-            "{} · {} 个软件包 · {}",
+            "{} · {} 个包 · {}",
             repo.name,
             repo.package_count,
             format_timestamp(repo.last_sync)
@@ -286,11 +355,11 @@ fn draw_topbar(
         String::new()
     };
 
-    let min_title_w = 130;
+    let min_title_w = 180;
     let max_status_w = (right - x - min_title_w - 16).max(0);
-    if !status.is_empty() && max_status_w >= 88 {
-        let width = (text.measure(&status, 11.0, Face::Bold) as i32 + 22).min(max_status_w);
-        let pill = Rect::new(right - width, rect.y + 14, width, 24);
+    if !status.is_empty() && max_status_w >= 96 {
+        let width = (text.measure(&status, 11.0, Face::Bold) as i32 + 24).min(max_status_w);
+        let pill = Rect::new(right - width, rect.y + 16, width, 24);
         ui_cards::badge(
             canvas,
             text,
@@ -303,30 +372,72 @@ fn draw_topbar(
                 theme.success
             },
         );
-        right = pill.x - 14;
+        right = pill.x - 16;
     }
 
-    let title = match (state.detail.as_deref(), state.view) {
-        (Some(name), _) => state
-            .package(name)
-            .map(|pkg| state.presentation(pkg).display_name)
-            .unwrap_or_else(|| name.to_string()),
-        (None, NavSection::Discover) => "探索精选".to_string(),
-        (None, NavSection::Browse) => "分类浏览".to_string(),
-        (None, NavSection::Updates) => "软件更新".to_string(),
-        (None, NavSection::Installed) => "已安装".to_string(),
-        (None, NavSection::Maintenance) => "仓库与维护".to_string(),
+    let (title, subtitle) = match (state.detail.as_deref(), state.view) {
+        (Some(name), _) => {
+            let pkg = state.package(name);
+            let disp = pkg
+                .map(|p| state.presentation(p).display_name)
+                .unwrap_or_else(|| name.to_string());
+            let sub = pkg
+                .map(|p| format!("软件包详情 · {}", p.name))
+                .unwrap_or_default();
+            (disp, sub)
+        }
+        (None, NavSection::Discover) => (
+            "探索精选".to_string(),
+            "精选桌面应用、主题扩展与核心系统工具".to_string(),
+        ),
+        (None, NavSection::Browse) => (
+            "分类浏览".to_string(),
+            format!("共收录 {} 个签名软件包", state.packages.len()),
+        ),
+        (None, NavSection::Updates) => (
+            "软件更新".to_string(),
+            if state.updates.is_empty() {
+                "所有已安装软件包均为最新版本".to_string()
+            } else {
+                format!("有 {} 个软件包可升级到新版本", state.updates.len())
+            },
+        ),
+        (None, NavSection::Installed) => (
+            "已安装".to_string(),
+            format!(
+                "已安装 {} 个软件包（手动 {} · 依赖 {}）",
+                state.installed_count(),
+                state.explicit_count(),
+                state.dependency_count()
+            ),
+        ),
+        (None, NavSection::Maintenance) => (
+            "仓库与维护".to_string(),
+            "管理软件源优先级、Ed25519 信任密钥与事务缓存".to_string(),
+        ),
     };
+    let avail_w = (right - x).max(60);
     ui_cards::draw_text_clipped(
         text,
         canvas,
         &title,
         x,
-        rect.y + 32,
-        (right - x).max(60),
-        16.0,
+        rect.y + 25,
+        avail_w,
+        16.5,
         theme.text,
         Face::Bold,
+    );
+    ui_cards::draw_text_clipped(
+        text,
+        canvas,
+        &subtitle,
+        x,
+        rect.y + 44,
+        avail_w,
+        11.0,
+        theme.text_muted,
+        Face::Ui,
     );
 }
 
@@ -413,16 +524,22 @@ fn draw_discover(
             }
 
             if !state_ref.updates.is_empty() {
-                let banner = Rect::new(area.x, y, inner_w, 58);
+                let banner = Rect::new(area.x, y, inner_w, 62);
                 if banner.bottom() >= area.y && banner.y <= area.bottom() {
-                    ui::card(canvas, theme, banner);
+                    ui_cards::elevated_card(canvas, theme, banner, false);
+                    ui_cards::icon_badge(
+                        canvas,
+                        Icon::Refresh,
+                        Rect::new(banner.x + 14, banner.y + 13, 36, 36),
+                        [theme.accent, ui_cards::mix(theme.accent, 0x0284c7, 0.45)],
+                    );
                     ui_cards::draw_text_clipped(
                         text,
                         canvas,
-                        &format!("{} 个软件包有新版本", state_ref.updates.len()),
-                        banner.x + 16,
-                        banner.y + 24,
-                        banner.w - 150,
+                        &format!("{} 个软件包有新版本可升级", state_ref.updates.len()),
+                        banner.x + 62,
+                        banner.y + 26,
+                        banner.w - 200,
                         13.5,
                         theme.text,
                         Face::Bold,
@@ -430,22 +547,22 @@ fn draw_discover(
                     ui_cards::draw_text_clipped(
                         text,
                         canvas,
-                        "查看更新中心可逐项确认版本变化与回滚保障",
-                        banner.x + 16,
-                        banner.y + 42,
-                        banner.w - 150,
+                        "前往软件更新中心可一键升级并享受事务级回滚保护",
+                        banner.x + 62,
+                        banner.y + 44,
+                        banner.w - 200,
                         11.5,
                         theme.text_muted,
                         Face::Ui,
                     );
-                    let cta = Rect::new(banner.right() - 122, banner.y + 15, 106, 28);
+                    let cta = Rect::new(banner.right() - 122, banner.y + 17, 106, 28);
                     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, cta);
                     ui_cards::cta_pill(
                         canvas, text, theme, cta, "查看更新", true, hovered, false, None,
                     );
                     hits.push_clipped(cta, area, Action::Nav(NavSection::Updates));
                 }
-                y += 74;
+                y += 76;
             }
 
             let columns = if inner_w >= 820 {
@@ -548,61 +665,80 @@ fn draw_browse(
     let pointer = state.last_pointer;
     let mut y = area.y;
 
-    let mut x = area.x;
-    for category in StoreCategory::ALL {
-        let label = category_label(&state.catalog, category);
-        let width = text.measure(&label, 12.0, Face::Ui) as i32 + 28;
-        let pill = Rect::new(x, y, width, 28);
-        let selected = state.category == category;
-        let hovered = prev_hits.hover_rect(pointer.0, pointer.1, pill);
-        let color = ui::filter_pill(canvas, theme, pill, selected, hovered);
-        let tw = text.measure(&label, 12.0, Face::Ui);
-        text.draw(
-            canvas,
-            &label,
-            (pill.x + pill.w / 2) as f32 - tw / 2.0,
-            (pill.y + 18) as f32,
-            12.0,
-            color,
-            if selected { Face::Bold } else { Face::Ui },
-        );
-        hits.push(pill, Action::Category(category));
-        x += width + 8;
+    // Segmented Category Bar
+    let mut cat_widths = [0i32; 4];
+    let mut cat_labels: [String; 4] = Default::default();
+    let mut cat_total_w = 6;
+    for (idx, category) in StoreCategory::ALL.iter().enumerate() {
+        let label = category_label(&state.catalog, *category);
+        let w = text.measure(&label, 12.0, Face::Bold) as i32 + 26;
+        cat_widths[idx] = w;
+        cat_labels[idx] = label;
+        cat_total_w += w + 2;
     }
-    y += 40;
+    let cat_track = Rect::new(area.x, y, cat_total_w, 34);
+    ui_cards::segmented_track(canvas, theme, cat_track);
+    let mut cx = cat_track.x + 3;
+    for (idx, category) in StoreCategory::ALL.iter().enumerate() {
+        let w = cat_widths[idx];
+        let pill = Rect::new(cx, cat_track.y + 3, w, 28);
+        let selected = state.category == *category;
+        let hovered = prev_hits.hover_rect(pointer.0, pointer.1, pill);
+        ui_cards::segmented_pill(
+            canvas,
+            text,
+            theme,
+            pill,
+            &cat_labels[idx],
+            None,
+            selected,
+            hovered,
+        );
+        hits.push(pill, Action::Category(*category));
+        cx += w + 2;
+    }
 
-    let mut x = area.x;
-    ui_cards::draw_text(
-        text,
-        canvas,
-        "排序",
-        x,
-        y + 18,
-        11.5,
-        theme.text_muted,
-        Face::Ui,
-    );
-    x += 34;
-    for sort in SortMode::ALL {
-        let width = text.measure(sort.label(), 11.5, Face::Ui) as i32 + 24;
-        let pill = Rect::new(x, y, width, 26);
-        let selected = state.sort == sort;
-        let hovered = prev_hits.hover_rect(pointer.0, pointer.1, pill);
-        let color = ui::filter_pill(canvas, theme, pill, selected, hovered);
-        let tw = text.measure(sort.label(), 11.5, Face::Ui);
-        text.draw(
-            canvas,
-            sort.label(),
-            (pill.x + pill.w / 2) as f32 - tw / 2.0,
-            (pill.y + 17) as f32,
-            11.5,
-            color,
-            if selected { Face::Bold } else { Face::Ui },
-        );
-        hits.push(pill, Action::Sort(sort));
-        x += width + 6;
+    // Segmented Sort Bar (inline right if space permits, else next row)
+    let mut sort_widths = [0i32; 4];
+    let mut sort_total_w = 6;
+    for (idx, sort) in SortMode::ALL.iter().enumerate() {
+        let w = text.measure(sort.label(), 11.5, Face::Bold) as i32 + 22;
+        sort_widths[idx] = w;
+        sort_total_w += w + 2;
     }
-    y += 38;
+    let inline_sort = area.w - SCROLLBAR_GUTTER - cat_track.w >= sort_total_w + 16;
+    let sort_track = if inline_sort {
+        Rect::new(
+            area.x + area.w - SCROLLBAR_GUTTER - sort_total_w,
+            y,
+            sort_total_w,
+            34,
+        )
+    } else {
+        y += 40;
+        Rect::new(area.x, y, sort_total_w, 32)
+    };
+    ui_cards::segmented_track(canvas, theme, sort_track);
+    let mut sx = sort_track.x + 3;
+    for (idx, sort) in SortMode::ALL.iter().enumerate() {
+        let w = sort_widths[idx];
+        let pill = Rect::new(sx, sort_track.y + 3, w, sort_track.h - 6);
+        let selected = state.sort == *sort;
+        let hovered = prev_hits.hover_rect(pointer.0, pointer.1, pill);
+        ui_cards::segmented_pill(
+            canvas,
+            text,
+            theme,
+            pill,
+            sort.label(),
+            None,
+            selected,
+            hovered,
+        );
+        hits.push(pill, Action::Sort(*sort));
+        sx += w + 2;
+    }
+    y += 46;
 
     let viewport = Rect::new(area.x, y, area.w, (area.bottom() - y).max(40));
     let packages: Vec<StorePackage> = state.filtered_packages().into_iter().cloned().collect();
@@ -651,7 +787,7 @@ fn draw_browse(
                 }
                 let pres = state_ref.presentation(pkg);
                 let hovered = prev_hits.hover_rect(pointer.0, pointer.1, card);
-                let cta_approx = Rect::new(card.right() - 90, card.bottom() - 38, 76, 26);
+                let cta_approx = Rect::new(card.right() - 92, card.bottom() - 38, 76, 26);
                 let cta_hovered = prev_hits.hover_rect(pointer.0, pointer.1, cta_approx);
                 let progress = state_ref
                     .job_for(&pkg.name)
@@ -698,24 +834,52 @@ fn draw_updates(
 ) {
     let area = content_scroll_area(main);
     let pointer = state.last_pointer;
+    let inner_w = (area.w - SCROLLBAR_GUTTER).max(160);
     let mut y = area.y;
     let count = state.updates.len();
+
+    // Elevated overview status card
+    let banner = Rect::new(area.x, y, inner_w, 68);
+    ui_cards::elevated_card(canvas, theme, banner, false);
+    let status_accent = if count == 0 {
+        [theme.success, ui_cards::mix(theme.success, 0x059669, 0.40)]
+    } else {
+        [theme.accent, ui_cards::mix(theme.accent, 0x1d4ed8, 0.40)]
+    };
+    ui_cards::icon_badge(
+        canvas,
+        Icon::Refresh,
+        Rect::new(banner.x + 16, banner.y + 14, 40, 40),
+        status_accent,
+    );
     ui_cards::draw_text_clipped(
         text,
         canvas,
         &if count == 0 {
-            "系统已是最新".to_string()
+            "系统所有软件包均已是最新版本".to_string()
         } else {
-            format!("{count} 个软件包可以更新")
+            format!("发现 {count} 个软件包可以升级")
         },
-        area.x,
-        y + 18,
-        area.w - 260,
-        15.0,
+        banner.x + 68,
+        banner.y + 28,
+        (banner.w - 320).max(80),
+        14.5,
         theme.text,
         Face::Bold,
     );
-    let all = Rect::new(area.right() - 118, y, 118, 28);
+    ui_cards::draw_text_clipped(
+        text,
+        canvas,
+        "所有更新包均经由 Ed25519 数字签名校验，支持事务快照与失败自动回滚",
+        banner.x + 68,
+        banner.y + 48,
+        (banner.w - 320).max(80),
+        11.5,
+        theme.text_muted,
+        Face::Ui,
+    );
+
+    let all = Rect::new(banner.right() - 116, banner.y + 19, 100, 30);
     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, all);
     ui_cards::cta_pill(
         canvas,
@@ -731,7 +895,7 @@ fn draw_updates(
     if count > 0 {
         hits.push(all, Action::UpdateAll);
     }
-    let check = Rect::new(area.right() - 236, y, 110, 28);
+    let check = Rect::new(banner.right() - 224, banner.y + 19, 98, 30);
     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, check);
     ui_cards::cta_pill(
         canvas,
@@ -745,25 +909,27 @@ fn draw_updates(
         None,
     );
     hits.push(check, Action::RefreshCatalog);
-    y += 44;
+    y += 82;
 
     let viewport = Rect::new(area.x, y, area.w, (area.bottom() - y).max(40));
     if count == 0 {
+        let empty_card = Rect::new(viewport.x, viewport.y, inner_w, (viewport.h - 8).max(160));
+        ui_cards::group_container(canvas, theme, empty_card);
         ui_cards::empty_state(
             canvas,
             text,
             theme,
-            viewport,
+            empty_card,
             Icon::Refresh,
-            "没有待处理的更新",
-            "同步软件源后可以再次检查新版本。",
+            "没有待处理的软件更新",
+            "点击右上角「检查更新」或「同步软件源」可获取最新仓库索引。",
         );
         return;
     }
 
-    let inner_w = (viewport.w - SCROLLBAR_GUTTER).max(160);
-    let row_h = 60;
-    let total_h = (count as i32 * (row_h + 10)).max(viewport.h);
+    let row_h = 68;
+    let group_h = count as i32 * row_h;
+    let total_h = (group_h + 12).max(viewport.h);
     let sb_rect = Rect::new(viewport.right() - 8, viewport.y, 8, viewport.h);
     state
         .grid_scroll
@@ -774,58 +940,101 @@ fn draw_updates(
     {
         let state_ref: &StoreState = state;
         canvas.with_clip(viewport, |canvas| {
+            let group_rect = Rect::new(viewport.x, viewport.y - offset, inner_w, group_h);
+            ui_cards::group_container(canvas, theme, group_rect);
+
             for (index, name) in update_names.iter().enumerate() {
                 let Some(pkg) = state_ref.package(name) else {
                     continue;
                 };
                 let row = Rect::new(
                     viewport.x,
-                    viewport.y + index as i32 * (row_h + 10) - offset,
+                    viewport.y + index as i32 * row_h - offset,
                     inner_w,
                     row_h,
                 );
                 if row.bottom() < viewport.y || row.y > viewport.bottom() {
                     continue;
                 }
-                ui::card(canvas, theme, row);
+                let row_hovered = prev_hits.hover_rect(pointer.0, pointer.1, row);
+                if row_hovered {
+                    canvas.rounded_rect(
+                        row.inset(3),
+                        8,
+                        ui_cards::mix(theme.window_high, theme.panel_hover, 0.35),
+                        1.0,
+                    );
+                }
+                if index > 0 {
+                    canvas.line(
+                        row.x + 70,
+                        row.y,
+                        row.right() - 16,
+                        row.y,
+                        ui_cards::soft_border(theme),
+                        0.85,
+                    );
+                }
+
                 let pres = state_ref.presentation(pkg);
                 ui_cards::icon_badge(
                     canvas,
                     pres.icon,
-                    Rect::new(row.x + 14, row.y + 14, 32, 32),
+                    Rect::new(row.x + 16, row.y + 13, 42, 42),
                     pres.accent,
                 );
                 ui_cards::draw_text_clipped(
                     text,
                     canvas,
                     &pres.display_name,
-                    row.x + 58,
-                    row.y + 25,
-                    row.w - 280,
-                    13.5,
+                    row.x + 70,
+                    row.y + 27,
+                    row.w - 310,
+                    14.0,
                     theme.text,
                     Face::Bold,
                 );
+                let name_w = text.measure(&pres.display_name, 14.0, Face::Bold) as i32;
                 let from = pkg.installed_version.as_deref().unwrap_or("-");
                 let to = pkg.available_version.as_deref().unwrap_or("-");
+                let ver_label = format!("{from} → {to}");
+                let ver_w = (text.measure(&ver_label, 11.0, Face::Bold) as i32 + 18).min(180);
+                let ver_x = row.x + 70 + name_w + 10;
+                if ver_x + ver_w < row.right() - 160 {
+                    ui_cards::badge(
+                        canvas,
+                        text,
+                        theme,
+                        Rect::new(ver_x, row.y + 12, ver_w, 20),
+                        &ver_label,
+                        theme.accent,
+                    );
+                }
+                if pkg.held {
+                    let lock_x = (ver_x + ver_w + 6).min(row.right() - 208);
+                    ui_cards::badge(
+                        canvas,
+                        text,
+                        theme,
+                        Rect::new(lock_x, row.y + 12, 56, 20),
+                        "已锁定",
+                        theme.warning,
+                    );
+                }
                 ui_cards::draw_text_clipped(
                     text,
                     canvas,
-                    &format!("{from} → {to} · {}", format_bytes(pkg.size)),
-                    row.x + 58,
-                    row.y + 44,
-                    row.w - 280,
+                    &format!("{}  ·  下载体积 {}", pres.subtitle, format_bytes(pkg.size)),
+                    row.x + 70,
+                    row.y + 47,
+                    row.w - 230,
                     11.5,
                     theme.text_muted,
                     Face::Ui,
                 );
-                if pkg.held {
-                    let pill = Rect::new(row.right() - 196, row.y + 19, 60, 22);
-                    ui_cards::badge(canvas, text, theme, pill, "已锁定", theme.warning);
-                }
                 hits.push_clipped(row, viewport, Action::OpenDetail(pkg.name.clone()));
 
-                let cta = Rect::new(row.right() - 122, row.y + 16, 102, 28);
+                let cta = Rect::new(row.right() - 134, row.y + 20, 78, 28);
                 let hovered = prev_hits.hover_rect(pointer.0, pointer.1, cta);
                 if let Some(job) = state_ref.job_for(&pkg.name) {
                     ui_cards::inline_progress(
@@ -838,7 +1047,7 @@ fn draw_updates(
                     hits.push_clipped(cta, viewport, Action::ToggleQueue);
                 } else if pkg.held {
                     ui_cards::cta_pill(
-                        canvas, text, theme, cta, "解除锁定", false, hovered, false, None,
+                        canvas, text, theme, cta, "解锁", false, hovered, false, None,
                     );
                     hits.push_clipped(cta, viewport, Action::Unhold(pkg.name.clone()));
                 } else {
@@ -847,6 +1056,19 @@ fn draw_updates(
                     );
                     hits.push_clipped(cta, viewport, Action::Update(pkg.name.clone()));
                 }
+
+                let more = Rect::new(row.right() - 48, row.y + 20, 34, 28);
+                let menu_open = state_ref
+                    .open_menu
+                    .as_ref()
+                    .is_some_and(|(cur, _)| cur == &pkg.name);
+                let hov_more = prev_hits.hover_rect(pointer.0, pointer.1, more);
+                ui_cards::more_button(canvas, theme, more, menu_open, hov_more);
+                hits.push_clipped(
+                    more,
+                    viewport,
+                    Action::TogglePkgMenu(pkg.name.clone(), more),
+                );
             }
         });
     }
@@ -876,54 +1098,132 @@ fn draw_installed(
 ) {
     let area = content_scroll_area(main);
     let pointer = state.last_pointer;
+    let inner_w = (area.w - SCROLLBAR_GUTTER).max(160);
     let mut y = area.y;
-    let mut x = area.x;
+
     let counts = [
         state.installed_count(),
         state.explicit_count(),
         state.dependency_count(),
         state.held_count(),
     ];
+    let mut pill_widths = [0i32; 4];
+    let mut track_w = 6;
     for (index, filter) in InstalledFilter::ALL.iter().enumerate() {
-        let label = format!("{} {}", filter.label(), counts[index]);
-        let width = text.measure(&label, 12.0, Face::Ui) as i32 + 28;
-        let pill = Rect::new(x, y, width, 28);
+        let lw = text.measure(filter.label(), 12.0, Face::Bold) as i32;
+        let cw = (text.measure(&counts[index].to_string(), 10.5, Face::Bold) as i32 + 12).max(20);
+        let w = lw + cw + 26;
+        pill_widths[index] = w;
+        track_w += w + 2;
+    }
+    let track = Rect::new(area.x, y, track_w, 34);
+    ui_cards::segmented_track(canvas, theme, track);
+    let mut x = track.x + 3;
+    for (index, filter) in InstalledFilter::ALL.iter().enumerate() {
+        let w = pill_widths[index];
+        let pill = Rect::new(x, track.y + 3, w, 28);
         let selected = state.installed_filter == *filter;
         let hovered = prev_hits.hover_rect(pointer.0, pointer.1, pill);
-        let color = ui::filter_pill(canvas, theme, pill, selected, hovered);
-        let tw = text.measure(&label, 12.0, Face::Ui);
-        text.draw(
+        ui_cards::segmented_pill(
             canvas,
-            &label,
-            (pill.x + pill.w / 2) as f32 - tw / 2.0,
-            (pill.y + 18) as f32,
-            12.0,
-            color,
-            if selected { Face::Bold } else { Face::Ui },
+            text,
+            theme,
+            pill,
+            filter.label(),
+            Some(counts[index]),
+            selected,
+            hovered,
         );
         hits.push(pill, Action::InstalledFilter(*filter));
-        x += width + 8;
+        x += w + 2;
     }
-    y += 42;
+
+    let packages: Vec<StorePackage> = state.filtered_packages().into_iter().cloned().collect();
+    let total_installed_bytes: u64 = packages
+        .iter()
+        .map(|p| p.installed_size.unwrap_or(p.size))
+        .sum();
+    if inner_w - track.w >= 160 {
+        let summary = format!(
+            "当前列表 {} 项 · 总占用 {}",
+            packages.len(),
+            format_bytes(total_installed_bytes)
+        );
+        let sw = text.measure(&summary, 11.5, Face::Ui) as i32;
+        ui_cards::draw_text(
+            text,
+            canvas,
+            &summary,
+            area.x + inner_w - sw - 4,
+            y + 22,
+            11.5,
+            theme.text_muted,
+            Face::Ui,
+        );
+    }
+    y += 46;
 
     let viewport = Rect::new(area.x, y, area.w, (area.bottom() - y).max(40));
-    let packages: Vec<StorePackage> = state.filtered_packages().into_iter().cloned().collect();
     if packages.is_empty() {
+        let empty_card = Rect::new(viewport.x, viewport.y, inner_w, (viewport.h - 8).max(160));
+        ui_cards::group_container(canvas, theme, empty_card);
         ui_cards::empty_state(
             canvas,
             text,
             theme,
-            viewport,
+            empty_card,
             Icon::Folder,
-            "这个筛选下没有软件包",
-            "切换筛选条件，或在「分类浏览」里安装新软件。",
+            "当前筛选下没有已安装软件包",
+            "可切换上方筛选标签，或前往「探索精选」「分类浏览」安装新软件。",
         );
         return;
     }
 
-    let inner_w = (viewport.w - SCROLLBAR_GUTTER).max(160);
-    let row_h = 56;
-    let total_h = (packages.len() as i32 * (row_h + 8)).max(viewport.h);
+    // Partition into GNOME Software / Mac App Store style PreferencesGroups:
+    // Group 1: Desktop Applications & Themes
+    // Group 2: Core System & Runtime Components
+    let mut app_group: Vec<StorePackage> = Vec::new();
+    let mut sys_group: Vec<StorePackage> = Vec::new();
+    for pkg in packages {
+        let pres = state.presentation(&pkg);
+        let is_desktop_app_or_theme = pres.is_theme
+            || pres.category == StoreCategory::Utilities
+            || pres.category == StoreCategory::Themes
+            || matches!(
+                pkg.name.as_str(),
+                "space-editor" | "space-store" | "space-askpass"
+            );
+        if is_desktop_app_or_theme {
+            app_group.push(pkg);
+        } else {
+            sys_group.push(pkg);
+        }
+    }
+
+    let mut groups: Vec<(&str, &str, Vec<StorePackage>)> = Vec::new();
+    if !app_group.is_empty() {
+        groups.push((
+            "桌面应用与外观主题",
+            "图形应用程序、授权前端与桌面视觉主题",
+            app_group,
+        ));
+    }
+    if !sys_group.is_empty() {
+        groups.push((
+            "系统核心与运行库",
+            "底层包管理引擎、权限工具、字体与系统基础元包",
+            sys_group,
+        ));
+    }
+
+    let row_h = 64;
+    let hdr_h = 34;
+    let group_gap = 16;
+    let mut content_h = 4;
+    for (_, _, items) in &groups {
+        content_h += hdr_h + items.len() as i32 * row_h + group_gap;
+    }
+    let total_h = content_h.max(viewport.h);
     let sb_rect = Rect::new(viewport.right() - 8, viewport.y, 8, viewport.h);
     state
         .grid_scroll
@@ -933,98 +1233,218 @@ fn draw_installed(
     {
         let state_ref: &StoreState = state;
         canvas.with_clip(viewport, |canvas| {
-            for (index, pkg) in packages.iter().enumerate() {
-                let row = Rect::new(
-                    viewport.x,
-                    viewport.y + index as i32 * (row_h + 8) - offset,
-                    inner_w,
-                    row_h,
-                );
-                if row.bottom() < viewport.y || row.y > viewport.bottom() {
-                    continue;
+            let mut cy = viewport.y - offset;
+            for (g_title, g_sub, items) in &groups {
+                let hdr_rect = Rect::new(viewport.x, cy, inner_w, hdr_h);
+                if hdr_rect.bottom() >= viewport.y && hdr_rect.y <= viewport.bottom() {
+                    ui_cards::group_section_header(
+                        canvas,
+                        text,
+                        theme,
+                        hdr_rect,
+                        g_title,
+                        items.len(),
+                        g_sub,
+                    );
                 }
-                let hovered = prev_hits.hover_rect(pointer.0, pointer.1, row);
-                ui::list_item_bg(canvas, theme, row, false, hovered);
-                canvas.rounded_border(row, theme.radius_control(), theme.panel_border, 0.5, 1);
+                cy += hdr_h;
 
-                let pres = state_ref.presentation(pkg);
-                ui_cards::icon_badge(
-                    canvas,
-                    pres.icon,
-                    Rect::new(row.x + 12, row.y + 12, 32, 32),
-                    pres.accent,
-                );
-                ui_cards::draw_text_clipped(
-                    text,
-                    canvas,
-                    &pres.display_name,
-                    row.x + 56,
-                    row.y + 24,
-                    row.w - 370,
-                    13.5,
-                    theme.text,
-                    Face::Bold,
-                );
-                let detail = match (pkg.installed_version.as_deref(), pkg.installed_size) {
-                    (Some(version), Some(size)) => format!("{version} · {}", format_bytes(size)),
-                    (Some(version), None) => version.to_string(),
-                    _ => String::new(),
-                };
-                ui_cards::draw_text_clipped(
-                    text,
-                    canvas,
-                    &detail,
-                    row.x + 56,
-                    row.y + 42,
-                    row.w - 370,
-                    11.0,
-                    theme.text_muted,
-                    Face::Ui,
-                );
-                if pkg.held {
-                    let pill = Rect::new(row.right() - 304, row.y + 17, 56, 22);
-                    ui_cards::badge(canvas, text, theme, pill, "已锁定", theme.warning);
+                let group_h = items.len() as i32 * row_h;
+                let group_rect = Rect::new(viewport.x, cy, inner_w, group_h);
+                if group_rect.bottom() >= viewport.y && group_rect.y <= viewport.bottom() {
+                    ui_cards::group_container(canvas, theme, group_rect);
+
+                    for (index, pkg) in items.iter().enumerate() {
+                        let row = Rect::new(viewport.x, cy + index as i32 * row_h, inner_w, row_h);
+                        if row.bottom() < viewport.y || row.y > viewport.bottom() {
+                            continue;
+                        }
+
+                        let cta_rect = Rect::new(row.right() - 134, row.y + 18, 76, 28);
+                        let more_rect = Rect::new(row.right() - 48, row.y + 18, 34, 28);
+                        let menu_open = state_ref
+                            .open_menu
+                            .as_ref()
+                            .is_some_and(|(cur, _)| cur == &pkg.name);
+
+                        let row_hovered = prev_hits.hover_rect(pointer.0, pointer.1, row)
+                            || prev_hits.hover_rect(pointer.0, pointer.1, cta_rect)
+                            || prev_hits.hover_rect(pointer.0, pointer.1, more_rect)
+                            || menu_open;
+                        if row_hovered {
+                            canvas.rounded_rect(
+                                row.inset(3),
+                                8,
+                                ui_cards::mix(theme.window_high, theme.panel_hover, 0.35),
+                                1.0,
+                            );
+                        }
+                        if index > 0 {
+                            canvas.line(
+                                row.x + 70,
+                                row.y,
+                                row.right() - 16,
+                                row.y,
+                                ui_cards::soft_border(theme),
+                                0.85,
+                            );
+                        }
+
+                        let pres = state_ref.presentation(pkg);
+                        ui_cards::icon_badge(
+                            canvas,
+                            pres.icon,
+                            Rect::new(row.x + 16, row.y + 11, 42, 42),
+                            pres.accent,
+                        );
+
+                        let title_max_w = (row.w - 340).max(90);
+                        ui_cards::draw_text_clipped(
+                            text,
+                            canvas,
+                            &pres.display_name,
+                            row.x + 70,
+                            row.y + 26,
+                            title_max_w,
+                            14.0,
+                            theme.text,
+                            Face::Bold,
+                        );
+
+                        // Inline version & metadata badges
+                        let shown_title =
+                            text.truncate(&pres.display_name, title_max_w as f32, 14.0, Face::Bold);
+                        let mut bx =
+                            row.x + 70 + text.measure(&shown_title, 14.0, Face::Bold) as i32 + 10;
+                        let max_bx = cta_rect.x - 12;
+
+                        if let Some(ver) = pkg.installed_version.as_deref() {
+                            let vw = (text.measure(ver, 11.0, Face::Bold) as i32 + 16).max(42);
+                            if bx + vw <= max_bx {
+                                ui_cards::badge(
+                                    canvas,
+                                    text,
+                                    theme,
+                                    Rect::new(bx, row.y + 11, vw, 19),
+                                    ver,
+                                    theme.panel_border,
+                                );
+                                bx += vw + 6;
+                            }
+                        }
+                        if pkg.install_reason.as_deref() == Some("dependency") && bx + 62 <= max_bx
+                        {
+                            ui_cards::badge(
+                                canvas,
+                                text,
+                                theme,
+                                Rect::new(bx, row.y + 11, 60, 19),
+                                "自动依赖",
+                                theme.text_muted,
+                            );
+                            bx += 66;
+                        }
+                        if pkg.held && bx + 56 <= max_bx {
+                            ui_cards::badge(
+                                canvas,
+                                text,
+                                theme,
+                                Rect::new(bx, row.y + 11, 54, 19),
+                                "已锁定",
+                                theme.warning,
+                            );
+                            bx += 60;
+                        }
+                        if pkg.upgrade_available && bx + 56 <= max_bx {
+                            ui_cards::badge(
+                                canvas,
+                                text,
+                                theme,
+                                Rect::new(bx, row.y + 11, 54, 19),
+                                "有更新",
+                                theme.accent,
+                            );
+                        }
+
+                        let size_bytes = pkg.installed_size.unwrap_or(pkg.size);
+                        let subtitle = if size_bytes > 0 {
+                            format!("{}  ·  占用 {}", pres.subtitle, format_bytes(size_bytes))
+                        } else {
+                            pres.subtitle.clone()
+                        };
+                        ui_cards::draw_text_clipped(
+                            text,
+                            canvas,
+                            &subtitle,
+                            row.x + 70,
+                            row.y + 46,
+                            (cta_rect.x - (row.x + 78)).max(80),
+                            11.5,
+                            theme.text_muted,
+                            Face::Ui,
+                        );
+
+                        // Row click opens package detail
+                        hits.push_clipped(row, viewport, Action::OpenDetail(pkg.name.clone()));
+
+                        // Single Primary Action Button
+                        let hov_cta = prev_hits.hover_rect(pointer.0, pointer.1, cta_rect);
+                        if let Some(job) = state_ref.job_for(&pkg.name) {
+                            ui_cards::inline_progress(
+                                canvas,
+                                theme,
+                                cta_rect,
+                                job.percent as f32 / 100.0,
+                                theme.accent,
+                            );
+                            hits.push_clipped(cta_rect, viewport, Action::ToggleQueue);
+                        } else if pkg.upgrade_available {
+                            ui_cards::cta_pill(
+                                canvas,
+                                text,
+                                theme,
+                                cta_rect,
+                                "更新",
+                                true,
+                                hov_cta,
+                                false,
+                                Some(pres.accent[0]),
+                            );
+                            hits.push_clipped(
+                                cta_rect,
+                                viewport,
+                                Action::Update(pkg.name.clone()),
+                            );
+                        } else {
+                            ui_cards::cta_pill(
+                                canvas,
+                                text,
+                                theme,
+                                cta_rect,
+                                "详情",
+                                false,
+                                hov_cta,
+                                false,
+                                None,
+                            );
+                            hits.push_clipped(
+                                cta_rect,
+                                viewport,
+                                Action::OpenDetail(pkg.name.clone()),
+                            );
+                        }
+
+                        // `···` Overflow Menu Button
+                        let hov_more = prev_hits.hover_rect(pointer.0, pointer.1, more_rect);
+                        ui_cards::more_button(canvas, theme, more_rect, menu_open, hov_more);
+                        hits.push_clipped(
+                            more_rect,
+                            viewport,
+                            Action::TogglePkgMenu(pkg.name.clone(), more_rect),
+                        );
+                    }
                 }
-
-                // Register row BEFORE action buttons so button hits always win cleanly.
-                hits.push_clipped(row, viewport, Action::OpenDetail(pkg.name.clone()));
-
-                let hold = Rect::new(row.right() - 236, row.y + 14, 66, 28);
-                let hov_h = prev_hits.hover_rect(pointer.0, pointer.1, hold);
-                ui_cards::cta_pill(
-                    canvas,
-                    text,
-                    theme,
-                    hold,
-                    if pkg.held { "解锁" } else { "锁定" },
-                    false,
-                    hov_h,
-                    false,
-                    None,
-                );
-                hits.push_clipped(
-                    hold,
-                    viewport,
-                    if pkg.held {
-                        Action::Unhold(pkg.name.clone())
-                    } else {
-                        Action::Hold(pkg.name.clone())
-                    },
-                );
-
-                let reinstall = Rect::new(row.right() - 162, row.y + 14, 66, 28);
-                let hov_r = prev_hits.hover_rect(pointer.0, pointer.1, reinstall);
-                ui_cards::cta_pill(
-                    canvas, text, theme, reinstall, "重装", false, hov_r, false, None,
-                );
-                hits.push_clipped(reinstall, viewport, Action::Reinstall(pkg.name.clone()));
-
-                let remove = Rect::new(row.right() - 88, row.y + 14, 68, 28);
-                let hov_d = prev_hits.hover_rect(pointer.0, pointer.1, remove);
-                ui_cards::cta_pill(
-                    canvas, text, theme, remove, "卸载", false, hov_d, false, None,
-                );
-                hits.push_clipped(remove, viewport, Action::Remove(pkg.name.clone()));
+                cy += group_h + group_gap;
             }
         });
     }
@@ -1043,6 +1463,112 @@ fn draw_installed(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_pkg_menu_overlay(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    state: &StoreState,
+    content: Rect,
+    pkg_name: &str,
+    anchor: Rect,
+    prev_hits: &Hits,
+    hits: &mut Hits,
+) {
+    // Clicking anywhere outside closes the popover menu cleanly.
+    hits.push(content, Action::ClosePkgMenu);
+
+    let Some(pkg) = state.package(pkg_name) else {
+        return;
+    };
+    let pointer = state.last_pointer;
+    let menu_w = 168;
+    let menu_h = 148;
+    let mx = (anchor.right() - menu_w).clamp(content.x + 12, content.right() - menu_w - 12);
+    let my = if anchor.bottom() + 6 + menu_h <= content.bottom() - 12 {
+        anchor.bottom() + 6
+    } else {
+        (anchor.y - menu_h - 6).max(content.y + 12)
+    };
+    let menu_rect = Rect::new(mx, my, menu_w, menu_h);
+
+    let radius = theme.radius_control().max(10);
+    canvas.rounded_drop_shadow(menu_rect, radius, 18, 5, 0.24);
+    canvas.rounded_rect(menu_rect, radius, theme.window_high, 1.0);
+    canvas.rounded_border(menu_rect, radius, theme.window_border, 0.95, 1);
+    hits.push(menu_rect, Action::Noop);
+
+    let items: [(&str, Action, bool); 4] = [
+        (
+            "查看软件包详情",
+            Action::OpenDetail(pkg.name.clone()),
+            false,
+        ),
+        (
+            if pkg.held {
+                "解除版本锁定"
+            } else {
+                "锁定当前版本"
+            },
+            if pkg.held {
+                Action::Unhold(pkg.name.clone())
+            } else {
+                Action::Hold(pkg.name.clone())
+            },
+            false,
+        ),
+        ("重新安装软件包", Action::Reinstall(pkg.name.clone()), false),
+        ("卸载软件包…", Action::Remove(pkg.name.clone()), true),
+    ];
+
+    let mut iy = menu_rect.y + 6;
+    for (idx, (label, act, is_danger)) in items.into_iter().enumerate() {
+        if idx == 3 {
+            canvas.line(
+                menu_rect.x + 10,
+                iy + 2,
+                menu_rect.right() - 10,
+                iy + 2,
+                ui_cards::soft_border(theme),
+                0.9,
+            );
+            iy += 6;
+        }
+        let item_r = Rect::new(menu_rect.x + 6, iy, menu_rect.w - 12, 32);
+        let hov = prev_hits.hover_rect(pointer.0, pointer.1, item_r);
+        if hov {
+            let h_bg = if is_danger {
+                ui_cards::mix(theme.window_high, theme.danger, 0.16)
+            } else {
+                ui_cards::mix(theme.window_high, theme.accent, 0.15)
+            };
+            canvas.rounded_rect(item_r, 6, h_bg, 1.0);
+        }
+        let fg = if is_danger {
+            ui_cards::badge_text_color(theme, theme.danger)
+        } else {
+            theme.text
+        };
+        ui_cards::draw_text_clipped(
+            text,
+            canvas,
+            label,
+            item_r.x + 12,
+            item_r.y + 21,
+            item_r.w - 24,
+            12.0,
+            fg,
+            if is_danger || hov {
+                Face::Bold
+            } else {
+                Face::Ui
+            },
+        );
+        hits.push(item_r, act);
+        iy += 33;
+    }
+}
+
 fn draw_detail(
     canvas: &mut Canvas,
     text: &mut TextRenderer,
@@ -1056,7 +1582,7 @@ fn draw_detail(
         return;
     };
     let Some(pkg) = state.package(&name).cloned() else {
-        canvas.fill(main, theme.bg_bottom);
+        canvas.fill(main, theme.window);
         ui_cards::empty_state(
             canvas,
             text,
@@ -1068,12 +1594,12 @@ fn draw_detail(
         );
         return;
     };
-    canvas.fill(main, theme.bg_bottom);
+    canvas.fill(main, theme.window);
     let pres = state.presentation(&pkg);
     let area = content_scroll_area(main);
     let header_h = 136;
     let header = Rect::new(area.x, area.y, area.w, header_h);
-    ui::card(canvas, theme, header);
+    ui_cards::elevated_card(canvas, theme, header, false);
 
     let show_preview =
         pres.screenshots.is_empty() && (pres.banner.is_some() || pres.is_theme) && header.w >= 720;
@@ -1198,7 +1724,7 @@ fn draw_detail(
     if pkg.installed {
         let remove = Rect::new(button_x, btn_y, 86, 32);
         let hovered = prev_hits.hover_rect(pointer.0, pointer.1, remove);
-        ui_cards::cta_pill(canvas, text, theme, remove, "卸载", false, hovered, false, None);
+        ui_cards::danger_pill(canvas, text, theme, remove, "卸载", hovered);
         hits.push(remove, Action::Remove(name.clone()));
         button_x += 96;
 
@@ -1269,29 +1795,40 @@ fn draw_detail(
     ];
     ui_cards::quick_stats(canvas, text, theme, stats, &items);
 
-    let tabs = Rect::new(area.x, stats.bottom() + 10, area.w, 30);
-    let mut tab_x = tabs.x;
-    for (tab, label) in [
-        (crate::model::DetailTab::Overview, "概览"),
-        (crate::model::DetailTab::Files, "文件列表"),
-    ] {
-        let width = text.measure(label, 12.5, Face::Ui) as i32 + 32;
-        let rect = Rect::new(tab_x, tabs.y, width, 30);
+    let tab_defs = [
+        (crate::model::DetailTab::Overview, "软件概览", None),
+        (
+            crate::model::DetailTab::Files,
+            "文件列表",
+            if state.detail_files.is_empty() {
+                None
+            } else {
+                Some(state.detail_files.len())
+            },
+        ),
+    ];
+    let mut tab_widths = [0i32; 2];
+    let mut track_w = 6;
+    for (idx, (_, label, cnt)) in tab_defs.iter().enumerate() {
+        let lw = text.measure(label, 12.0, Face::Bold) as i32;
+        let cw = cnt
+            .map(|c| (text.measure(&c.to_string(), 10.5, Face::Bold) as i32 + 12).max(20) + 6)
+            .unwrap_or(0);
+        let w = lw + cw + 26;
+        tab_widths[idx] = w;
+        track_w += w + 2;
+    }
+    let tabs = Rect::new(area.x, stats.bottom() + 10, track_w, 34);
+    ui_cards::segmented_track(canvas, theme, tabs);
+    let mut tab_x = tabs.x + 3;
+    for (idx, (tab, label, cnt)) in tab_defs.into_iter().enumerate() {
+        let width = tab_widths[idx];
+        let rect = Rect::new(tab_x, tabs.y + 3, width, 28);
         let active = state.detail_tab == tab;
         let hovered = prev_hits.hover_rect(pointer.0, pointer.1, rect);
-        let color = ui::tab_item(canvas, theme, rect, active, hovered, false, None);
-        let tw = text.measure(label, 12.5, Face::Ui);
-        text.draw(
-            canvas,
-            label,
-            (rect.x + rect.w / 2) as f32 - tw / 2.0,
-            (rect.y + 20) as f32,
-            12.5,
-            color,
-            if active { Face::Bold } else { Face::Ui },
-        );
+        ui_cards::segmented_pill(canvas, text, theme, rect, label, cnt, active, hovered);
         hits.push(rect, Action::SetTab(tab));
-        tab_x += width + 4;
+        tab_x += width + 2;
     }
 
     let body = Rect::new(
@@ -1300,12 +1837,21 @@ fn draw_detail(
         area.w,
         (area.bottom() - tabs.bottom() - 10).max(40),
     );
-    let inner_w = (body.w - SCROLLBAR_GUTTER).max(160);
+    let body_card = Rect::new(
+        body.x,
+        body.y,
+        (body.w - SCROLLBAR_GUTTER).max(160),
+        body.h,
+    );
+    ui_cards::group_container(canvas, theme, body_card);
+    let inner_body = body_card.inset(14);
+    let inner_w = inner_body.w.max(120);
     let offset = state.detail_scroll.offset_i32();
     let total_h: i32;
 
     {
         let state_ref: &StoreState = state;
+        let body = inner_body;
         let mut y = body.y - offset;
         canvas.with_clip(body, |canvas| match state_ref.detail_tab {
             crate::model::DetailTab::Overview => {
@@ -1624,17 +2170,17 @@ fn draw_detail(
         total_h = (y + offset - body.y + 8).max(body.h);
     }
 
-    let sb_rect = Rect::new(body.right() - 8, body.y, 8, body.h);
+    let sb_rect = Rect::new(body.right() - 8, body_card.y, 8, body_card.h);
     state
         .detail_scroll
-        .set_bounds(body.h as f32, total_h as f32, sb_rect);
+        .set_bounds(inner_body.h as f32, total_h as f32, sb_rect);
     ui::scrollbar_v_animated(
         canvas,
         theme,
         "store_detail_scrollbar",
         sb_rect,
         total_h as f32,
-        body.h as f32,
+        inner_body.h as f32,
         offset as f32,
         state.detail_scroll.is_hovered(),
         state.detail_scroll.is_dragging(),
@@ -1676,7 +2222,7 @@ fn draw_maintenance(
 
             for repo in &state_ref.repos {
                 let row = Rect::new(viewport.x, y, inner_w, 56);
-                ui::card(canvas, theme, row);
+                ui_cards::elevated_card(canvas, theme, row, false);
                 ui_cards::draw_text_clipped(
                     text,
                     canvas,
@@ -1723,7 +2269,7 @@ fn draw_maintenance(
             }
 
             let form = Rect::new(viewport.x, y, inner_w, 82);
-            ui::card(canvas, theme, form);
+            ui_cards::elevated_card(canvas, theme, form, false);
             let name_rect = Rect::new(form.x + 14, form.y + 14, 176, 32);
             let name_focus = focus == FocusedInput::RepoName;
             let name_caret = ui::text_input_ime(
@@ -1789,16 +2335,15 @@ fn draw_maintenance(
             );
             y += 46;
             for key in &state_ref.trust_keys {
-                let row = Rect::new(viewport.x, y, inner_w, 42);
-                ui::list_item_bg(canvas, theme, row, false, false);
-                canvas.rounded_border(row, theme.radius_control(), theme.panel_border, 0.45, 1);
-                icons::draw(canvas, Icon::Shield, row.x + 12, row.y + 13, 16, Some(theme.success));
+                let row = Rect::new(viewport.x, y, inner_w, 44);
+                ui_cards::elevated_card(canvas, theme, row, false);
+                icons::draw(canvas, Icon::Shield, row.x + 14, row.y + 14, 16, Some(theme.success));
                 ui_cards::draw_text_clipped(
                     text,
                     canvas,
                     &key.key_id,
-                    row.x + 36,
-                    row.y + 25,
+                    row.x + 38,
+                    row.y + 26,
                     row.w - 220,
                     12.0,
                     theme.text,
@@ -1809,16 +2354,16 @@ fn draw_maintenance(
                     canvas,
                     &key.comment,
                     row.right() - 180,
-                    row.y + 25,
+                    row.y + 26,
                     168,
                     11.0,
                     theme.text_muted,
                     Face::Ui,
                 );
-                y += 48;
+                y += 50;
             }
             let trust_row = Rect::new(viewport.x, y, inner_w, 48);
-            ui::card(canvas, theme, trust_row);
+            ui_cards::elevated_card(canvas, theme, trust_row, false);
             let trust_rect = Rect::new(
                 trust_row.x + 12,
                 trust_row.y + 8,
@@ -1902,7 +2447,7 @@ fn draw_maintenance(
                 let detail_count = result.details.len().min(6) as i32;
                 let panel_h = 74 + detail_count * 18;
                 let panel = Rect::new(viewport.x, y, inner_w, panel_h);
-                ui::card(canvas, theme, panel);
+                ui_cards::elevated_card(canvas, theme, panel, false);
                 ui_cards::draw_text_clipped(
                     text,
                     canvas,
