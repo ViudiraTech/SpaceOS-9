@@ -9,7 +9,7 @@
 name = "space-store"
 epoch = 0
 version = "1.0.0"
-release = 1
+release = 2
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "Space 商店：图形软件包管理器"
@@ -19,7 +19,7 @@ url = "https://github.com/ViudiraTech/SpaceOS-9"
 packager = "SpaceOS Build <build@spaceos>"
 build_date = 0
 
-depends = ["spk-runtime"]
+depends = ["spk-runtime", "spui-askpass"]
 provides = ["space-store"]
 conflicts = []
 replaces = []

@@ -1294,3 +1294,240 @@ pub fn trust_list_with_json(paths: &Paths, json: bool) -> Result<()> {
     }
     Ok(())
 }
+
+pub fn validate_asset_rel_path(raw: &str) -> Result<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.contains("..")
+        || trimmed.contains('\\')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.chars().any(|c| c.is_control())
+    {
+        return Err(SpkError::Usage(format!(
+            "asset path must be a clean repository-relative path: {raw}"
+        )));
+    }
+    let ext = std::path::Path::new(trimmed)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+        return Err(SpkError::Usage(format!(
+            "unsupported asset extension for {trimmed}"
+        )));
+    }
+    Ok(trimmed)
+}
+
+fn read_bounded_asset(path: &std::path::Path, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(SpkError::Usage(format!(
+            "asset source is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut out = Vec::new();
+    let limit = max_bytes.saturating_add(1);
+    file.take(limit).read_to_end(&mut out)?;
+    if out.len() as u64 > max_bytes {
+        return Err(SpkError::Network(format!(
+            "asset {} exceeds {} byte limit",
+            path.display(),
+            max_bytes
+        )));
+    }
+    Ok(out)
+}
+
+/// Download or copy a repository-relative preview image without requiring root
+/// or modifying `/var/lib/spk` / `/var/cache/spk`.
+pub fn fetch_asset(
+    paths: &Paths,
+    repos: &[String],
+    rel_path: &str,
+    out: &std::path::Path,
+    report: ReportOptions,
+    _lang: Lang,
+) -> Result<()> {
+    let rel = validate_asset_rel_path(rel_path)?;
+    let state = State::load(paths)?;
+
+    let mut urls: Vec<String> = Vec::new();
+    if repos.is_empty() {
+        let mut enabled: Vec<_> = state
+            .repos
+            .repos
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.enabled)
+            .collect();
+        enabled.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
+        for (_, cfg) in enabled {
+            urls.extend(cfg.urls.iter().cloned());
+        }
+    } else {
+        for item in repos {
+            if let Some(cfg) = state
+                .repos
+                .repos
+                .iter()
+                .find(|r| r.enabled && r.name == *item)
+            {
+                urls.extend(cfg.urls.iter().cloned());
+            } else {
+                urls.push(item.clone());
+            }
+        }
+    }
+
+    let mut local_dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut remote_mirrors: Vec<String> = Vec::new();
+    for src in urls {
+        if repo::is_remote_url(&src) {
+            remote_mirrors.push(src);
+        } else {
+            local_dirs.push(std::path::PathBuf::from(src));
+        }
+    }
+    let embedded = paths.root.join("var/lib/spk/repo/x86_64");
+    if embedded.is_dir() && !local_dirs.iter().any(|p| p == &embedded) {
+        local_dirs.push(embedded);
+    }
+
+    let mut chosen_bytes: Option<Vec<u8>> = None;
+    let mut chosen_src = String::new();
+    let mut last_err: Option<SpkError> = None;
+
+    for dir in &local_dirs {
+        let candidate = dir.join(rel);
+        if candidate.is_file() {
+            match read_bounded_asset(&candidate, crate::remote::MAX_ASSET_BYTES) {
+                Ok(bytes) => {
+                    chosen_src = candidate.display().to_string();
+                    chosen_bytes = Some(bytes);
+                    break;
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+    }
+
+    if chosen_bytes.is_none() && !report.offline && !remote_mirrors.is_empty() {
+        match crate::remote::fetch_asset_bytes(
+            &remote_mirrors,
+            rel,
+            crate::remote::MAX_ASSET_BYTES,
+        ) {
+            Ok(bytes) => {
+                chosen_src = remote_mirrors.join(", ");
+                chosen_bytes = Some(bytes);
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    let Some(bytes) = chosen_bytes else {
+        return Err(last_err.unwrap_or_else(|| {
+            SpkError::Network(format!("repository asset not found: {rel}"))
+        }));
+    };
+
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    atomic_write(out, &bytes, 0o644)?;
+    if report.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "ok": true,
+                "path": rel,
+                "out": out.display().to_string(),
+                "bytes": bytes.len(),
+                "source": chosen_src,
+            }))?
+        );
+    } else {
+        println!("{}", out.display());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("{name}_{}_{}", std::process::id(), nanos));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn fetch_asset_rejects_traversal_and_bad_extensions() {
+        assert!(validate_asset_rel_path("../etc/passwd").is_err());
+        assert!(validate_asset_rel_path("/etc/passwd.jpg").is_err());
+        assert!(validate_asset_rel_path(r"previews\a.jpg").is_err());
+        assert!(validate_asset_rel_path("previews/a.jpg?x=1").is_err());
+        assert!(validate_asset_rel_path("previews/script.sh").is_err());
+        assert_eq!(
+            validate_asset_rel_path("previews/theme-winxp.JPG").unwrap(),
+            "previews/theme-winxp.JPG"
+        );
+    }
+
+    #[test]
+    fn fetch_asset_reads_local_repo_without_root_and_enforces_size_limit() {
+        let root_tmp = TempDir::new("spk_fetch_asset_root");
+        let paths = Paths::new(&root_tmp.0).unwrap();
+        let embedded = root_tmp.0.join("var/lib/spk/repo/x86_64/previews");
+        std::fs::create_dir_all(&embedded).unwrap();
+        let sample = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10];
+        std::fs::write(embedded.join("demo.jpg"), &sample).unwrap();
+
+        let out_file = root_tmp.0.join("cache/out/demo.jpg");
+        fetch_asset(
+            &paths,
+            &[],
+            "previews/demo.jpg",
+            &out_file,
+            ReportOptions {
+                offline: true,
+                json: false,
+                ..Default::default()
+            },
+            Lang::En,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out_file).unwrap(), sample);
+
+        let too_big = root_tmp.0.join("big.png");
+        let f = std::fs::File::create(&too_big).unwrap();
+        f.set_len(crate::remote::MAX_ASSET_BYTES + 16).unwrap();
+        assert!(read_bounded_asset(&too_big, crate::remote::MAX_ASSET_BYTES).is_err());
+    }
+}

@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         preserve_env: false,
         non_interactive: cli.non_interactive,
         stdin_password: cli.stdin_password,
+        askpass: false,
         doas: true,
         command: cli.command,
     };

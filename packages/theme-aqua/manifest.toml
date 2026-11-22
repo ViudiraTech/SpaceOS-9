@@ -9,7 +9,7 @@
 name = "theme-aqua"
 epoch = 0
 version = "1.0.0"
-release = 3
+release = 4
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "Aqua Classic SPUI theme"
@@ -34,6 +34,7 @@ subtitle = "拉丝银白顶栏 · 晶球窗口控制 · 水蓝极光波纹"
 category = "themes"
 icon = "wallpaper"
 accent = ["#38bdf8", "#0284c7"]
+banner = "previews/theme-aqua.jpg"
 featured_rank = 95
 highlights = [
     "顶部经典菜单栏架构与左侧晶球控制按钮",

@@ -2,22 +2,14 @@
   "schema": 1,
   "hero": [
     {
-      "overline": "SpaceOS-9 软件中心",
-      "title": "安全、可复现的原子软件包管理",
-      "subtitle": "基于 Ed25519 签名验证与事务回滚日志，轻松管理桌面主题与系统组件。",
-      "cta": "同步软件源",
-      "go_updates": false,
-      "accent": ["#1e293b", "#2563eb"],
-      "icon": "store"
-    },
-    {
       "overline": "精选推荐 · 声明式桌面主题",
       "title": "XP Luna 经典主题",
       "subtitle": "支持经典与深色多变体切换、抗锯齿标题栏与主题专属关机动画，安装后即刻热生效。",
       "cta": "获取主题",
       "package": "theme-winxp",
       "accent": ["#1e3a8a", "#2563eb"],
-      "icon": "appearance"
+      "icon": "appearance",
+      "banner": "previews/theme-winxp.jpg"
     },
     {
       "overline": "编辑精选 · 暖色创作环境",
@@ -26,7 +18,27 @@
       "cta": "立即体验",
       "package": "theme-ambiance",
       "accent": ["#4c1d3d", "#c2410c"],
-      "icon": "wallpaper"
+      "icon": "wallpaper",
+      "banner": "previews/theme-ambiance.jpg"
+    },
+    {
+      "overline": "精致视觉 · 水蓝晶球体验",
+      "title": "Aqua Classic 晶球主题",
+      "subtitle": "拉丝银白顶栏配合晶球窗口控制按钮与极光水蓝波纹壁纸，支持浅色与深色模式无缝切换。",
+      "cta": "立即获取",
+      "package": "theme-aqua",
+      "accent": ["#0c4a6e", "#0284c7"],
+      "icon": "wallpaper",
+      "banner": "previews/theme-aqua.jpg"
+    },
+    {
+      "overline": "SpaceOS-9 软件中心",
+      "title": "安全、可复现的原子软件包管理",
+      "subtitle": "基于 Ed25519 签名验证与事务回滚日志，轻松管理桌面主题与系统组件。",
+      "cta": "同步软件源",
+      "go_updates": false,
+      "accent": ["#1e293b", "#2563eb"],
+      "icon": "store"
     }
   ],
   "sections": [
@@ -38,7 +50,7 @@
     {
       "title": "系统核心",
       "subtitle": "SpaceOS 的基石组件",
-      "packages": ["base-core", "spk-runtime", "sudo", "base"]
+      "packages": ["base-core", "spk-runtime", "sudo", "spui-askpass", "base"]
     }
   ],
   "categories": [

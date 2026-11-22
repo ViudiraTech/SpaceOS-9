@@ -184,6 +184,14 @@ enum Command {
         #[command(subcommand)]
         command: TrustCommand,
     },
+    /// Fetch a repository preview asset (non-root safe)
+    FetchAsset {
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        #[arg(long)]
+        out: PathBuf,
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -814,5 +822,21 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             TrustCommand::Add { key } => ops::trust_add_with_json(&paths, &key, cli.json, lang),
             TrustCommand::List => ops::trust_list_with_json(&paths, cli.json),
         },
+        Command::FetchAsset { repos, out, path } => ops::fetch_asset(
+            &paths,
+            &repos,
+            &path,
+            &out,
+            ReportOptions {
+                json: cli.json,
+                print: false,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
+            },
+            lang,
+        ),
     }
 }

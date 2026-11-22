@@ -8,3 +8,4 @@ Terminal=false
 Icon=preferences-desktop-theme
 Categories=Settings;DesktopSettings;
 StartupNotify=false
+NoDisplay=true

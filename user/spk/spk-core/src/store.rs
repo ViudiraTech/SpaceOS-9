@@ -124,6 +124,17 @@ impl StoreDoc {
             if let Some(package) = &slide.package {
                 crate::manifest::validate_package_name(package)?;
             }
+            if let Some(banner) = &slide.banner {
+                if banner.starts_with('/')
+                    || banner.contains("..")
+                    || banner.contains('\\')
+                    || banner.chars().any(|ch| ch.is_control())
+                {
+                    return Err(Error::Index(
+                        "store hero banner must be a repository-relative path".into(),
+                    ));
+                }
+            }
         }
         let mut section_titles = BTreeSet::new();
         for section in &self.sections {

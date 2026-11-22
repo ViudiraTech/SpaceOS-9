@@ -65,6 +65,16 @@ if [ -f "$STORE_SOURCE" ]; then
     install -m 0644 "$STORE_SOURCE" "$REPO/store.in.json"
 fi
 
+PREVIEWS_DIR=${SPK_PREVIEWS_DIR:-$ROOT/packages/previews}
+if [ -d "$PREVIEWS_DIR" ]; then
+    install -d -m 0755 "$REPO/previews"
+    for asset in "$PREVIEWS_DIR"/*.jpg "$PREVIEWS_DIR"/*.png; do
+        if [ -f "$asset" ]; then
+            install -m 0644 "$asset" "$REPO/previews/$(basename "$asset")"
+        fi
+    done
+fi
+
 # shellcheck disable=SC2086
 "$HOST_BIN" index \
     --repo-dir "$REPO" \

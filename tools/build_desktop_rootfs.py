@@ -865,6 +865,10 @@ EndSection
             if spimed.is_symlink() or spimed.exists():
                 spimed.unlink()
             spimed.symlink_to("/usr/bin/spui")
+            # spui-askpass ships as its own spk package; drop any legacy symlink.
+            askpass = STAGE / "usr/bin/spui-askpass"
+            if askpass.is_symlink():
+                askpass.unlink()
         if (STAGE / "usr/bin/NetworkManager").exists():
             nm_sbin = STAGE / "usr/sbin/NetworkManager"
             if nm_sbin.is_symlink() or nm_sbin.exists():

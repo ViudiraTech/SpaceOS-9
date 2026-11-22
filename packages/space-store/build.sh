@@ -16,6 +16,7 @@ if [ ! -x "$BIN" ]; then
 fi
 
 rm -rf "$STAGE"
-install -d -m 0755 "$STAGE/usr/bin"
+install -d -m 0755 "$STAGE/usr/bin" "$STAGE/usr/share/applications"
 install -m 0755 "$BIN" "$STAGE/usr/bin/space-store"
+install -m 0644 "$ROOT/packages/space-store/space-store.desktop" "$STAGE/usr/share/applications/space-store.desktop"
 printf 'staged space-store in %s\n' "$STAGE"

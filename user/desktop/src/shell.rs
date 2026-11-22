@@ -22,6 +22,9 @@ use crate::compositor::{
     WindowAnim,
 };
 use crate::ddm::wire::PowerAction;
+use crate::desktop_entries::{
+    applications_fingerprint, discover_applications, resolve_binary, AppLaunch, ResolvedApp,
+};
 use crate::draw::{mix, BlurScratch, Canvas, Rect, RectRegion, Sprite};
 use crate::icons::{self, Icon};
 use crate::start_screen::{ShellConfigHost, StartAction, StartScreenState};
@@ -117,140 +120,10 @@ const VORTEX_PLACES: [StartPlace; 7] = [
     },
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AppCategory {
-    System,
-    Productivity,
-    Media,
-    Games,
-}
-
-pub struct AppEntry {
-    pub name: &'static str,
-    pub subtitle: &'static str,
-    pub keywords: &'static str,
-    pub icon: Icon,
-    pub mode: &'static str,
-    pub category: AppCategory,
-}
-
-pub const APPS: [AppEntry; 13] = [
-    AppEntry {
-        name: "文件管理器",
-        subtitle: "浏览目录与系统文件",
-        keywords: "files folder directory dolphin 文件 目录",
-        icon: Icon::Files,
-        mode: "files",
-        category: AppCategory::Productivity,
-    },
-    AppEntry {
-        name: "终端",
-        subtitle: "交互式命令行会话",
-        keywords: "term terminal shell sh bash console 终端 命令行",
-        icon: Icon::Terminal,
-        mode: "term",
-        category: AppCategory::System,
-    },
-    AppEntry {
-        name: "系统监视器",
-        subtitle: "CPU、内存、进程性能监控与管理",
-        keywords: "monitor taskmgr top htop task manager 监视器 性能 进程 任务管理器",
-        icon: Icon::Monitor,
-        mode: "monitor",
-        category: AppCategory::System,
-    },
-    AppEntry {
-        name: "文本编辑器",
-        subtitle: "查看与编辑文本文档",
-        keywords: "edit editor text notepad kwrite 文本 编辑器",
-        icon: Icon::Editor,
-        mode: "edit",
-        category: AppCategory::Productivity,
-    },
-    AppEntry {
-        name: "计算器",
-        subtitle: "标准四则运算与即时数值计算",
-        keywords: "calc calculator math 计算器 计算 数学",
-        icon: Icon::Calculator,
-        mode: "calc",
-        category: AppCategory::Productivity,
-    },
-    AppEntry {
-        name: "扫雷",
-        subtitle: "经典 XP 扫雷 · AI 约束推演与概率预测",
-        keywords: "mines minesweeper game ai xp 扫雷 排雷 游戏 益智",
-        icon: Icon::Minesweeper,
-        mode: "mines",
-        category: AppCategory::Games,
-    },
-    AppEntry {
-        name: "看图工具",
-        subtitle: "图像浏览、缩放与壁纸设定",
-        keywords: "view image viewer photo picture 看图 图片 图像 相册",
-        icon: Icon::ImageViewer,
-        mode: "view",
-        category: AppCategory::Media,
-    },
-    AppEntry {
-        name: "音乐播放器",
-        subtitle: "播放示例 MP3 曲目",
-        keywords: "music mp3 audio player media 音乐 播放器 音频 歌曲",
-        icon: Icon::Music,
-        mode: "music",
-        category: AppCategory::Media,
-    },
-    AppEntry {
-        name: "系统设置",
-        subtitle: "外观、网络、桌面、输入设备与系统偏好",
-        keywords:
-            "settings network ip dhcp ethernet display wallpaper theme 外观 网络 壁纸 分辨率 设置",
-        icon: Icon::Settings,
-        mode: "settings",
-        category: AppCategory::System,
-    },
-    AppEntry {
-        name: "帮助手册",
-        subtitle: "SpaceOS-9 桌面使用与快捷键指南",
-        keywords: "help manual guide doc 帮助 手册 快捷键 文档 指南",
-        icon: Icon::Help,
-        mode: "help",
-        category: AppCategory::System,
-    },
-    AppEntry {
-        name: "Space 浏览器",
-        subtitle: "网页浏览与 QuickJS 交互引擎",
-        keywords: "browser web html internet js space 浏览器 网页 上网",
-        icon: Icon::Browser,
-        mode: "browser",
-        category: AppCategory::Productivity,
-    },
-    AppEntry {
-        name: "Space 商店",
-        subtitle: "浏览、安装与更新软件包",
-        keywords: "store shop app market install update 商店 软件 应用 安装 更新",
-        icon: Icon::Store,
-        mode: "store",
-        category: AppCategory::System,
-    },
-    AppEntry {
-        name: "检查新软件",
-        subtitle: "检查软件源中的新版本与更新",
-        keywords: "check update upgrade refresh new 检查 更新 升级 新软件",
-        icon: Icon::StoreCheck,
-        mode: "store-check",
-        category: AppCategory::System,
-    },
-];
-
 /// Curated taskbar quick-launch apps; all applications remain in Start Menu & Desktop.
 const PINNED_MODES: [&str; 4] = ["files", "term", "edit", "settings"];
 
-fn pinned_app_entry(slot: usize) -> Option<&'static AppEntry> {
-    let mode = *PINNED_MODES.get(slot)?;
-    APPS.iter().find(|app| app.mode == mode)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Hit {
     None,
     DesktopIcon(usize),
@@ -381,6 +254,10 @@ pub struct Shell {
     menu_ime_focused: bool,
     menu_ime_spot: Option<(i32, i32, i32)>,
     menu_confirm_power: Option<PowerAction>,
+    menu_hits: Vec<(Rect, Hit)>,
+    menu_scroll_y: i32,
+    menu_max_scroll: i32,
+    menu_list_viewport: Rect,
     start_screen: StartScreenState,
     ctx_menu: Window,
     ctx_canvas: Canvas,
@@ -410,11 +287,14 @@ pub struct Shell {
     net_fd: Option<i32>,
     net_status: crate::netmgr::NetStatus,
     last_net_refresh: Instant,
-    last_launch: Option<(&'static str, Instant)>,
+    last_launch: Option<(String, Instant)>,
     last_composite: Instant,
     theme_stamp: Option<std::time::SystemTime>,
     theme_fp: u64,
     last_theme_fp_check: Instant,
+    apps: Vec<ResolvedApp>,
+    apps_fp: u64,
+    last_apps_fp_check: Instant,
     dirty_rects_buf: Vec<Rect>,
     comp_plan_buf: Vec<WinCompPlan>,
     capture_keep_buf: Vec<Window>,
@@ -667,12 +547,100 @@ fn draw_etched_hsep(canvas: &mut Canvas, theme: &Theme, x: i32, y: i32, w: i32) 
     }
 }
 
-fn menu_row_rect(index: usize) -> Rect {
-    Rect::new(12, 58 + index as i32 * 52, MENU_WIDTH - 24, 48)
+fn compact_menu_viewport(w: i32, h: i32) -> Rect {
+    Rect::new(8, 56, (w - 16).max(40), (h - 54 - 60).max(40))
+}
+
+fn compact_menu_row_rect(list_vp: Rect, index: usize, scroll_y: i32) -> Rect {
+    Rect::new(
+        list_vp.x + 4,
+        list_vp.y + index as i32 * 52 - scroll_y,
+        (list_vp.w - 14).max(40),
+        48,
+    )
+}
+
+fn build_compact_menu_layout(
+    filtered_len: usize,
+    w: i32,
+    h: i32,
+    scroll_y: i32,
+) -> (Rect, i32, i32) {
+    let list_vp = compact_menu_viewport(w, h);
+    let total_h = filtered_len as i32 * 52;
+    let max_scroll = (total_h - list_vp.h).max(0);
+    (list_vp, total_h, scroll_y.clamp(0, max_scroll))
+}
+
+fn push_compact_menu_hits(
+    hits: &mut Vec<(Rect, Hit)>,
+    filtered: &[usize],
+    list_vp: Rect,
+    scroll_y: i32,
+    confirm_power: bool,
+) {
+    for (slot, &app_idx) in filtered.iter().enumerate() {
+        let row = compact_menu_row_rect(list_vp, slot, scroll_y);
+        let clipped = row.intersect(list_vp);
+        if !clipped.is_empty() {
+            hits.push((clipped, Hit::MenuRow(app_idx)));
+        }
+    }
+    let (logout, reboot, power_off, confirm_cancel, confirm_ok) = compact_footer_rects();
+    if confirm_power {
+        hits.push((confirm_cancel, Hit::ConfirmPowerCancel));
+        hits.push((confirm_ok, Hit::ConfirmPowerOk));
+    } else {
+        hits.push((logout, Hit::Logout));
+        hits.push((reboot, Hit::Reboot));
+        hits.push((power_off, Hit::PowerOff));
+    }
+}
+
+fn draw_menu_scrollbar(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    list_vp: Rect,
+    total_h: i32,
+    scroll_y: i32,
+) {
+    if total_h <= list_vp.h {
+        return;
+    }
+    let track = Rect::new(
+        list_vp.right() - 6,
+        list_vp.y + 4,
+        4,
+        (list_vp.h - 8).max(12),
+    );
+    canvas.rounded_rect(track, 2, theme.panel_border, 0.35);
+    let thumb_h =
+        ((track.h as f32 * list_vp.h as f32 / total_h as f32) as i32).clamp(22, track.h);
+    let max_scroll = (total_h - list_vp.h).max(1);
+    let max_offset = (track.h - thumb_h).max(0);
+    let thumb_y = track.y
+        + ((scroll_y.clamp(0, max_scroll) as f32 / max_scroll as f32) * max_offset as f32) as i32;
+    canvas.rounded_rect(
+        Rect::new(track.x, thumb_y, track.w, thumb_h),
+        2,
+        theme.text_muted,
+        0.68,
+    );
 }
 
 fn vortex_menu_row_rect(index: usize) -> Rect {
     Rect::new(14, 16 + index as i32 * 54, 244, 50)
+}
+
+fn vortex_menu_viewport(h: i32) -> Rect {
+    Rect::new(10, 12, 252, (h - 62 - 12).max(40))
+}
+
+fn custom_menu_viewport(sm: &crate::theme::StartMenuSkin) -> Rect {
+    let body_top = sm.header_height + 4;
+    let left_w = (sm.width / 2 + 6).clamp(180, sm.width - 140);
+    let search_r = custom_menu_search_rect(sm);
+    Rect::new(4, body_top, (left_w - 6).max(80), (search_r.y - 28 - body_top).max(40))
 }
 
 fn vortex_menu_search_rect() -> Rect {
@@ -800,6 +768,8 @@ fn infer_window_icon(title: &str) -> Icon {
         Icon::Music
     } else if title.contains("商店") || lower.contains("store") {
         Icon::Store
+    } else if title.contains("身份验证") || title.contains("授权") || lower.contains("auth") {
+        Icon::Shield
     } else if title.contains("浏览器") || lower.contains("browser") {
         Icon::Browser
     } else if title.contains("设置") || lower.contains("setting") {
@@ -1220,6 +1190,10 @@ impl Shell {
             comp.active, x.has_composite, x.has_damage, x.has_xfixes
         );
 
+        let apps = discover_applications();
+        let apps_fp = applications_fingerprint();
+        let mut start_screen = StartScreenState::new();
+        start_screen.set_apps(apps.clone());
         let ime_chinese = x.get_spime_status().map(|(c, _)| c).unwrap_or(true);
         let ime_active = config.ime_enabled;
         let mut shell = Self {
@@ -1251,7 +1225,11 @@ impl Shell {
             menu_ime_focused: false,
             menu_ime_spot: None,
             menu_confirm_power: None,
-            start_screen: StartScreenState::new(),
+            menu_hits: Vec::with_capacity(24),
+            menu_scroll_y: 0,
+            menu_max_scroll: 0,
+            menu_list_viewport: Rect::new(0, 0, 0, 0),
+            start_screen,
             ctx_menu,
             ctx_canvas,
             ctx_open: false,
@@ -1285,6 +1263,9 @@ impl Shell {
             theme_stamp: crate::theme::theme_reload_stamp(),
             theme_fp: crate::theme::installed_themes_fingerprint(),
             last_theme_fp_check: Instant::now(),
+            apps,
+            apps_fp,
+            last_apps_fp_check: Instant::now(),
             dirty_rects_buf: Vec::with_capacity(16),
             comp_plan_buf: Vec::with_capacity(8),
             capture_keep_buf: Vec::with_capacity(16),
@@ -1434,9 +1415,9 @@ impl Shell {
             StartAction::Close => {
                 self.close_menu()?;
             }
-            StartAction::Launch(mode) => {
+            StartAction::Launch(id) => {
                 self.close_menu()?;
-                self.launch(mode);
+                self.launch(&id);
             }
             StartAction::Logout => {
                 self.close_menu()?;
@@ -1486,44 +1467,118 @@ impl Shell {
         }
     }
 
-    /// APPS indices shown on the desktop, in the order the user arranged.
-    fn desktop_app_indices(&self) -> Vec<usize> {
-        self.config
-            .desktop_shortcuts
-            .split(',')
-            .filter(|mode| !mode.is_empty())
-            .filter_map(|mode| APPS.iter().position(|app| app.mode == mode))
-            .collect()
+    fn pinned_app_entry(&self, slot: usize) -> Option<&ResolvedApp> {
+        let mode = *PINNED_MODES.get(slot)?;
+        self.apps.iter().find(|app| app.id == mode)
     }
 
-    /// Add or remove `APPS[index]` from the desktop, persisting the choice.
+    fn reload_applications(&mut self) -> Result<()> {
+        self.apps_fp = applications_fingerprint();
+        self.last_apps_fp_check = Instant::now();
+        self.apps = discover_applications();
+        self.start_screen.set_apps(self.apps.clone());
+        self.selected_desktop_icon = None;
+        self.menu_scroll_y = 0;
+        self.draw_desktop();
+        self.present_desktop()?;
+        if self.menu_open {
+            self.draw_menu();
+            self.present_menu()?;
+        }
+        self.comp.mark_full_dirty();
+        Ok(())
+    }
+
+    /// `self.apps` indices shown on the desktop: manual order plus installed auto-shortcuts.
+    fn desktop_app_indices(&self) -> Vec<usize> {
+        let hidden: Vec<&str> = self
+            .config
+            .desktop_hidden_shortcuts
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut indices = Vec::new();
+        for id in self
+            .config
+            .desktop_shortcuts
+            .split(',')
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(pos) = self.apps.iter().position(|app| app.id == id) {
+                if !indices.contains(&pos) {
+                    indices.push(pos);
+                }
+            }
+        }
+        for (pos, app) in self.apps.iter().enumerate() {
+            if app.desktop_shortcut
+                && !indices.contains(&pos)
+                && !hidden.iter().any(|h| *h == app.id)
+            {
+                indices.push(pos);
+            }
+        }
+        indices
+    }
+
+    /// Add or remove `self.apps[index]` from the desktop, persisting both manual and hidden lists.
     fn toggle_desktop_shortcut(&mut self, index: usize) {
-        let mode = APPS[index].mode;
-        let mut modes: Vec<String> = self
+        let Some(app) = self.apps.get(index).cloned() else {
+            return;
+        };
+        let currently_shown = self.desktop_app_indices().contains(&index);
+        let mut manual: Vec<String> = self
             .config
             .desktop_shortcuts
             .split(',')
             .filter(|m| !m.is_empty())
             .map(str::to_string)
             .collect();
-        let present = modes.iter().any(|m| m == mode);
-        if present {
-            modes.retain(|m| m != mode);
+        let mut hidden: Vec<String> = self
+            .config
+            .desktop_hidden_shortcuts
+            .split(',')
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .collect();
+        if currently_shown {
+            manual.retain(|m| m != &app.id);
+            if app.desktop_shortcut && !hidden.iter().any(|h| h == &app.id) {
+                hidden.push(app.id.clone());
+            }
         } else {
-            modes.push(mode.to_string());
+            hidden.retain(|h| h != &app.id);
+            if !manual.iter().any(|m| m == &app.id) {
+                manual.push(app.id.clone());
+            }
         }
-        let next = modes.join(",");
+        let next_manual = manual.join(",");
+        let next_hidden = hidden.join(",");
         if let Some(client) = self.ux_client.as_mut() {
             let _ = client.set(
                 "desktop",
                 "/icons/shortcuts",
-                uxconf::Value::String(next.clone()),
+                uxconf::Value::String(next_manual.clone()),
+            );
+            let _ = client.set(
+                "desktop",
+                "/icons/hidden-shortcuts",
+                uxconf::Value::String(next_hidden.clone()),
             );
         }
-        let _ = self.config.apply_property("desktop", "/icons/shortcuts", &uxconf::Value::String(next));
+        let _ = self.config.apply_property(
+            "desktop",
+            "/icons/shortcuts",
+            &uxconf::Value::String(next_manual),
+        );
+        let _ = self.config.apply_property(
+            "desktop",
+            "/icons/hidden-shortcuts",
+            &uxconf::Value::String(next_hidden),
+        );
         self.show_toast(
-            if present { "已从桌面移除" } else { "已添加到桌面" },
-            APPS[index].name,
+            if currently_shown { "已从桌面移除" } else { "已添加到桌面" },
+            &app.name,
         );
         let _ = self.draw_desktop();
         let _ = self.present_desktop();
@@ -1612,6 +1667,14 @@ impl Shell {
     }
 
     fn apply_live_config_diff(&mut self, prev: DesktopConfig) -> Result<()> {
+        if prev.apps_reload_gen != self.config.apps_reload_gen {
+            self.apps_fp = applications_fingerprint();
+            self.last_apps_fp_check = Instant::now();
+            self.apps = discover_applications();
+            self.start_screen.set_apps(self.apps.clone());
+            self.selected_desktop_icon = None;
+            self.menu_scroll_y = 0;
+        }
         if prev.theme_reload_gen != self.config.theme_reload_gen
             || prev.theme_id != self.config.theme_id
         {
@@ -2065,6 +2128,13 @@ impl Shell {
                 if next_fp != self.theme_fp {
                     self.theme_fp = next_fp;
                     self.reload_theme_pack()?;
+                }
+            }
+            if self.last_apps_fp_check.elapsed() >= Duration::from_secs(2) {
+                self.last_apps_fp_check = Instant::now();
+                let next_apps_fp = applications_fingerprint();
+                if next_apps_fp != self.apps_fp {
+                    self.reload_applications()?;
                 }
             }
 
@@ -3019,6 +3089,21 @@ impl Shell {
                                 }
                             }
                         }
+                    } else if e.detail == 4 || e.detail == 5 {
+                        if self.menu_max_scroll > 0 && self.menu_list_viewport.contains(x, y) {
+                            let raw = if e.detail == 4 { -44 } else { 44 };
+                            let step = if self.config.mouse_natural_scroll {
+                                -raw
+                            } else {
+                                raw
+                            };
+                            let next = (self.menu_scroll_y + step).clamp(0, self.menu_max_scroll);
+                            if next != self.menu_scroll_y {
+                                self.menu_scroll_y = next;
+                                self.draw_menu();
+                                self.present_menu()?;
+                            }
+                        }
                     } else if e.detail == 1 {
                         self.menu_click(x, y)?;
                     } else if e.detail == 3 {
@@ -3053,7 +3138,9 @@ impl Shell {
                             self.draw_desktop();
                             self.present_desktop()?;
                             crate::sound::play(&self.config, crate::sound::SystemSound::Click);
-                            self.launch(APPS[idx].mode);
+                            if let Some(id) = self.apps.get(idx).map(|a| a.id.clone()) {
+                                self.launch(&id);
+                            }
                         } else if self.selected_desktop_icon.take().is_some() {
                             self.draw_desktop();
                             self.present_desktop()?;
@@ -3321,19 +3408,23 @@ impl Shell {
                         self.close_menu()?;
                     } else if key.is_backspace() {
                         if self.menu_query.pop().is_some() {
+                            self.menu_scroll_y = 0;
                             self.draw_menu();
                             self.present_menu()?;
                         }
                     } else if key.is_enter() {
                         let filtered = self.filtered_apps();
                         if let Some(&idx) = filtered.first() {
-                            let mode = APPS[idx].mode;
+                            let id = self.apps.get(idx).map(|a| a.id.clone());
                             self.close_menu()?;
-                            self.launch(mode);
+                            if let Some(id) = id {
+                                self.launch(&id);
+                            }
                         }
                     } else if let Some(ch) = key.text().filter(|c| !c.is_control()) {
                         if self.menu_query.chars().count() < 24 {
                             self.menu_query.push(ch);
+                            self.menu_scroll_y = 0;
                             self.draw_menu();
                             self.present_menu()?;
                         }
@@ -3459,14 +3550,16 @@ impl Shell {
     fn filtered_apps(&self) -> Vec<usize> {
         let q = self.menu_query.trim().to_lowercase();
         if q.is_empty() {
-            return (0..APPS.len()).collect();
+            return (0..self.apps.len()).collect();
         }
-        APPS.iter()
+        self.apps
+            .iter()
             .enumerate()
             .filter(|(_, app)| {
                 app.name.to_lowercase().contains(&q)
                     || app.subtitle.to_lowercase().contains(&q)
                     || app.keywords.to_lowercase().contains(&q)
+                    || app.id.contains(&q)
             })
             .map(|(idx, _)| idx)
             .collect()
@@ -4474,8 +4567,8 @@ impl Shell {
                 self.close_menu()?;
                 self.close_vol_popup()?;
                 crate::sound::play(&self.config, crate::sound::SystemSound::Click);
-                if let Some(app) = pinned_app_entry(idx) {
-                    self.launch(app.mode);
+                if let Some(id) = self.pinned_app_entry(idx).map(|a| a.id.clone()) {
+                    self.launch(&id);
                 }
                 Ok(())
             }
@@ -4649,6 +4742,7 @@ impl Shell {
                 for ch in reply.commit_text.chars() {
                     if !ch.is_control() && self.menu_query.chars().count() < 24 {
                         self.menu_query.push(ch);
+                        self.menu_scroll_y = 0;
                         dirty = true;
                     }
                 }
@@ -4872,95 +4966,22 @@ impl Shell {
     }
 
     fn menu_hit(&self, x: i32, y: i32) -> Hit {
-        if let Some(ref sm) = self.theme.skin().and_then(|s| s.start_menu.as_ref()) {
-            if sm.layout == crate::theme::StartMenuLayoutKind::TwoColumn {
-                let (logout, reboot, power_off, confirm_cancel, confirm_ok) =
-                    custom_menu_footer_rects(sm);
-                if self.menu_confirm_power.is_some() {
-                    if confirm_cancel.contains(x, y) {
-                        return Hit::ConfirmPowerCancel;
-                    }
-                    if confirm_ok.contains(x, y) {
-                        return Hit::ConfirmPowerOk;
-                    }
-                    return Hit::None;
-                }
-                let filtered = self.filtered_apps();
-                for (slot, &app_idx) in filtered.iter().take(7).enumerate() {
-                    if custom_menu_row_rect(sm, slot).contains(x, y) {
-                        return Hit::MenuRow(app_idx);
-                    }
-                }
-                for (i, _) in VORTEX_PLACES.iter().enumerate() {
-                    if custom_menu_place_rect(sm, i).contains(x, y) {
-                        return Hit::MenuPlace(i);
-                    }
-                }
-                if logout.contains(x, y) {
-                    return Hit::Logout;
-                }
-                if reboot.contains(x, y) {
-                    return Hit::Reboot;
-                }
-                if power_off.contains(x, y) {
-                    return Hit::PowerOff;
-                }
-                return Hit::None;
-            }
-        }
-        let is_vortex = self.theme.is_vortexglass();
-        let (logout, reboot, power_off, confirm_cancel, confirm_ok) = if is_vortex {
-            vortex_menu_footer_rects()
-        } else {
-            compact_footer_rects()
-        };
-        if self.menu_confirm_power.is_some() {
-            if confirm_cancel.contains(x, y) {
-                return Hit::ConfirmPowerCancel;
-            }
-            if confirm_ok.contains(x, y) {
-                return Hit::ConfirmPowerOk;
-            }
-            return Hit::None;
-        }
-        let filtered = self.filtered_apps();
-        if is_vortex {
-            for (slot, &app_idx) in filtered.iter().take(8).enumerate() {
-                if vortex_menu_row_rect(slot).contains(x, y) {
-                    return Hit::MenuRow(app_idx);
-                }
-            }
-            for (i, _) in VORTEX_PLACES.iter().enumerate() {
-                if vortex_menu_place_rect(i).contains(x, y) {
-                    return Hit::MenuPlace(i);
-                }
-            }
-        } else {
-            for (slot, &app_idx) in filtered.iter().enumerate() {
-                if menu_row_rect(slot).contains(x, y) {
-                    return Hit::MenuRow(app_idx);
-                }
-            }
-        }
-        if logout.contains(x, y) {
-            return Hit::Logout;
-        }
-        if reboot.contains(x, y) {
-            return Hit::Reboot;
-        }
-        if power_off.contains(x, y) {
-            return Hit::PowerOff;
-        }
-        Hit::None
+        self.menu_hits
+            .iter()
+            .rev()
+            .find_map(|&(rect, hit)| rect.contains(x, y).then_some(hit))
+            .unwrap_or(Hit::None)
     }
 
     fn menu_click(&mut self, x: i32, y: i32) -> Result<()> {
         match self.menu_hit(x, y) {
             Hit::MenuRow(app_idx) => {
-                let mode = APPS[app_idx].mode;
+                let id = self.apps.get(app_idx).map(|a| a.id.clone());
                 crate::sound::play(&self.config, crate::sound::SystemSound::Click);
                 self.close_menu()?;
-                self.launch(mode);
+                if let Some(id) = id {
+                    self.launch(&id);
+                }
                 Ok(())
             }
             Hit::MenuPlace(idx) => {
@@ -5132,6 +5153,7 @@ impl Shell {
             self.menu_query.clear();
             self.menu_ime_preedit.clear();
             self.menu_ime_spot = None;
+            self.menu_scroll_y = 0;
             self.hover = Hit::None;
             self.sync_menu_window()?;
             if self.config.panel_start_fullscreen {
@@ -5183,60 +5205,58 @@ impl Shell {
         Ok(())
     }
 
-    fn launch(&mut self, mode: &'static str) {
-        self.launch_inner(mode, None);
+    fn launch(&mut self, id: &str) {
+        self.launch_inner(id, None);
     }
 
-    fn launch_arg(&mut self, mode: &'static str, arg: &str) {
-        self.launch_inner(mode, Some(arg));
+    fn launch_arg(&mut self, id: &str, arg: &str) {
+        self.launch_inner(id, Some(arg));
     }
 
-    fn launch_inner(&mut self, mode: &'static str, extra_arg: Option<&str>) {
+    fn launch_inner(&mut self, id: &str, extra_arg: Option<&str>) {
         let now = Instant::now();
-        if let Some((prev_mode, ts)) = self.last_launch {
-            if prev_mode == mode && now.duration_since(ts) < Duration::from_millis(350) {
+        if let Some((prev_id, ts)) = &self.last_launch {
+            if prev_id == id && now.duration_since(*ts) < Duration::from_millis(350) {
                 return;
             }
         }
-        self.last_launch = Some((mode, now));
-        let mut cmd = if mode == "browser" || mode == "store" || mode == "store-check" {
-            let binary = if mode == "browser" {
-                "space-browser"
-            } else {
-                "space-store"
-            };
-            let sibling = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join(binary)))
-                .filter(|p| p.is_file());
-            if let Some(bin) = sibling {
-                Command::new(bin)
-            } else {
-                let installed = std::path::PathBuf::from(format!("/usr/bin/{binary}"));
-                if !installed.is_file() {
-                    if mode == "store" {
-                        self.show_toast(
-                            "Space 商店尚未安装",
-                            "在终端执行 doas spk install space-store 即可安装。",
-                        );
+        self.last_launch = Some((id.to_string(), now));
+        let mut cmd = if let Some(app) = self.apps.iter().find(|a| a.id == id) {
+            match &app.launch {
+                AppLaunch::External { exec } => {
+                    let Some(program) = exec.first() else {
+                        return;
+                    };
+                    let mut c = Command::new(program);
+                    if exec.len() > 1 {
+                        c.args(&exec[1..]);
                     }
-                    return;
+                    c
                 }
-                Command::new(installed)
+                AppLaunch::Builtin(mode) => {
+                    let Ok(path) = std::env::current_exe() else {
+                        return;
+                    };
+                    let mut c = Command::new(path);
+                    c.arg(mode);
+                    c
+                }
             }
+        } else if id == "browser" {
+            let Some(bin) = resolve_binary("space-browser") else {
+                return;
+            };
+            Command::new(bin)
         } else {
             let Ok(path) = std::env::current_exe() else {
                 return;
             };
             let mut c = Command::new(path);
-            c.arg(mode);
+            c.arg(id);
             c
         };
         if let Some(arg) = extra_arg {
             cmd.arg(arg);
-        }
-        if mode == "store-check" {
-            cmd.arg("--updates");
         }
         let _ = cmd.spawn();
     }
@@ -5284,7 +5304,9 @@ impl Shell {
 
         let icon_sz = self.config.desktop_icon_size.clamp(32, 48) as u32;
         for (slot, idx) in self.desktop_app_indices().into_iter().enumerate() {
-            let app = &APPS[idx];
+            let Some(app) = self.apps.get(idx) else {
+                continue;
+            };
             let cell = self.desktop_icon_rect(slot);
             let hovered = self.hover == Hit::DesktopIcon(idx);
             let selected = self.selected_desktop_icon == Some(idx);
@@ -5329,7 +5351,7 @@ impl Shell {
             let by = (cell.y + icon_sz as i32 + 28) as f32;
             self.text.draw_centered(
                 &mut self.desktop_canvas,
-                app.name,
+                &app.name,
                 cx + 1.0,
                 by + 1.0,
                 11.5,
@@ -5338,7 +5360,7 @@ impl Shell {
             );
             self.text.draw_centered(
                 &mut self.desktop_canvas,
-                app.name,
+                &app.name,
                 cx,
                 by,
                 11.5,
@@ -5352,6 +5374,7 @@ impl Shell {
         match icon {
             Icon::Files | Icon::Browser => 0x56a8f5,
             Icon::Store => 0x7c8cf8,
+            Icon::Shield => 0x4f8ef7,
             Icon::Terminal => 0x62c4e8,
             Icon::Monitor | Icon::Minesweeper => 0x4fd18b,
             Icon::Editor => 0xf2a74b,
@@ -5363,6 +5386,8 @@ impl Shell {
     }
 
     fn draw_taskbar(&mut self) {
+        let pinned_icons: [Option<Icon>; PINNED_MODES.len()] =
+            std::array::from_fn(|i| self.pinned_app_entry(i).map(|app| app.icon));
         let w = self.taskbar_canvas.width as i32;
         let h = self.panel_height();
         let show_pinned = self.config.panel_show_pinned;
@@ -5565,7 +5590,7 @@ impl Shell {
         // Quick-launch curated core apps (optional).
         if show_pinned {
             for (i, &rect) in pinned_rects.iter().enumerate() {
-                let Some(app) = pinned_app_entry(i) else {
+                let Some(app_icon) = pinned_icons[i] else {
                     continue;
                 };
                 let pin_pressed = ui::is_rect_pressed(rect);
@@ -5594,7 +5619,7 @@ impl Shell {
                     }
                 } else if is_vortex && (hov_t > 0.001 || pin_pressed) {
                     let t = hov_t.max(f32::from(u8::from(pin_pressed)));
-                    let glow = Self::superbar_glow_tint(app.icon, self.theme.accent);
+                    let glow = Self::superbar_glow_tint(app_icon, self.theme.accent);
                     canvas.rounded_rect(rect, ctrl_r, 0xffffff, 0.28 * t);
                     canvas.with_clip(rect, |c| {
                         c.radial_glow(
@@ -5616,7 +5641,7 @@ impl Shell {
                 }
                 icons::draw(
                     canvas,
-                    app.icon,
+                    app_icon,
                     rect.x + (rect.w - 20) / 2 + pin_shift,
                     rect.y + (rect.h - 20) / 2 + pin_shift,
                     20,
@@ -6178,9 +6203,19 @@ impl Shell {
 
     fn draw_menu_vortex(&mut self) {
         let filtered = self.filtered_apps();
-        let canvas = &mut self.menu_canvas;
         let (w, h) = (VORTEX_MENU_WIDTH, VORTEX_MENU_HEIGHT);
         let r = self.theme.radius_popup();
+        let list_vp = vortex_menu_viewport(h);
+        let total_list_h = if filtered.is_empty() {
+            0
+        } else {
+            filtered.len() as i32 * 54 + 4
+        };
+        let max_scroll = (total_list_h - list_vp.h).max(0);
+        let scroll_y = self.menu_scroll_y.clamp(0, max_scroll);
+        let mut hits = Vec::with_capacity(filtered.len() + VORTEX_PLACES.len() + 4);
+
+        let canvas = &mut self.menu_canvas;
         if canvas.is_argb() {
             canvas.clear_transparent(Rect::new(0, 0, w, h), self.theme.panel);
         } else {
@@ -6215,32 +6250,53 @@ impl Shell {
                 Face::Ui,
             );
         } else {
-            for (slot, &app_idx) in filtered.iter().take(8).enumerate() {
-                let app = &APPS[app_idx];
-                let row = vortex_menu_row_rect(slot);
-                let hovered = self.hover == Hit::MenuRow(app_idx)
-                    || (slot == 0 && !self.menu_query.is_empty());
-                let fg = ui::list_item_bg(canvas, &self.theme, row, hovered, false);
-                icons::draw(canvas, app.icon, row.x + 8, row.y + 9, 32, None);
-                self.text.draw(
-                    canvas,
-                    app.name,
-                    (row.x + 48) as f32,
-                    (row.y + 22) as f32,
-                    12.5,
-                    fg,
-                    Face::Bold,
-                );
-                self.text.draw(
-                    canvas,
-                    app.subtitle,
-                    (row.x + 48) as f32,
-                    (row.y + 39) as f32,
-                    10.5,
-                    self.theme.text_muted,
-                    Face::Ui,
-                );
-            }
+            let apps = &self.apps;
+            let theme = &self.theme;
+            let text = &mut self.text;
+            let hover = self.hover;
+            let has_query = !self.menu_query.is_empty();
+            canvas.with_clip(list_vp, |canvas| {
+                for (slot, &app_idx) in filtered.iter().enumerate() {
+                    let Some(app) = apps.get(app_idx) else {
+                        continue;
+                    };
+                    let mut row = vortex_menu_row_rect(slot);
+                    row.y -= scroll_y;
+                    if max_scroll > 0 {
+                        row.w = (row.w - 8).max(80);
+                    }
+                    let clipped = row.intersect(list_vp);
+                    if clipped.is_empty() {
+                        continue;
+                    }
+                    hits.push((clipped, Hit::MenuRow(app_idx)));
+                    let hovered = hover == Hit::MenuRow(app_idx) || (slot == 0 && has_query);
+                    let fg = ui::list_item_bg(canvas, theme, row, hovered, false);
+                    icons::draw(canvas, app.icon, row.x + 8, row.y + 9, 32, None);
+                    let max_tw = (row.w - 54).max(40) as f32;
+                    let name = text.truncate(&app.name, max_tw, 12.5, Face::Bold);
+                    let sub = text.truncate(&app.subtitle, max_tw, 10.5, Face::Ui);
+                    text.draw(
+                        canvas,
+                        &name,
+                        (row.x + 48) as f32,
+                        (row.y + 22) as f32,
+                        12.5,
+                        fg,
+                        Face::Bold,
+                    );
+                    text.draw(
+                        canvas,
+                        &sub,
+                        (row.x + 48) as f32,
+                        (row.y + 39) as f32,
+                        10.5,
+                        theme.text_muted,
+                        Face::Ui,
+                    );
+                }
+            });
+            draw_menu_scrollbar(canvas, &self.theme, list_vp, total_list_h, scroll_y);
         }
 
         let search_r = vortex_menu_search_rect();
@@ -6294,6 +6350,7 @@ impl Shell {
                 canvas.fill_alpha(Rect::new(274, 82 + 4 * 38 - 2, w - 288, 1), 0xffffff, 0.30);
             }
             let pr = vortex_menu_place_rect(i);
+            hits.push((pr, Hit::MenuPlace(i)));
             let hovered = self.hover == Hit::MenuPlace(i);
             if hovered {
                 canvas.rounded_rect(pr, 4, 0xffffff, 0.34);
@@ -6348,6 +6405,8 @@ impl Shell {
                 true,
                 self.hover == Hit::ConfirmPowerOk,
             );
+            hits.push((confirm_cancel, Hit::ConfirmPowerCancel));
+            hits.push((confirm_ok, Hit::ConfirmPowerOk));
         } else {
             ui::button(
                 canvas,
@@ -6379,19 +6438,37 @@ impl Shell {
                 false,
                 self.hover == Hit::Logout,
             );
+            hits.push((power_off, Hit::PowerOff));
+            hits.push((reboot, Hit::Reboot));
+            hits.push((logout, Hit::Logout));
         }
         if canvas.is_argb() {
             canvas.mask_rounded_corners(r);
         }
+        self.menu_list_viewport = list_vp;
+        self.menu_max_scroll = max_scroll;
+        self.menu_scroll_y = scroll_y;
+        self.menu_hits = hits;
         self.sync_menu_ime_spot(search_caret);
     }
 
     fn draw_menu_custom_two_column(&mut self, sm: &'static crate::theme::StartMenuSkin) {
         let filtered = self.filtered_apps();
-        let canvas = &mut self.menu_canvas;
         let (w, h) = (sm.width, sm.height);
         let top_r = sm.top_radius;
         let bot_r = sm.bottom_radius;
+        let list_vp = custom_menu_viewport(sm);
+        let total_list_h = if filtered.is_empty() {
+            0
+        } else {
+            let last = filtered.len() - 1;
+            (custom_menu_row_rect(sm, last).bottom() - list_vp.y + 4).max(0)
+        };
+        let max_scroll = (total_list_h - list_vp.h).max(0);
+        let scroll_y = self.menu_scroll_y.clamp(0, max_scroll);
+        let mut hits = Vec::with_capacity(filtered.len() + VORTEX_PLACES.len() + 4);
+
+        let canvas = &mut self.menu_canvas;
         canvas.clear(sm.frame_border);
 
         // 1. Top User Banner
@@ -6454,7 +6531,7 @@ impl Shell {
             }
         }
 
-        // Left column: pinned + frequent applications
+        // Left column: pinned + installed applications (clipped + scrollable)
         if filtered.is_empty() {
             self.text.draw_centered(
                 canvas,
@@ -6466,55 +6543,73 @@ impl Shell {
                 Face::Ui,
             );
         } else {
-            for (slot, &app_idx) in filtered.iter().take(7).enumerate() {
-                if slot == 2 {
-                    let sep_y = custom_menu_row_rect(sm, slot).y - 5;
-                    let l_mid = left_pane.x + left_pane.w / 2;
-                    for x in (left_pane.x + 10)..(left_pane.right() - 10) {
-                        let dist = (x - l_mid).abs() as f32 / (left_pane.w as f32 * 0.5);
-                        let a = (1.0 - dist).clamp(0.0, 1.0) * 0.22;
-                        canvas.fill_alpha(Rect::new(x, sep_y, 1, 1), 0x000000, a);
+            let apps = &self.apps;
+            let text = &mut self.text;
+            let hover = self.hover;
+            let has_query = !self.menu_query.is_empty();
+            canvas.with_clip(list_vp, |canvas| {
+                for (slot, &app_idx) in filtered.iter().enumerate() {
+                    let Some(app) = apps.get(app_idx) else {
+                        continue;
+                    };
+                    if slot == 2 {
+                        let sep_y = custom_menu_row_rect(sm, slot).y - 5 - scroll_y;
+                        let l_mid = left_pane.x + left_pane.w / 2;
+                        for x in (left_pane.x + 10)..(left_pane.right() - 10) {
+                            let dist = (x - l_mid).abs() as f32 / (left_pane.w as f32 * 0.5);
+                            let a = (1.0 - dist).clamp(0.0, 1.0) * 0.22;
+                            canvas.fill_alpha(Rect::new(x, sep_y, 1, 1), 0x000000, a);
+                        }
                     }
+                    let mut row = custom_menu_row_rect(sm, slot);
+                    row.y -= scroll_y;
+                    if max_scroll > 0 {
+                        row.w = (row.w - 8).max(80);
+                    }
+                    let clipped = row.intersect(list_vp);
+                    if clipped.is_empty() {
+                        continue;
+                    }
+                    hits.push((clipped, Hit::MenuRow(app_idx)));
+                    let hovered = hover == Hit::MenuRow(app_idx) || (slot == 0 && has_query);
+                    if hovered {
+                        canvas.fill(row, sm.item_hover_bg);
+                    }
+                    let title_fg = if hovered {
+                        sm.item_hover_text
+                    } else {
+                        sm.left_text
+                    };
+                    let sub_fg = if hovered {
+                        sm.item_hover_text
+                    } else {
+                        sm.left_subtext
+                    };
+                    icons::draw(canvas, app.icon, row.x + 6, row.y + 6, 30, None);
+                    let max_title = (row.w - 46).max(30) as f32;
+                    let name_shown = text.truncate(&app.name, max_title, 12.0, Face::Bold);
+                    text.draw(
+                        canvas,
+                        &name_shown,
+                        (row.x + 42) as f32,
+                        (row.y + 18) as f32,
+                        12.0,
+                        title_fg,
+                        if slot < 2 { Face::Bold } else { Face::Ui },
+                    );
+                    let sub_shown = text.truncate(&app.subtitle, max_title, 10.0, Face::Ui);
+                    text.draw(
+                        canvas,
+                        &sub_shown,
+                        (row.x + 42) as f32,
+                        (row.y + 33) as f32,
+                        10.0,
+                        sub_fg,
+                        Face::Ui,
+                    );
                 }
-                let app = &APPS[app_idx];
-                let row = custom_menu_row_rect(sm, slot);
-                let hovered = self.hover == Hit::MenuRow(app_idx)
-                    || (slot == 0 && !self.menu_query.is_empty());
-                if hovered {
-                    canvas.fill(row, sm.item_hover_bg);
-                }
-                let title_fg = if hovered {
-                    sm.item_hover_text
-                } else {
-                    sm.left_text
-                };
-                let sub_fg = if hovered {
-                    sm.item_hover_text
-                } else {
-                    sm.left_subtext
-                };
-                icons::draw(canvas, app.icon, row.x + 6, row.y + 6, 30, None);
-                self.text.draw(
-                    canvas,
-                    app.name,
-                    (row.x + 42) as f32,
-                    (row.y + 18) as f32,
-                    12.0,
-                    title_fg,
-                    if slot < 2 { Face::Bold } else { Face::Ui },
-                );
-                let max_sub = (row.w - 46).max(30) as f32;
-                let sub_shown = self.text.truncate(app.subtitle, max_sub, 10.0, Face::Ui);
-                self.text.draw(
-                    canvas,
-                    &sub_shown,
-                    (row.x + 42) as f32,
-                    (row.y + 33) as f32,
-                    10.0,
-                    sub_fg,
-                    Face::Ui,
-                );
-            }
+            });
+            draw_menu_scrollbar(canvas, &self.theme, list_vp, total_list_h, scroll_y);
         }
 
         // Bottom of Left Column: All Programs badge + compact search input
@@ -6556,9 +6651,14 @@ impl Shell {
         );
 
         // Right column: Places & System Tools
+        let place_limit_y = h - sm.footer_height - 2;
         for (i, place) in VORTEX_PLACES.iter().enumerate() {
+            let pr = custom_menu_place_rect(sm, i);
+            if pr.bottom() > place_limit_y {
+                continue;
+            }
             if i == 3 {
-                let sep_y = custom_menu_place_rect(sm, i).y - 6;
+                let sep_y = pr.y - 6;
                 let r_mid = right_pane.x + right_pane.w / 2;
                 for x in (right_pane.x + 10)..(right_pane.right() - 10) {
                     let dist = (x - r_mid).abs() as f32 / (right_pane.w as f32 * 0.5);
@@ -6566,7 +6666,7 @@ impl Shell {
                     canvas.fill_alpha(Rect::new(x, sep_y, 1, 1), sm.right_border_left, a);
                 }
             }
-            let pr = custom_menu_place_rect(sm, i);
+            hits.push((pr, Hit::MenuPlace(i)));
             let hovered = self.hover == Hit::MenuPlace(i);
             if hovered {
                 canvas.fill(pr, sm.item_hover_bg);
@@ -6627,6 +6727,8 @@ impl Shell {
                 true,
                 self.hover == Hit::ConfirmPowerOk,
             );
+            hits.push((confirm_cancel, Hit::ConfirmPowerCancel));
+            hits.push((confirm_ok, Hit::ConfirmPowerOk));
         } else {
             for (btn_r, badge_surf, icon, label, hit_kind) in [
                 (logout, &sm.logout_badge, Icon::Logout, "注销", Hit::Logout),
@@ -6655,6 +6757,7 @@ impl Shell {
                     sm.footer_text,
                     Face::Ui,
                 );
+                hits.push((btn_r, hit_kind));
             }
         }
 
@@ -6666,11 +6769,19 @@ impl Shell {
             1.0,
             2,
         );
+        self.menu_list_viewport = list_vp;
+        self.menu_max_scroll = max_scroll;
+        self.menu_scroll_y = scroll_y;
+        self.menu_hits = hits;
         self.sync_menu_ime_spot(search_caret);
     }
 
     fn draw_menu(&mut self) {
         if self.config.panel_start_fullscreen {
+            self.menu_hits.clear();
+            self.menu_list_viewport = Rect::default();
+            self.menu_max_scroll = 0;
+            self.menu_scroll_y = 0;
             let host = ShellConfigHost::new(&self.x, &mut self.config, &mut self.ux_client);
             self.start_screen.draw(
                 &mut self.menu_canvas,
@@ -6698,8 +6809,20 @@ impl Shell {
             return;
         }
         let filtered = self.filtered_apps();
-        let canvas = &mut self.menu_canvas;
         let (w, h) = (MENU_WIDTH, MENU_HEIGHT);
+        let (list_vp, total_list_h, scroll_y) =
+            build_compact_menu_layout(filtered.len(), w, h, self.menu_scroll_y);
+        let max_scroll = (total_list_h - list_vp.h).max(0);
+        let mut hits = Vec::with_capacity(filtered.len() + 4);
+        push_compact_menu_hits(
+            &mut hits,
+            &filtered,
+            list_vp,
+            scroll_y,
+            self.menu_confirm_power.is_some(),
+        );
+
+        let canvas = &mut self.menu_canvas;
         canvas.clear(self.theme.panel);
         ui::popup_surface(
             canvas,
@@ -6732,37 +6855,52 @@ impl Shell {
             );
         } else {
             let is_win98 = self.theme.is_win98();
-            for (slot, &app_idx) in filtered.iter().enumerate() {
-                let app = &APPS[app_idx];
-                let row = menu_row_rect(slot);
-                let hovered = self.hover == Hit::MenuRow(app_idx)
-                    || (slot == 0 && !self.menu_query.is_empty());
-                let fg = ui::list_item_bg(canvas, &self.theme, row, hovered, false);
-                let sub_fg = if hovered && is_win98 {
-                    self.theme.selection_text
-                } else {
-                    self.theme.text_muted
-                };
-                icons::draw(canvas, app.icon, row.x + 10, row.y + 8, 32, None);
-                self.text.draw(
-                    canvas,
-                    app.name,
-                    (row.x + 52) as f32,
-                    (row.y + 20) as f32,
-                    13.0,
-                    fg,
-                    Face::Bold,
-                );
-                self.text.draw(
-                    canvas,
-                    app.subtitle,
-                    (row.x + 52) as f32,
-                    (row.y + 37) as f32,
-                    11.0,
-                    sub_fg,
-                    Face::Ui,
-                );
-            }
+            let apps = &self.apps;
+            let theme = &self.theme;
+            let text = &mut self.text;
+            let hover = self.hover;
+            let has_query = !self.menu_query.is_empty();
+            canvas.with_clip(list_vp, |canvas| {
+                for (slot, &app_idx) in filtered.iter().enumerate() {
+                    let Some(app) = apps.get(app_idx) else {
+                        continue;
+                    };
+                    let row = compact_menu_row_rect(list_vp, slot, scroll_y);
+                    if row.intersect(list_vp).is_empty() {
+                        continue;
+                    }
+                    let hovered = hover == Hit::MenuRow(app_idx) || (slot == 0 && has_query);
+                    let fg = ui::list_item_bg(canvas, theme, row, hovered, false);
+                    let sub_fg = if hovered && is_win98 {
+                        theme.selection_text
+                    } else {
+                        theme.text_muted
+                    };
+                    icons::draw(canvas, app.icon, row.x + 10, row.y + 8, 32, None);
+                    let max_tw = (row.w - 60).max(40) as f32;
+                    let name = text.truncate(&app.name, max_tw, 13.0, Face::Bold);
+                    let sub = text.truncate(&app.subtitle, max_tw, 11.0, Face::Ui);
+                    text.draw(
+                        canvas,
+                        &name,
+                        (row.x + 52) as f32,
+                        (row.y + 20) as f32,
+                        13.0,
+                        fg,
+                        Face::Bold,
+                    );
+                    text.draw(
+                        canvas,
+                        &sub,
+                        (row.x + 52) as f32,
+                        (row.y + 37) as f32,
+                        11.0,
+                        sub_fg,
+                        Face::Ui,
+                    );
+                }
+            });
+            draw_menu_scrollbar(canvas, &self.theme, list_vp, total_list_h, scroll_y);
         }
 
         // Footer bar.
@@ -6848,6 +6986,10 @@ impl Shell {
                 self.hover == Hit::PowerOff,
             );
         }
+        self.menu_list_viewport = list_vp;
+        self.menu_max_scroll = max_scroll;
+        self.menu_scroll_y = scroll_y;
+        self.menu_hits = hits;
         self.sync_menu_ime_spot(search_caret);
     }
 
@@ -8516,6 +8658,7 @@ fn draw_vortex_popup_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desktop_entries;
 
     #[test]
     fn infer_window_icon_matches_all_apps() {
@@ -8530,6 +8673,7 @@ mod tests {
         assert_eq!(infer_window_icon("系统设置"), Icon::Settings);
         assert_eq!(infer_window_icon("Space 浏览器"), Icon::Browser);
         assert_eq!(infer_window_icon("Space 商店"), Icon::Store);
+        assert_eq!(infer_window_icon("管理员授权"), Icon::Shield);
         assert_eq!(infer_window_icon("帮助手册"), Icon::Help);
         assert_eq!(infer_window_icon("系统通知"), Icon::Notify);
         assert_eq!(infer_window_icon("会话账户"), Icon::Login);
@@ -8538,7 +8682,7 @@ mod tests {
 
     #[test]
     fn icon_prop_name_roundtrips() {
-        for app in APPS {
+        for app in desktop_entries::builtin_apps() {
             let prop = app.icon.prop_name();
             assert_eq!(Icon::from_prop_name(prop), Some(app.icon));
         }
@@ -8546,14 +8690,74 @@ mod tests {
             Icon::from_prop_name(Icon::SpaceLogo.prop_name()),
             Some(Icon::SpaceLogo)
         );
+        assert_eq!(
+            Icon::from_prop_name(Icon::Shield.prop_name()),
+            Some(Icon::Shield)
+        );
     }
 
     #[test]
     fn pinned_modes_resolve_cleanly() {
+        let builtins = desktop_entries::builtin_apps();
         assert!(PINNED_MODES.len() <= 4);
-        for slot in 0..PINNED_MODES.len() {
-            let entry = pinned_app_entry(slot).expect("pinned mode must exist in APPS");
-            assert_eq!(entry.mode, PINNED_MODES[slot]);
+        for mode in PINNED_MODES {
+            assert!(
+                builtins.iter().any(|app| app.id == mode),
+                "pinned mode {mode} must resolve cleanly in builtin_apps"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_menu_hits_never_shadow_footer_with_many_apps() {
+        let filtered: Vec<usize> = (0..18).collect();
+        let search_r = Rect::new(14, 14, MENU_WIDTH - 28, 34);
+        let footer_top = MENU_HEIGHT - 54;
+        let (_, total_h, _) = build_compact_menu_layout(filtered.len(), MENU_WIDTH, MENU_HEIGHT, 0);
+        let list_vp = compact_menu_viewport(MENU_WIDTH, MENU_HEIGHT);
+        assert!(list_vp.bottom() <= footer_top);
+        assert!(list_vp.y >= search_r.bottom());
+        let max_scroll = (total_h - list_vp.h).max(0);
+        assert!(max_scroll > 0);
+
+        for confirm in [false, true] {
+            for scroll in [0, max_scroll / 2, max_scroll] {
+                let (vp, _, clamped) =
+                    build_compact_menu_layout(filtered.len(), MENU_WIDTH, MENU_HEIGHT, scroll);
+                let mut hits = Vec::new();
+                push_compact_menu_hits(&mut hits, &filtered, vp, clamped, confirm);
+
+                for &(rect, hit) in &hits {
+                    assert!(
+                        rect.intersect(search_r).is_empty(),
+                        "hit {hit:?} overlapped search bar"
+                    );
+                    if let Hit::MenuRow(_) = hit {
+                        assert!(
+                            rect.y >= vp.y && rect.bottom() <= vp.bottom(),
+                            "row rect {rect:?} must stay clipped inside {vp:?}"
+                        );
+                    }
+                }
+
+                let resolve = |r: Rect| {
+                    let cx = r.x + r.w / 2;
+                    let cy = r.y + r.h / 2;
+                    hits.iter()
+                        .rev()
+                        .find_map(|&(hr, h)| hr.contains(cx, cy).then_some(h))
+                };
+                let (logout, reboot, power_off, confirm_cancel, confirm_ok) =
+                    compact_footer_rects();
+                if confirm {
+                    assert_eq!(resolve(confirm_cancel), Some(Hit::ConfirmPowerCancel));
+                    assert_eq!(resolve(confirm_ok), Some(Hit::ConfirmPowerOk));
+                } else {
+                    assert_eq!(resolve(logout), Some(Hit::Logout));
+                    assert_eq!(resolve(reboot), Some(Hit::Reboot));
+                    assert_eq!(resolve(power_off), Some(Hit::PowerOff));
+                }
+            }
         }
     }
 

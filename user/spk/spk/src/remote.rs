@@ -725,6 +725,40 @@ pub fn load_manifest(
     Ok(None)
 }
 
+/// Fetch a repository-relative static asset (e.g. a store preview banner)
+/// from the first reachable mirror within `max_bytes`.
+pub const MAX_ASSET_BYTES: u64 = 4 * 1024 * 1024;
+
+pub fn fetch_asset_bytes(mirrors: &[String], relative: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let client = HttpClient::new()?;
+    let mut last = None;
+    for mirror in mirrors {
+        let base = mirror.trim_end_matches('/');
+        if base.is_empty() {
+            continue;
+        }
+        let url = http::join_url(base, relative);
+        match get(&client, &url, &[], max_bytes) {
+            Ok(response) if (200..=299).contains(&response.status) => {
+                if response.body.len() as u64 > max_bytes {
+                    return Err(SpkError::Network(format!(
+                        "{url}: asset exceeds {max_bytes} byte limit"
+                    )));
+                }
+                return Ok(response.body);
+            }
+            Ok(response) => {
+                last = Some(SpkError::Network(format!(
+                    "HTTP {} fetching {url}",
+                    response.status
+                )));
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| SpkError::Network(format!("no mirror provided {relative}"))))
+}
+
 /// Fetch one per-package history file from the first reachable mirror.
 pub fn fetch_history(repo: &crate::repo::LoadedRepo, relative: &str) -> Result<Vec<u8>> {
     if repo.mirrors.is_empty() {

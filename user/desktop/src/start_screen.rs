@@ -20,7 +20,8 @@ use crate::ddm::wire::PowerAction;
 use crate::draw::{mix, BlurScratch, Canvas, Rect};
 use crate::icons::{self, Icon};
 use crate::netmgr::NetStatus;
-use crate::shell::{now_local, session_identity, AppCategory, APPS};
+use crate::desktop_entries::{builtin_apps, AppCategory, ResolvedApp};
+use crate::shell::{now_local, session_identity};
 use crate::text::{Face, TextRenderer};
 use crate::theme::Theme;
 use crate::ui;
@@ -85,12 +86,12 @@ impl AppCabinetFilter {
 }
 
 /// Actions propagated from [`StartScreenState`] back to `Shell`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartAction {
     None,
     Redraw,
     Close,
-    Launch(&'static str),
+    Launch(String),
     Logout,
     Power(PowerAction),
     ToggleMute,
@@ -221,7 +222,7 @@ struct StartHitBox {
     rect: Rect,
     target: StartHit,
     ctx_tile_id: Option<String>,
-    ctx_app_mode: Option<&'static str>,
+    ctx_app_mode: Option<String>,
 }
 
 /// Right-click context menu overlay for any tile or app card.
@@ -230,7 +231,7 @@ struct TileCtxMenu {
     x: i32,
     y: i32,
     tile_id: String,
-    app_mode: Option<&'static str>,
+    app_mode: Option<String>,
 }
 
 impl TileCtxMenu {
@@ -246,7 +247,7 @@ impl TileCtxMenu {
     }
 
     fn item_count(&self) -> usize {
-        if self.app_mode == Some("settings") {
+        if self.app_mode.as_deref() == Some("settings") {
             7
         } else {
             6
@@ -389,6 +390,7 @@ pub struct StartScreenState {
     kernel_summary: String,
     identity: String,
     last_clock: (i32, i32, i32),
+    apps: Vec<ResolvedApp>,
 }
 
 impl StartScreenState {
@@ -422,7 +424,12 @@ impl StartScreenState {
             kernel_summary: read_kernel_summary(),
             identity: session_identity(),
             last_clock: (-1, -1, -1),
+            apps: builtin_apps(),
         }
+    }
+
+    pub fn set_apps(&mut self, apps: Vec<ResolvedApp>) {
+        self.apps = apps;
     }
 
     pub fn invalidate_backdrop(&mut self) {
@@ -671,7 +678,7 @@ impl StartScreenState {
                         x,
                         y,
                         tile_id,
-                        app_mode: hb.ctx_app_mode,
+                        app_mode: hb.ctx_app_mode.clone(),
                     });
                     crate::sound::play(host.config(), crate::sound::SystemSound::Click);
                     return StartAction::Redraw;
@@ -792,14 +799,14 @@ impl StartScreenState {
         }
 
         if key.is_enter() && !self.query.trim().is_empty() {
-            let matching_apps = filtered_apps_for(&self.query, None, &[]);
+            let matching_apps = filtered_apps_for(&self.apps, &self.query, None, &[]);
             if let Some(&app_idx) = matching_apps.first() {
-                let mode = APPS[app_idx].mode;
-                if mode == "settings" {
+                let id = self.apps[app_idx].id.clone();
+                if id == "settings" {
                     self.open_settings_tab(host, None);
                     return StartAction::Redraw;
                 }
-                return StartAction::Launch(mode);
+                return StartAction::Launch(id);
             }
             let matching_settings = search_settings(&self.query);
             if let Some(first_set) = matching_settings.first() {
@@ -992,12 +999,15 @@ impl StartScreenState {
             }
             StartHit::AppCard(app_idx) | StartHit::SearchApp(app_idx) => {
                 crate::sound::play(host.config(), crate::sound::SystemSound::Click);
-                let mode = APPS[app_idx].mode;
-                if mode == "settings" {
-                    self.open_settings_tab(host, None);
-                    StartAction::Redraw
+                if let Some(id) = self.apps.get(app_idx).map(|a| a.id.clone()) {
+                    if id == "settings" {
+                        self.open_settings_tab(host, None);
+                        StartAction::Redraw
+                    } else {
+                        StartAction::Launch(id)
+                    }
                 } else {
-                    StartAction::Launch(mode)
+                    StartAction::None
                 }
             }
             StartHit::SearchSetting(idx) => {
@@ -1053,7 +1063,7 @@ impl StartScreenState {
             StartHit::CtxOpenStandaloneSettings => {
                 self.ctx = None;
                 crate::sound::play(host.config(), crate::sound::SystemSound::Click);
-                StartAction::Launch("settings")
+                StartAction::Launch("settings".to_string())
             }
             StartHit::CtxResetTiles => {
                 self.ctx = None;
@@ -1082,15 +1092,15 @@ impl StartScreenState {
                 self.open_settings_tab(host, Some(SettingsPage::Sound));
                 StartAction::Redraw
             }
-            "status-sys" => StartAction::Launch("monitor"),
+            "status-sys" => StartAction::Launch("monitor".to_string()),
             "app-settings" => {
                 self.open_settings_tab(host, None);
                 StartAction::Redraw
             }
             other => {
-                if let Some(mode) = other.strip_prefix("app-") {
-                    if let Some(entry) = APPS.iter().find(|a| a.mode == mode) {
-                        return StartAction::Launch(entry.mode);
+                if let Some(id) = other.strip_prefix("app-") {
+                    if let Some(entry) = self.apps.iter().find(|a| a.id == id) {
+                        return StartAction::Launch(entry.id.clone());
                     }
                 }
                 StartAction::None
@@ -1120,7 +1130,7 @@ impl StartScreenState {
         viewport: Rect,
         target: StartHit,
         tile_id: String,
-        app_mode: Option<&'static str>,
+        app_mode: Option<String>,
     ) {
         let clipped = rect.intersect(viewport);
         if !clipped.is_empty() {
@@ -1865,7 +1875,7 @@ impl StartScreenState {
         w: i32,
         mut y: i32,
     ) -> i32 {
-        let app_matches = filtered_apps_for(&self.query, None, &[]);
+        let app_matches = filtered_apps_for(&self.apps, &self.query, None, &[]);
         let setting_matches = search_settings(&self.query);
         let power_matches = matching_power_actions(&self.query);
 
@@ -1915,7 +1925,7 @@ impl StartScreenState {
                 let target = StartHit::SearchApp(app_idx);
                 let sel = self.hover == Some(target) || slot == 0;
                 let row_fg = ui::list_item_bg(canvas, theme, r, sel, false);
-                let app = &APPS[app_idx];
+                let app = &self.apps[app_idx];
                 icons::draw(canvas, app.icon, r.x + 8, r.y + 6, 22, None);
                 let label = format!("{}  ·  {}", app.name, app.subtitle);
                 let shown = text.truncate(&label, (col_w - 44).max(60) as f32, 12.0, Face::Ui);
@@ -2031,7 +2041,7 @@ impl StartScreenState {
         let accent = tile_accent_color(&tile.id, theme.accent);
         draw_xj380_card(canvas, theme, r, accent, hovered, 0.90);
 
-        let app_mode = tile_app_mode(&tile.id);
+        let app_mode = tile_app_mode(&self.apps, &tile.id).map(str::to_owned);
         match tile.id.as_str() {
             "status-clock" => self.draw_clock_tile(canvas, text, theme, cfg, tile),
             "status-net" => self.draw_network_tile(canvas, text, theme, net_status, tile),
@@ -2521,10 +2531,10 @@ impl StartScreenState {
         tile: &PlacedTile,
     ) {
         let r = tile.rect;
-        let Some(mode) = tile_app_mode(&tile.id) else {
+        let Some(mode) = tile_app_mode(&self.apps, &tile.id) else {
             return;
         };
-        let Some(entry) = APPS.iter().find(|a| a.mode == mode) else {
+        let Some(entry) = self.apps.iter().find(|a| a.id == mode) else {
             return;
         };
         match tile.size {
@@ -2549,7 +2559,7 @@ impl StartScreenState {
                     sz as u32,
                     None,
                 );
-                let title = text.truncate(entry.name, (r.w - 18).max(40) as f32, 12.0, Face::Bold);
+                let title = text.truncate(&entry.name, (r.w - 18).max(40) as f32, 12.0, Face::Bold);
                 text.draw(
                     canvas,
                     &title,
@@ -2576,8 +2586,8 @@ impl StartScreenState {
                 );
                 let tx = r.x + sz + 30;
                 let max_w = (r.right() - tx - 14).max(60) as f32;
-                let title = text.truncate(entry.name, max_w, 15.0, Face::Bold);
-                let sub = text.truncate(entry.subtitle, max_w, 11.5, Face::Ui);
+                let title = text.truncate(&entry.name, max_w, 15.0, Face::Bold);
+                let sub = text.truncate(&entry.subtitle, max_w, 11.5, Face::Ui);
                 text.draw(
                     canvas,
                     &title,
@@ -2596,7 +2606,7 @@ impl StartScreenState {
                     theme.text_dim,
                     Face::Ui,
                 );
-                if entry.mode == "settings" {
+                if entry.id == "settings" {
                     text.draw(
                         canvas,
                         "点击直达控制中心设置面板",
@@ -2694,7 +2704,7 @@ impl StartScreenState {
         let grid_x = pane_x + ((pane_w - grid_w) / 2).max(pad);
         let viewport = Rect::new(pane_x, body.y, pane_w - 1, body.h);
 
-        let filtered = filtered_apps_for(&self.query, Some(self.app_filter), &pinned);
+        let filtered = filtered_apps_for(&self.apps, &self.query, Some(self.app_filter), &pinned);
         let scroll_y = self.apps_scroll.offset_i32().max(0);
         let start_y = viewport.y + 20 - scroll_y;
         let mut end_y = start_y;
@@ -2744,8 +2754,8 @@ impl StartScreenState {
                         card_h,
                     );
                     let target = StartHit::AppCard(app_idx);
-                    let app = &APPS[app_idx];
-                    let tid = app_tile_id(app.mode);
+                    let app = &self.apps[app_idx];
+                    let tid = app_tile_id(&app.id);
                     let is_pinned = pinned.iter().any(|t| t.id == tid);
                     let accent = tile_accent_color(&tid, theme.accent);
 
@@ -2762,7 +2772,7 @@ impl StartScreenState {
                     let name_x = card_r.x + 70;
                     let title_max =
                         (card_r.right() - name_x - if is_pinned { 64 } else { 14 }).max(40);
-                    let shown_name = text.truncate(app.name, title_max as f32, 14.5, Face::Bold);
+                    let shown_name = text.truncate(&app.name, title_max as f32, 14.5, Face::Bold);
                     text.draw(
                         canvas,
                         &shown_name,
@@ -2773,7 +2783,7 @@ impl StartScreenState {
                         Face::Bold,
                     );
                     let shown_sub = text.truncate(
-                        app.subtitle,
+                        &app.subtitle,
                         (card_r.right() - name_x - 14).max(40) as f32,
                         11.5,
                         Face::Ui,
@@ -2805,7 +2815,7 @@ impl StartScreenState {
                             Face::Bold,
                         );
                     }
-                    self.push_tile_hit(card_r, viewport, target, tid, Some(app.mode));
+                    self.push_tile_hit(card_r, viewport, target, tid, Some(app.id.clone()));
                 }
                 let rows = (filtered.len() as i32 + cols - 1) / cols;
                 y += rows * (card_h + gap) + 12;
@@ -2931,7 +2941,7 @@ impl StartScreenState {
                 false,
             ),
         ];
-        if ctx.app_mode == Some("settings") {
+        if ctx.app_mode.as_deref() == Some("settings") {
             items.insert(
                 5,
                 (
@@ -3087,9 +3097,9 @@ fn app_tile_id(mode: &str) -> String {
     format!("app-{mode}")
 }
 
-fn tile_app_mode(tile_id: &str) -> Option<&'static str> {
+fn tile_app_mode<'a>(apps: &'a [ResolvedApp], tile_id: &str) -> Option<&'a str> {
     let mode = tile_id.strip_prefix("app-")?;
-    APPS.iter().find(|a| a.mode == mode).map(|a| a.mode)
+    apps.iter().find(|a| a.id == mode).map(|a| a.id.as_str())
 }
 
 fn tile_accent_color(tile_id: &str, theme_accent: u32) -> u32 {
@@ -3272,16 +3282,17 @@ pub fn pack_tile_group(
 }
 
 pub fn filtered_apps_for(
+    apps: &[ResolvedApp],
     query: &str,
     filter: Option<AppCabinetFilter>,
     pinned: &[StartTileSpec],
 ) -> Vec<usize> {
     let q = query.trim().to_lowercase();
-    APPS.iter()
+    apps.iter()
         .enumerate()
         .filter(|(_, app)| {
             if let Some(f) = filter {
-                if !f.matches(app.mode, app.category, pinned) {
+                if !f.matches(&app.id, app.category, pinned) {
                     return false;
                 }
             }
@@ -3291,7 +3302,7 @@ pub fn filtered_apps_for(
             app.name.to_lowercase().contains(&q)
                 || app.subtitle.to_lowercase().contains(&q)
                 || app.keywords.to_lowercase().contains(&q)
-                || app.mode.contains(&q)
+                || app.id.contains(&q)
         })
         .map(|(i, _)| i)
         .collect()
@@ -3560,14 +3571,15 @@ mod tests {
 
     #[test]
     fn filtered_apps_matches_cabinet_categories_and_keywords() {
+        let apps = builtin_apps();
         let pinned = parse_start_tiles(DEFAULT_START_TILES);
         assert_eq!(
-            filtered_apps_for("", Some(AppCabinetFilter::All), &pinned).len(),
-            APPS.len()
+            filtered_apps_for(&apps, "", Some(AppCabinetFilter::All), &pinned).len(),
+            apps.len()
         );
-        let media = filtered_apps_for("", Some(AppCabinetFilter::Media), &pinned);
+        let media = filtered_apps_for(&apps, "", Some(AppCabinetFilter::Media), &pinned);
         assert_eq!(media.len(), 2);
-        let term = filtered_apps_for("终端", None, &pinned);
-        assert!(term.iter().any(|&i| APPS[i].mode == "term"));
+        let term = filtered_apps_for(&apps, "终端", None, &pinned);
+        assert!(term.iter().any(|&i| apps[i].id == "term"));
     }
 }

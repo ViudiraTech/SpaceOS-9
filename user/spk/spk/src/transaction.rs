@@ -436,12 +436,33 @@ fn confirm(lang: &Lang, noconfirm: bool, operation: OperationKind) -> Result<boo
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
 }
 
+fn resolve_sudo_validator(
+    paths: &Paths,
+    staged: &BTreeMap<String, Staged>,
+    solution: &Solution,
+) -> PathBuf {
+    for action in &solution.actions {
+        let Some(package) = staged.get(&action.to.name) else {
+            continue;
+        };
+        if package.manifest.files.iter().any(|file| {
+            file.path == "/usr/bin/sudo" && file.file_type == FileType::File
+        }) {
+            let candidate = package.dir.join("usr/bin/sudo");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    paths.root.join("usr/bin/sudo")
+}
+
 fn check_sudo_configs(
     paths: &Paths,
     staged: &BTreeMap<String, Staged>,
     solution: &Solution,
 ) -> Result<()> {
-    let sudo = paths.root.join("usr/bin/sudo");
+    let sudo = resolve_sudo_validator(paths, staged, solution);
     for action in &solution.actions {
         let Some(package) = staged.get(&action.to.name) else {
             continue;
@@ -1569,4 +1590,140 @@ fn kind_name(kind: OnDiskKind) -> &'static str {
 
 fn cleanup_dir(path: &Path) {
     let _ = fs::remove_dir_all(path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("{name}_{}_{}", std::process::id(), nanos));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sudo_pkg_entry(path: &str) -> PackageFile {
+        PackageFile {
+            path: path.into(),
+            file_type: FileType::File,
+            mode: "0755".into(),
+            uid: 0,
+            gid: 0,
+            sha256: String::new(),
+            size: 0,
+            target: None,
+        }
+    }
+
+    fn fake_solution(name: &str) -> Solution {
+        use crate::solver::{Action, Candidate, Origin};
+        Solution {
+            assignment: BTreeMap::new(),
+            actions: vec![Action {
+                from: None,
+                to: Candidate {
+                    name: name.into(),
+                    version: spk_core::version::Version::parse("0.1.0-5").unwrap(),
+                    arch: "x86_64".into(),
+                    abi: "spaceos-1".into(),
+                    depends: Vec::new(),
+                    provides: Vec::new(),
+                    conflicts: Vec::new(),
+                    replaces: Vec::new(),
+                    origin: Origin::Repo(0),
+                    repo_pkg: None,
+                    installed_pkg: None,
+                },
+                kind: TargetKind::Install,
+            }],
+            removals: Vec::new(),
+            explicit: BTreeSet::new(),
+            held_back: Vec::new(),
+            cleared_holds: BTreeSet::new(),
+        }
+    }
+
+    fn fake_manifest(files: Vec<PackageFile>) -> Manifest {
+        Manifest {
+            name: "sudo".into(),
+            epoch: 0,
+            version: "0.1.0".into(),
+            release: 5,
+            arch: "x86_64".into(),
+            abi: "spaceos-1".into(),
+            summary: "sudo".into(),
+            description: String::new(),
+            license: "MIT".into(),
+            url: String::new(),
+            packager: String::new(),
+            build_date: 0,
+            depends: Vec::new(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+            replaces: Vec::new(),
+            conffiles: vec!["/etc/sudoers".into()],
+            scripts: false,
+            triggers: Vec::new(),
+            allow_setuid: true,
+            store: None,
+            files,
+        }
+    }
+
+    #[test]
+    fn check_sudo_configs_uses_staged_sudo_and_fails_closed() {
+        let root_tmp = TempDir::new("spk_check_sudo_cfg");
+        let paths = Paths::new(&root_tmp.0).unwrap();
+        let pkg_dir = root_tmp.0.join("staged_sudo");
+        fs::create_dir_all(pkg_dir.join("usr/bin")).unwrap();
+        fs::create_dir_all(pkg_dir.join("etc")).unwrap();
+        fs::write(pkg_dir.join("etc/sudoers"), "%wheel ALL=(ALL) ALL\n").unwrap();
+
+        let sudo_bin = pkg_dir.join("usr/bin/sudo");
+        fs::write(&sudo_bin, "#!/bin/sh\n[ \"$1\" = \"--check-config\" ] && grep -q wheel \"$2\"\n").unwrap();
+        fs::set_permissions(&sudo_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let solution = fake_solution("sudo");
+        let mut staged = BTreeMap::new();
+        staged.insert(
+            "sudo".into(),
+            Staged {
+                manifest: fake_manifest(vec![
+                    sudo_pkg_entry("/usr/bin/sudo"),
+                    sudo_pkg_entry("/etc/sudoers"),
+                ]),
+                dir: pkg_dir.clone(),
+                conffiles: BTreeSet::from(["/etc/sudoers".to_string()]),
+                install_script: None,
+            },
+        );
+
+        // Fresh target root has no /usr/bin/sudo yet; staged binary validates /etc/sudoers cleanly.
+        assert!(!paths.root.join("usr/bin/sudo").exists());
+        check_sudo_configs(&paths, &staged, &solution).unwrap();
+
+        // Failing validator still rejects (fail-closed).
+        fs::write(pkg_dir.join("etc/sudoers"), "broken line\n").unwrap();
+        assert!(check_sudo_configs(&paths, &staged, &solution).is_err());
+
+        // Without staged or installed sudo, validation fails closed.
+        fs::remove_file(&sudo_bin).unwrap();
+        let err = check_sudo_configs(&paths, &staged, &solution).unwrap_err();
+        assert!(err.to_string().contains("fail closed"));
+    }
 }
