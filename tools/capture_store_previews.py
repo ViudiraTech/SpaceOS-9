@@ -168,11 +168,11 @@ THEMES: dict[str, list[tuple[str, str, str, str]]] = {
 # Curated atmospheric backdrop palettes:
 # (bg_top_left, bg_bottom_right, orb1_rgb, orb2_rgb, glow_shadow_rgb)
 PALETTES: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]] = {
-    "theme-winxp": ((14, 34, 84), (18, 86, 178), (56, 189, 248), (52, 211, 153), (12, 46, 118)),
-    "theme-aqua": ((11, 37, 69), (14, 116, 186), (125, 211, 252), (56, 189, 248), (12, 68, 128)),
-    "theme-ambiance": ((42, 16, 36), (132, 42, 24), (249, 115, 22), (217, 70, 127), (64, 18, 34)),
-    "space-editor": ((15, 23, 42), (30, 64, 175), (59, 130, 246), (56, 189, 248), (15, 38, 108)),
-    "space-store": ((15, 23, 42), (49, 46, 129), (99, 102, 241), (56, 189, 248), (30, 27, 94)),
+    "theme-winxp": ((11, 24, 58), (16, 62, 134), (56, 189, 248), (34, 197, 94), (6, 18, 46)),
+    "theme-aqua": ((10, 27, 52), (15, 84, 142), (125, 211, 252), (56, 189, 248), (8, 28, 58)),
+    "theme-ambiance": ((52, 26, 48), (118, 46, 36), (251, 146, 60), (236, 72, 153), (24, 10, 22)),
+    "space-editor": ((12, 19, 36), (24, 48, 118), (96, 165, 250), (56, 189, 248), (8, 16, 42)),
+    "space-store": ((13, 18, 38), (38, 36, 104), (129, 140, 248), (56, 189, 248), (12, 14, 44)),
 }
 
 
@@ -271,31 +271,17 @@ def build_backdrop(palette_key: str, flip_glows: bool = False) -> Image.Image:
             px[x, y] = (r, g, b, 255)
     canvas = base.resize((w, h), Image.Resampling.BICUBIC)
 
-    # Ambient radial color glows
+    # Ambient radial color glows (no text-washing diagonal glare sweep or dot noise)
     glow_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow_layer)
     if not flip_glows:
-        gd.ellipse([int(w * 0.56), -int(h * 0.28), int(w * 1.18), int(h * 0.65)], fill=(*orb1, 128))
-        gd.ellipse([-int(w * 0.16), int(h * 0.42), int(w * 0.48), int(h * 1.24)], fill=(*orb2, 96))
+        gd.ellipse([int(w * 0.56), -int(h * 0.28), int(w * 1.18), int(h * 0.65)], fill=(*orb1, 105))
+        gd.ellipse([-int(w * 0.16), int(h * 0.42), int(w * 0.48), int(h * 1.24)], fill=(*orb2, 82))
     else:
-        gd.ellipse([-int(w * 0.14), -int(h * 0.24), int(w * 0.46), int(h * 0.62)], fill=(*orb2, 120))
-        gd.ellipse([int(w * 0.52), int(h * 0.40), int(w * 1.14), int(h * 1.22)], fill=(*orb1, 108))
-    # Subtle soft diagonal studio light sweep
-    gd.polygon(
-        [(int(w * 0.12), 0), (int(w * 0.48), 0), (int(w * 0.85), h), (int(w * 0.45), h)],
-        fill=(255, 255, 255, 18),
-    )
-    glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(140))
+        gd.ellipse([-int(w * 0.14), -int(h * 0.24), int(w * 0.46), int(h * 0.62)], fill=(*orb2, 98))
+        gd.ellipse([int(w * 0.52), int(h * 0.40), int(w * 1.14), int(h * 1.22)], fill=(*orb1, 90))
+    glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(150))
     canvas.alpha_composite(glow_layer)
-
-    # Delicate studio micro-dot pattern (very subtle texture)
-    dots = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    dd = ImageDraw.Draw(dots)
-    step = 48
-    for yy in range(24, h, step):
-        for xx in range(24, w, step):
-            dd.ellipse([xx - 2, yy - 2, xx + 2, yy + 2], fill=(255, 255, 255, 18))
-    canvas.alpha_composite(dots)
     return canvas
 
 
@@ -312,17 +298,9 @@ def prepare_framed_card(
     aspect = im.height / max(1, im.width)
     target_h = max(120, round(target_w * aspect))
     im = im.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=115, threshold=2))
     if dim_factor < 0.999:
         im = ImageEnhance.Brightness(im).enhance(dim_factor)
-
-    # Subtle glass specular sheen across upper-left triangle
-    sheen = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(sheen)
-    sd.polygon(
-        [(0, 0), (int(target_w * 0.64), 0), (int(target_w * 0.16), target_h), (0, target_h)],
-        fill=(255, 255, 255, 14),
-    )
-    im.alpha_composite(sheen)
 
     # Smooth rounded alpha mask (supersampled 2x internally for silky edges)
     mw, mh = target_w * 2, target_h * 2
@@ -332,13 +310,13 @@ def prepare_framed_card(
     mask = mask_2x.resize((target_w, target_h), Image.Resampling.LANCZOS)
     im.putalpha(mask)
 
-    # Crisp glass rim highlight around rounded bezel
+    # Crisp rim highlight around rounded bezel (no diagonal sheen covering UI text)
     border = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
     bd = ImageDraw.Draw(border)
     bd.rounded_rectangle(
         [1, 1, target_w - 2, target_h - 2],
         radius=radius,
-        outline=(255, 255, 255, 115),
+        outline=(255, 255, 255, 148),
         width=2,
     )
     border.putalpha(
@@ -397,41 +375,41 @@ def compose_pair(
 ) -> None:
     shadow_rgb = PALETTES[palette_key][4]
 
-    # --- Primary banner (`*.jpg`): Shot1 upfront tilted + Shot2 layered top-right ---
+    # --- Primary banner (`*.jpg`): Refined low-angle 3D perspective for high text readability ---
     c1 = build_backdrop(palette_key, flip_glows=False)
-    back2 = prepare_framed_card(shot2_path, crop_box, target_w=1080, radius=20, dim_factor=0.86)
+    back2 = prepare_framed_card(shot2_path, crop_box, target_w=1060, radius=20, dim_factor=0.78)
     place_perspective_card(
         c1,
         back2,
-        quad=[(765, 60), (1835, 128), (1802, 742), (792, 695)],
+        quad=[(816, 54), (1848, 86), (1830, 720), (832, 694)],
         shadow_color=shadow_rgb,
-        soft_blur=1.1,
+        soft_blur=0.6,
     )
-    front1 = prepare_framed_card(shot1_path, crop_box, target_w=1400, radius=24, dim_factor=1.0)
+    front1 = prepare_framed_card(shot1_path, crop_box, target_w=1520, radius=22, dim_factor=1.0)
     place_perspective_card(
         c1,
         front1,
-        quad=[(95, 165), (1490, 74), (1450, 995), (155, 916)],
+        quad=[(84, 116), (1588, 82), (1566, 996), (106, 964)],
         shadow_color=shadow_rgb,
         soft_blur=0.0,
     )
     save_final_jpeg(c1, OUT_DIR / out1_name)
 
-    # --- Secondary gallery shot (`*-2.jpg`): Complementary opposite tilt with Shot2 prominent ---
+    # --- Secondary gallery shot (`*-2.jpg`): Complementary gentle tilt with Shot2 upfront ---
     c2 = build_backdrop(palette_key, flip_glows=True)
-    back1 = prepare_framed_card(shot1_path, crop_box, target_w=1040, radius=20, dim_factor=0.84)
+    back1 = prepare_framed_card(shot1_path, crop_box, target_w=1040, radius=20, dim_factor=0.78)
     place_perspective_card(
         c2,
         back1,
-        quad=[(88, 305), (1125, 250), (1105, 895), (125, 965)],
+        quad=[(72, 288), (1090, 258), (1076, 904), (90, 932)],
         shadow_color=shadow_rgb,
-        soft_blur=1.2,
+        soft_blur=0.6,
     )
-    front2 = prepare_framed_card(shot2_path, crop_box, target_w=1420, radius=24, dim_factor=1.0)
+    front2 = prepare_framed_card(shot2_path, crop_box, target_w=1520, radius=22, dim_factor=1.0)
     place_perspective_card(
         c2,
         front2,
-        quad=[(340, 76), (1805, 166), (1742, 932), (378, 1002)],
+        quad=[(328, 82), (1832, 116), (1810, 964), (350, 996)],
         shadow_color=shadow_rgb,
         soft_blur=0.0,
     )
@@ -441,7 +419,8 @@ def compose_pair(
 def save_final_jpeg(canvas: Image.Image, out_jpg: pathlib.Path) -> None:
     out_jpg.parent.mkdir(parents=True, exist_ok=True)
     rgb = canvas.convert("RGB").resize(PREVIEW_SIZE, Image.Resampling.LANCZOS)
-    rgb.save(out_jpg, format="JPEG", quality=90, optimize=True, progressive=False)
+    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=0.85, percent=110, threshold=2))
+    rgb.save(out_jpg, format="JPEG", quality=93, optimize=True, progressive=False)
     size = out_jpg.stat().st_size
     if size <= 15_000:
         raise SystemExit(f"captured preview {out_jpg} unexpectedly small ({size} bytes)")
@@ -586,6 +565,9 @@ def main() -> int:
     bins = check_bins()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for stale in OUT_DIR.glob("*.jpg"):
+        # Font specimen cards belong to build_font_previews.py; keep them.
+        if stale.name.startswith("font-"):
+            continue
         stale.unlink()
 
     display = pick_display()
@@ -707,6 +689,10 @@ def main() -> int:
             "space-store.jpg",
             "space-store-2.jpg",
         )
+        font_script = ROOT / "tools" / "build_font_previews.py"
+        if font_script.is_file():
+            # Keep the font specimen set in step with a capture run.
+            subprocess.run([sys.executable, str(font_script)], check=False)
         print(f"composed {len(list(OUT_DIR.glob('*.jpg')))} angled previews into {OUT_DIR}")
         return 0
     finally:

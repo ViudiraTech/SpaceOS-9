@@ -195,6 +195,10 @@ pub enum Action {
     ReplaceAll,
     SetBlockKind(BlockKind),
     CycleFont,
+    ToggleFontMenu(Rect),
+    CloseFontMenu,
+    SelectFontRole(FontFamily),
+    SelectSystemFont(String),
     SizeDelta(f32),
     ToggleBold,
     ToggleItalic,
@@ -289,6 +293,20 @@ impl Hits {
 
 pub const PAGE_GAP: i32 = 24;
 
+/// Discover installed font families dynamically via `spui_ui::fonts::scan`
+/// without hardcoding font names.
+pub fn discover_system_font_families() -> Vec<String> {
+    let sysroot = std::env::var("SPUI_SYSROOT")
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    spui_ui::fonts::scan(&sysroot)
+        .into_iter()
+        .map(|f| f.name)
+        .collect()
+}
+
 pub struct EditorState {
     pub doc: Document,
     pub layout: Option<DocLayout>,
@@ -308,6 +326,12 @@ pub struct EditorState {
     pub find_matches: Vec<SearchMatch>,
     pub find_index: usize,
     pub modal: Option<ModalState>,
+    pub available_fonts: Vec<String>,
+    pub uxconf_ui_font: String,
+    pub uxconf_doc_font: String,
+    pub uxconf_mono_font: String,
+    pub font_menu_open: bool,
+    pub font_menu_anchor: Rect,
     pub dragging_select: bool,
     pub last_click: Option<(Instant, (i32, i32))>,
     pub last_pointer: (i32, i32),
@@ -367,6 +391,12 @@ impl EditorState {
             find_matches: Vec::new(),
             find_index: 0,
             modal: None,
+            available_fonts: discover_system_font_families(),
+            uxconf_ui_font: String::new(),
+            uxconf_doc_font: String::new(),
+            uxconf_mono_font: String::new(),
+            font_menu_open: false,
+            font_menu_anchor: Rect::default(),
             dragging_select: false,
             last_click: None,
             last_pointer: (0, 0),
@@ -379,6 +409,102 @@ impl EditorState {
             state.refresh_find_matches();
         }
         state
+    }
+
+    pub fn sync_uxconf_fonts(&mut self, config: &uxconf::DesktopConfig) {
+        self.uxconf_ui_font = config.font_ui_family.trim().to_string();
+        self.uxconf_doc_font = config.font_document_family.trim().to_string();
+        self.uxconf_mono_font = config.font_mono_family.trim().to_string();
+        self.available_fonts = discover_system_font_families();
+    }
+
+    pub fn uxconf_font_for_role(&self, role: FontFamily) -> &str {
+        match role {
+            FontFamily::Serif => self.uxconf_doc_font.as_str(),
+            FontFamily::Sans => self.uxconf_ui_font.as_str(),
+            FontFamily::Mono => self.uxconf_mono_font.as_str(),
+        }
+    }
+
+    pub fn default_scanned_family_for_role(&self, role: FontFamily) -> Option<&str> {
+        match role {
+            FontFamily::Serif => self
+                .available_fonts
+                .iter()
+                .find(|n| {
+                    let l = n.to_ascii_lowercase();
+                    l.contains("serif") && l.contains("cjk sc")
+                })
+                .or_else(|| {
+                    self.available_fonts.iter().find(|n| {
+                        let l = n.to_ascii_lowercase();
+                        l.contains("serif") && (l.contains("cjk") || l.contains("noto"))
+                    })
+                })
+                .or_else(|| {
+                    self.available_fonts
+                        .iter()
+                        .find(|n| n.to_ascii_lowercase().contains("serif"))
+                })
+                .or_else(|| self.available_fonts.first())
+                .map(String::as_str),
+            FontFamily::Sans => self
+                .available_fonts
+                .iter()
+                .find(|n| {
+                    let l = n.to_ascii_lowercase();
+                    l.contains("sans") && !l.contains("mono") && l.contains("cjk sc")
+                })
+                .or_else(|| {
+                    self.available_fonts.iter().find(|n| {
+                        let l = n.to_ascii_lowercase();
+                        l.contains("sans") && !l.contains("mono") && (l.contains("cjk") || l.contains("noto"))
+                    })
+                })
+                .or_else(|| {
+                    self.available_fonts.iter().find(|n| {
+                        let l = n.to_ascii_lowercase();
+                        l.contains("sans") && !l.contains("mono")
+                    })
+                })
+                .or_else(|| self.available_fonts.first())
+                .map(String::as_str),
+            FontFamily::Mono => self
+                .available_fonts
+                .iter()
+                .find(|n| {
+                    let l = n.to_ascii_lowercase();
+                    l.contains("mono") && l.contains("cjk sc")
+                })
+                .or_else(|| {
+                    self.available_fonts.iter().find(|n| {
+                        let l = n.to_ascii_lowercase();
+                        l.contains("mono") && (l.contains("cjk") || l.contains("noto"))
+                    })
+                })
+                .or_else(|| {
+                    self.available_fonts.iter().find(|n| {
+                        let l = n.to_ascii_lowercase();
+                        l.contains("mono") || l.contains("hack") || l.contains("code")
+                    })
+                })
+                .or_else(|| self.available_fonts.first())
+                .map(String::as_str),
+        }
+    }
+
+    /// Resolve the active font display name dynamically from `uxconfd` and
+    /// `/usr/share/fonts` (`spui_ui::fonts::scan`) without hardcoded family names.
+    pub fn active_font_display_name(&self) -> String {
+        let role = self.doc.active_style.font;
+        let configured = self.uxconf_font_for_role(role);
+        if !configured.is_empty() {
+            return configured.to_string();
+        }
+        if let Some(scanned) = self.default_scanned_family_for_role(role) {
+            return scanned.to_string();
+        }
+        role.label().to_string()
     }
 
     pub fn invalidate_layout(&mut self) {
@@ -494,6 +620,7 @@ pub fn run_editor(options: EditorOptions) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     app.min_width = 760;
     app.min_height = 500;
+    state.sync_uxconf_fonts(&app.config);
 
     let mut prev_hits = Hits::new();
     let mut last_title = state.window_title();
@@ -559,7 +686,12 @@ fn handle_event(
 ) {
     match event {
         UiEvent::Close => app.request_close(),
-        UiEvent::Expose | UiEvent::Configure { .. } | UiEvent::ConfigChanged => {
+        UiEvent::ConfigChanged => {
+            state.sync_uxconf_fonts(&app.config);
+            state.invalidate_layout();
+            app.needs_redraw = true;
+        }
+        UiEvent::Expose | UiEvent::Configure { .. } => {
             state.invalidate_layout();
             app.needs_redraw = true;
         }
@@ -610,6 +742,7 @@ fn handle_event(
 
             if button == 1 && down {
                 if state.modal.is_none()
+                    && !state.font_menu_open
                     && state.canvas_viewport.contains(x, y)
                     && hits.at(x, y).is_none()
                 {
@@ -717,6 +850,10 @@ fn select_current_word_or_line(doc: &mut Document) {
 }
 
 fn handle_key(app: &mut App, state: &mut EditorState, key: Key) {
+    if state.font_menu_open && key.is_escape() {
+        state.font_menu_open = false;
+        return;
+    }
     if state.modal.is_some() {
         if key.is_escape() {
             perform_action(app, state, Action::CloseModal);
@@ -1010,7 +1147,57 @@ fn handle_key(app: &mut App, state: &mut EditorState, key: Key) {
     }
 }
 
+fn apply_uxconf_font_for_role(
+    app: &mut App,
+    state: &mut EditorState,
+    role: FontFamily,
+    family: String,
+) {
+    let prop = match role {
+        FontFamily::Serif => {
+            app.config.font_document_family = family.clone();
+            "/document-family"
+        }
+        FontFamily::Sans => {
+            app.config.font_ui_family = family.clone();
+            "/ui-family"
+        }
+        FontFamily::Mono => {
+            app.config.font_mono_family = family.clone();
+            "/monospace-family"
+        }
+    };
+    if let Some(client) = app.uxconf.as_mut() {
+        let _ = client.set("font", prop, uxconf::Value::String(family.clone()));
+    }
+    let prefs = spui_ui::text::FontPrefs::from_values(
+        &app.config.font_ui_family,
+        &app.config.font_document_family,
+        &app.config.font_mono_family,
+    );
+    if let Ok(mut loaded) = spui_ui::text::TextRenderer::load_with(&prefs) {
+        loaded.set_ui_scale(app.theme.ui_scale());
+        app.text = loaded;
+    }
+    state.sync_uxconf_fonts(&app.config);
+    state.doc.apply_style_change(|st| st.font = role);
+    state.invalidate_layout();
+    state.focused = FocusedField::Canvas;
+    let shown = state.active_font_display_name();
+    state.status = if family.is_empty() {
+        format!("已恢复默认字体：{shown} (uxconfd font:{prop})")
+    } else {
+        format!("已切换字体：{shown} (uxconfd font:{prop})")
+    };
+}
+
 pub fn perform_action(app: &mut App, state: &mut EditorState, action: Action) {
+    if !matches!(
+        action,
+        Action::ToggleFontMenu(_) | Action::SelectFontRole(_)
+    ) {
+        state.font_menu_open = false;
+    }
     match action {
         Action::NewDoc => {
             state.doc = Document::empty();
@@ -1151,16 +1338,53 @@ pub fn perform_action(app: &mut App, state: &mut EditorState, action: Action) {
             state.invalidate_layout();
             state.focused = FocusedField::Canvas;
         }
-        Action::CycleFont => {
-            let next = match state.doc.active_style.font {
-                FontFamily::Sans => FontFamily::Serif,
-                FontFamily::Serif => FontFamily::Mono,
-                FontFamily::Mono => FontFamily::Sans,
-            };
-            state.doc.apply_style_change(|st| st.font = next);
+        Action::ToggleFontMenu(anchor) => {
+            state.available_fonts = discover_system_font_families();
+            state.font_menu_anchor = anchor;
+            state.font_menu_open = !state.font_menu_open;
+        }
+        Action::CloseFontMenu => {
+            state.font_menu_open = false;
+        }
+        Action::SelectFontRole(role) => {
+            state.doc.apply_style_change(|st| st.font = role);
             state.invalidate_layout();
             state.focused = FocusedField::Canvas;
-            state.status = format!("字体切换为 {}", next.label());
+            let shown = state.active_font_display_name();
+            state.status = format!("字体角色切换为 {} ({shown})", role.label());
+        }
+        Action::SelectSystemFont(family) => {
+            let role = state.doc.active_style.font;
+            apply_uxconf_font_for_role(app, state, role, family);
+        }
+        Action::CycleFont => {
+            state.available_fonts = discover_system_font_families();
+            let role = state.doc.active_style.font;
+            if state.available_fonts.is_empty() {
+                let next = match role {
+                    FontFamily::Sans => FontFamily::Serif,
+                    FontFamily::Serif => FontFamily::Mono,
+                    FontFamily::Mono => FontFamily::Sans,
+                };
+                state.doc.apply_style_change(|st| st.font = next);
+                state.invalidate_layout();
+                state.focused = FocusedField::Canvas;
+                let shown = state.active_font_display_name();
+                state.status = format!("字体切换为 {shown}");
+            } else {
+                let current = state.uxconf_font_for_role(role);
+                let next_family = if current.is_empty() {
+                    state.available_fonts[0].clone()
+                } else {
+                    match state.available_fonts.iter().position(|n| n == current) {
+                        Some(idx) if idx + 1 < state.available_fonts.len() => {
+                            state.available_fonts[idx + 1].clone()
+                        }
+                        _ => String::new(),
+                    }
+                };
+                apply_uxconf_font_for_role(app, state, role, next_family);
+            }
         }
         Action::SizeDelta(d) => {
             let cur = state.doc.active_style.size_pt;
@@ -1432,5 +1656,40 @@ fn resolve_modal_path(m: &ModalState) -> PathBuf {
         p.to_path_buf()
     } else {
         m.dir.join(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uxconf_font_sync_and_dynamic_display_name() {
+        let mut state = EditorState::new(&EditorOptions::default());
+        let mut cfg = uxconf::DesktopConfig::default();
+        cfg.font_document_family = "Hack".into();
+        cfg.font_ui_family = "Orbitron".into();
+        cfg.font_mono_family = "Rajdhani".into();
+        state.sync_uxconf_fonts(&cfg);
+
+        // Default body style is FontFamily::Serif -> font:/document-family
+        assert_eq!(state.doc.active_style.font, FontFamily::Serif);
+        assert_eq!(state.active_font_display_name(), "Hack");
+
+        state.doc.active_style.font = FontFamily::Sans;
+        assert_eq!(state.active_font_display_name(), "Orbitron");
+
+        state.doc.active_style.font = FontFamily::Mono;
+        assert_eq!(state.active_font_display_name(), "Rajdhani");
+
+        // When uxconf role is empty, falls back to discovered system fonts from /usr/share/fonts
+        cfg.font_document_family.clear();
+        state.sync_uxconf_fonts(&cfg);
+        state.doc.active_style.font = FontFamily::Serif;
+        let resolved = state.active_font_display_name();
+        assert!(!resolved.is_empty());
+        if !state.available_fonts.is_empty() {
+            assert!(state.available_fonts.contains(&resolved));
+        }
     }
 }

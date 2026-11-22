@@ -177,8 +177,8 @@ pub enum FontFamily {
 impl FontFamily {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Sans => "思源黑体",
-            Self::Serif => "思源宋体",
+            Self::Sans => "界面无衬线",
+            Self::Serif => "文档衬线",
             Self::Mono => "等宽字体",
         }
     }

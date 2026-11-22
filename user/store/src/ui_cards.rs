@@ -18,10 +18,10 @@ use spui_ui::ui;
 use crate::curated::{HeroSlide, PackagePresentation};
 use crate::model::{format_bytes, StorePackage};
 
-pub const SIDEBAR_W: i32 = 220;
-pub const TOPBAR_H: i32 = 52;
-pub const CARD_H: i32 = 148;
-pub const FEATURED_CARD_H: i32 = 212;
+pub const SIDEBAR_W: i32 = 224;
+pub const TOPBAR_H: i32 = 56;
+pub const CARD_H: i32 = 152;
+pub const FEATURED_CARD_H: i32 = 220;
 
 pub fn mix(a: u32, b: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
@@ -42,17 +42,203 @@ pub fn luminance(color: u32) -> f32 {
 
 pub fn contrast_text(bg: u32) -> u32 {
     if luminance(bg) > 0.60 {
-        0x111827
+        0x0f172a
     } else {
         0xffffff
     }
 }
 
 pub fn badge_text_color(theme: &Theme, accent: u32) -> u32 {
-    if luminance(theme.panel) > 0.52 {
-        mix(accent, 0x111827, 0.28)
+    if luminance(theme.window_high) > 0.52 {
+        mix(accent, 0x0f172a, 0.34)
     } else {
-        mix(accent, 0xffffff, 0.34)
+        mix(accent, 0xffffff, 0.38)
+    }
+}
+
+/// Subtle 1px hairline border color for elevated cards and grouped sheets.
+pub fn soft_border(theme: &Theme) -> u32 {
+    mix(theme.panel_border, theme.window_high, 0.32)
+}
+
+/// Modern elevated card surface (`theme.window_high`) with soft shadow and hairline border.
+pub fn elevated_card(canvas: &mut Canvas, theme: &Theme, rect: Rect, hovered: bool) {
+    if rect.is_empty() {
+        return;
+    }
+    let radius = theme.radius_control().max(10);
+    canvas.rounded_drop_shadow(rect, radius, 10, 2, if hovered { 0.11 } else { 0.05 });
+    let fill = if hovered {
+        mix(theme.window_high, theme.panel_hover, 0.26)
+    } else {
+        theme.window_high
+    };
+    canvas.rounded_rect(rect, radius, fill, 1.0);
+    let border = if hovered {
+        mix(theme.accent, theme.panel_border, 0.40)
+    } else {
+        soft_border(theme)
+    };
+    canvas.rounded_border(rect, radius, border, 0.95, 1);
+}
+
+/// Outer rounded container for a Libadwaita / Mac App Store style PreferencesGroup.
+pub fn group_container(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    if rect.is_empty() {
+        return;
+    }
+    let radius = theme.radius_control().max(10);
+    canvas.rounded_drop_shadow(rect, radius, 10, 2, 0.05);
+    canvas.rounded_rect(rect, radius, theme.window_high, 1.0);
+    canvas.rounded_border(rect, radius, soft_border(theme), 0.95, 1);
+}
+
+/// Group section header with title, item count pill, and right-aligned description.
+pub fn group_section_header(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    rect: Rect,
+    title: &str,
+    count: usize,
+    subtitle: &str,
+) {
+    draw_text_clipped(
+        text,
+        canvas,
+        title,
+        rect.x + 2,
+        rect.y + 22,
+        240,
+        14.0,
+        theme.text,
+        Face::Bold,
+    );
+    let title_w = text.measure(title, 14.0, Face::Bold) as i32;
+    let count_str = count.to_string();
+    let pill_w = (text.measure(&count_str, 11.0, Face::Bold) as i32 + 16).max(24);
+    let pill = Rect::new(rect.x + title_w + 10, rect.y + 7, pill_w, 19);
+    badge(canvas, text, theme, pill, &count_str, theme.accent);
+
+    if !subtitle.is_empty() && rect.w >= 420 {
+        let sub_x = pill.right() + 12;
+        let avail = (rect.right() - sub_x - 4).max(40);
+        draw_text_clipped(
+            text,
+            canvas,
+            subtitle,
+            sub_x,
+            rect.y + 21,
+            avail,
+            11.5,
+            theme.text_muted,
+            Face::Ui,
+        );
+    }
+}
+
+/// Recessed track for a modern segmented filter bar.
+pub fn segmented_track(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    if rect.is_empty() {
+        return;
+    }
+    let radius = (rect.h / 2).min(theme.radius_control().max(8));
+    let bg = mix(theme.window_alt, theme.panel_border, 0.16);
+    canvas.rounded_rect(rect, radius, bg, 1.0);
+    canvas.rounded_border(rect, radius, soft_border(theme), 0.85, 1);
+}
+
+/// Single segment button inside a `segmented_track`.
+pub fn segmented_pill(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    rect: Rect,
+    label: &str,
+    count: Option<usize>,
+    selected: bool,
+    hovered: bool,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    let radius = (rect.h / 2).min(theme.radius_control().max(6));
+    if selected {
+        canvas.rounded_drop_shadow(rect, radius, 6, 1, 0.08);
+        canvas.rounded_rect(rect, radius, theme.window_high, 1.0);
+        canvas.rounded_border(
+            rect,
+            radius,
+            mix(theme.accent, theme.panel_border, 0.45),
+            0.95,
+            1,
+        );
+    } else if hovered {
+        canvas.rounded_rect(
+            rect,
+            radius,
+            mix(theme.window_high, theme.window_alt, 0.50),
+            0.75,
+        );
+    }
+
+    let fg = if selected {
+        theme.text
+    } else if hovered {
+        theme.text
+    } else {
+        theme.text_dim
+    };
+    let face = if selected { Face::Bold } else { Face::Ui };
+
+    if let Some(c) = count {
+        let c_str = c.to_string();
+        let chip_w = (text.measure(&c_str, 10.5, Face::Bold) as i32 + 12).max(20);
+        let lw = text.measure(label, 12.0, face) as i32;
+        let total_w = lw + 6 + chip_w;
+        let start_x = rect.x + (rect.w - total_w) / 2;
+        text.draw(
+            canvas,
+            label,
+            start_x as f32,
+            (rect.y + (rect.h + 8) / 2) as f32,
+            12.0,
+            fg,
+            face,
+        );
+        let chip = Rect::new(start_x + lw + 6, rect.y + (rect.h - 17) / 2, chip_w, 17);
+        let chip_bg = if selected {
+            mix(theme.window_high, theme.accent, 0.16)
+        } else {
+            mix(theme.window_alt, theme.panel_border, 0.25)
+        };
+        let chip_fg = if selected {
+            badge_text_color(theme, theme.accent)
+        } else {
+            theme.text_muted
+        };
+        canvas.rounded_rect(chip, 8, chip_bg, 1.0);
+        let cw = text.measure(&c_str, 10.5, Face::Bold);
+        text.draw(
+            canvas,
+            &c_str,
+            (chip.x + chip.w / 2) as f32 - cw * 0.5,
+            (chip.y + 12) as f32,
+            10.5,
+            chip_fg,
+            Face::Bold,
+        );
+    } else {
+        let lw = text.measure(label, 12.0, face);
+        text.draw(
+            canvas,
+            label,
+            (rect.x + rect.w / 2) as f32 - lw * 0.5,
+            (rect.y + (rect.h + 8) / 2) as f32,
+            12.0,
+            fg,
+            face,
+        );
     }
 }
 
@@ -346,39 +532,120 @@ pub fn cta_pill(
         } else {
             base
         };
-        (fill, mix(fill, 0x000000, 0.22), contrast_text(fill))
+        (fill, mix(fill, 0x000000, 0.20), contrast_text(fill))
     } else {
         let fill = if pressed {
             mix(theme.panel_hover, 0x000000, 0.08)
         } else if hovered {
-            theme.panel_hover
+            mix(theme.window_high, theme.panel_hover, 0.65)
         } else {
-            theme.panel_high
+            mix(theme.window_alt, theme.window_high, 0.45)
         };
-        let b = if hovered { theme.accent } else { theme.panel_border };
-        (fill, b, contrast_text(fill))
+        let b = if hovered {
+            mix(theme.accent, theme.panel_border, 0.40)
+        } else {
+            soft_border(theme)
+        };
+        (fill, b, theme.text)
     };
 
     if primary {
         canvas.rounded_gradient(
             rect,
             radius,
-            mix(bg, 0xffffff, 0.10),
-            mix(bg, 0x000000, 0.10),
+            mix(bg, 0xffffff, 0.08),
+            mix(bg, 0x000000, 0.08),
             1.0,
         );
     } else {
         canvas.rounded_rect(rect, radius, bg, 1.0);
     }
-    canvas.rounded_border(rect, radius, border, 0.90, 1);
+    canvas.rounded_border(rect, radius, border, 0.92, 1);
 
     let max_tw = (rect.w - 12).max(8) as f32;
-    let shown = text.truncate(label, max_tw, 12.5, Face::Bold);
-    let width = text.measure(&shown, 12.5, Face::Bold);
+    let shown = text.truncate(label, max_tw, 12.0, Face::Bold);
+    let width = text.measure(&shown, 12.0, Face::Bold);
     let x = rect.x as f32 + ((rect.w as f32 - width) / 2.0).max(4.0);
-    let baseline = rect.y + (rect.h + 9) / 2;
-    text.draw(canvas, &shown, x, baseline as f32, 12.5, text_color, Face::Bold);
+    let baseline = rect.y + (rect.h + 8) / 2;
+    text.draw(canvas, &shown, x, baseline as f32, 12.0, text_color, Face::Bold);
     rect
+}
+
+/// Subtle destructive action pill button (e.g. for "卸载").
+pub fn danger_pill(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    rect: Rect,
+    label: &str,
+    hovered: bool,
+) -> Rect {
+    if rect.is_empty() {
+        return rect;
+    }
+    let radius = (rect.h / 2).min(theme.radius_control().max(8));
+    let bg = mix(
+        theme.window_high,
+        theme.danger,
+        if hovered { 0.20 } else { 0.10 },
+    );
+    let border = mix(
+        theme.danger,
+        theme.window_high,
+        if hovered { 0.15 } else { 0.48 },
+    );
+    let fg = badge_text_color(theme, theme.danger);
+    canvas.rounded_rect(rect, radius, bg, 1.0);
+    canvas.rounded_border(rect, radius, border, 0.95, 1);
+
+    let max_tw = (rect.w - 12).max(8) as f32;
+    let shown = text.truncate(label, max_tw, 12.0, Face::Bold);
+    let width = text.measure(&shown, 12.0, Face::Bold);
+    let x = rect.x as f32 + ((rect.w as f32 - width) / 2.0).max(4.0);
+    let baseline = rect.y + (rect.h + 8) / 2;
+    text.draw(canvas, &shown, x, baseline as f32, 12.0, fg, Face::Bold);
+    rect
+}
+
+/// Compact `···` overflow menu button for list rows.
+pub fn more_button(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    active: bool,
+    hovered: bool,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    let radius = (rect.h / 2).min(theme.radius_control().max(8));
+    let bg = if active {
+        mix(theme.window_high, theme.accent, 0.18)
+    } else if hovered {
+        mix(theme.window_high, theme.panel_hover, 0.65)
+    } else {
+        mix(theme.window_alt, theme.window_high, 0.50)
+    };
+    let border = if active || hovered {
+        mix(theme.accent, theme.panel_border, 0.45)
+    } else {
+        soft_border(theme)
+    };
+    canvas.rounded_rect(rect, radius, bg, 1.0);
+    canvas.rounded_border(rect, radius, border, 0.92, 1);
+
+    let dot_color = if active {
+        theme.accent
+    } else if hovered {
+        theme.text
+    } else {
+        theme.text_dim
+    };
+    let cy = rect.y + rect.h / 2 - 2;
+    let cx = rect.x + rect.w / 2;
+    for dx in [-7, -1, 5] {
+        canvas.rounded_rect(Rect::new(cx + dx, cy, 4, 4), 2, dot_color, 1.0);
+    }
 }
 
 pub fn badge(
@@ -392,9 +659,9 @@ pub fn badge(
     if rect.is_empty() {
         return;
     }
-    let fill = mix(theme.panel, color, 0.15);
+    let fill = mix(theme.window_high, color, 0.14);
     canvas.rounded_rect(rect, rect.h / 2, fill, 1.0);
-    canvas.rounded_border(rect, rect.h / 2, color, 0.55, 1);
+    canvas.rounded_border(rect, rect.h / 2, mix(color, theme.window_high, 0.42), 0.85, 1);
     let max_tw = (rect.w - 10).max(6) as f32;
     let shown = text.truncate(label, max_tw, 11.0, Face::Bold);
     let tw = text.measure(&shown, 11.0, Face::Bold);
@@ -464,18 +731,18 @@ pub fn quick_stats(
     if items.is_empty() {
         return;
     }
-    ui::card(canvas, theme, rect);
+    elevated_card(canvas, theme, rect, false);
     let cell = rect.w / items.len() as i32;
     for (index, (label, value)) in items.iter().enumerate() {
         let cell_rect = Rect::new(rect.x + cell * index as i32, rect.y, cell, rect.h);
         if index > 0 {
             canvas.line(
                 cell_rect.x,
-                rect.y + 10,
+                rect.y + 12,
                 cell_rect.x,
-                rect.y + rect.h - 10,
-                theme.panel_border,
-                0.6,
+                rect.y + rect.h - 12,
+                soft_border(theme),
+                0.85,
             );
         }
         avatar_stat(canvas, text, theme, cell_rect, label, value);
@@ -497,7 +764,7 @@ pub fn section_header(
         rect.x,
         rect.y + 18,
         rect.w - 40,
-        17.0,
+        16.5,
         theme.text,
         Face::Bold,
     );
@@ -529,9 +796,9 @@ pub fn featured_package_card(
     cta_hovered: bool,
     progress: Option<f32>,
 ) -> Rect {
-    ui::selectable_card(canvas, theme, rect, false, hovered);
-    let pad = 10;
-    let banner_h = 98;
+    elevated_card(canvas, theme, rect, hovered);
+    let pad = 12;
+    let banner_h = 104;
     let banner_rect = Rect::new(rect.x + pad, rect.y + pad, rect.w - pad * 2, banner_h);
     draw_preview_artwork(
         canvas,
@@ -584,7 +851,7 @@ pub fn featured_package_card(
         let label = if pkg.upgrade_available {
             "更新"
         } else if pkg.installed {
-            "查看"
+            "详情"
         } else {
             "安装"
         };
@@ -651,7 +918,7 @@ pub fn package_card(
     rect: Rect,
     pkg: &StorePackage,
     pres: &PackagePresentation,
-    selected: bool,
+    _selected: bool,
     hovered: bool,
     cta_hovered: bool,
     progress: Option<f32>,
@@ -661,16 +928,21 @@ pub fn package_card(
         if hovered { 1.0 } else { 0.0 },
         0.14,
     );
-    ui::selectable_card(canvas, theme, rect, selected, hovered);
-    if hover > 0.01 && !selected {
-        canvas.rounded_rect(rect, theme.radius_control(), theme.panel_hover, hover * 0.25);
+    elevated_card(canvas, theme, rect, hovered);
+    if hover > 0.01 {
+        canvas.rounded_rect(
+            rect,
+            theme.radius_control().max(10),
+            theme.panel_hover,
+            hover * 0.14,
+        );
     }
-    let pad = 14;
+    let pad = 16;
     let badge_size = 48;
     let badge_rect = Rect::new(rect.x + pad, rect.y + pad, badge_size, badge_size);
     icon_badge(canvas, pres.icon, badge_rect, pres.accent);
 
-    let text_x = badge_rect.right() + 12;
+    let text_x = badge_rect.right() + 14;
     let text_w = rect.right() - pad - text_x;
     draw_text_clipped(
         text,
@@ -712,7 +984,7 @@ pub fn package_card(
         let label = if pkg.upgrade_available {
             "更新"
         } else if pkg.installed {
-            "查看"
+            "详情"
         } else {
             "安装"
         };
@@ -880,12 +1152,48 @@ pub fn nav_item(
     active: bool,
     hovered: bool,
 ) {
-    let fg = ui::list_item_bg(canvas, theme, rect, active, hovered);
-    let icon_fg = if active { fg } else { theme.text_muted };
+    let radius = theme.radius_control().max(8);
+    if active {
+        canvas.rounded_drop_shadow(rect, radius, 6, 1, 0.06);
+        canvas.rounded_rect(rect, radius, theme.window_high, 1.0);
+        canvas.rounded_border(
+            rect,
+            radius,
+            mix(theme.accent, theme.panel_border, 0.42),
+            0.95,
+            1,
+        );
+        canvas.rounded_rect(
+            Rect::new(rect.x + 4, rect.y + 8, 3, (rect.h - 16).max(8)),
+            1,
+            theme.accent,
+            1.0,
+        );
+    } else if hovered {
+        canvas.rounded_rect(
+            rect,
+            radius,
+            mix(theme.window_high, theme.window_alt, 0.52),
+            0.85,
+        );
+    }
+
+    let fg = if active || hovered {
+        theme.text
+    } else {
+        theme.text_dim
+    };
+    let icon_fg = if active {
+        theme.accent
+    } else if hovered {
+        theme.text
+    } else {
+        theme.text_muted
+    };
     icons::draw(
         canvas,
         icon,
-        rect.x + 12,
+        rect.x + 14,
         rect.y + (rect.h - 16) / 2,
         16,
         Some(icon_fg),
@@ -895,9 +1203,9 @@ pub fn nav_item(
         text,
         canvas,
         label,
-        rect.x + 38,
+        rect.x + 40,
         rect.y + (rect.h + 9) / 2,
-        rect.w - 38 - right_pad,
+        rect.w - 40 - right_pad,
         13.0,
         fg,
         if active { Face::Bold } else { Face::Ui },
