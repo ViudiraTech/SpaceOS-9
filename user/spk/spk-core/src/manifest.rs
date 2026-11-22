@@ -101,6 +101,9 @@ pub struct PackageStoreMeta {
     /// Repository-relative banner or preview image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub banner: Option<String>,
+    /// Repository-relative preview screenshots shown in the store detail gallery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screenshots: Vec<String>,
     /// Higher sorts first in the store's featured grid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub featured_rank: Option<i32>,
@@ -113,6 +116,15 @@ fn is_hex_color(text: &str) -> bool {
     rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn valid_repo_rel_asset(path: &str) -> bool {
+    !path.trim().is_empty()
+        && path.chars().count() <= 200
+        && !path.starts_with('/')
+        && !path.contains("..")
+        && !path.contains('\\')
+        && !path.chars().any(|ch| ch.is_control())
+}
+
 impl PackageStoreMeta {
     pub fn is_empty(&self) -> bool {
         self.display_name.is_none()
@@ -123,6 +135,7 @@ impl PackageStoreMeta {
             && self.icon.is_none()
             && self.accent.is_empty()
             && self.banner.is_none()
+            && self.screenshots.is_empty()
             && self.featured_rank.is_none()
     }
 
@@ -178,11 +191,21 @@ impl PackageStoreMeta {
             )));
         }
         if let Some(banner) = &self.banner {
-            if banner.starts_with('/') || banner.contains("..") || banner.contains('\\') {
+            if !valid_repo_rel_asset(banner) {
                 return Err(Error::Manifest(format!(
                     "{package}: store banner must be a repository-relative path"
                 )));
             }
+        }
+        if self.screenshots.len() > 6
+            || self
+                .screenshots
+                .iter()
+                .any(|shot| !valid_repo_rel_asset(shot))
+        {
+            return Err(Error::Manifest(format!(
+                "{package}: store screenshots must list at most 6 repository-relative paths"
+            )));
         }
         Ok(())
     }

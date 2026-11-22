@@ -29,10 +29,10 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uxconf::{
-    format_hex_rgb, BackdropStyle, ButtonLayout, CompositorQuality, ConfError, CursorStyle,
-    DesktopConfig, DoubleClickAction, FocusMode, NetMode, PanelPosition, ThemeMode, ThemePreset,
-    Value, WindowPlacement, ACCENT_PRESETS, RESOLUTIONS, SOLID_BG_PRESETS, THEME_PRESETS,
-    TIMEZONES, WALLPAPER_DIR,
+    format_hex_rgb, wallpaper_dir, BackdropStyle, ButtonLayout, CompositorQuality, ConfError,
+    CursorStyle, DesktopConfig, DoubleClickAction, FocusMode, NetMode, PanelPosition, ThemeMode,
+    ThemePreset, Value, WindowPlacement, ACCENT_PRESETS, RESOLUTIONS, SOLID_BG_PRESETS,
+    THEME_PRESETS, TIMEZONES,
 };
 use x11rb::protocol::xproto::ConnectionExt;
 
@@ -981,10 +981,11 @@ fn scroll_viewport_in(bounds: Rect, style: SettingsRenderStyle) -> Rect {
 fn load_wallpaper_thumbnails(
     wallpapers: &[crate::theme::DiscoveredWallpaper],
 ) -> Vec<Option<Sprite>> {
+    let dir = wallpaper_dir();
     wallpapers
         .iter()
         .map(|wp| {
-            let path = format!("{WALLPAPER_DIR}/{}", wp.file);
+            let path = format!("{dir}/{}", wp.file);
             let decoded = icons::decode_jpeg(Path::new(&path))
                 .or_else(|| icons::decode_png(Path::new(&path)))?;
             let opaque = decoded.scale_cover_opaque(THUMB_W, THUMB_H);
@@ -1800,7 +1801,7 @@ impl SettingsState {
                         Value::String(format_hex_rgb(pack.accent)),
                     );
                     if let Some(wp) = pack.wallpaper.as_deref().filter(|s| !s.is_empty()) {
-                        let wp_exists = std::path::Path::new(WALLPAPER_DIR).join(wp).exists();
+                        let wp_exists = std::path::Path::new(&wallpaper_dir()).join(wp).exists();
                         if wp_exists {
                             host.set_config_property(
                                 "desktop",

@@ -46,6 +46,7 @@ fi
 
 "$ROOT/packages/space-store/build.sh" "$BUILD/packages/space-store"
 "$ROOT/packages/spui-askpass/build.sh" "$BUILD/packages/spui-askpass"
+"$ROOT/packages/space-editor/build.sh" "$BUILD/packages/space-editor"
 "$ROOT/packages/hello/build.sh" 0.1.0 "$BUILD/packages/hello-0.1.0"
 "$ROOT/packages/hello/build.sh" 0.2.0 "$BUILD/packages/hello-0.2.0"
 "$ROOT/packages/sudo/build.sh" "$BUILD/packages/sudo"
@@ -91,16 +92,17 @@ pack_one() {
         --level 19
 }
 
-pack_one space-store 1.0.0-2 "$ROOT/packages/space-store/manifest.toml" "$BUILD/packages/space-store"
+pack_one space-store 1.0.0-3 "$ROOT/packages/space-store/manifest.toml" "$BUILD/packages/space-store"
 pack_one spui-askpass 1.0.0-1 "$ROOT/packages/spui-askpass/manifest.toml" "$BUILD/packages/spui-askpass"
+pack_one space-editor 1.0.0-1 "$ROOT/packages/space-editor/manifest.toml" "$BUILD/packages/space-editor"
 pack_one hello 0.1.0-2 "$ROOT/packages/hello/manifest.toml" "$BUILD/packages/hello-0.1.0"
 pack_one hello 0.2.0-2 "$ROOT/packages/hello/manifest-0.2.0.toml" "$BUILD/packages/hello-0.2.0"
 pack_one sudo 0.1.0-5 "$ROOT/packages/sudo/manifest.toml" "$BUILD/packages/sudo"
-pack_one base-core 1.0.0-10 "$ROOT/packages/base-core/manifest.toml" "$BUILD/packages/base-core"
+pack_one base-core 1.0.0-11 "$ROOT/packages/base-core/manifest.toml" "$BUILD/packages/base-core"
 pack_one base 1.0.0-7 "$ROOT/packages/base/manifest.toml" "$BUILD/packages/base"
-pack_one theme-winxp 1.0.0-7 "$ROOT/packages/theme-winxp/manifest.toml" "$BUILD/packages/theme-winxp"
-pack_one theme-aqua 1.0.0-4 "$ROOT/packages/theme-aqua/manifest.toml" "$BUILD/packages/theme-aqua"
-pack_one theme-ambiance 1.0.0-4 "$ROOT/packages/theme-ambiance/manifest.toml" "$BUILD/packages/theme-ambiance"
-pack_one spk-runtime 1.0.0-6 "$ROOT/packages/spk-runtime/manifest.toml" "$BUILD/packages/spk-runtime"
+pack_one theme-winxp 1.0.0-8 "$ROOT/packages/theme-winxp/manifest.toml" "$BUILD/packages/theme-winxp"
+pack_one theme-aqua 1.0.0-5 "$ROOT/packages/theme-aqua/manifest.toml" "$BUILD/packages/theme-aqua"
+pack_one theme-ambiance 1.0.0-5 "$ROOT/packages/theme-ambiance/manifest.toml" "$BUILD/packages/theme-ambiance"
+pack_one spk-runtime 1.0.0-7 "$ROOT/packages/spk-runtime/manifest.toml" "$BUILD/packages/spk-runtime"
 
 printf 'reproducible packages in %s\n' "$REPO"

@@ -32,16 +32,32 @@
       "banner": "previews/theme-aqua.jpg"
     },
     {
+      "overline": "精选办公 · 所见即所得排版",
+      "title": "SpaceEditor A4 文档引擎",
+      "subtitle": "支持 A4/Letter 分页布局、文档大纲、混合字体、原生表格与图片嵌入，以及标准 .docx 双向读写。",
+      "cta": "立即获取",
+      "package": "space-editor",
+      "accent": ["#1e40af", "#2563eb"],
+      "icon": "document",
+      "banner": "previews/space-editor.jpg"
+    },
+    {
       "overline": "SpaceOS-9 软件中心",
       "title": "安全、可复现的原子软件包管理",
       "subtitle": "基于 Ed25519 签名验证与事务回滚日志，轻松管理桌面主题与系统组件。",
       "cta": "同步软件源",
       "go_updates": false,
       "accent": ["#1e293b", "#2563eb"],
-      "icon": "store"
+      "icon": "store",
+      "banner": "previews/space-store.jpg"
     }
   ],
   "sections": [
+    {
+      "title": "办公与效率",
+      "subtitle": "文档排版与系统软件工具",
+      "packages": ["space-editor", "space-store"]
+    },
     {
       "title": "精选主题",
       "subtitle": "让桌面换一种气质",

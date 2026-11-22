@@ -235,14 +235,6 @@ def main() -> int:
             if item.is_file():
                 shutil.copy2(item, target / item.name)
                 (target / item.name).chmod(0o644)
-        previews_dir = arguments.local_repo / "previews"
-        if previews_dir.is_dir():
-            dst_previews = target / "previews"
-            dst_previews.mkdir(parents=True, exist_ok=True)
-            for item in sorted(previews_dir.iterdir(), key=lambda path: path.name):
-                if item.is_file():
-                    shutil.copy2(item, dst_previews / item.name)
-                    (dst_previews / item.name).chmod(0o644)
         print(f"embedded local repository {arguments.local_repo} into {stage}")
     # A previous local-validation overlay may have installed this unit.
     (stage / "etc/systemg/spk-verify.service").unlink(missing_ok=True)

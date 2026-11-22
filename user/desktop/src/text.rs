@@ -22,13 +22,44 @@ use std::ops::Deref;
 use std::sync::Arc;
 use ttf_parser::{Face as ParsedFace, GlyphId, OutlineBuilder};
 
+const ITALIC_SLANT: f32 = 0.21;
+
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Face {
     Ui,
     Bold,
+    Italic,
+    BoldItalic,
+    Serif,
+    SerifBold,
+    SerifItalic,
+    SerifBoldItalic,
     Mono,
     CyberDisplay,
     CyberMono,
+}
+
+impl Face {
+    #[inline]
+    pub const fn is_italic(self) -> bool {
+        matches!(
+            self,
+            Self::Italic | Self::BoldItalic | Self::SerifItalic | Self::SerifBoldItalic
+        )
+    }
+}
+
+fn resolve_font_path(path: &str) -> String {
+    if path.starts_with("/usr/") {
+        if let Ok(root) = std::env::var("SPUI_SYSROOT") {
+            let trimmed = root.trim();
+            if !trimmed.is_empty() {
+                return format!("{}{}", trimmed.trim_end_matches('/'), path);
+            }
+        }
+    }
+    path.to_string()
 }
 
 pub struct Glyph {
@@ -116,6 +147,7 @@ struct Font {
 struct Outline<'a> {
     raster: &'a mut Rasterizer,
     scale: f32,
+    slant: f32,
     left: f32,
     top: f32,
     pen: Point,
@@ -124,7 +156,8 @@ struct Outline<'a> {
 
 impl Outline<'_> {
     fn point(&self, x: f32, y: f32) -> Point {
-        point(x * self.scale - self.left, self.top - y * self.scale)
+        let sx = x + y * self.slant;
+        point(sx * self.scale - self.left, self.top - y * self.scale)
     }
 }
 
@@ -163,7 +196,7 @@ impl Font {
             .is_some_and(|id| id.0 != 0)
     }
 
-    fn rasterize(&self, ch: char, px: f32) -> Glyph {
+    fn rasterize(&self, ch: char, px: f32, slant: f32) -> Glyph {
         let face = ParsedFace::parse(&self.data, self.index).expect("validated font");
         let id = face.glyph_index(ch).unwrap_or(GlyphId(0));
         let scale = px / f32::from(face.units_per_em());
@@ -177,10 +210,22 @@ impl Font {
             coverage: Vec::new(),
         };
         if let Some(bounds) = face.glyph_bounding_box(id) {
-            glyph.xmin = (f32::from(bounds.x_min) * scale).floor() as i32;
-            glyph.ymin = (f32::from(bounds.y_min) * scale).floor() as i32;
-            let right = (f32::from(bounds.x_max) * scale).ceil() as i32;
-            let top = (f32::from(bounds.y_max) * scale).ceil() as i32;
+            let x0 = f32::from(bounds.x_min);
+            let x1 = f32::from(bounds.x_max);
+            let y0 = f32::from(bounds.y_min);
+            let y1 = f32::from(bounds.y_max);
+            let (min_x, max_x) = if slant != 0.0 {
+                (
+                    (x0 + y0 * slant).min(x0 + y1 * slant),
+                    (x1 + y0 * slant).max(x1 + y1 * slant),
+                )
+            } else {
+                (x0, x1)
+            };
+            glyph.xmin = (min_x * scale).floor() as i32;
+            glyph.ymin = (y0 * scale).floor() as i32;
+            let right = (max_x * scale).ceil() as i32;
+            let top = (y1 * scale).ceil() as i32;
             glyph.width = (right - glyph.xmin).max(0) as usize;
             glyph.height = (top - glyph.ymin).max(0) as usize;
             if glyph.width != 0 && glyph.height != 0 {
@@ -190,6 +235,7 @@ impl Font {
                     &mut Outline {
                         raster: &mut raster,
                         scale,
+                        slant,
                         left: glyph.xmin as f32,
                         top: top as f32,
                         pen: point(0.0, 0.0),
@@ -230,6 +276,8 @@ struct CachedGlow {
 pub struct TextRenderer {
     ui: Font,
     bold: Font,
+    serif: Option<Font>,
+    serif_bold: Option<Font>,
     mono: Font,
     cyber_display: Option<Font>,
     cyber_mono: Option<Font>,
@@ -445,11 +493,12 @@ fn load(
     needle: &str,
     files: &mut HashMap<String, Arc<FontData>>,
 ) -> Result<Font, String> {
-    let data = if let Some(data) = files.get(path) {
+    let resolved = resolve_font_path(path);
+    let data = if let Some(data) = files.get(&resolved) {
         data.clone()
     } else {
-        let data = Arc::new(FontData::open(path)?);
-        files.insert(path.to_owned(), data.clone());
+        let data = Arc::new(FontData::open(&resolved)?);
+        files.insert(resolved, data.clone());
         data
     };
     let index = collection_index(&data, needle);
@@ -464,6 +513,8 @@ impl TextRenderer {
             .or_else(|_| load(theme::FONT_FALLBACK, "", &mut files))?;
         let bold = load(theme::FONT_UI_BOLD, "CJK SC", &mut files)
             .or_else(|_| load(theme::FONT_UI, "CJK SC", &mut files))?;
+        let serif = load(theme::FONT_SERIF, "CJK SC", &mut files).ok();
+        let serif_bold = load(theme::FONT_SERIF_BOLD, "CJK SC", &mut files).ok();
         let mono = load(theme::FONT_MONO, "Mono CJK SC", &mut files)
             .or_else(|_| load(theme::FONT_MONO, "CJK SC", &mut files))?;
         let cyber_display = load(theme::FONT_CYBER_DISPLAY, "", &mut files).ok();
@@ -471,6 +522,8 @@ impl TextRenderer {
         Ok(Self {
             ui,
             bold,
+            serif,
+            serif_bold,
             mono,
             cyber_display,
             cyber_mono,
@@ -492,10 +545,17 @@ impl TextRenderer {
         self.ui_scale = clamped;
     }
 
-    fn font_for_char(&self, face: Face, ch: char) -> &Font {
-        match face {
-            Face::Ui => &self.ui,
-            Face::Bold => &self.bold,
+    fn font_for_char(&self, face: Face, ch: char) -> (&Font, f32) {
+        let slant = if face.is_italic() { ITALIC_SLANT } else { 0.0 };
+        let font = match face {
+            Face::Ui | Face::Italic => &self.ui,
+            Face::Bold | Face::BoldItalic => &self.bold,
+            Face::Serif | Face::SerifItalic => self.serif.as_ref().unwrap_or(&self.ui),
+            Face::SerifBold | Face::SerifBoldItalic => self
+                .serif_bold
+                .as_ref()
+                .or(self.serif.as_ref())
+                .unwrap_or(&self.bold),
             Face::Mono => &self.mono,
             Face::CyberDisplay => self
                 .cyber_display
@@ -507,11 +567,22 @@ impl TextRenderer {
                 .as_ref()
                 .filter(|f| f.has_glyph(ch))
                 .unwrap_or(&self.mono),
-        }
+        };
+        (font, slant)
     }
 
     pub fn glyph(&mut self, face: Face, ch: char, px: f32) -> Arc<Glyph> {
-        let eff_px = if matches!(face, Face::Ui | Face::Bold) {
+        let eff_px = if matches!(
+            face,
+            Face::Ui
+                | Face::Bold
+                | Face::Italic
+                | Face::BoldItalic
+                | Face::Serif
+                | Face::SerifBold
+                | Face::SerifItalic
+                | Face::SerifBoldItalic
+        ) {
             px * self.ui_scale
         } else {
             px
@@ -520,8 +591,8 @@ impl TextRenderer {
         if let Some(glyph) = self.cache.get(&key) {
             return glyph.clone();
         }
-        let font = self.font_for_char(face, ch);
-        let glyph = Arc::new(font.rasterize(ch, eff_px));
+        let (font, slant) = self.font_for_char(face, ch);
+        let glyph = Arc::new(font.rasterize(ch, eff_px, slant));
         self.cache.insert(key, glyph.clone());
         glyph
     }
@@ -929,7 +1000,7 @@ mod tests {
         assert!(Arc::ptr_eq(&ui.data, &mono.data));
         assert_ne!(ui.index, mono.index);
         for ch in ['A', '中', '文', '，', 'g'] {
-            let glyph = ui.rasterize(ch, 18.0);
+            let glyph = ui.rasterize(ch, 18.0, 0.0);
             assert!(glyph.advance > 0.0, "{ch}");
             assert_eq!(glyph.coverage.len(), glyph.width * glyph.height);
             assert!(glyph.coverage.iter().any(|&v| v > 0), "{ch}");
@@ -937,14 +1008,21 @@ mod tests {
                 glyph.coverage.iter().any(|&v| v > 0 && v < 255),
                 "antialias {ch}"
             );
+            let italic = ui.rasterize(ch, 18.0, ITALIC_SLANT);
+            assert_eq!(italic.coverage.len(), italic.width * italic.height);
+            assert!(italic.width >= glyph.width);
+            assert!(italic.coverage.iter().any(|&v| v > 0), "italic {ch}");
         }
-        let space = ui.rasterize(' ', 18.0);
+        let space = ui.rasterize(' ', 18.0, 0.0);
         assert!(space.advance > 0.0);
         assert!(space.coverage.is_empty());
         assert_eq!(
-            mono.rasterize('i', 18.0).advance,
-            mono.rasterize('W', 18.0).advance
+            mono.rasterize('i', 18.0, 0.0).advance,
+            mono.rasterize('W', 18.0, 0.0).advance
         );
+        assert!(Face::Italic.is_italic());
+        assert!(Face::SerifBoldItalic.is_italic());
+        assert!(!Face::Serif.is_italic());
     }
 
     #[test]
@@ -963,6 +1041,8 @@ mod tests {
         let mut renderer = TextRenderer {
             ui,
             bold,
+            serif: None,
+            serif_bold: None,
             mono,
             cyber_display: None,
             cyber_mono: None,

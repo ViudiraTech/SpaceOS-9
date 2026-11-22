@@ -227,7 +227,7 @@ rootfs-image: modules
 busybox:
 	tools/build_busybox.sh
 
-packages: desktop-store desktop-askpass
+packages: desktop-store desktop-askpass desktop-editor
 	SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" tools/build_packages.sh
 
 repo: packages
@@ -268,12 +268,15 @@ desktop-iso:
 desktop-spui:
 	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/desktop/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
 
-# The store and askpass helper ship as their own packages, not inside the base image.
+# The store, askpass helper, and SpaceEditor ship as their own packages, not inside the base image.
 desktop-store:
 	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/store/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
 
 desktop-askpass:
 	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/askpass/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
+
+desktop-editor:
+	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/editor/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
 
 musl-sysroot:
 	python3 tools/ensure_musl_sysroot.py

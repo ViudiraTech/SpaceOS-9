@@ -234,6 +234,22 @@ impl BrowserState {
             }
             return;
         }
+        if is_docx_file(&entry.path) {
+            let bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("space-editor")))
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| PathBuf::from("/usr/bin/space-editor"));
+            if bin.is_file() {
+                match Command::new(&bin).arg(&entry.path).spawn() {
+                    Ok(_) => self.status = format!("已在 SpaceEditor 中打开 {}", entry.name),
+                    Err(e) => self.status = format!("启动 SpaceEditor 失败: {e}"),
+                }
+            } else {
+                self.status = "请先在 Space 商店安装 SpaceEditor 以打开 .docx 文档".to_string();
+            }
+            return;
+        }
         if is_editable_text(&entry.path, entry.size) {
             match std::env::current_exe() {
                 Ok(exe) => match Command::new(exe).arg("edit").arg(&entry.path).spawn() {
@@ -892,6 +908,7 @@ fn classify_kind(path: &Path, is_dir: bool) -> &'static str {
         Some("sh") => "Shell 脚本",
         Some("py") => "Python 脚本",
         Some("toml" | "json" | "yaml" | "yml" | "conf" | "ini" | "service") => "配置文件",
+        Some("docx") => "SpaceEditor 文档",
         Some("md" | "txt") => "文本文档",
         Some("log") => "日志文件",
         Some("png" | "jpg" | "jpeg" | "svg" | "bmp") => "图像",
@@ -917,6 +934,16 @@ fn is_html_file(path: &Path) -> bool {
             .map(str::to_ascii_lowercase)
             .as_deref(),
         Some("html" | "htm")
+    )
+}
+
+fn is_docx_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("docx")
     )
 }
 

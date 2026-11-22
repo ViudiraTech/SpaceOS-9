@@ -193,6 +193,7 @@ mod tests {
                     display_name: Some("Aqua Classic".into()),
                     category: Some("themes".into()),
                     accent: vec!["#38bdf8".into(), "#0284c7".into()],
+                    screenshots: vec!["previews/theme-aqua.jpg".into(), "previews/theme-aqua-2.jpg".into()],
                     ..Default::default()
                 },
             )]),
@@ -207,7 +208,26 @@ mod tests {
         let bytes = doc.to_bytes().unwrap();
         let parsed = StoreDoc::from_slice(&bytes).unwrap();
         assert_eq!(parsed.packages["theme-aqua"].display_name.as_deref(), Some("Aqua Classic"));
+        assert_eq!(parsed.packages["theme-aqua"].screenshots.len(), 2);
         assert!(!bytes.windows(11).any(|w| w == b"\"go_updates\""));
+    }
+
+    #[test]
+    fn rejects_invalid_screenshots() {
+        let mut doc = StoreDoc::default();
+        doc.packages.insert(
+            "demo".into(),
+            PackageStoreMeta {
+                screenshots: vec!["../escape.jpg".into()],
+                ..Default::default()
+            },
+        );
+        assert!(doc.validate().is_err());
+
+        doc.packages.get_mut("demo").unwrap().screenshots = (0..7)
+            .map(|i| format!("previews/shot-{i}.jpg"))
+            .collect();
+        assert!(doc.validate().is_err());
     }
 
     #[test]

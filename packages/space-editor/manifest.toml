@@ -1,0 +1,44 @@
+#
+#       packages/space-editor/manifest.toml
+#       SpaceEditor: WYSIWYG paginated word processor for SpaceOS-9
+#
+#       2026/11/22 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "space-editor"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "SpaceEditor：所见即所得 A4 分页文档编辑器"
+description = "基于 SPUI 4.0 构建的原生所见即所得文字处理软件。支持 A4/Letter 分页排版、标题大纲、丰富字体与配色、原生表格与图片嵌入，并支持与主流办公套件互通的 .docx（OOXML）以及 Markdown、HTML 与纯文本格式。"
+license = "LicenseRef-Proprietary"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = ["space-editor"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false
+
+[store]
+display_name = "SpaceEditor 文档"
+subtitle = "A4 分页字处理 · 原生 .docx 读写 · 表格与插图"
+category = "utilities"
+icon = "document"
+accent = ["#1e40af", "#2563eb"]
+banner = "previews/space-editor.jpg"
+screenshots = ["previews/space-editor.jpg", "previews/space-editor-2.jpg"]
+featured_rank = 98
+highlights = [
+    "所见即所得 A4/Letter 分页视图，支持标准/窄/宽页边距、页眉页脚与页码",
+    "内置功能区（开始/插入/布局/视图）、标尺、文档大纲与 Ctrl+F/H 查找替换",
+    "纯静态 Rust OOXML 引擎，双向读写 .docx 以及 Markdown / HTML / TXT",
+]

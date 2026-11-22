@@ -82,6 +82,9 @@ enum Action {
     HeroDot(usize),
     HeroPrev,
     HeroNext,
+    SelectDetailShot(usize),
+    DetailShotPrev,
+    DetailShotNext,
     Back,
     SetTab(crate::model::DetailTab),
     Reinstall(String),
@@ -220,6 +223,7 @@ struct StoreState {
     focused: FocusedInput,
     detail: Option<String>,
     detail_tab: crate::model::DetailTab,
+    detail_shot_idx: usize,
     detail_files: Vec<PackageFileEntry>,
     discover_scroll: ui::SmoothScroll,
     detail_scroll: ui::SmoothScroll,
@@ -289,6 +293,7 @@ impl StoreState {
             focused: FocusedInput::None,
             detail: None,
             detail_tab: crate::model::DetailTab::Overview,
+            detail_shot_idx: 0,
             detail_files: Vec::new(),
             discover_scroll: ui::SmoothScroll::new("store_discover_scroll"),
             detail_scroll: ui::SmoothScroll::new("store_detail_scroll"),
@@ -333,6 +338,28 @@ impl StoreState {
         }
         if let Some(backend) = backend {
             self.request_missing_banners(backend);
+            if let Some(detail_pkg) = self.detail.clone() {
+                self.request_detail_screenshots(&detail_pkg, backend);
+            }
+        }
+    }
+
+    fn request_detail_screenshots(&mut self, name: &str, backend: &StoreBackend) {
+        let mut rels: Vec<String> = Vec::new();
+        if let Some(meta) = self.meta(name) {
+            if let Some(b) = &meta.banner {
+                rels.push(b.clone());
+            }
+            for s in &meta.screenshots {
+                rels.push(s.clone());
+            }
+        }
+        for rel in rels {
+            if self.banners.contains_key(&rel) || !self.banner_requested.insert(rel.clone()) {
+                continue;
+            }
+            let dest = self.banner_cache_dir.join(sanitize_cache_name(&rel));
+            backend.fetch_banner(rel, dest, self.offline);
         }
     }
 
@@ -344,8 +371,13 @@ impl StoreState {
             }
         }
         for pkg in &self.packages {
-            if let Some(banner) = self.meta(&pkg.name).and_then(|m| m.banner.clone()) {
-                rels.push(banner);
+            if let Some(meta) = self.meta(&pkg.name) {
+                if let Some(banner) = &meta.banner {
+                    rels.push(banner.clone());
+                }
+                for shot in &meta.screenshots {
+                    rels.push(shot.clone());
+                }
             }
         }
         for rel in rels {
@@ -498,9 +530,9 @@ impl StoreState {
 }
 
 pub fn run_store(options: StoreOptions) -> Result<(), String> {
-    let mut app = App::new("Space 商店", Icon::Store, 1060, 700).map_err(|e| e.to_string())?;
+    let mut app = App::new("Space 商店", Icon::Store, 1060, 648).map_err(|e| e.to_string())?;
     app.min_width = 880;
-    app.min_height = 600;
+    app.min_height = 560;
 
     let backend = StoreBackend::spawn();
     let mut state = StoreState::new();
@@ -802,8 +834,10 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
         Action::OpenDetail(name) => {
             state.detail = Some(name.clone());
             state.detail_tab = crate::model::DetailTab::Overview;
+            state.detail_shot_idx = 0;
             state.detail_files.clear();
             state.detail_scroll.snap_to(0.0);
+            state.request_detail_screenshots(&name, backend);
             backend.load_package_details(name);
             app.needs_redraw = true;
         }
@@ -859,6 +893,24 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
             state.hero_index = (state.hero_index + 1) % len;
             state.hero_last = Instant::now();
             app.needs_redraw = true;
+        }
+        Action::SelectDetailShot(index) => {
+            state.detail_shot_idx = index;
+            app.needs_redraw = true;
+        }
+        Action::DetailShotPrev => {
+            if let Some(pkg) = state.detail.clone().and_then(|n| state.package(&n).cloned()) {
+                let len = state.presentation(&pkg).screenshots.len().max(1);
+                state.detail_shot_idx = (state.detail_shot_idx + len - 1) % len;
+                app.needs_redraw = true;
+            }
+        }
+        Action::DetailShotNext => {
+            if let Some(pkg) = state.detail.clone().and_then(|n| state.package(&n).cloned()) {
+                let len = state.presentation(&pkg).screenshots.len().max(1);
+                state.detail_shot_idx = (state.detail_shot_idx + 1) % len;
+                app.needs_redraw = true;
+            }
         }
         Action::Reinstall(name) => {
             enqueue_or_preview(app, state, backend, TxJobKind::Reinstall(name));
@@ -1076,7 +1128,7 @@ fn apply_backend_event(state: &mut StoreState, backend: &StoreBackend, event: Ba
             });
         }
         BackendEvent::BannerReady { rel_path, path } => {
-            if let Some(sprite) = icons::decode_theme_asset(&path, Some((720, 360))) {
+            if let Some(sprite) = icons::decode_theme_asset(&path, None) {
                 state.banners.insert(rel_path, sprite);
             }
         }

@@ -738,6 +738,42 @@ fn vol_popup_settings_rect() -> Rect {
     Rect::new(VOL_POPUP_WIDTH - 110, 95, 96, 28)
 }
 
+fn place_window_in_work_area(
+    scr_w: i32,
+    top_y: i32,
+    usable_h: i32,
+    min_x: i32,
+    req_w: u16,
+    req_h: u16,
+    placement: WindowPlacement,
+    existing_count: usize,
+) -> (i32, i32, u16, u16) {
+    let win_w = req_w.min((scr_w - 24).max(200) as u16);
+    let win_h = req_h.min((usable_h - 16).max(200) as u16);
+
+    let (mut wx, mut wy) = match placement {
+        WindowPlacement::Center => (
+            (scr_w - i32::from(win_w)) / 2,
+            top_y + (usable_h - i32::from(win_h)) / 2,
+        ),
+        WindowPlacement::Cascade => {
+            let index = existing_count as i32;
+            (
+                (scr_w - i32::from(win_w)) / 2 - 24 + (index % 5) * 28,
+                top_y + (usable_h - i32::from(win_h)) / 2 - 16 + (index % 5) * 26,
+            )
+        }
+    };
+
+    let eff_min_x = min_x.min((scr_w - i32::from(win_w) - 12).max(8));
+    let max_x = (scr_w - i32::from(win_w) - 12).max(eff_min_x);
+    let min_y = top_y + 8;
+    let max_y = (top_y + usable_h - i32::from(win_h) - 8).max(min_y);
+    wx = wx.clamp(eff_min_x, max_x);
+    wy = wy.clamp(min_y, max_y);
+    (wx, wy, win_w, win_h)
+}
+
 fn vol_from_slider_x(rect: Rect, x: i32) -> i32 {
     let frac = ((x - rect.x) as f32 / rect.w.max(1) as f32).clamp(0.0, 1.0);
     (frac * 100.0).round() as i32
@@ -749,6 +785,12 @@ fn infer_window_icon(title: &str) -> Icon {
         Icon::Terminal
     } else if title.contains("文件") || lower.contains("file") {
         Icon::Files
+    } else if title.contains("SpaceEditor")
+        || title.contains("文档")
+        || lower.contains("space-editor")
+        || lower.contains("spaceeditor")
+    {
+        Icon::Document
     } else if title.contains("编辑") || lower.contains("edit") {
         Icon::Editor
     } else if title.contains("监视器") || lower.contains("monitor") || title.contains("任务") {
@@ -3614,36 +3656,19 @@ impl Shell {
             16
         };
 
-        let (mut wx, mut wy) = match self.config.wm_placement {
-            WindowPlacement::Center => (
-                (i32::from(self.x.width) - i32::from(geometry.width)) / 2,
-                top_y + (usable_h - i32::from(geometry.height)) / 2,
-            ),
-            WindowPlacement::Cascade => {
-                let index = self.windows.len() as i32;
-                (
-                    (i32::from(self.x.width) - i32::from(geometry.width)) / 2 - 24
-                        + (index % 5) * 28,
-                    top_y + (usable_h - i32::from(geometry.height)) / 2 - 16 + (index % 5) * 26,
-                )
-            }
-        };
-        wx = wx.clamp(
+        let (wx, wy, win_w, win_h) = place_window_in_work_area(
+            i32::from(self.x.width),
+            top_y,
+            usable_h,
             min_x,
-            (i32::from(self.x.width) - i32::from(geometry.width) - 12).max(12),
-        );
-        wy = wy.clamp(
-            top_y + 10,
-            (top_y + usable_h - i32::from(geometry.height) - 10).max(top_y + 4),
-        );
-
-        self.x.move_resize(
-            window,
-            wx as i16,
-            wy as i16,
             geometry.width,
             geometry.height,
-        )?;
+            self.config.wm_placement,
+            self.windows.len(),
+        );
+
+        self.x
+            .move_resize(window, wx as i16, wy as i16, win_w, win_h)?;
         let glass_extents = self.x.get_glass_extents(window);
         self.x.map(window)?;
         self.x.raise(window)?;
@@ -3658,8 +3683,8 @@ impl Shell {
             minimized: false,
             x: wx as i16,
             y: wy as i16,
-            width: geometry.width,
-            height: geometry.height,
+            width: win_w,
+            height: win_h,
         });
         if self.comp.active {
             let mut cw = CompWindow::new(window, geometry.depth, glass_extents);
@@ -3668,14 +3693,9 @@ impl Shell {
                 start: Instant::now(),
                 duration_ms: 200,
             });
-            attach_window_pixmap(&self.x, &mut cw, geometry.width, geometry.height, geometry.depth);
+            attach_window_pixmap(&self.x, &mut cw, win_w, win_h, geometry.depth);
             self.comps.insert(window, cw);
-            let open_rect = Rect::new(
-                wx,
-                wy,
-                i32::from(geometry.width),
-                i32::from(geometry.height),
-            );
+            let open_rect = Rect::new(wx, wy, i32::from(win_w), i32::from(win_h));
             self.comp.mark_dirty(
                 window_damage_bounds(open_rect, self.theme.is_vortexglass(), false).expand(24),
             );
@@ -8661,10 +8681,35 @@ mod tests {
     use crate::desktop_entries;
 
     #[test]
+    fn oversized_client_windows_clamp_without_panicking() {
+        for (req_w, req_h) in [(1140u16, 720u16), (1300, 900), (800, 600)] {
+            for placement in [WindowPlacement::Center, WindowPlacement::Cascade] {
+                for top_y in [0, 28, 44] {
+                    let usable_h = 720 - 44;
+                    let (wx, wy, w, h) = place_window_in_work_area(
+                        1280,
+                        top_y,
+                        usable_h,
+                        84,
+                        req_w,
+                        req_h,
+                        placement,
+                        2,
+                    );
+                    assert!(wx >= 8 && wx + i32::from(w) <= 1280);
+                    assert!(wy >= top_y + 8 && wy + i32::from(h) <= top_y + usable_h);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn infer_window_icon_matches_all_apps() {
         assert_eq!(infer_window_icon("终端"), Icon::Terminal);
         assert_eq!(infer_window_icon("文件管理器"), Icon::Files);
         assert_eq!(infer_window_icon("文本编辑器"), Icon::Editor);
+        assert_eq!(infer_window_icon("SpaceEditor 文档"), Icon::Document);
+        assert_eq!(infer_window_icon("报告.docx — SpaceEditor"), Icon::Document);
         assert_eq!(infer_window_icon("系统监视器"), Icon::Monitor);
         assert_eq!(infer_window_icon("计算器"), Icon::Calculator);
         assert_eq!(infer_window_icon("扫雷"), Icon::Minesweeper);

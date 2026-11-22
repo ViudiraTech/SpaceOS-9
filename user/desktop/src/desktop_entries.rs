@@ -168,7 +168,22 @@ pub fn resolve_binary(program: &str) -> Option<PathBuf> {
     }
     let candidate = Path::new(trimmed);
     if candidate.is_absolute() || trimmed.contains('/') {
-        return is_executable_file(candidate).then(|| candidate.to_path_buf());
+        if is_executable_file(candidate) {
+            return Some(candidate.to_path_buf());
+        }
+        if candidate.is_absolute() {
+            if let Ok(root) = std::env::var("SPUI_SYSROOT") {
+                let rt = root.trim();
+                if !rt.is_empty() {
+                    let mapped = Path::new(rt.trim_end_matches('/'))
+                        .join(trimmed.trim_start_matches('/'));
+                    if is_executable_file(&mapped) {
+                        return Some(mapped);
+                    }
+                }
+            }
+        }
+        return None;
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -278,6 +293,10 @@ fn icon_from_desktop_key(raw: &str) -> Icon {
         "utilities-terminal" | "terminal" => Icon::Terminal,
         "system-file-manager" | "files" => Icon::Files,
         "accessories-text-editor" | "editor" => Icon::Editor,
+        "document" | "space-editor" | "x-office-document"
+        | "application-vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            Icon::Document
+        }
         "preferences-system" | "settings" => Icon::Settings,
         "utilities-system-monitor" | "monitor" => Icon::Monitor,
         "accessories-calculator" | "calculator" => Icon::Calculator,
@@ -414,6 +433,17 @@ pub fn parse_desktop_entry(id: &str, content: &str, check_exec_exists: bool) -> 
     })
 }
 
+fn system_applications_dir() -> PathBuf {
+    if let Ok(root) = std::env::var("SPUI_SYSROOT") {
+        let trimmed = root.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed.trim_end_matches('/'))
+                .join(SYSTEM_APPLICATIONS_DIR.trim_start_matches('/'));
+        }
+    }
+    PathBuf::from(SYSTEM_APPLICATIONS_DIR)
+}
+
 fn user_applications_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
@@ -421,13 +451,10 @@ fn user_applications_dir() -> Option<PathBuf> {
 }
 
 pub fn discover_applications() -> Vec<ResolvedApp> {
-    let dirs: Vec<PathBuf> = [
-        Some(PathBuf::from(SYSTEM_APPLICATIONS_DIR)),
-        user_applications_dir(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let dirs: Vec<PathBuf> = [Some(system_applications_dir()), user_applications_dir()]
+        .into_iter()
+        .flatten()
+        .collect();
     discover_applications_in(&dirs, true)
 }
 
@@ -475,13 +502,10 @@ fn hash_bytes(state: &mut u64, bytes: &[u8]) {
 }
 
 pub fn applications_fingerprint() -> u64 {
-    let dirs: Vec<PathBuf> = [
-        Some(PathBuf::from(SYSTEM_APPLICATIONS_DIR)),
-        user_applications_dir(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let dirs: Vec<PathBuf> = [Some(system_applications_dir()), user_applications_dir()]
+        .into_iter()
+        .flatten()
+        .collect();
     applications_fingerprint_in(&dirs, Some(Path::new(APPS_RELOAD_STAMP)))
 }
 

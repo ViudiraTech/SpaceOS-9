@@ -25,6 +25,24 @@ use std::fmt;
 
 pub const WALLPAPER_DIR: &str = "/usr/share/spui/wallpapers";
 
+/// Resolve the active wallpaper directory, honoring `SPUI_WALLPAPER_DIR` or `SPUI_SYSROOT`
+/// when running preview/capture tools on the host build machine.
+pub fn wallpaper_dir() -> String {
+    if let Ok(dir) = std::env::var("SPUI_WALLPAPER_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return trimmed.trim_end_matches('/').to_string();
+        }
+    }
+    if let Ok(root) = std::env::var("SPUI_SYSROOT") {
+        let trimmed = root.trim();
+        if !trimmed.is_empty() {
+            return format!("{}{}", trimmed.trim_end_matches('/'), WALLPAPER_DIR);
+        }
+    }
+    WALLPAPER_DIR.to_string()
+}
+
 /// Error returned by `uxconf` validation, storage or IPC operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfError {
@@ -1198,7 +1216,7 @@ impl Default for DesktopConfig {
 
 impl DesktopConfig {
     pub fn wallpaper_path(&self) -> String {
-        format!("{WALLPAPER_DIR}/{}", self.wallpaper)
+        format!("{}/{}", wallpaper_dir(), self.wallpaper)
     }
 
     /// Apply a built-in theme preset bundle in memory (used by tests & offline previews).

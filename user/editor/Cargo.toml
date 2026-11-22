@@ -1,0 +1,30 @@
+#
+#       user/editor/Cargo.toml
+#       SpaceEditor: WYSIWYG paginated word processor powered by SPUI 4.0 and pure-Rust OOXML
+#
+#       2026/11/22 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+[package]
+name = "space_editor"
+version = "1.0.0"
+edition = "2021"
+description = "SpaceEditor: WYSIWYG A4 word processor for SpaceOS-9"
+license = "LicenseRef-Proprietary"
+
+[lib]
+name = "space_editor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "space-editor"
+path = "src/main.rs"
+
+[dependencies]
+spui_ui = { path = "../spui_ui" }
+uxconf = { package = "spui", path = "../desktop" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+crc32fast = "1"
+roxmltree = "0.20"
+libc = "0.2"

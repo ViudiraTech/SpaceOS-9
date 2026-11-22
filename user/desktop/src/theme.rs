@@ -27,8 +27,8 @@ use std::time::SystemTime;
 use crate::draw::{build_gradient_lut, mix, Canvas, Rect, Sprite};
 use crate::icons;
 use uxconf::{
-    ButtonLayout, DesktopConfig, PanelPosition, ThemeMode, ThemeStyle, THEME_PRESETS, WALLPAPERS,
-    WALLPAPER_DIR,
+    wallpaper_dir, ButtonLayout, DesktopConfig, PanelPosition, ThemeMode, ThemeStyle,
+    THEME_PRESETS, WALLPAPERS,
 };
 
 pub const TITLEBAR_HEIGHT: i32 = 34;
@@ -1215,7 +1215,7 @@ pub fn discover_wallpapers() -> Vec<DiscoveredWallpaper> {
             label: w.label.to_string(),
         })
         .collect();
-    let Ok(entries) = fs::read_dir(WALLPAPER_DIR) else {
+    let Ok(entries) = fs::read_dir(wallpaper_dir()) else {
         return list;
     };
     let mut extras: Vec<DiscoveredWallpaper> = Vec::new();
@@ -4291,6 +4291,8 @@ mod tests {
 
 pub const FONT_UI: &str = "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc";
 pub const FONT_UI_BOLD: &str = "/usr/share/fonts/noto/NotoSansCJK-Bold.ttc";
+pub const FONT_SERIF: &str = "/usr/share/fonts/noto/NotoSerifCJK-Regular.ttc";
+pub const FONT_SERIF_BOLD: &str = "/usr/share/fonts/noto/NotoSerifCJK-Bold.ttc";
 pub const FONT_MONO: &str = "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc";
 pub const FONT_FALLBACK: &str = "/usr/share/fonts/dejavu/DejaVuSans.ttf";
 pub const FONT_CYBER_DISPLAY: &str = "/usr/share/spui/fonts/Audiowide-Regular.ttf";

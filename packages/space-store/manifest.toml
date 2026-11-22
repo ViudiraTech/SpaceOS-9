@@ -9,7 +9,7 @@
 name = "space-store"
 epoch = 0
 version = "1.0.0"
-release = 2
+release = 3
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "Space 商店：图形软件包管理器"
@@ -34,6 +34,8 @@ subtitle = "浏览、安装与更新 SpaceOS 软件包"
 category = "utilities"
 icon = "store"
 accent = ["#6366f1", "#4338ca"]
+banner = "previews/space-store.jpg"
+screenshots = ["previews/space-store.jpg", "previews/space-store-2.jpg"]
 featured_rank = 85
 highlights = [
     "原生 SPUI 界面，跟随系统主题实时切换",

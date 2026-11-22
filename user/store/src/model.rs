@@ -47,6 +47,8 @@ pub struct StoreMeta {
     #[serde(default)]
     pub banner: Option<String>,
     #[serde(default)]
+    pub screenshots: Vec<String>,
+    #[serde(default)]
     pub featured_rank: Option<i32>,
 }
 
