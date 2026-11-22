@@ -10,6 +10,7 @@
 /user/spk/target/
 /user/sudo/target/
 /user/askpass/target/
+/user/store/target/
 /build/
 
 # Locally generated spk repository artifacts and signing keys.
