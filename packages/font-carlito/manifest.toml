@@ -1,0 +1,42 @@
+#
+#       packages/font-carlito/manifest.toml
+#       Carlito 界面字体
+#
+#       2026/11/22 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "font-carlito"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "Carlito 界面字体"
+description = "与常见办公文档排版兼容的人文无衬线字体。安装后可在系统设置的「字体」页中选择使用。"
+license = "OFL-1.1"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = []
+provides = ["font"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false
+
+[store]
+display_name = "Carlito 界面字体"
+subtitle = "与常见办公文档排版兼容的人文无衬线字体"
+category = "utilities"
+icon = "editor"
+accent = ["#f59e0b", "#b45309"]
+screenshots = ["previews/font-carlito.jpg", "previews/font-carlito-2.jpg"]
+featured_rank = 33
+highlights = [
+    "在系统设置 → 字体中一键切换",
+    "缺字时自动回退到内置中文字体",
+]

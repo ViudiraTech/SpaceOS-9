@@ -7,7 +7,10 @@
       "subtitle": "支持经典与深色多变体切换、抗锯齿标题栏与主题专属关机动画，安装后即刻热生效。",
       "cta": "获取主题",
       "package": "theme-winxp",
-      "accent": ["#1e3a8a", "#2563eb"],
+      "accent": [
+        "#1e3a8a",
+        "#2563eb"
+      ],
       "icon": "appearance",
       "banner": "previews/theme-winxp.jpg"
     },
@@ -17,7 +20,10 @@
       "subtitle": "暖炭黑面板配合象牙白高对比窗口与四重变体配色，适合长时间开发与文字工作。",
       "cta": "立即体验",
       "package": "theme-ambiance",
-      "accent": ["#4c1d3d", "#c2410c"],
+      "accent": [
+        "#4c1d3d",
+        "#c2410c"
+      ],
       "icon": "wallpaper",
       "banner": "previews/theme-ambiance.jpg"
     },
@@ -27,7 +33,10 @@
       "subtitle": "拉丝银白顶栏配合晶球窗口控制按钮与极光水蓝波纹壁纸，支持浅色与深色模式无缝切换。",
       "cta": "立即获取",
       "package": "theme-aqua",
-      "accent": ["#0c4a6e", "#0284c7"],
+      "accent": [
+        "#0c4a6e",
+        "#0284c7"
+      ],
       "icon": "wallpaper",
       "banner": "previews/theme-aqua.jpg"
     },
@@ -37,7 +46,10 @@
       "subtitle": "支持 A4/Letter 分页布局、文档大纲、混合字体、原生表格与图片嵌入，以及标准 .docx 双向读写。",
       "cta": "立即获取",
       "package": "space-editor",
-      "accent": ["#1e40af", "#2563eb"],
+      "accent": [
+        "#1e40af",
+        "#2563eb"
+      ],
       "icon": "document",
       "banner": "previews/space-editor.jpg"
     },
@@ -47,7 +59,10 @@
       "subtitle": "基于 Ed25519 签名验证与事务回滚日志，轻松管理桌面主题与系统组件。",
       "cta": "同步软件源",
       "go_updates": false,
-      "accent": ["#1e293b", "#2563eb"],
+      "accent": [
+        "#1e293b",
+        "#2563eb"
+      ],
       "icon": "store",
       "banner": "previews/space-store.jpg"
     }
@@ -56,22 +71,56 @@
     {
       "title": "办公与效率",
       "subtitle": "文档排版与系统软件工具",
-      "packages": ["space-editor", "space-store"]
+      "packages": [
+        "space-editor",
+        "space-store"
+      ]
     },
     {
       "title": "精选主题",
       "subtitle": "让桌面换一种气质",
-      "packages": ["theme-winxp", "theme-aqua", "theme-ambiance"]
+      "packages": [
+        "theme-winxp",
+        "theme-aqua",
+        "theme-ambiance"
+      ]
     },
     {
       "title": "系统核心",
       "subtitle": "SpaceOS 的基石组件",
-      "packages": ["base-core", "spk-runtime", "sudo", "spui-askpass", "base"]
+      "packages": [
+        "base-core",
+        "spk-runtime",
+        "sudo",
+        "spui-askpass",
+        "base"
+      ]
+    },
+    {
+      "title": "字体",
+      "subtitle": "为界面、文档与代码换个字面",
+      "packages": [
+        "font-hack",
+        "font-croscore",
+        "font-carlito"
+      ]
     }
   ],
   "categories": [
-    { "slug": "themes", "label": "桌面主题", "subtitle": "窗口、图标与关机动画" },
-    { "slug": "system", "label": "系统核心", "subtitle": "运行时、权限与包管理" },
-    { "slug": "utilities", "label": "实用工具", "subtitle": "命令行与验证工具" }
+    {
+      "slug": "themes",
+      "label": "桌面主题",
+      "subtitle": "窗口、图标与关机动画"
+    },
+    {
+      "slug": "system",
+      "label": "系统核心",
+      "subtitle": "运行时、权限与包管理"
+    },
+    {
+      "slug": "utilities",
+      "label": "实用工具",
+      "subtitle": "命令行与验证工具"
+    }
   ]
 }

@@ -45,6 +45,9 @@ fi
     --target-dir "$ROOT/target" )
 
 "$ROOT/packages/space-store/build.sh" "$BUILD/packages/space-store"
+"$ROOT/packages/font-hack/build.sh" "$BUILD/packages/font-hack"
+"$ROOT/packages/font-carlito/build.sh" "$BUILD/packages/font-carlito"
+"$ROOT/packages/font-croscore/build.sh" "$BUILD/packages/font-croscore"
 "$ROOT/packages/spui-askpass/build.sh" "$BUILD/packages/spui-askpass"
 "$ROOT/packages/space-editor/build.sh" "$BUILD/packages/space-editor"
 "$ROOT/packages/hello/build.sh" 0.1.0 "$BUILD/packages/hello-0.1.0"
@@ -94,7 +97,10 @@ pack_one() {
 
 pack_one space-store 1.0.0-3 "$ROOT/packages/space-store/manifest.toml" "$BUILD/packages/space-store"
 pack_one spui-askpass 1.0.0-1 "$ROOT/packages/spui-askpass/manifest.toml" "$BUILD/packages/spui-askpass"
-pack_one space-editor 1.0.0-1 "$ROOT/packages/space-editor/manifest.toml" "$BUILD/packages/space-editor"
+pack_one space-editor 1.0.0-2 "$ROOT/packages/space-editor/manifest.toml" "$BUILD/packages/space-editor"
+pack_one font-hack 1.0.0-1 "$ROOT/packages/font-hack/manifest.toml" "$BUILD/packages/font-hack"
+pack_one font-carlito 1.0.0-1 "$ROOT/packages/font-carlito/manifest.toml" "$BUILD/packages/font-carlito"
+pack_one font-croscore 1.0.0-1 "$ROOT/packages/font-croscore/manifest.toml" "$BUILD/packages/font-croscore"
 pack_one hello 0.1.0-2 "$ROOT/packages/hello/manifest.toml" "$BUILD/packages/hello-0.1.0"
 pack_one hello 0.2.0-2 "$ROOT/packages/hello/manifest-0.2.0.toml" "$BUILD/packages/hello-0.2.0"
 pack_one sudo 0.1.0-5 "$ROOT/packages/sudo/manifest.toml" "$BUILD/packages/sudo"
