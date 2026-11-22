@@ -446,8 +446,9 @@ pub fn search_settings(query: &str) -> Vec<&'static SettingSearchItem> {
         .collect()
 }
 
-const NAV: [(Page, &str, Icon); 11] = [
+const NAV: [(Page, &str, Icon); 12] = [
     (Page::Appearance, "外观", Icon::Appearance),
+    (Page::Fonts, "字体", Icon::Editor),
     (Page::Network, "网络", Icon::Network),
     (Page::DesktopPanel, "桌面与面板", Icon::Panel),
     (Page::Windows, "窗口", Icon::WindowManager),
@@ -459,6 +460,38 @@ const NAV: [(Page, &str, Icon); 11] = [
     (Page::Logs, "启动日志", Icon::FileText),
     (Page::About, "关于", Icon::About),
 ];
+
+/// Every page must appear in the sidebar; a page that is missing from `NAV`
+/// can only be reached by search or by slug, which is easy to miss.
+#[cfg(test)]
+mod nav_tests {
+    use super::*;
+
+    #[test]
+    fn nav_lists_every_page() {
+        let pages = [
+            Page::Appearance,
+            Page::Fonts,
+            Page::Network,
+            Page::DesktopPanel,
+            Page::Windows,
+            Page::Display,
+            Page::Sound,
+            Page::Input,
+            Page::Applications,
+            Page::DateTime,
+            Page::Logs,
+            Page::About,
+        ];
+        for page in pages {
+            assert!(
+                NAV.iter().any(|(candidate, _, _)| *candidate == page),
+                "{page:?} is missing from NAV"
+            );
+        }
+        assert_eq!(NAV.len(), pages.len(), "NAV has a duplicate or extra entry");
+    }
+}
 
 /// Installed families, scanned once per settings process.
 fn font_family_choices() -> &'static [String] {
@@ -1108,6 +1141,7 @@ impl NetPageState {
 /// Parse a category slug or identifier into a concrete [`Page`].
 pub fn parse_initial_page(arg: Option<&str>) -> Page {
     match arg.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("font" | "fonts" | "字体") => Page::Fonts,
         Some("network" | "net") => Page::Network,
         Some("desktop" | "panel") => Page::DesktopPanel,
         Some("windows" | "wm") => Page::Windows,
