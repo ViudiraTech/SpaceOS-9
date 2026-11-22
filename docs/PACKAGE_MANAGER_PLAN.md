@@ -238,6 +238,24 @@ size = 11
 - `[store]` 字段全部可选：`display_name`、`subtitle`、`description`、`category`（themes/system/utilities/development/multimedia）、`highlights`、`icon`、`accent`（1–2 个 `#rrggbb`）、`banner`、`featured_rank`。旧包没有该表时，客户端按 `theme-` 前缀/`spui-theme` provides 与 summary 通用降级。
 - 兼容性：`manifest.rs` 不再 `deny_unknown_fields`，旧客户端可以安装带新字段的包；`index.json` 结构未变，旧客户端照常工作。
 
+### 4.4 镜像里的软件源配置
+
+镜像内的 `var/lib/spk/repos.json` 同时登记两个仓库：
+
+| 名称 | 地址 | 优先级 | 用途 |
+|---|---|---|---|
+| `spaceos-main` | `https://goutoustdio.top/spaceos/repo/x86_64` | 10 | 唯一能带来更新的源 |
+| `local` | `/var/lib/spk/repo/x86_64` | 1 | 构建时冻结的快照，仅作离线兜底 |
+
+优先级决定同版本时的取舍（先出现的仓库胜出），版本号仍然优先于优先级。早期 P5 镜像只登记了 `local`，等于把系统钉在构建那一刻，`spk sync` 永远同步不到新包 —— 这是「收不到更新」的根因。旧镜像可在运行时修正：
+
+```sh
+doas spk repo add spaceos-main https://goutoustdio.top/spaceos/repo/x86_64
+doas spk repo priority spaceos-main 10
+doas spk repo priority local 1
+doas spk sync
+```
+
 ## 5. 依赖与求解
 
 ### 5.1 版本比较
