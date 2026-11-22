@@ -229,6 +229,44 @@ button_active_border = "1px solid #003c74"
 button_primary_bg = "linear-gradient(180deg, #ffffff 0%, #ecebe5 86%, #d8d0c4 100%)"
 button_primary_border = "1px solid #003c74"
 button_primary_box_shadow = "inset -1px 1px #cee7ff, inset 1px 2px #98b8ea, inset -2px 2px #bcd4f6, inset 1px -1px #89ade4, inset 2px -2px #89ade4"
+button_primary_hover_bg = "linear-gradient(180deg, #ffffff 0%, #eef2f8 86%, #d7e2f4 100%)"
+button_primary_hover_border = "1px solid #003c74"
+button_primary_hover_box_shadow = "inset -1px 1px #fff0cf, inset 1px 2px #fdd889, inset -2px 2px #fbc761, inset 2px -2px #e5a01a"
+button_primary_active_bg = "linear-gradient(180deg, #cdcac3 0%, #e0e3ea 10%, #d2d9e6 100%)"
+button_primary_active_border = "1px solid #003c74"
+button_primary_active_box_shadow = "inset 1px 1px #8a95a8"
+popup_radius = 2
+popup_bg = "#ffffff"
+popup_border = "1px solid #7f9db9"
+popup_box_shadow = "inset 1px 1px #ffffff, inset -1px -1px #d6d3c8"
+switch_radius = 4
+switch_track_off_bg = "linear-gradient(180deg, #d8d5cc 0%, #ecebe5 100%)"
+switch_track_off_border = "1px solid #7f9db9"
+switch_track_off_box_shadow = "inset 1px 1px #bab6aa"
+switch_track_on_bg = "linear-gradient(180deg, #4da252 0%, #2e8433 100%)"
+switch_track_on_border = "1px solid #1b5c1f"
+switch_track_on_box_shadow = "inset 0 1px #86d48a"
+switch_knob_bg = "linear-gradient(180deg, #ffffff 0%, #ecebe5 85%, #d6d0c4 100%)"
+switch_knob_border = "1px solid #003c74"
+switch_knob_box_shadow = "inset 1px 1px #ffffff"
+slider_track_bg = "linear-gradient(180deg, #d4d0c8 0%, #ecebe5 100%)"
+slider_track_border = "1px solid #8c8c8c"
+slider_fill_bg = "linear-gradient(180deg, #5496ec 0%, #2468d4 100%)"
+slider_thumb_radius = 2
+slider_thumb_bg = "linear-gradient(180deg, #ffffff 0%, #ecebe5 80%, #d6d0c4 100%)"
+slider_thumb_border = "1px solid #003c74"
+slider_thumb_box_shadow = "inset 1px 1px #ffffff"
+slider_thumb_hover_bg = "linear-gradient(180deg, #ffffff 0%, #f5efe0 80%, #f3d28b 100%)"
+slider_thumb_hover_border = "1px solid #003c74"
+slider_thumb_hover_box_shadow = "inset 0 -1px #e5a01a"
+toolbar_bg = "linear-gradient(180deg, #fbfaf7 0%, #ecebe4 100%)"
+toolbar_border_bottom = "1px solid #b5b2a8"
+list_item_radius = 2
+list_item_selected_bg = "linear-gradient(180deg, #3b7be0 0%, #2c65cc 100%)"
+list_item_selected_border = "1px solid #1f4ea8"
+list_item_selected_text = "#ffffff"
+list_item_hover_bg = "#e4ecfa"
+list_item_hover_border = "1px solid #b4cbed"
 card_radius = 4
 card_bg = "linear-gradient(180deg, #fcfcfe 0%, #f4f3ee 100%)"
 card_border = "1px solid #919b9c"
@@ -265,6 +303,86 @@ progress_track_border = "1px solid #686868"
 progress_fill_bg = "linear-gradient(180deg, #acedad 0%, #7be47d 14%, #4cda50 28%, #2ed330 42%, #42d845 57%, #76e275 71%, #8fe791 85%, #ffffff 100%)"
 progress_chunk_w = 8
 progress_chunk_gap = 2
+
+[power_splash]
+bg_color = "#5a7edc"
+show_space_logo = true
+logo_anchor = "center"
+logo_x = 0
+logo_y = -76
+logo_size = 72
+title_anchor = "center"
+title_x = 0
+title_y = 8
+title_size = 24.0
+title_color = "#ffffff"
+title_shadow = "#183780"
+subtitle_anchor = "center"
+subtitle_x = 0
+subtitle_y = 82
+subtitle_size = 13.0
+subtitle_color = "#dce7ff"
+poweroff_title = "正在关机..."
+reboot_title = "正在重新启动..."
+done_title = "即将关闭计算机..."
+poweroff_subtitle = "正在保存您的设置并停止系统服务..."
+reboot_subtitle = "正在同步文件系统并准备重新启动..."
+done_subtitle = "正在移交控制权至系统内核..."
+log_bg = "#0c2052"
+log_border = "#6c97f0"
+log_text = "#dce7ff"
+log_accent = "#7fb4ff"
+hint_color = "#b8cff8"
+
+[[power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = "14%"
+w = "100%"
+h = "72%"
+bg = "radial-gradient(circle at 22% 18%, #8bb0f8 0%, #5a7edc 55%, #3d63c4 100%)"
+
+[[power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = "14%"
+bg = "linear-gradient(to bottom, #00309c 0%, #002a8c 100%)"
+
+[[power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = "14%"
+w = "100%"
+h = 2
+bg = "linear-gradient(to right, #4f78d8 0%, #c8dcff 48%, #4f78d8 100%)"
+
+[[power_splash.layers]]
+anchor = "bottom_left"
+x = 0
+y = 0
+w = "100%"
+h = "14%"
+bg = "linear-gradient(to bottom, #002d96 0%, #002378 100%)"
+
+[[power_splash.layers]]
+anchor = "bottom_left"
+x = 0
+y = "-14%"
+w = "100%"
+h = 2
+bg = "linear-gradient(to right, #3a62c4 0%, #f59b38 50%, #3a62c4 100%)"
+
+[power_splash.animation]
+sprite_sheet = "splash_anim.svg"
+frame_count = 12
+width = 160
+height = 14
+fps = 10.0
+anchor = "center"
+x = 0
+y = 46
 
 # ==============================================================================
 # XP Color Scheme Variant 1: Olive Green (Homestead)
@@ -364,6 +482,60 @@ scrollbar_thumb_active_bg = "linear-gradient(to right, #b6c79a 0%, #9ab076 50%, 
 scrollbar_thumb_active_border = "1px solid #495930"
 scrollbar_grip_light = "#f2f6ea"
 scrollbar_grip_dark = "#6d804c"
+switch_track_on_bg = "linear-gradient(180deg, #8aa062 0%, #687c45 100%)"
+switch_track_on_border = "1px solid #4c5c30"
+slider_fill_bg = "linear-gradient(180deg, #95aa6c 0%, #748753 100%)"
+list_item_selected_bg = "linear-gradient(180deg, #879b64 0%, #6d804c 100%)"
+list_item_selected_border = "1px solid #526138"
+
+[accents.olive.power_splash]
+bg_color = "#687a4a"
+title_shadow = "#303b1d"
+subtitle_color = "#ebf0df"
+log_bg = "#252e17"
+log_border = "#96ab72"
+log_accent = "#c8dba4"
+hint_color = "#dbe3c8"
+
+[[accents.olive.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = "14%"
+w = "100%"
+h = "72%"
+bg = "radial-gradient(circle at 22% 18%, #98ac74 0%, #6f824f 55%, #516137 100%)"
+
+[[accents.olive.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = "14%"
+bg = "linear-gradient(to bottom, #3b4827 0%, #2e381e 100%)"
+
+[[accents.olive.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = "14%"
+w = "100%"
+h = 2
+bg = "linear-gradient(to right, #5a6c3d 0%, #d2e0b6 48%, #5a6c3d 100%)"
+
+[[accents.olive.power_splash.layers]]
+anchor = "bottom_left"
+x = 0
+y = 0
+w = "100%"
+h = "14%"
+bg = "linear-gradient(to bottom, #394526 0%, #2a331c 100%)"
+
+[[accents.olive.power_splash.layers]]
+anchor = "bottom_left"
+x = 0
+y = "-14%"
+w = "100%"
+h = 2
+bg = "linear-gradient(to right, #4f5f35 0%, #e68b2c 50%, #4f5f35 100%)"
 
 # ==============================================================================
 # XP Color Scheme Variant 2: Metallic Silver
@@ -470,6 +642,60 @@ scrollbar_thumb_active_bg = "linear-gradient(to right, #c8ccd6 0%, #aeb4c0 50%, 
 scrollbar_thumb_active_border = "1px solid #545a68"
 scrollbar_grip_light = "#ffffff"
 scrollbar_grip_dark = "#7a8190"
+switch_track_on_bg = "linear-gradient(180deg, #7c899e 0%, #586375 100%)"
+switch_track_on_border = "1px solid #3f4856"
+slider_fill_bg = "linear-gradient(180deg, #8b97ab 0%, #616d82 100%)"
+list_item_selected_bg = "linear-gradient(180deg, #758399 0%, #586478 100%)"
+list_item_selected_border = "1px solid #414a59"
+
+[accents.silver.power_splash]
+bg_color = "#7c8494"
+title_shadow = "#383e4a"
+subtitle_color = "#eef1f6"
+log_bg = "#252932"
+log_border = "#9aa2b2"
+log_accent = "#cfd6e4"
+hint_color = "#dfe4ed"
+
+[[accents.silver.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = "14%"
+w = "100%"
+h = "72%"
+bg = "radial-gradient(circle at 22% 18%, #a6aebf 0%, #7d8596 55%, #5b6373 100%)"
+
+[[accents.silver.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = "14%"
+bg = "linear-gradient(to bottom, #464c59 0%, #363b45 100%)"
+
+[[accents.silver.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = "14%"
+w = "100%"
+h = 2
+bg = "linear-gradient(to right, #687080 0%, #e4e8f0 48%, #687080 100%)"
+
+[[accents.silver.power_splash.layers]]
+anchor = "bottom_left"
+x = 0
+y = 0
+w = "100%"
+h = "14%"
+bg = "linear-gradient(to bottom, #424854 0%, #323740 100%)"
+
+[[accents.silver.power_splash.layers]]
+anchor = "bottom_left"
+x = 0
+y = "-14%"
+w = "100%"
+h = 2
+bg = "linear-gradient(to right, #5a6272 0%, #cfd6e4 50%, #5a6272 100%)"
 
 # ==============================================================================
 # XP Dark Theme Variant: Royale Noir / Zune Dark
@@ -642,3 +868,92 @@ scrollbar_grip_light = "#6e82a8"
 scrollbar_grip_dark = "#1c2433"
 progress_track_bg = "#151820"
 progress_track_border = "1px solid #454e61"
+progress_fill_bg = "linear-gradient(180deg, #5d8fd9 0%, #3964a8 52%, #24457a 100%)"
+button_primary_hover_bg = "linear-gradient(180deg, #425a82 0%, #324669 86%, #263652 100%)"
+button_primary_hover_border = "1px solid #76a4ed"
+button_primary_hover_box_shadow = "inset -1px 1px #98bdf5, inset 1px 2px #5a82c2"
+button_primary_active_bg = "linear-gradient(180deg, #1d2b42 0%, #273854 90%, #35496b 100%)"
+button_primary_active_border = "1px solid #4c78bf"
+popup_radius = 3
+popup_bg = "#22252e"
+popup_border = "1px solid #454c5c"
+popup_box_shadow = "inset 1px 1px #323846, inset -1px -1px #0c0e13"
+switch_radius = 4
+switch_track_off_bg = "linear-gradient(180deg, #171a22 0%, #232834 100%)"
+switch_track_off_border = "1px solid #454e61"
+switch_track_off_box_shadow = "inset 1px 1px #0c0e13"
+switch_track_on_bg = "linear-gradient(180deg, #4d7ec7 0%, #335b99 100%)"
+switch_track_on_border = "1px solid #244273"
+switch_track_on_box_shadow = "inset 0 1px #76a4ed"
+switch_knob_bg = "linear-gradient(180deg, #3c4354 0%, #2b303d 85%, #20242e 100%)"
+switch_knob_border = "1px solid #596580"
+switch_knob_box_shadow = "inset 1px 1px #4f586e"
+slider_track_bg = "linear-gradient(180deg, #151820 0%, #1e232e 100%)"
+slider_track_border = "1px solid #454e61"
+slider_fill_bg = "linear-gradient(180deg, #5d8fd9 0%, #3964a8 100%)"
+slider_thumb_radius = 2
+slider_thumb_bg = "linear-gradient(180deg, #3c4354 0%, #2b303d 80%, #20242e 100%)"
+slider_thumb_border = "1px solid #596580"
+slider_thumb_box_shadow = "inset 1px 1px #4f586e"
+slider_thumb_hover_bg = "linear-gradient(180deg, #4b556b 0%, #353c4d 80%, #292f3d 100%)"
+slider_thumb_hover_border = "1px solid #e68b2c"
+slider_thumb_hover_box_shadow = "inset 0 -1px #d99316"
+toolbar_bg = "linear-gradient(180deg, #2b303b 0%, #20242d 100%)"
+toolbar_border_bottom = "1px solid #3d4454"
+list_item_radius = 3
+list_item_selected_bg = "linear-gradient(180deg, #4674bd 0%, #315694 100%)"
+list_item_selected_border = "1px solid #5a82c2"
+list_item_selected_text = "#ffffff"
+list_item_hover_bg = "#2d3545"
+list_item_hover_border = "1px solid #434f66"
+
+[dark.power_splash]
+bg_color = "#1b2333"
+title_color = "#eef1f7"
+title_shadow = "#090c14"
+subtitle_color = "#b7c2d6"
+log_bg = "#10141e"
+log_border = "#4a6394"
+log_text = "#d7dfed"
+log_accent = "#7fb4ff"
+hint_color = "#8c98b0"
+
+[[dark.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = "14%"
+w = "100%"
+h = "72%"
+bg = "radial-gradient(circle at 22% 18%, #2d3b59 0%, #1d2638 55%, #121824 100%)"
+
+[[dark.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = "14%"
+bg = "linear-gradient(to bottom, #0f141f 0%, #090c14 100%)"
+
+[[dark.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = "14%"
+w = "100%"
+h = 2
+bg = "linear-gradient(to right, #2b3852 0%, #5c78ab 48%, #2b3852 100%)"
+
+[[dark.power_splash.layers]]
+anchor = "bottom_left"
+x = 0
+y = 0
+w = "100%"
+h = "14%"
+bg = "linear-gradient(to bottom, #0d111a 0%, #080a10 100%)"
+
+[[dark.power_splash.layers]]
+anchor = "bottom_left"
+x = 0
+y = "-14%"
+w = "100%"
+h = 2
+bg = "linear-gradient(to right, #232d42 0%, #d96b18 50%, #232d42 100%)"

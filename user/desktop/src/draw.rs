@@ -443,6 +443,15 @@ fn f32_to_u8(alpha: f32) -> u8 {
     (alpha.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
+/// Pre-bake a 256-entry `0x00RRGGBB` gradient lookup table from sorted CSS stops.
+pub fn build_gradient_lut(stops: &[(f32, u32)]) -> [u32; 256] {
+    let mut lut = [0u32; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        *slot = Canvas::sample_gradient_stops(stops, i as f32 / 255.0) & 0x00ff_ffff;
+    }
+    lut
+}
+
 /// Premultiplied `0xAARRGGBB` sprite used for icons, logos and thumbnails.
 #[derive(Clone, Debug)]
 pub struct Sprite {
@@ -725,6 +734,28 @@ impl PixelBuffer {
     }
 }
 
+struct RoundedRowCorner {
+    x_start: i32,
+    x_end: i32,
+    cx: f32,
+    dy: f32,
+    rf: f32,
+}
+
+enum RoundedRowSpans {
+    Circle {
+        cx: f32,
+        dy: f32,
+        rf: f32,
+    },
+    Rect {
+        mid_l: i32,
+        mid_r: i32,
+        left: Option<RoundedRowCorner>,
+        right: Option<RoundedRowCorner>,
+    },
+}
+
 pub struct Canvas {
     pub width: usize,
     pub height: usize,
@@ -768,6 +799,19 @@ impl Canvas {
 
     pub const fn is_argb(&self) -> bool {
         self.argb
+    }
+
+    /// Consume this offscreen canvas into a premultiplied `Sprite` without copying heap buffers.
+    pub fn into_sprite(mut self) -> Sprite {
+        let pixels = match &mut self.buffer {
+            PixelBuffer::Heap(vec) => std::mem::take(vec),
+            PixelBuffer::Shm { .. } => self.buffer.as_slice().to_vec(),
+        };
+        Sprite {
+            width: self.width as u32,
+            height: self.height as u32,
+            pixels,
+        }
     }
 
     #[inline(always)]
@@ -1232,6 +1276,27 @@ impl Canvas {
         if a_u8 == 0 || rect.is_empty() {
             return;
         }
+        if rect.w == rect.h && radius * 2 >= rect.w && rect.w >= 4 {
+            let clip = self.clip_rect(rect);
+            if clip.is_empty() {
+                return;
+            }
+            self.mark_dirty(clip);
+            let cx = rect.x as f32 + rect.w as f32 * 0.5;
+            let cy = rect.y as f32 + rect.h as f32 * 0.5;
+            let rf = rect.w as f32 * 0.5;
+            for y in clip.y..clip.bottom() {
+                let dy = y as f32 + 0.5 - cy;
+                for x in clip.x..clip.right() {
+                    let dx = x as f32 + 0.5 - cx;
+                    let cov = Self::corner_coverage(dx, dy, rf);
+                    if cov > 0.0 {
+                        self.blend_pixel_u8(x, y, color, ((a_u8 as f32) * cov + 0.5) as u8);
+                    }
+                }
+            }
+            return;
+        }
         let r = radius.max(0).min(rect.w / 2).min(rect.h / 2);
         if r == 0 {
             self.fill_u8(rect, color, a_u8);
@@ -1424,6 +1489,31 @@ impl Canvas {
         if a_u8 == 0 || rect.is_empty() {
             return;
         }
+        if rect.w == rect.h && radius * 2 >= rect.w && rect.w >= 4 {
+            let clip = self.clip_rect(rect);
+            if clip.is_empty() {
+                return;
+            }
+            self.mark_dirty(clip);
+            let cx = rect.x as f32 + rect.w as f32 * 0.5;
+            let cy = rect.y as f32 + rect.h as f32 * 0.5;
+            let outer_r = rect.w as f32 * 0.5;
+            let inner_r = (outer_r - bw as f32).max(0.0);
+            for y in clip.y..clip.bottom() {
+                let dy = y as f32 + 0.5 - cy;
+                for x in clip.x..clip.right() {
+                    let dx = x as f32 + 0.5 - cx;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    let outer_cov = (outer_r + 0.5 - dist).clamp(0.0, 1.0);
+                    let inner_cov = (dist - inner_r + 0.5).clamp(0.0, 1.0);
+                    let cov = outer_cov * inner_cov;
+                    if cov > 0.0 {
+                        self.blend_pixel_u8(x, y, color, ((a_u8 as f32) * cov + 0.5) as u8);
+                    }
+                }
+            }
+            return;
+        }
         let r = radius.max(0).min(rect.w / 2).min(rect.h / 2);
         if r == 0 && bw == 1 && a_u8 == 255 {
             self.border_1px(rect, color);
@@ -1534,6 +1624,12 @@ impl Canvas {
         if !rect.contains(x, y) {
             return 0.0;
         }
+        if rect.w == rect.h && radii.iter().all(|&r| r * 2 >= rect.w) && rect.w >= 4 {
+            let cx = rect.x as f32 + rect.w as f32 * 0.5;
+            let cy = rect.y as f32 + rect.h as f32 * 0.5;
+            let rf = rect.w as f32 * 0.5;
+            return Self::corner_coverage(x as f32 + 0.5 - cx, y as f32 + 0.5 - cy, rf);
+        }
         let max_r = (rect.w / 2).min(rect.h / 2).max(0);
         let tl = radii[0].clamp(0, max_r);
         let tr = radii[1].clamp(0, max_r);
@@ -1574,15 +1670,22 @@ impl Canvas {
         1.0
     }
 
-    fn fill_rounded_row_corners(
-        &mut self,
+    fn rounded_row_spans(
         rect: Rect,
         clip: Rect,
         radii: [i32; 4],
         y: i32,
-        row_color: u32,
-        a_u8: u8,
-    ) {
+    ) -> RoundedRowSpans {
+        if rect.w == rect.h && radii.iter().all(|&r| r * 2 >= rect.w) && rect.w >= 4 {
+            let cx = rect.x as f32 + rect.w as f32 * 0.5;
+            let cy = rect.y as f32 + rect.h as f32 * 0.5;
+            let rf = rect.w as f32 * 0.5;
+            return RoundedRowSpans::Circle {
+                cx,
+                dy: y as f32 + 0.5 - cy,
+                rf,
+            };
+        }
         let max_r = (rect.w / 2).min(rect.h / 2).max(0);
         let tl = radii[0].clamp(0, max_r);
         let tr = radii[1].clamp(0, max_r);
@@ -1604,36 +1707,90 @@ impl Canvas {
             None
         };
 
-        if left_r.is_none() && right_r.is_none() {
-            self.fill_u8(Rect::new(clip.x, y, clip.w, 1), row_color, a_u8);
-            return;
-        }
         let l_inset = left_r.map_or(0, |(r, _)| r);
         let r_inset = right_r.map_or(0, |(r, _)| r);
         let mid_l = (rect.x + l_inset).max(clip.x);
         let mid_r = (rect.right() - r_inset).min(clip.right());
-        if mid_r > mid_l {
-            self.fill_u8(Rect::new(mid_l, y, mid_r - mid_l, 1), row_color, a_u8);
+        let left = left_r.and_then(|(r, cy)| {
+            let end = mid_l.min(clip.right());
+            if clip.x < end {
+                let rf = r as f32;
+                Some(RoundedRowCorner {
+                    x_start: clip.x,
+                    x_end: end,
+                    cx: rect.x as f32 + rf,
+                    dy: y as f32 + 0.5 - cy,
+                    rf,
+                })
+            } else {
+                None
+            }
+        });
+        let right = right_r.and_then(|(r, cy)| {
+            let start = mid_r.max(clip.x);
+            if start < clip.right() {
+                Some(RoundedRowCorner {
+                    x_start: start,
+                    x_end: clip.right(),
+                    cx: (rect.right() - r) as f32,
+                    dy: y as f32 + 0.5 - cy,
+                    rf: r as f32,
+                })
+            } else {
+                None
+            }
+        });
+        RoundedRowSpans::Rect {
+            mid_l,
+            mid_r,
+            left,
+            right,
         }
-        if let Some((r, cy)) = left_r {
-            let rf = r as f32;
-            let dy = y as f32 + 0.5 - cy;
-            let cx = rect.x as f32 + rf;
-            for x in clip.x..mid_l.min(clip.right()) {
-                let cov = Self::corner_coverage(x as f32 + 0.5 - cx, dy, rf);
-                if cov > 0.0 {
-                    self.blend_pixel_u8(x, y, row_color, ((a_u8 as f32) * cov + 0.5) as u8);
+    }
+
+    fn fill_rounded_row_corners(
+        &mut self,
+        rect: Rect,
+        clip: Rect,
+        radii: [i32; 4],
+        y: i32,
+        row_color: u32,
+        a_u8: u8,
+    ) {
+        match Self::rounded_row_spans(rect, clip, radii, y) {
+            RoundedRowSpans::Circle { cx, dy, rf } => {
+                for x in clip.x..clip.right() {
+                    let cov = Self::corner_coverage(x as f32 + 0.5 - cx, dy, rf);
+                    if cov > 0.0 {
+                        self.blend_pixel_u8(x, y, row_color, ((a_u8 as f32) * cov + 0.5) as u8);
+                    }
                 }
             }
-        }
-        if let Some((r, cy)) = right_r {
-            let rf = r as f32;
-            let dy = y as f32 + 0.5 - cy;
-            let cx = (rect.right() - r) as f32;
-            for x in mid_r.max(clip.x)..clip.right() {
-                let cov = Self::corner_coverage(x as f32 + 0.5 - cx, dy, rf);
-                if cov > 0.0 {
-                    self.blend_pixel_u8(x, y, row_color, ((a_u8 as f32) * cov + 0.5) as u8);
+            RoundedRowSpans::Rect {
+                mid_l,
+                mid_r,
+                left,
+                right,
+            } => {
+                if mid_r > mid_l {
+                    self.fill_u8(Rect::new(mid_l, y, mid_r - mid_l, 1), row_color, a_u8);
+                }
+                for corner in [left, right].into_iter().flatten() {
+                    for x in corner.x_start..corner.x_end {
+                        let cov = Self::corner_coverage(
+                            x as f32 + 0.5 - corner.cx,
+                            corner.dy,
+                            corner.rf,
+                        );
+                        if cov > 0.0 {
+                            self.blend_pixel_u8(
+                                x,
+                                y,
+                                row_color,
+                                ((a_u8 as f32) * cov + 0.5) as u8,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1665,6 +1822,30 @@ impl Canvas {
         }
     }
 
+    /// Fill `rect` with a multi-stop vertical CSS `linear-gradient(to bottom, ...)` using a pre-baked 256-entry LUT.
+    pub fn multi_stop_gradient_v_lut(
+        &mut self,
+        rect: Rect,
+        lut: &[u32; 256],
+        radii: [i32; 4],
+        alpha: f32,
+    ) {
+        let a_u8 = f32_to_u8(alpha);
+        if a_u8 == 0 || rect.is_empty() {
+            return;
+        }
+        let clip = self.clip_rect(rect);
+        if clip.is_empty() {
+            return;
+        }
+        self.mark_dirty(clip);
+        let span = (rect.h - 1).max(1);
+        for y in clip.y..clip.bottom() {
+            let idx = (((y - rect.y) * 255 + span / 2) / span).clamp(0, 255) as usize;
+            self.fill_rounded_row_corners(rect, clip, radii, y, lut[idx], a_u8);
+        }
+    }
+
     /// Fill `rect` with a multi-stop vertical CSS `linear-gradient(to bottom, ...)` and 4-corner radii.
     pub fn multi_stop_gradient_v(
         &mut self,
@@ -1673,8 +1854,23 @@ impl Canvas {
         radii: [i32; 4],
         alpha: f32,
     ) {
+        if stops.is_empty() {
+            return;
+        }
+        let lut = build_gradient_lut(stops);
+        self.multi_stop_gradient_v_lut(rect, &lut, radii, alpha);
+    }
+
+    /// Fill `rect` with a multi-stop horizontal CSS `linear-gradient(to right, ...)` using a pre-baked 256-entry LUT.
+    pub fn multi_stop_gradient_h_lut(
+        &mut self,
+        rect: Rect,
+        lut: &[u32; 256],
+        radii: [i32; 4],
+        alpha: f32,
+    ) {
         let a_u8 = f32_to_u8(alpha);
-        if a_u8 == 0 || rect.is_empty() || stops.is_empty() {
+        if a_u8 == 0 || rect.is_empty() {
             return;
         }
         let clip = self.clip_rect(rect);
@@ -1682,11 +1878,89 @@ impl Canvas {
             return;
         }
         self.mark_dirty(clip);
-        let span = (rect.h - 1).max(1) as f32;
+
+        let w = clip.w as usize;
+        let mut stack_buf = [0u32; 1024];
+        let mut heap_buf = Vec::new();
+        let row_cols: &mut [u32] = if w <= stack_buf.len() {
+            &mut stack_buf[..w]
+        } else {
+            heap_buf.resize(w, 0);
+            heap_buf.as_mut_slice()
+        };
+        let span = (rect.w - 1).max(1);
+        let argb = self.argb;
+        let fill_mask = if a_u8 == 255 && argb { 0xff00_0000 } else { 0 };
+        for (i, slot) in row_cols.iter_mut().enumerate() {
+            let dx = (clip.x - rect.x) + i as i32;
+            let idx = ((dx * 255 + span / 2) / span).clamp(0, 255) as usize;
+            *slot = (lut[idx] & 0x00ff_ffff) | fill_mask;
+        }
+
+        let dw = self.width;
+        let pixels = self.buffer.as_mut_slice();
         for y in clip.y..clip.bottom() {
-            let t = ((y - rect.y) as f32 / span).clamp(0.0, 1.0);
-            let row_color = Self::sample_gradient_stops(stops, t);
-            self.fill_rounded_row_corners(rect, clip, radii, y, row_color, a_u8);
+            let row_off = y as usize * dw;
+            match Self::rounded_row_spans(rect, clip, radii, y) {
+                RoundedRowSpans::Circle { cx, dy, rf } => {
+                    for (i, x) in (clip.x..clip.right()).enumerate() {
+                        let cov = Self::corner_coverage(x as f32 + 0.5 - cx, dy, rf);
+                        let eff_a = ((a_u8 as f32) * cov + 0.5) as u8;
+                        if eff_a != 0 {
+                            let idx = row_off + x as usize;
+                            let src = row_cols[i];
+                            pixels[idx] = if argb {
+                                src_over_u8(pixels[idx], src, eff_a)
+                            } else {
+                                blend_u8(pixels[idx], src, eff_a)
+                            };
+                        }
+                    }
+                }
+                RoundedRowSpans::Rect {
+                    mid_l,
+                    mid_r,
+                    left,
+                    right,
+                } => {
+                    if mid_r > mid_l {
+                        let off = (mid_l - clip.x) as usize;
+                        let cnt = (mid_r - mid_l) as usize;
+                        let dst = &mut pixels[row_off + mid_l as usize..row_off + mid_r as usize];
+                        let src_slice = &row_cols[off..off + cnt];
+                        if a_u8 == 255 {
+                            dst.copy_from_slice(src_slice);
+                        } else if argb {
+                            for (d, &s) in dst.iter_mut().zip(src_slice.iter()) {
+                                *d = src_over_u8(*d, s, a_u8);
+                            }
+                        } else {
+                            for (d, &s) in dst.iter_mut().zip(src_slice.iter()) {
+                                *d = blend_u8(*d, s, a_u8);
+                            }
+                        }
+                    }
+                    for corner in [left, right].into_iter().flatten() {
+                        for x in corner.x_start..corner.x_end {
+                            let cov = Self::corner_coverage(
+                                x as f32 + 0.5 - corner.cx,
+                                corner.dy,
+                                corner.rf,
+                            );
+                            let eff_a = ((a_u8 as f32) * cov + 0.5) as u8;
+                            if eff_a != 0 {
+                                let idx = row_off + x as usize;
+                                let src = row_cols[(x - clip.x) as usize];
+                                pixels[idx] = if argb {
+                                    src_over_u8(pixels[idx], src, eff_a)
+                                } else {
+                                    blend_u8(pixels[idx], src, eff_a)
+                                };
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1698,8 +1972,23 @@ impl Canvas {
         radii: [i32; 4],
         alpha: f32,
     ) {
+        if stops.is_empty() {
+            return;
+        }
+        let lut = build_gradient_lut(stops);
+        self.multi_stop_gradient_h_lut(rect, &lut, radii, alpha);
+    }
+
+    /// Fill `rect` with a multi-stop diagonal (`135deg`) gradient using a pre-baked 256-entry LUT.
+    pub fn multi_stop_gradient_diag_lut(
+        &mut self,
+        rect: Rect,
+        lut: &[u32; 256],
+        radii: [i32; 4],
+        alpha: f32,
+    ) {
         let a_u8 = f32_to_u8(alpha);
-        if a_u8 == 0 || rect.is_empty() || stops.is_empty() {
+        if a_u8 == 0 || rect.is_empty() {
             return;
         }
         let clip = self.clip_rect(rect);
@@ -1707,14 +1996,80 @@ impl Canvas {
             return;
         }
         self.mark_dirty(clip);
-        let span = (rect.w - 1).max(1) as f32;
+        let span = (rect.w - 1).max(1) + (rect.h - 1).max(1);
+        let dw = self.width;
+        let argb = self.argb;
+        let opaque_mask = if argb { 0xff00_0000 } else { 0 };
+        let pixels = self.buffer.as_mut_slice();
         for y in clip.y..clip.bottom() {
-            for x in clip.x..clip.right() {
-                let cov = Self::corner_point_coverage(rect, radii, x, y);
-                if cov > 0.0 {
-                    let t = ((x - rect.x) as f32 / span).clamp(0.0, 1.0);
-                    let col = Self::sample_gradient_stops(stops, t);
-                    self.blend_pixel_u8(x, y, col, ((a_u8 as f32) * cov + 0.5) as u8);
+            let row_off = y as usize * dw;
+            let dy = y - rect.y;
+            match Self::rounded_row_spans(rect, clip, radii, y) {
+                RoundedRowSpans::Circle { cx, dy: cdy, rf } => {
+                    for x in clip.x..clip.right() {
+                        let cov = Self::corner_coverage(x as f32 + 0.5 - cx, cdy, rf);
+                        let eff_a = ((a_u8 as f32) * cov + 0.5) as u8;
+                        if eff_a != 0 {
+                            let idx = (((x - rect.x + dy) * 255 + span / 2) / span)
+                                .clamp(0, 255) as usize;
+                            let p = row_off + x as usize;
+                            pixels[p] = if argb {
+                                src_over_u8(pixels[p], lut[idx], eff_a)
+                            } else {
+                                blend_u8(pixels[p], lut[idx], eff_a)
+                            };
+                        }
+                    }
+                }
+                RoundedRowSpans::Rect {
+                    mid_l,
+                    mid_r,
+                    left,
+                    right,
+                } => {
+                    if mid_r > mid_l {
+                        let base_num = (mid_l - rect.x) + dy;
+                        let dst = &mut pixels[row_off + mid_l as usize..row_off + mid_r as usize];
+                        if a_u8 == 255 {
+                            for (i, slot) in dst.iter_mut().enumerate() {
+                                let idx = (((base_num + i as i32) * 255 + span / 2) / span)
+                                    .clamp(0, 255) as usize;
+                                *slot = lut[idx] | opaque_mask;
+                            }
+                        } else if argb {
+                            for (i, slot) in dst.iter_mut().enumerate() {
+                                let idx = (((base_num + i as i32) * 255 + span / 2) / span)
+                                    .clamp(0, 255) as usize;
+                                *slot = src_over_u8(*slot, lut[idx], a_u8);
+                            }
+                        } else {
+                            for (i, slot) in dst.iter_mut().enumerate() {
+                                let idx = (((base_num + i as i32) * 255 + span / 2) / span)
+                                    .clamp(0, 255) as usize;
+                                *slot = blend_u8(*slot, lut[idx], a_u8);
+                            }
+                        }
+                    }
+                    for corner in [left, right].into_iter().flatten() {
+                        for x in corner.x_start..corner.x_end {
+                            let cov = Self::corner_coverage(
+                                x as f32 + 0.5 - corner.cx,
+                                corner.dy,
+                                corner.rf,
+                            );
+                            let eff_a = ((a_u8 as f32) * cov + 0.5) as u8;
+                            if eff_a != 0 {
+                                let idx = (((x - rect.x + dy) * 255 + span / 2) / span)
+                                    .clamp(0, 255) as usize;
+                                let p = row_off + x as usize;
+                                pixels[p] = if argb {
+                                    src_over_u8(pixels[p], lut[idx], eff_a)
+                                } else {
+                                    blend_u8(pixels[p], lut[idx], eff_a)
+                                };
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1728,8 +2083,25 @@ impl Canvas {
         radii: [i32; 4],
         alpha: f32,
     ) {
+        if stops.is_empty() {
+            return;
+        }
+        let lut = build_gradient_lut(stops);
+        self.multi_stop_gradient_diag_lut(rect, &lut, radii, alpha);
+    }
+
+    /// Fill `rect` with a CSS `radial-gradient(circle at cx% cy%, ...)` using a pre-baked 256-entry LUT.
+    pub fn multi_stop_radial_gradient_lut(
+        &mut self,
+        rect: Rect,
+        cx_pct: f32,
+        cy_pct: f32,
+        lut: &[u32; 256],
+        radii: [i32; 4],
+        alpha: f32,
+    ) {
         let a_u8 = f32_to_u8(alpha);
-        if a_u8 == 0 || rect.is_empty() || stops.is_empty() {
+        if a_u8 == 0 || rect.is_empty() {
             return;
         }
         let clip = self.clip_rect(rect);
@@ -1737,14 +2109,91 @@ impl Canvas {
             return;
         }
         self.mark_dirty(clip);
-        let span = ((rect.w - 1).max(1) + (rect.h - 1).max(1)) as f32;
+        let cx = rect.x as f32 + rect.w as f32 * cx_pct;
+        let cy = rect.y as f32 + rect.h as f32 * cy_pct;
+        let max_dx = (cx - rect.x as f32).abs().max((rect.right() as f32 - cx).abs());
+        let max_dy = (cy - rect.y as f32).abs().max((rect.bottom() as f32 - cy).abs());
+        let max_dist = (max_dx * max_dx + max_dy * max_dy).sqrt().max(1.0);
+        let inv_scale = 255.0 / max_dist;
+        let dw = self.width;
+        let argb = self.argb;
+        let opaque_mask = if argb { 0xff00_0000 } else { 0 };
+        let pixels = self.buffer.as_mut_slice();
         for y in clip.y..clip.bottom() {
-            for x in clip.x..clip.right() {
-                let cov = Self::corner_point_coverage(rect, radii, x, y);
-                if cov > 0.0 {
-                    let t = (((x - rect.x) + (y - rect.y)) as f32 / span).clamp(0.0, 1.0);
-                    let col = Self::sample_gradient_stops(stops, t);
-                    self.blend_pixel_u8(x, y, col, ((a_u8 as f32) * cov + 0.5) as u8);
+            let row_off = y as usize * dw;
+            let dy = y as f32 + 0.5 - cy;
+            let dy_sq = dy * dy;
+            match Self::rounded_row_spans(rect, clip, radii, y) {
+                RoundedRowSpans::Circle { cx: ccx, dy: cdy, rf } => {
+                    for x in clip.x..clip.right() {
+                        let cov = Self::corner_coverage(x as f32 + 0.5 - ccx, cdy, rf);
+                        let eff_a = ((a_u8 as f32) * cov + 0.5) as u8;
+                        if eff_a != 0 {
+                            let dx = x as f32 + 0.5 - cx;
+                            let idx = (((dx * dx + dy_sq).sqrt() * inv_scale) + 0.5)
+                                .clamp(0.0, 255.0) as usize;
+                            let p = row_off + x as usize;
+                            pixels[p] = if argb {
+                                src_over_u8(pixels[p], lut[idx], eff_a)
+                            } else {
+                                blend_u8(pixels[p], lut[idx], eff_a)
+                            };
+                        }
+                    }
+                }
+                RoundedRowSpans::Rect {
+                    mid_l,
+                    mid_r,
+                    left,
+                    right,
+                } => {
+                    if mid_r > mid_l {
+                        let base_dx = mid_l as f32 + 0.5 - cx;
+                        let dst = &mut pixels[row_off + mid_l as usize..row_off + mid_r as usize];
+                        if a_u8 == 255 {
+                            for (i, slot) in dst.iter_mut().enumerate() {
+                                let dx = base_dx + i as f32;
+                                let idx = (((dx * dx + dy_sq).sqrt() * inv_scale) + 0.5)
+                                    .clamp(0.0, 255.0) as usize;
+                                *slot = lut[idx] | opaque_mask;
+                            }
+                        } else if argb {
+                            for (i, slot) in dst.iter_mut().enumerate() {
+                                let dx = base_dx + i as f32;
+                                let idx = (((dx * dx + dy_sq).sqrt() * inv_scale) + 0.5)
+                                    .clamp(0.0, 255.0) as usize;
+                                *slot = src_over_u8(*slot, lut[idx], a_u8);
+                            }
+                        } else {
+                            for (i, slot) in dst.iter_mut().enumerate() {
+                                let dx = base_dx + i as f32;
+                                let idx = (((dx * dx + dy_sq).sqrt() * inv_scale) + 0.5)
+                                    .clamp(0.0, 255.0) as usize;
+                                *slot = blend_u8(*slot, lut[idx], a_u8);
+                            }
+                        }
+                    }
+                    for corner in [left, right].into_iter().flatten() {
+                        for x in corner.x_start..corner.x_end {
+                            let cov = Self::corner_coverage(
+                                x as f32 + 0.5 - corner.cx,
+                                corner.dy,
+                                corner.rf,
+                            );
+                            let eff_a = ((a_u8 as f32) * cov + 0.5) as u8;
+                            if eff_a != 0 {
+                                let dx = x as f32 + 0.5 - cx;
+                                let idx = (((dx * dx + dy_sq).sqrt() * inv_scale) + 0.5)
+                                    .clamp(0.0, 255.0) as usize;
+                                let p = row_off + x as usize;
+                                pixels[p] = if argb {
+                                    src_over_u8(pixels[p], lut[idx], eff_a)
+                                } else {
+                                    blend_u8(pixels[p], lut[idx], eff_a)
+                                };
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1760,32 +2209,11 @@ impl Canvas {
         radii: [i32; 4],
         alpha: f32,
     ) {
-        let a_u8 = f32_to_u8(alpha);
-        if a_u8 == 0 || rect.is_empty() || stops.is_empty() {
+        if stops.is_empty() {
             return;
         }
-        let clip = self.clip_rect(rect);
-        if clip.is_empty() {
-            return;
-        }
-        self.mark_dirty(clip);
-        let cx = rect.x as f32 + rect.w as f32 * cx_pct;
-        let cy = rect.y as f32 + rect.h as f32 * cy_pct;
-        let max_dx = (cx - rect.x as f32).abs().max((rect.right() as f32 - cx).abs());
-        let max_dy = (cy - rect.y as f32).abs().max((rect.bottom() as f32 - cy).abs());
-        let max_dist = (max_dx * max_dx + max_dy * max_dy).sqrt().max(1.0);
-        for y in clip.y..clip.bottom() {
-            let dy = y as f32 + 0.5 - cy;
-            for x in clip.x..clip.right() {
-                let cov = Self::corner_point_coverage(rect, radii, x, y);
-                if cov > 0.0 {
-                    let dx = x as f32 + 0.5 - cx;
-                    let t = ((dx * dx + dy * dy).sqrt() / max_dist).clamp(0.0, 1.0);
-                    let col = Self::sample_gradient_stops(stops, t);
-                    self.blend_pixel_u8(x, y, col, ((a_u8 as f32) * cov + 0.5) as u8);
-                }
-            }
-        }
+        let lut = build_gradient_lut(stops);
+        self.multi_stop_radial_gradient_lut(rect, cx_pct, cy_pct, &lut, radii, alpha);
     }
 
     /// Draw a border with per-corner radii `[tl, tr, br, bl]`.
@@ -2104,17 +2532,30 @@ impl Canvas {
             let sy = (oy + py) as usize;
             let src_row = &sprite.pixels[sy * sw + sx_start..sy * sw + sx_start + cnt];
             let dst_row = &mut pixels[py as usize * dw + dx_start..py as usize * dw + dx_start + cnt];
-            for (slot, &raw) in dst_row.iter_mut().zip(src_row.iter()) {
-                let mut spx = raw;
-                if (spx >> 24) != 0 {
-                    if opacity < 255 {
-                        spx = scale_premul(spx, opacity);
+            if opacity == 255 {
+                let opaque_mask = if argb { 0xff00_0000 } else { 0 };
+                for (slot, &spx) in dst_row.iter_mut().zip(src_row.iter()) {
+                    let sa = spx >> 24;
+                    if sa == 255 {
+                        *slot = (spx & 0x00ff_ffff) | opaque_mask;
+                    } else if sa != 0 {
+                        *slot = if argb {
+                            src_over_premul(*slot, spx)
+                        } else {
+                            blend_premul(*slot, spx)
+                        };
                     }
-                    *slot = if argb {
-                        src_over_premul(*slot, spx)
-                    } else {
-                        blend_premul(*slot, spx)
-                    };
+                }
+            } else {
+                for (slot, &raw) in dst_row.iter_mut().zip(src_row.iter()) {
+                    if (raw >> 24) != 0 {
+                        let spx = scale_premul(raw, opacity);
+                        *slot = if argb {
+                            src_over_premul(*slot, spx)
+                        } else {
+                            blend_premul(*slot, spx)
+                        };
+                    }
                 }
             }
         }

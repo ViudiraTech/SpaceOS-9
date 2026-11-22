@@ -579,7 +579,7 @@ pub fn run(argument: Option<&str>) -> Result<()> {
         }
 
         if app.needs_redraw {
-            app.set_glass_toolbar_height(if app.theme.is_vortexglass() {
+            app.set_glass_toolbar_height(if app.theme.glass_chrome_enabled() {
                 TOOLBAR_H
             } else {
                 0
@@ -609,33 +609,11 @@ fn draw_browser(
     let w = canvas.width as i32;
     let h = canvas.height as i32;
     let content = content_rect(theme, w, h);
-    let is_win98 = theme.is_win98();
-    let is_vortex = theme.is_vortexglass();
-    let ctrl_r = theme.radius_control();
     canvas.clear(theme.window);
 
-    // Top toolbar (extended DWM Aero glass band under titlebar in VortexGlass)
+    // Top toolbar
     let toolbar_r = Rect::new(content.x, content.y, content.w, TOOLBAR_H);
-    if is_vortex {
-        ui::draw_aero_extended_toolbar(canvas, theme, toolbar_r, glass_toolbar, true);
-    } else {
-        canvas.fill(toolbar_r, theme.panel);
-        if is_win98 {
-            canvas.fill(
-                Rect::new(content.x, content.y + TOOLBAR_H - 2, content.w, 1),
-                theme.bevel_shadow,
-            );
-            canvas.fill(
-                Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
-                theme.bevel_hi,
-            );
-        } else {
-            canvas.fill(
-                Rect::new(content.x, content.y + TOOLBAR_H - 1, content.w, 1),
-                theme.window_border,
-            );
-        }
-    }
+    ui::toolbar_surface(canvas, theme, toolbar_r, glass_toolbar, true);
 
     let can_back = !state.history.is_empty();
     let can_up = state.current.parent().is_some_and(|p| p != state.current);
@@ -690,20 +668,7 @@ fn draw_browser(
         (term_btn.x - (content.x + 150)).max(80),
         28,
     );
-    if is_win98 {
-        canvas.fill(path_box, theme.input_bg);
-        ui::sunken_bevel(canvas, theme, path_box);
-    } else if is_vortex {
-        canvas.rounded_rect(path_box, ctrl_r, theme.input_bg, 0.94);
-        canvas.rounded_border(path_box, ctrl_r, theme.window_border, 0.90, 1);
-        canvas.fill(
-            Rect::new(path_box.x + 2, path_box.y + 1, (path_box.w - 4).max(0), 1),
-            crate::draw::mix(theme.input_bg, 0xffffff, if theme.is_dark() { 0.14 } else { 0.85 }),
-        );
-    } else {
-        canvas.rounded_rect(path_box, ctrl_r, theme.input_bg, 1.0);
-        canvas.rounded_border(path_box, ctrl_r, theme.panel_border, 1.0, 1);
-    }
+    ui::input_frame(canvas, theme, path_box, false);
     icons::draw(
         canvas,
         Icon::Folder,
@@ -728,14 +693,7 @@ fn draw_browser(
     let body_top = content.y + TOOLBAR_H;
     let body_bottom = (content.bottom() - STATUS_H).max(body_top);
     let body_h = body_bottom - body_top;
-    canvas.fill(
-        Rect::new(content.x, body_top, SIDEBAR_W, body_h),
-        theme.window_alt,
-    );
-    canvas.fill(
-        Rect::new(content.x + SIDEBAR_W - 1, body_top, 1, body_h),
-        theme.window_border,
-    );
+    ui::sidebar_surface(canvas, theme, Rect::new(content.x, body_top, SIDEBAR_W, body_h));
     text.draw(
         canvas,
         "位置",
@@ -749,17 +707,7 @@ fn draw_browser(
     for (i, place) in state.places.iter().enumerate() {
         let r = place_rect(content, i);
         let active = state.current == place.path;
-        let fg = if is_win98 || is_vortex {
-            ui::list_item_bg(canvas, theme, r, active, state.hover == HoverTarget::Place(i))
-        } else {
-            if active {
-                canvas.rounded_rect(r, ctrl_r, theme.accent_soft, 1.0);
-                canvas.fill(Rect::new(r.x, r.y + 6, 3, r.h - 12), theme.accent);
-            } else if state.hover == HoverTarget::Place(i) {
-                canvas.rounded_rect(r, ctrl_r, theme.panel_hover, 1.0);
-            }
-            if active { theme.text } else { theme.text_dim }
-        };
+        let fg = ui::list_item_bg(canvas, theme, r, active, state.hover == HoverTarget::Place(i));
         icons::draw(canvas, place.icon, r.x + 10, r.y + 7, 16, None);
         text.draw(
             canvas,
@@ -776,20 +724,7 @@ fn draw_browser(
     let table_x = content.x + SIDEBAR_W;
     let table_w = (content.w - SIDEBAR_W).max(1);
     let header_r = Rect::new(table_x, body_top, table_w, HEADER_H);
-    if is_vortex {
-        let (h_top, h_bot) = if theme.is_dark() {
-            (0x212c3c, 0x161f2c)
-        } else {
-            (0xfafcff, 0xe8eff8)
-        };
-        canvas.fill_gradient_v(header_r, h_top, h_bot, 1.0, 1.0);
-    } else {
-        canvas.fill(header_r, theme.panel);
-    }
-    canvas.fill(
-        Rect::new(table_x, body_top + HEADER_H - 1, table_w, 1),
-        theme.window_border,
-    );
+    ui::toolbar_surface(canvas, theme, header_r, false, true);
     let hdr_y = (body_top + 19) as f32;
     let col_type_x = (content.right() - 170).max(table_x + 160);
     let col_size_right = (content.right() - SCROLLBAR_W - 14) as f32;
@@ -829,12 +764,11 @@ fn draw_browser(
         (table_w - SCROLLBAR_W - 2).max(1),
         (body_bottom - rows_top).max(0),
     );
-    if is_win98 {
-        canvas.fill(
-            Rect::new(table_x, rows_top, table_w, (body_bottom - rows_top).max(0)),
-            theme.input_bg,
-        );
-    }
+    ui::table_body_bg(
+        canvas,
+        theme,
+        Rect::new(table_x, rows_top, table_w, (body_bottom - rows_top).max(0)),
+    );
     let sb_track = scrollbar_track(content);
     let total_rows_h = (state.entries.len() as i32 * ROW_H) as f32;
 
@@ -870,24 +804,8 @@ fn draw_browser(
                 let is_sel = state.selected == Some(slot);
                 let is_hov = state.hover == HoverTarget::Row(slot);
                 let row_rect = Rect::new(table_x + 4, ry + 1, rows_clip.w - 6, ROW_H - 2);
-                let row_fg = if is_win98 || is_vortex {
-                    ui::list_item_bg(c, theme, row_rect, is_sel, is_hov)
-                } else {
-                    if is_sel {
-                        c.rounded_rect(row_rect, 4, theme.accent_soft, 1.0);
-                        c.rounded_border(row_rect, 4, theme.accent, 0.55, 1);
-                    } else if is_hov {
-                        c.rounded_rect(row_rect, 4, theme.panel_hover, 0.75);
-                    }
-                    theme.text
-                };
-                let sub_fg = if is_win98 && is_sel {
-                    theme.selection_text
-                } else if is_vortex && is_sel {
-                    crate::draw::mix(row_fg, theme.text_muted, 0.32)
-                } else {
-                    theme.text_muted
-                };
+                let row_fg = ui::list_item_bg(c, theme, row_rect, is_sel, is_hov);
+                let sub_fg = if is_sel { row_fg } else { theme.text_muted };
 
                 icons::draw(c, entry.icon, table_x + 12, ry + (ROW_H - 16) / 2, 16, None);
                 let max_name_w = (col_type_x - (table_x + 42)).max(48) as f32;
@@ -935,20 +853,7 @@ fn draw_browser(
     // Bottom status bar
     let status_y = content.bottom() - STATUS_H;
     let status_r = Rect::new(content.x, status_y, content.w, STATUS_H);
-    if is_vortex {
-        let (s_top, s_bot) = if theme.is_dark() {
-            (0x1f2b3c, 0x151e2b)
-        } else {
-            (0xf3f7fc, 0xe1ebf6)
-        };
-        canvas.fill_gradient_v(status_r, s_top, s_bot, 1.0, 1.0);
-    } else {
-        canvas.fill(status_r, theme.panel);
-    }
-    canvas.fill(
-        Rect::new(content.x, status_y, content.w, 1),
-        theme.window_border,
-    );
+    ui::status_bar_surface(canvas, theme, status_r);
     let shown_status = text.truncate(&state.status, (content.w - 28) as f32, 11.5, Face::Ui);
     text.draw(
         canvas,

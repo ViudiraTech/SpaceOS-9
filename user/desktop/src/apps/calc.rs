@@ -370,29 +370,11 @@ fn draw_calc(
     hover: Option<(usize, usize)>,
     pressed: Option<(usize, usize)>,
 ) {
-    let is_win98 = theme.is_win98();
-    let is_vortex = theme.is_vortexglass();
-    let ctrl_r = theme.radius_control();
     canvas.clear(theme.window);
 
     // Readout Display Area
     let display_r = Rect::new(content.x + 12, content.y + 8, content.w - 24, 88);
-    if is_win98 {
-        canvas.fill(display_r, theme.input_bg);
-        ui::sunken_bevel(canvas, theme, display_r);
-    } else if is_vortex {
-        let (lcd_top, lcd_bot, lcd_brd, lcd_rim) = if theme.is_dark() {
-            (0x131e2c, 0x1e2e42, 0x3b4d66, 0.20)
-        } else {
-            (0xe5effb, 0xffffff, 0x8e9fbb, 0.90)
-        };
-        ui::draw_win7_glossy_box(
-            canvas, display_r, 4, lcd_top, lcd_top, lcd_bot, lcd_bot, lcd_brd, lcd_rim,
-        );
-    } else {
-        canvas.rounded_rect(display_r, 6, theme.window_alt, 1.0);
-        canvas.rounded_border(display_r, 6, theme.window_border, 1.0, 1);
-    }
+    ui::input_frame(canvas, theme, display_r, false);
 
     // Expression history line
     if !state.expression_history.is_empty() {
@@ -442,7 +424,7 @@ fn draw_calc(
         for col in 0..4 {
             let bx = content.x + 12 + col as i32 * (btn_w + gap);
             let by = keypad_top + row as i32 * (btn_h + gap);
-            let mut btn_r = Rect::new(bx, by, btn_w, btn_h);
+            let btn_r = Rect::new(bx, by, btn_w, btn_h);
             let is_hover = hover == Some((row, col));
             let is_pressed = pressed == Some((row, col));
             let kind = BUTTON_GRID[row][col];
@@ -468,92 +450,20 @@ fn draw_calc(
                 _ => ("", false, false),
             };
 
-            if is_win98 {
-                let bg = if is_accent {
-                    theme.accent
-                } else if is_hover {
-                    theme.panel_hover
-                } else {
-                    theme.panel
-                };
-                canvas.fill(btn_r, bg);
-                if is_pressed {
-                    ui::sunken_bevel(canvas, theme, btn_r);
-                } else {
-                    ui::raised_bevel(canvas, theme, btn_r);
-                }
-            } else if is_vortex {
-                let hover_t = ui::animate_bool(
-                    (row as u64) << 16 | (col as u64),
-                    is_hover,
-                    ui::MOTION_HOVER,
-                );
-                ui::draw_aero_surface(
-                    canvas,
-                    theme,
-                    btn_r,
-                    ctrl_r,
-                    is_accent,
-                    is_func,
-                    hover_t,
-                    is_pressed,
-                );
+            let surf_fg = ui::action_button_surface(
+                canvas,
+                theme,
+                btn_r,
+                is_accent,
+                is_hover,
+                is_pressed,
+                false,
+            );
+            let shift = ui::button_press_offset(theme, is_pressed);
+            let fg = if !is_accent && is_func {
+                theme.text_dim
             } else {
-                // Press tactile micro-inset
-                if is_pressed {
-                    btn_r.x += 1;
-                    btn_r.y += 1;
-                    btn_r.w = (btn_r.w - 2).max(1);
-                    btn_r.h = (btn_r.h - 2).max(1);
-                }
-
-                let hover_t = ui::animate_bool(
-                    (row as u64) << 16 | (col as u64),
-                    is_hover,
-                    ui::MOTION_HOVER,
-                );
-
-                let bg = if is_accent {
-                    if is_pressed {
-                        theme.accent
-                    } else if hover_t > 0.001 {
-                        crate::draw::mix(theme.accent, 0xffffff, 0.12 * hover_t)
-                    } else {
-                        theme.accent
-                    }
-                } else if is_func {
-                    let base = theme.window_high;
-                    if is_pressed {
-                        theme.window_alt
-                    } else if hover_t > 0.001 {
-                        crate::draw::mix(base, theme.panel_hover, hover_t)
-                    } else {
-                        base
-                    }
-                } else {
-                    let base = theme.panel;
-                    if is_pressed {
-                        theme.window_alt
-                    } else if hover_t > 0.001 {
-                        crate::draw::mix(base, theme.panel_hover, hover_t)
-                    } else {
-                        base
-                    }
-                };
-
-                canvas.rounded_rect(btn_r, ctrl_r, bg, 1.0);
-                if !is_accent {
-                    canvas.rounded_border(btn_r, ctrl_r, theme.window_border, 1.0, 1);
-                }
-            }
-
-            let shift = if is_win98 && is_pressed { 1 } else { 0 };
-            let fg = if is_accent {
-                0xffffff
-            } else if is_func {
-                if is_win98 { 0x800000 } else { theme.text_dim }
-            } else {
-                theme.text
+                surf_fg
             };
 
             let face = if is_accent || is_func {

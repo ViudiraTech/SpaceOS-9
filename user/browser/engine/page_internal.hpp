@@ -33,6 +33,8 @@ struct SpacePage {
     bool is_win98 = false;
     bool is_vortex = false;
     int theme_style = SPACE_THEME_SPUI4;
+    SpaceThemePalette palette{};
+    bool has_palette = false;
     bool restyle_needed = false;
     bool relayout_needed = false;
     bool repaint_needed = false;

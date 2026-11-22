@@ -1,9 +1,224 @@
 use crate::storage::BrowserStorage;
+use spui_ui::draw::mix;
+use spui_ui::theme::Theme;
 
 pub struct BuiltinPage {
     pub status: u16,
     pub content_type: &'static str,
     pub body: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageThemeColors {
+    pub bg: u32,
+    pub card_bg: u32,
+    pub card_border: u32,
+    pub text: u32,
+    pub text_muted: u32,
+    pub accent: u32,
+    pub accent_soft: u32,
+    pub link: u32,
+    pub pill_bg: u32,
+    pub pill_text: u32,
+    pub pill_border: u32,
+    pub input_bg: u32,
+    pub input_border: u32,
+    pub button_bg: u32,
+    pub button_border: u32,
+    pub button_text: u32,
+    pub code_accent: u32,
+    pub radius_card: i32,
+    pub radius_control: i32,
+    pub dark_mode: bool,
+    pub theme_style: i32,
+}
+
+impl PageThemeColors {
+    pub fn from_theme(theme: &Theme) -> Self {
+        if theme.is_win98() {
+            return Self::from_legacy(false, 1);
+        }
+        if theme.is_vortexglass() {
+            return Self::from_legacy(theme.is_dark(), 2);
+        }
+        let dark = theme.is_dark();
+        let skin_ctrl = theme.skin().map(|s| &s.controls);
+        let card_bg = skin_ctrl
+            .and_then(|c| c.card.bg.as_ref().map(|b| b.primary_color()))
+            .unwrap_or(theme.window_high);
+        let card_border = skin_ctrl
+            .and_then(|c| c.card.border.map(|(col, _, _)| col))
+            .unwrap_or(theme.panel_border);
+        let button_bg = skin_ctrl
+            .and_then(|c| c.button_normal.bg.as_ref().map(|b| b.primary_color()))
+            .unwrap_or(theme.panel_high);
+        let button_border = skin_ctrl
+            .and_then(|c| c.button_normal.border.map(|(col, _, _)| col))
+            .unwrap_or(theme.window_border);
+        let button_text = skin_ctrl.map_or(theme.text, |c| c.button_text);
+        let input_bg = skin_ctrl.map_or(theme.input_bg, |c| c.input_bg);
+        let input_border = skin_ctrl.map_or(theme.window_border, |c| c.input_border);
+        let link = if dark {
+            mix(theme.accent, 0xffffff, 0.35)
+        } else {
+            theme.accent
+        };
+        Self {
+            bg: theme.window,
+            card_bg,
+            card_border,
+            text: theme.text,
+            text_muted: theme.text_muted,
+            accent: theme.accent,
+            accent_soft: theme.accent_soft,
+            link,
+            pill_bg: theme.accent_soft,
+            pill_text: if dark {
+                mix(theme.accent, 0xffffff, 0.55)
+            } else {
+                mix(theme.accent, 0x000000, 0.20)
+            },
+            pill_border: mix(theme.accent, card_border, 0.45),
+            input_bg,
+            input_border,
+            button_bg,
+            button_border,
+            button_text,
+            code_accent: if dark {
+                mix(theme.success, 0xffffff, 0.25)
+            } else {
+                mix(theme.success, 0x000000, 0.15)
+            },
+            radius_card: theme.radius_card().clamp(2, 12),
+            radius_control: theme.radius_control().clamp(2, 10),
+            dark_mode: dark,
+            theme_style: 0,
+        }
+    }
+
+    pub fn from_legacy(dark_mode: bool, theme_style: i32) -> Self {
+        match theme_style {
+            1 => Self {
+                bg: 0xc0c0c0,
+                card_bg: 0xffffff,
+                card_border: 0x808080,
+                text: 0x000000,
+                text_muted: 0x404040,
+                accent: 0x000080,
+                accent_soft: 0xdfdfdf,
+                link: 0x0000ee,
+                pill_bg: 0xdfdfdf,
+                pill_text: 0x000000,
+                pill_border: 0x808080,
+                input_bg: 0xffffff,
+                input_border: 0x808080,
+                button_bg: 0xc0c0c0,
+                button_border: 0x000000,
+                button_text: 0x000000,
+                code_accent: 0x000080,
+                radius_card: 0,
+                radius_control: 0,
+                dark_mode: false,
+                theme_style: 1,
+            },
+            2 if dark_mode => Self {
+                bg: 0x0d1726,
+                card_bg: 0x19263a,
+                card_border: 0x486387,
+                text: 0xe8f1fc,
+                text_muted: 0x9db6d4,
+                accent: 0x3b82f6,
+                accent_soft: 0x213754,
+                link: 0x6cb8ff,
+                pill_bg: 0x213754,
+                pill_text: 0x8ed0ff,
+                pill_border: 0x4873a6,
+                input_bg: 0x16202e,
+                input_border: 0x465a73,
+                button_bg: 0x243142,
+                button_border: 0x485b73,
+                button_text: 0xf1f6fc,
+                code_accent: 0x7dd3fc,
+                radius_card: 8,
+                radius_control: 4,
+                dark_mode: true,
+                theme_style: 2,
+            },
+            2 => Self {
+                bg: 0xdfeaf8,
+                card_bg: 0xfbfdff,
+                card_border: 0x8fb1d9,
+                text: 0x0f172a,
+                text_muted: 0x4f647d,
+                accent: 0x0066cc,
+                accent_soft: 0xe6f2ff,
+                link: 0x0066cc,
+                pill_bg: 0xe6f2ff,
+                pill_text: 0x0b57a4,
+                pill_border: 0x96c2ed,
+                input_bg: 0xffffff,
+                input_border: 0xabadb3,
+                button_bg: 0xebf1f8,
+                button_border: 0x7f97b2,
+                button_text: 0x0f172a,
+                code_accent: 0x0c5aa6,
+                radius_card: 8,
+                radius_control: 4,
+                dark_mode: false,
+                theme_style: 2,
+            },
+            _ if dark_mode => Self {
+                bg: 0x14161d,
+                card_bg: 0x1c202b,
+                card_border: 0x2d3343,
+                text: 0xf1f5f9,
+                text_muted: 0x94a3b8,
+                accent: 0x3b82f6,
+                accent_soft: 0x252b3b,
+                link: 0x60a5fa,
+                pill_bg: 0x252b3b,
+                pill_text: 0x93c5fd,
+                pill_border: 0x334155,
+                input_bg: 0x1e2430,
+                input_border: 0x475569,
+                button_bg: 0x1e293b,
+                button_border: 0x475569,
+                button_text: 0xf1f5f9,
+                code_accent: 0x34d399,
+                radius_card: 10,
+                radius_control: 5,
+                dark_mode: true,
+                theme_style: 0,
+            },
+            _ => Self {
+                bg: 0xf4f6fb,
+                card_bg: 0xffffff,
+                card_border: 0xe2e8f0,
+                text: 0x0f172a,
+                text_muted: 0x64748b,
+                accent: 0x2563eb,
+                accent_soft: 0xeff6ff,
+                link: 0x2563eb,
+                pill_bg: 0xeff6ff,
+                pill_text: 0x1d4ed8,
+                pill_border: 0xcbd5e1,
+                input_bg: 0xffffff,
+                input_border: 0xcbd5e1,
+                button_bg: 0xe2e8f0,
+                button_border: 0x94a3b8,
+                button_text: 0x0f172a,
+                code_accent: 0x0f766e,
+                radius_card: 10,
+                radius_control: 5,
+                dark_mode: false,
+                theme_style: 0,
+            },
+        }
+    }
+}
+
+fn hex(c: u32) -> String {
+    format!("#{:06x}", c & 0x00ff_ffff)
 }
 
 fn escape_html(s: &str) -> String {
@@ -30,8 +245,14 @@ pub fn serve_builtin_styled(
     dark_mode: bool,
     theme_style: i32,
 ) -> BuiltinPage {
-    let is_win98 = theme_style == 1;
-    let is_vortex = theme_style == 2;
+    serve_builtin_themed(url, storage, PageThemeColors::from_legacy(dark_mode, theme_style))
+}
+
+pub fn serve_builtin_themed(
+    url: &str,
+    storage: Option<&BrowserStorage>,
+    colors: PageThemeColors,
+) -> BuiltinPage {
     if url.starts_with("about:blank") || url.is_empty() {
         return BuiltinPage {
             status: 200,
@@ -52,79 +273,92 @@ pub fn serve_builtin_styled(
         "space://js-lab" => BuiltinPage {
             status: 200,
             content_type: "text/html; charset=utf-8",
-            body: js_lab_html(dark_mode, is_win98, is_vortex),
+            body: js_lab_html(colors),
         },
         "space://about" => BuiltinPage {
             status: 200,
             content_type: "text/html; charset=utf-8",
-            body: about_html(dark_mode, is_win98, is_vortex),
+            body: about_html(colors),
         },
         _ => {
-            // If space://search?q=... arrived from home form, render quick offline/search router page
             if route == "space://search" {
                 let q = url.split("q=").nth(1).unwrap_or("").split('&').next().unwrap_or("");
                 let decoded = q.replace('+', " ");
                 return BuiltinPage {
                     status: 200,
                     content_type: "text/html; charset=utf-8",
-                    body: search_router_html(&decoded, dark_mode, is_win98, is_vortex),
+                    body: search_router_html(&decoded, colors),
                 };
             }
             BuiltinPage {
                 status: 200,
                 content_type: "text/html; charset=utf-8",
-                body: home_html(storage, dark_mode, is_win98, is_vortex),
+                body: home_html(storage, colors),
             }
         }
     }
 }
 
-fn base_css(dark_mode: bool, is_win98: bool, is_vortex: bool) -> &'static str {
-    if is_win98 {
-        return r#"
-        body { font-family: sans-serif; margin: 20px; background: #c0c0c0; color: #000; }
-        .card { background: #fff; border: 2px solid #808080; padding: 14px; margin-bottom: 14px; }
-        .btn { background: #c0c0c0; border: 2px solid #000; padding: 6px 12px; color: #000; text-decoration: none; display: inline-block; }
-        .pill { background: #dfdfdf; border: 1px solid #808080; padding: 4px 10px; display: inline-block; margin-right: 6px; }
-        "#;
+fn base_css(c: PageThemeColors) -> String {
+    if c.theme_style == 1 {
+        return format!(
+            "body {{ font-family: sans-serif; margin: 20px; background: {}; color: {}; }}
+            a {{ color: {}; }}
+            .card {{ background: {}; border: 2px solid {}; padding: 14px; margin-bottom: 14px; }}
+            .btn {{ background: {}; border: 2px solid {}; padding: 6px 12px; color: {}; text-decoration: none; display: inline-block; }}
+            .pill {{ background: {}; border: 1px solid {}; padding: 4px 10px; display: inline-block; margin-right: 6px; }}
+            .link-card {{ display: block; background: {}; border: 1px solid {}; padding: 10px 12px; color: {}; text-decoration: none; margin-bottom: 8px; }}
+            .muted {{ color: {}; }}",
+            hex(c.bg),
+            hex(c.text),
+            hex(c.link),
+            hex(c.card_bg),
+            hex(c.card_border),
+            hex(c.button_bg),
+            hex(c.button_border),
+            hex(c.button_text),
+            hex(c.pill_bg),
+            hex(c.pill_border),
+            hex(c.accent_soft),
+            hex(c.card_border),
+            hex(c.text),
+            hex(c.text_muted),
+        );
     }
-    if is_vortex {
-        if dark_mode {
-            return r#"
-            body { font-family: sans-serif; margin: 0; padding: 28px 36px; background: linear-gradient(180deg, #0d1726 0%, #142238 100%); color: #e8f1fc; }
-            .card { background: #19263a; border: 1px solid #486387; border-top-color: #7094c2; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
-            .muted { color: #9db6d4; }
-            .pill { background: #213754; color: #8ed0ff; border: 1px solid #4873a6; border-radius: 999px; padding: 4px 11px; font-size: 12px; display: inline-block; margin-right: 6px; }
-            .link-card { display: block; background: #202f46; border: 1px solid #3f5879; border-radius: 6px; padding: 12px 14px; color: #e8f1fc; text-decoration: none; margin-bottom: 8px; }
-            "#;
-        }
-        return r#"
-        body { font-family: sans-serif; margin: 0; padding: 28px 36px; background: linear-gradient(180deg, #dfeaf8 0%, #f4f8fe 100%); color: #0f172a; }
-        .card { background: #fbfdff; border: 1px solid #8fb1d9; border-top-color: #ffffff; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
-        .muted { color: #4f647d; }
-        .pill { background: #e6f2ff; color: #0b57a4; border: 1px solid #96c2ed; border-radius: 999px; padding: 4px 11px; font-size: 12px; display: inline-block; margin-right: 6px; }
-        .link-card { display: block; background: #f2f7fd; border: 1px solid #b8cfe8; border-radius: 6px; padding: 12px 14px; color: #0f172a; text-decoration: none; margin-bottom: 8px; }
-        "#;
-    }
-    if dark_mode {
-        return r#"
-        body { font-family: sans-serif; margin: 0; padding: 28px 36px; background: #14161d; color: #f1f5f9; }
-        .card { background: #1c202b; border: 1px solid #2d3343; border-radius: 10px; padding: 18px; margin-bottom: 16px; }
-        .muted { color: #94a3b8; }
-        .pill { background: #252b3b; color: #93c5fd; border-radius: 999px; padding: 4px 11px; font-size: 12px; display: inline-block; margin-right: 6px; }
-        .link-card { display: block; background: #232836; border: 1px solid #333b4f; border-radius: 8px; padding: 12px 14px; color: #e2e8f0; text-decoration: none; margin-bottom: 8px; }
-        "#;
-    }
-    r#"
-    body { font-family: sans-serif; margin: 0; padding: 28px 36px; background: #f4f6fb; color: #0f172a; }
-    .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 18px; margin-bottom: 16px; }
-    .muted { color: #64748b; }
-    .pill { background: #eff6ff; color: #1d4ed8; border-radius: 999px; padding: 4px 11px; font-size: 12px; display: inline-block; margin-right: 6px; }
-    .link-card { display: block; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 14px; color: #0f172a; text-decoration: none; margin-bottom: 8px; }
-    "#
+    let body_bg = if c.theme_style == 2 {
+        let top = hex(c.bg);
+        let bot = hex(mix(c.bg, c.card_bg, 0.65));
+        format!("linear-gradient(180deg, {top} 0%, {bot} 100%)")
+    } else {
+        hex(c.bg)
+    };
+    let link_bg = hex(mix(c.card_bg, c.accent_soft, 0.35));
+    let pill_rad = if c.theme_style == 2 { 999 } else { 999 };
+    let link_rad = (c.radius_card - 2).max(2);
+    format!(
+        "body {{ font-family: sans-serif; margin: 0; padding: 28px 36px; background: {body_bg}; color: {text}; }}
+        a {{ color: {link}; }}
+        .card {{ background: {card_bg}; border: 1px solid {card_border}; border-radius: {rc}px; padding: 18px; margin-bottom: 16px; }}
+        .muted {{ color: {muted}; }}
+        .pill {{ background: {pill_bg}; color: {pill_text}; border: 1px solid {pill_border}; border-radius: {pill_rad}px; padding: 4px 11px; font-size: 12px; display: inline-block; margin-right: 6px; }}
+        .link-card {{ display: block; background: {link_bg}; border: 1px solid {card_border}; border-radius: {link_rad}px; padding: 12px 14px; color: {text}; text-decoration: none; margin-bottom: 8px; }}",
+        body_bg = body_bg,
+        text = hex(c.text),
+        link = hex(c.link),
+        card_bg = hex(c.card_bg),
+        card_border = hex(c.card_border),
+        rc = c.radius_card,
+        muted = hex(c.text_muted),
+        pill_bg = hex(c.pill_bg),
+        pill_text = hex(c.pill_text),
+        pill_border = hex(c.pill_border),
+        pill_rad = pill_rad,
+        link_bg = link_bg,
+        link_rad = link_rad,
+    )
 }
 
-fn home_html(storage: Option<&BrowserStorage>, dark_mode: bool, is_win98: bool, is_vortex: bool) -> String {
+fn home_html(storage: Option<&BrowserStorage>, colors: PageThemeColors) -> String {
     let mut bmarks_html = String::new();
     if let Some(st) = storage {
         for b in st.bookmarks.iter().take(12) {
@@ -208,12 +442,12 @@ if (st) st.textContent = 'QuickJS-NG 就绪 · UA: SpaceBrowser/1.0';
 </script>
 </body>
 </html>"#,
-        css = base_css(dark_mode, is_win98, is_vortex),
+        css = base_css(colors),
         bookmarks = bmarks_html
     )
 }
 
-fn search_router_html(query: &str, dark_mode: bool, is_win98: bool, is_vortex: bool) -> String {
+fn search_router_html(query: &str, colors: PageThemeColors) -> String {
     let trimmed = query.trim();
     if trimmed.contains("://") || trimmed.starts_with('/') {
         let escaped = escape_html(trimmed);
@@ -223,7 +457,7 @@ fn search_router_html(query: &str, dark_mode: bool, is_win98: bool, is_vortex: b
     }
     let q_esc = escape_html(trimmed);
     let url_q = url_encode_simple(trimmed);
-    let css = base_css(dark_mode, is_win98, is_vortex);
+    let css = base_css(colors);
     format!(
         r#"<!doctype html>
 <html>
@@ -260,9 +494,9 @@ fn url_encode_simple(s: &str) -> String {
     out
 }
 
-fn js_lab_html(dark_mode: bool, is_win98: bool, is_vortex: bool) -> String {
-    let base = base_css(dark_mode, is_win98, is_vortex);
-    let extra = if is_win98 {
+fn js_lab_html(colors: PageThemeColors) -> String {
+    let base = base_css(colors);
+    let extra = if colors.theme_style == 1 {
         r#"
   .box { background: #fff; border: 2px solid #808080; padding: 14px; margin-bottom: 14px; }
   .badge { background: #dfdfdf; color: #000; border: 1px solid #808080; padding: 3px 9px; font-size: 12px; }
@@ -270,38 +504,27 @@ fn js_lab_html(dark_mode: bool, is_win98: bool, is_vortex: bool) -> String {
   canvas { border: 2px solid #808080; background: #fff; }
   #form-out { margin-top: 8px; font-size: 13px; color: #000080; }
 "#
-    } else if is_vortex && dark_mode {
-        r#"
-  .box { background: linear-gradient(180deg, #1b2839 0%, #121c2a 100%); border: 1px solid #48688c; border-radius: 8px; padding: 14px; margin-bottom: 14px; color: #eef5fd; }
-  .badge { background: linear-gradient(180deg, #2b4d78 0%, #1c3556 100%); color: #d8ebff; padding: 3px 9px; border-radius: 4px; font-size: 12px; border: 1px solid #5994d6; }
-  .highlighted { background: #854d0e; color: #fef08a; border-color: #facc15; font-weight: bold; }
-  canvas { border: 1px solid #48688c; border-radius: 6px; background: #0f1722; }
-  #form-out { margin-top: 8px; font-size: 13px; color: #7dd3fc; }
-"#
-    } else if is_vortex {
-        r#"
-  .box { background: linear-gradient(180deg, #ffffff 0%, #eff6fd 100%); border: 1px solid #9ab4cf; border-radius: 8px; padding: 14px; margin-bottom: 14px; color: #0e1a28; }
-  .badge { background: linear-gradient(180deg, #f3f9ff 0%, #d4e8fc 100%); color: #0c4d8a; padding: 3px 9px; border-radius: 4px; font-size: 12px; border: 1px solid #7fb3e6; }
-  .highlighted { background: #fef08a; color: #854d0e; border-color: #eab308; font-weight: bold; }
-  canvas { border: 1px solid #8ea7c4; border-radius: 6px; background: #fff; }
-  #form-out { margin-top: 8px; font-size: 13px; color: #0c5aa6; }
-"#
-    } else if dark_mode {
-        r#"
-  .box { background: #1c202b; border: 1px solid #2d3343; border-radius: 8px; padding: 14px; margin-bottom: 14px; color: #f1f5f9; }
-  .badge { background: #1e3a8a; color: #bfdbfe; padding: 3px 9px; border-radius: 4px; font-size: 12px; border: 1px solid #3b82f6; }
-  .highlighted { background: #854d0e; color: #fef08a; border-color: #facc15; font-weight: bold; }
-  canvas { border: 1px solid #334155; border-radius: 6px; background: #0f172a; }
-  #form-out { margin-top: 8px; font-size: 13px; color: #34d399; }
-"#
+        .to_string()
     } else {
-        r#"
-  .box { background: #fff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 14px; margin-bottom: 14px; color: #0f172a; }
-  .badge { background: #e0f2fe; color: #0369a1; padding: 3px 9px; border-radius: 4px; font-size: 12px; }
-  .highlighted { background: #fef08a; color: #854d0e; border-color: #eab308; font-weight: bold; }
-  canvas { border: 1px solid #94a3b8; border-radius: 6px; background: #fff; }
-  #form-out { margin-top: 8px; font-size: 13px; color: #0f766e; }
-"#
+        format!(
+            "
+  .box {{ background: {card_bg}; border: 1px solid {card_border}; border-radius: {rc}px; padding: 14px; margin-bottom: 14px; color: {text}; }}
+  .badge {{ background: {pill_bg}; color: {pill_text}; padding: 3px 9px; border-radius: {rctrl}px; font-size: 12px; border: 1px solid {pill_border}; }}
+  .highlighted {{ background: #fef08a; color: #854d0e; border-color: #eab308; font-weight: bold; }}
+  canvas {{ border: 1px solid {card_border}; border-radius: {rctrl}px; background: {input_bg}; }}
+  #form-out {{ margin-top: 8px; font-size: 13px; color: {code_accent}; }}
+",
+            card_bg = hex(colors.card_bg),
+            card_border = hex(colors.card_border),
+            rc = colors.radius_card,
+            text = hex(colors.text),
+            pill_bg = hex(colors.pill_bg),
+            pill_text = hex(colors.pill_text),
+            rctrl = colors.radius_control,
+            pill_border = hex(colors.pill_border),
+            input_bg = hex(colors.input_bg),
+            code_accent = hex(colors.code_accent),
+        )
     };
     format!(
         r#"<!doctype html>
@@ -452,18 +675,18 @@ document.getElementById('btn-store').addEventListener('click', function(){{
     )
 }
 
-fn about_html(dark_mode: bool, is_win98: bool, is_vortex: bool) -> String {
-    let css = base_css(dark_mode, is_win98, is_vortex);
-    let box_extra = if is_win98 {
-        ".box { background: #fff; border: 2px solid #808080; padding: 16px; }"
-    } else if is_vortex && dark_mode {
-        ".box { background: linear-gradient(180deg, #1b2839 0%, #121c2a 100%); border: 1px solid #48688c; border-radius: 8px; padding: 16px; color: #eef5fd; }"
-    } else if is_vortex {
-        ".box { background: linear-gradient(180deg, #ffffff 0%, #eff6fd 100%); border: 1px solid #9ab4cf; border-radius: 8px; padding: 16px; color: #0e1a28; }"
-    } else if dark_mode {
-        ".box { background: #1c202b; border: 1px solid #2d3343; border-radius: 8px; padding: 16px; color: #f1f5f9; }"
+fn about_html(colors: PageThemeColors) -> String {
+    let css = base_css(colors);
+    let box_extra = if colors.theme_style == 1 {
+        ".box { background: #fff; border: 2px solid #808080; padding: 16px; }".to_string()
     } else {
-        ".box { background: #fff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px; color: #0f172a; }"
+        format!(
+            ".box {{ background: {}; border: 1px solid {}; border-radius: {}px; padding: 16px; color: {}; }}",
+            hex(colors.card_bg),
+            hex(colors.card_border),
+            colors.radius_card,
+            hex(colors.text),
+        )
     };
     format!(
         r#"<!doctype html>

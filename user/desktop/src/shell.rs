@@ -397,6 +397,8 @@ pub struct Shell {
     last_launch: Option<(&'static str, Instant)>,
     last_composite: Instant,
     theme_stamp: Option<std::time::SystemTime>,
+    theme_fp: u64,
+    last_theme_fp_check: Instant,
     dirty_rects_buf: Vec<Rect>,
     comp_plan_buf: Vec<WinCompPlan>,
     capture_keep_buf: Vec<Window>,
@@ -1263,6 +1265,8 @@ impl Shell {
             last_launch: None,
             last_composite: Instant::now() - Duration::from_millis(32),
             theme_stamp: crate::theme::theme_reload_stamp(),
+            theme_fp: crate::theme::installed_themes_fingerprint(),
+            last_theme_fp_check: Instant::now(),
             dirty_rects_buf: Vec::with_capacity(16),
             comp_plan_buf: Vec::with_capacity(8),
             capture_keep_buf: Vec::with_capacity(16),
@@ -1547,6 +1551,18 @@ impl Shell {
     }
 
     fn apply_live_config_diff(&mut self, prev: DesktopConfig) -> Result<()> {
+        if prev.theme_reload_gen != self.config.theme_reload_gen
+            || prev.theme_id != self.config.theme_id
+        {
+            self.theme_fp = crate::theme::installed_themes_fingerprint();
+            self.last_theme_fp_check = Instant::now();
+            if let Some(missing) = crate::theme::fallback_missing_theme(&mut self.config) {
+                eprintln!(
+                    "theme '{missing}' is no longer installed; falling back to the default theme"
+                );
+                self.persist_fallback_theme_props();
+            }
+        }
         self.theme = Theme::from_config(&self.config);
         self.text.set_ui_scale(self.theme.ui_scale());
 
@@ -1562,7 +1578,9 @@ impl Shell {
         let panel_geom_changed = prev.panel_position != self.config.panel_position
             || prev.panel_size != self.config.panel_size
             || prev_panel_h != ph;
-        let theme_style_changed = prev.theme_style != self.config.theme_style;
+        let theme_style_changed = prev.theme_style != self.config.theme_style
+            || prev.theme_id != self.config.theme_id
+            || prev.theme_reload_gen != self.config.theme_reload_gen;
         if theme_style_changed {
             let radius = self.theme.radius_popup();
             self.x
@@ -1622,8 +1640,8 @@ impl Shell {
         let backdrop_changed = wp_file_changed
             || prev.backdrop_style != self.config.backdrop_style
             || prev.solid_color != self.config.solid_color;
-        if backdrop_changed {
-            self.reload_wallpaper(wp_file_changed);
+        if backdrop_changed || theme_style_changed {
+            self.reload_wallpaper(wp_file_changed || theme_style_changed);
         }
         let desktop_redraw_needed = backdrop_changed
             || theme_style_changed
@@ -1795,18 +1813,72 @@ impl Shell {
         }
     }
 
+    fn persist_fallback_theme_props(&mut self) {
+        let accent_hex = format!("#{:06x}", self.config.accent & 0x00ff_ffff);
+        self.persist_config_prop(
+            "appearance",
+            "/theme/id",
+            uxconf::Value::String(self.config.theme_id.clone()),
+        );
+        self.persist_config_prop(
+            "appearance",
+            "/theme/style",
+            uxconf::Value::String(self.config.theme_style.as_str().to_string()),
+        );
+        self.persist_config_prop(
+            "appearance",
+            "/theme/mode",
+            uxconf::Value::String(self.config.mode.as_str().to_string()),
+        );
+        self.persist_config_prop("appearance", "/theme/accent", uxconf::Value::String(accent_hex));
+        self.persist_config_prop(
+            "desktop",
+            "/backdrop/wallpaper",
+            uxconf::Value::String(self.config.wallpaper.clone()),
+        );
+        self.persist_config_prop(
+            "panel",
+            "/position",
+            uxconf::Value::String(self.config.panel_position.as_str().to_string()),
+        );
+        self.persist_config_prop(
+            "panel",
+            "/size",
+            uxconf::Value::Int(i64::from(self.config.panel_size)),
+        );
+        self.persist_config_prop(
+            "panel",
+            "/start-fullscreen",
+            uxconf::Value::Bool(self.config.panel_start_fullscreen),
+        );
+        self.persist_config_prop(
+            "wm",
+            "/button-layout",
+            uxconf::Value::String(self.config.wm_button_layout.as_str().to_string()),
+        );
+    }
+
     fn reload_theme_pack(&mut self) -> Result<()> {
+        self.theme_fp = crate::theme::installed_themes_fingerprint();
+        self.last_theme_fp_check = Instant::now();
         let prev = self.config.clone();
         if let Some(missing) = crate::theme::fallback_missing_theme(&mut self.config) {
             eprintln!(
                 "theme '{missing}' is no longer installed; falling back to the default theme"
             );
+            self.persist_fallback_theme_props();
         }
         if self.config != prev {
             self.apply_live_config_diff(prev)?;
         } else {
             self.theme = Theme::from_config(&self.config);
+            self.text.set_ui_scale(self.theme.ui_scale());
+            self.sync_menu_window()?;
             self.reload_wallpaper(true);
+            self.sync_argb_canvases();
+            self.draw_desktop();
+            self.present_desktop()?;
+            self.draw_taskbar();
             self.comp.mark_full_dirty();
         }
         Ok(())
@@ -1925,6 +1997,14 @@ impl Shell {
 
             if self.last_net_refresh.elapsed() >= Duration::from_secs(3) {
                 net_dirty |= self.refresh_net_status();
+            }
+            if self.last_theme_fp_check.elapsed() >= Duration::from_secs(2) {
+                self.last_theme_fp_check = Instant::now();
+                let next_fp = crate::theme::installed_themes_fingerprint();
+                if next_fp != self.theme_fp {
+                    self.theme_fp = next_fp;
+                    self.reload_theme_pack()?;
+                }
             }
 
             // Coalesce burst MotionNotify, ConfigureNotify & geometry ConfigureRequest events cleanly.

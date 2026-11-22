@@ -19,7 +19,8 @@ for svg in \
     close.svg close_hover.svg close_active.svg \
     minimize.svg minimize_hover.svg minimize_active.svg \
     maximize.svg maximize_hover.svg maximize_active.svg \
-    restore.svg restore_hover.svg restore_active.svg
+    restore.svg restore_hover.svg restore_active.svg \
+    splash_anim.svg
 do
     install -m 0644 "$ROOT/packages/theme-ambiance/$svg" \
         "$STAGE/usr/share/spui/themes/ambiance/$svg"

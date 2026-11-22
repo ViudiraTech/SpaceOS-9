@@ -181,6 +181,8 @@ pub struct App {
     last_win_origin: Option<(i16, i16)>,
     last_ime_spot: Option<(i32, i32, i32)>,
     last_ime_spot_local: Option<Rect>,
+    theme_fp: u64,
+    last_theme_fp_check: Instant,
 }
 
 impl App {
@@ -338,6 +340,8 @@ impl App {
             last_win_origin: None,
             last_ime_spot: None,
             last_ime_spot_local: None,
+            theme_fp: theme::installed_themes_fingerprint(),
+            last_theme_fp_check: Instant::now(),
         })
     }
 
@@ -471,6 +475,8 @@ impl App {
                 "theme '{missing}' is no longer installed; falling back to the default theme"
             );
         }
+        self.theme_fp = theme::installed_themes_fingerprint();
+        self.last_theme_fp_check = Instant::now();
         self.theme = Theme::from_config(&self.config);
         self.text.set_ui_scale(self.theme.ui_scale());
         if self.maximized {
@@ -784,6 +790,15 @@ impl App {
                 _ => {}
             }
             coalesced.push(ev);
+        }
+
+        if self.last_theme_fp_check.elapsed() >= Duration::from_secs(2) {
+            self.last_theme_fp_check = Instant::now();
+            let next_fp = theme::installed_themes_fingerprint();
+            if next_fp != self.theme_fp {
+                self.theme_fp = next_fp;
+                cfg_changed = true;
+            }
         }
 
         let mut events = Vec::new();
