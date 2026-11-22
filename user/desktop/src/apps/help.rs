@@ -306,19 +306,10 @@ fn draw_help(
     hover: Option<usize>,
     content: Rect,
 ) -> i32 {
-    let is_win98 = theme.is_win98();
-    let ctrl_r = theme.radius_control();
     canvas.clear(theme.window);
 
     // Left navigation sidebar
-    canvas.fill(
-        Rect::new(content.x, content.y, SIDEBAR_W, content.h),
-        theme.window_alt,
-    );
-    canvas.fill(
-        Rect::new(content.x + SIDEBAR_W - 1, content.y, 1, content.h),
-        theme.window_border,
-    );
+    ui::sidebar_surface(canvas, theme, Rect::new(content.x, content.y, SIDEBAR_W, content.h));
 
     text.draw(
         canvas,
@@ -334,17 +325,7 @@ fn draw_help(
         let ry = content.y + 36 + i as i32 * 38;
         let r = Rect::new(content.x + 10, ry, SIDEBAR_W - 20, 32);
         let active = topic == *t;
-        let fg = if is_win98 || theme.is_vortexglass() {
-            ui::list_item_bg(canvas, theme, r, active, hover == Some(i))
-        } else {
-            if active {
-                canvas.rounded_rect(r, ctrl_r, theme.accent_soft, 1.0);
-                canvas.fill(Rect::new(r.x, r.y + 6, 3, r.h - 12), theme.accent);
-            } else if hover == Some(i) {
-                canvas.rounded_rect(r, ctrl_r, theme.panel_hover, 1.0);
-            }
-            if active { theme.text } else { theme.text_dim }
-        };
+        let fg = ui::list_item_bg(canvas, theme, r, active, hover == Some(i));
         text.draw(
             canvas,
             label,
@@ -454,30 +435,7 @@ fn draw_help(
                 let code_lines: Vec<&str> = code.lines().collect();
                 let card_h = code_lines.len() as i32 * 20 + 20;
                 let card_r = Rect::new(content_x, y, content_w, card_h);
-                if is_win98 {
-                    c.fill(card_r, theme.input_bg);
-                    ui::sunken_bevel(c, theme, card_r);
-                } else if theme.is_vortexglass() {
-                    let (top, bot) = if theme.is_dark() {
-                        (0x182334, 0x111926)
-                    } else {
-                        (0xf3f8fe, 0xe8f0fa)
-                    };
-                    ui::draw_win7_glossy_box(
-                        c,
-                        card_r,
-                        ctrl_r,
-                        top,
-                        top,
-                        bot,
-                        bot,
-                        theme.panel_border,
-                        if theme.is_dark() { 0.16 } else { 0.85 },
-                    );
-                } else {
-                    c.rounded_rect(card_r, ctrl_r, theme.input_bg, 1.0);
-                    c.rounded_border(card_r, ctrl_r, theme.panel_border, 1.0, 1);
-                }
+                ui::input_frame(c, theme, card_r, false);
                 for (c_idx, c_line) in code_lines.into_iter().enumerate() {
                     let ly = card_r.y + 18 + c_idx as i32 * 20;
                     let is_comment = c_line.starts_with('#');

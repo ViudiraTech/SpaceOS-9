@@ -4,8 +4,9 @@ use crate::net::{
     FetchPool, FetchResponse,
 };
 use crate::storage::{origin_for_url, BrowserStorage};
-use spui_ui::draw::{blend_u8, Canvas, Rect, Sprite};
+use spui_ui::draw::{blend_u8, mix, Canvas, Rect, Sprite};
 use spui_ui::text::{Face, TextRenderer};
+use spui_ui::theme::Theme;
 use spui_ui::x11::CursorKind;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -305,6 +306,99 @@ pub const SPACE_THEME_SPUI4: c_int = 0;
 pub const SPACE_THEME_WIN98: c_int = 1;
 pub const SPACE_THEME_VORTEXGLASS: c_int = 2;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpaceThemePalette {
+    pub bg: u32,
+    pub text: u32,
+    pub text_muted: u32,
+    pub link: u32,
+    pub accent: u32,
+    pub button_bg: u32,
+    pub button_bg_active: u32,
+    pub button_border: u32,
+    pub button_text: u32,
+    pub input_bg: u32,
+    pub input_border: u32,
+    pub input_focus_border: u32,
+    pub input_text: u32,
+    pub track_bg: u32,
+    pub selection_bg: u32,
+    pub selection_text: u32,
+    pub button_radius: i32,
+    pub input_radius: i32,
+    pub dark_mode: i32,
+    pub theme_style: i32,
+}
+
+impl SpaceThemePalette {
+    #[inline]
+    fn argb(rgb: u32) -> u32 {
+        0xff00_0000 | (rgb & 0x00ff_ffff)
+    }
+
+    pub fn from_theme(theme: &Theme, theme_style: i32) -> Self {
+        let dark = !theme.is_win98() && theme.is_dark();
+        let skin_ctrl = theme.skin().map(|s| &s.controls);
+        let button_bg = skin_ctrl
+            .and_then(|c| c.button_normal.bg.as_ref().map(|b| b.primary_color()))
+            .unwrap_or(if theme.is_win98() { 0xc0c0c0 } else { theme.panel_high });
+        let button_bg_active = skin_ctrl
+            .and_then(|c| c.button_active.bg.as_ref().map(|b| b.primary_color()))
+            .unwrap_or_else(|| mix(button_bg, 0x000000, 0.14));
+        let button_border = skin_ctrl
+            .and_then(|c| c.button_normal.border.map(|(col, _, _)| col))
+            .unwrap_or(theme.window_border);
+        let button_text = skin_ctrl.map_or(theme.text, |c| c.button_text);
+        let input_bg = skin_ctrl.map_or(theme.input_bg, |c| c.input_bg);
+        let input_border = skin_ctrl.map_or(theme.window_border, |c| c.input_border);
+        let input_focus_border = skin_ctrl.map_or(theme.accent, |c| c.input_focus_border);
+        let track_bg = skin_ctrl
+            .and_then(|c| c.slider_track.bg.as_ref().map(|b| b.primary_color()))
+            .unwrap_or(theme.window_alt);
+        let button_radius = if theme.is_win98() {
+            0
+        } else {
+            skin_ctrl.map_or(theme.radius_control(), |c| c.button_radius)
+        };
+        let input_radius = if theme.is_win98() {
+            0
+        } else {
+            skin_ctrl.map_or(theme.radius_control(), |c| c.input_radius)
+        };
+        let bg = if theme.is_win98() { 0xffffff } else { theme.window };
+        let link = if theme.is_win98() {
+            0x0000ee
+        } else if dark {
+            mix(theme.accent, 0xffffff, 0.35)
+        } else {
+            theme.accent
+        };
+        Self {
+            bg: Self::argb(bg),
+            text: Self::argb(theme.text),
+            text_muted: Self::argb(theme.text_muted),
+            link: Self::argb(link),
+            accent: Self::argb(theme.accent),
+            button_bg: Self::argb(button_bg),
+            button_bg_active: Self::argb(button_bg_active),
+            button_border: Self::argb(button_border),
+            button_text: Self::argb(button_text),
+            input_bg: Self::argb(input_bg),
+            input_border: Self::argb(input_border),
+            input_focus_border: Self::argb(input_focus_border),
+            input_text: Self::argb(theme.text),
+            track_bg: Self::argb(track_bg),
+            selection_bg: Self::argb(theme.selection_bg),
+            selection_text: Self::argb(theme.selection_text),
+            button_radius,
+            input_radius,
+            dark_mode: i32::from(dark),
+            theme_style,
+        }
+    }
+}
+
 extern "C" {
     pub fn space_page_create(
         cb: *const SpaceHostCallbacks,
@@ -315,6 +409,7 @@ extern "C" {
     ) -> *mut SpacePage;
     pub fn space_page_destroy(page: *mut SpacePage);
     pub fn space_page_set_theme(page: *mut SpacePage, dark_mode: c_int, theme_style: c_int);
+    pub fn space_page_set_palette(page: *mut SpacePage, palette: *const SpaceThemePalette);
     pub fn space_page_load_html(
         page: *mut SpacePage,
         html: *const c_char,
@@ -462,6 +557,7 @@ pub struct HostState {
     pub dark_mode: bool,
     pub is_win98: bool,
     pub theme_style: i32,
+    pub theme_colors: crate::pages::PageThemeColors,
     pub page_url: String,
     pub base_url: String,
     pub title: String,
@@ -524,6 +620,7 @@ impl HostState {
             dark_mode,
             is_win98: theme_style == SPACE_THEME_WIN98,
             theme_style,
+            theme_colors: crate::pages::PageThemeColors::from_legacy(dark_mode, theme_style),
             page_url: String::from("about:blank"),
             base_url: String::from("about:blank"),
             title: String::new(),
@@ -1356,14 +1453,13 @@ unsafe extern "C" fn cb_load_image(
         || resolved.starts_with("file://")
         || resolved.starts_with("space://")
     {
-        let resp = crate::net::sync_fetch_styled(
+        let resp = crate::net::sync_fetch_themed(
             "GET",
             &resolved,
             &Default::default(),
             &[],
             Some(&host.storage),
-            host.dark_mode,
-            host.theme_style,
+            host.theme_colors,
         );
         if resp.status >= 200 && resp.status < 400 {
             if let Some(sprite) = decode_image_sprite(&resp.body, &resolved) {
@@ -1558,14 +1654,13 @@ unsafe extern "C" fn cb_fetch_sync(
     } else {
         &[]
     };
-    let resp = crate::net::sync_fetch_with_kind_styled(
+    let resp = crate::net::sync_fetch_with_kind_themed(
         if m.is_empty() { "GET" } else { &m },
         &u,
         &hdrs,
         req_body,
         Some(&host.storage),
-        host.dark_mode,
-        host.theme_style,
+        host.theme_colors,
         FetchKind::Subresource,
     );
     if !out_status.is_null() {
@@ -1633,11 +1728,10 @@ unsafe extern "C" fn cb_prefetch_urls(ud: *mut c_void, urls_nl: *const c_char) {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    crate::net::prefetch_subresources_styled(
+    crate::net::prefetch_subresources_themed(
         &urls,
         Some(&host.storage),
-        host.dark_mode,
-        host.theme_style,
+        host.theme_colors,
     );
 }
 
@@ -2016,9 +2110,26 @@ impl SpacePageHandle {
         self.host.dark_mode = dark_mode;
         self.host.is_win98 = theme_style == SPACE_THEME_WIN98;
         self.host.theme_style = theme_style;
+        self.host.theme_colors = crate::pages::PageThemeColors::from_legacy(dark_mode, theme_style);
         let page = self.page;
         self.host.with_text(text, || unsafe {
             space_page_set_theme(page, i32::from(dark_mode), theme_style);
+        });
+    }
+
+    pub fn set_theme_palette(
+        &mut self,
+        palette: SpaceThemePalette,
+        colors: crate::pages::PageThemeColors,
+        text: Option<&mut TextRenderer>,
+    ) {
+        self.host.dark_mode = palette.dark_mode != 0;
+        self.host.is_win98 = palette.theme_style == SPACE_THEME_WIN98;
+        self.host.theme_style = palette.theme_style;
+        self.host.theme_colors = colors;
+        let page = self.page;
+        self.host.with_text(text, || unsafe {
+            space_page_set_palette(page, &palette);
         });
     }
 

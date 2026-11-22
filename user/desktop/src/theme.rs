@@ -20,10 +20,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use crate::draw::{mix, Canvas, Rect, Sprite};
+use crate::draw::{build_gradient_lut, mix, Canvas, Rect, Sprite};
 use crate::icons;
 use uxconf::{
     ButtonLayout, DesktopConfig, PanelPosition, ThemeMode, ThemeStyle, THEME_PRESETS, WALLPAPERS,
@@ -95,29 +96,88 @@ pub struct DiscoveredWallpaper {
     pub label: String,
 }
 
-/// Parsed CSS background specification (`solid`, `linear-gradient`, or `radial-gradient`).
+/// Parsed CSS background specification (`solid`, `linear-gradient`, or `radial-gradient`)
+/// with pre-baked 256-entry gradient LUTs.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CssBackground {
     Solid(u32, f32),
-    LinearV(Vec<(f32, u32)>, f32),
-    LinearH(Vec<(f32, u32)>, f32),
-    LinearDiag(Vec<(f32, u32)>, f32),
+    LinearV {
+        stops: Vec<(f32, u32)>,
+        alpha: f32,
+        lut: Box<[u32; 256]>,
+    },
+    LinearH {
+        stops: Vec<(f32, u32)>,
+        alpha: f32,
+        lut: Box<[u32; 256]>,
+    },
+    LinearDiag {
+        stops: Vec<(f32, u32)>,
+        alpha: f32,
+        lut: Box<[u32; 256]>,
+    },
     Radial {
         cx_pct: f32,
         cy_pct: f32,
         stops: Vec<(f32, u32)>,
         alpha: f32,
+        lut: Box<[u32; 256]>,
     },
 }
 
 impl CssBackground {
+    pub fn linear_v(stops: Vec<(f32, u32)>, alpha: f32) -> Self {
+        let lut = Box::new(build_gradient_lut(&stops));
+        Self::LinearV { stops, alpha, lut }
+    }
+
+    pub fn linear_h(stops: Vec<(f32, u32)>, alpha: f32) -> Self {
+        let lut = Box::new(build_gradient_lut(&stops));
+        Self::LinearH { stops, alpha, lut }
+    }
+
+    pub fn linear_diag(stops: Vec<(f32, u32)>, alpha: f32) -> Self {
+        let lut = Box::new(build_gradient_lut(&stops));
+        Self::LinearDiag { stops, alpha, lut }
+    }
+
+    pub fn radial(cx_pct: f32, cy_pct: f32, stops: Vec<(f32, u32)>, alpha: f32) -> Self {
+        let lut = Box::new(build_gradient_lut(&stops));
+        Self::Radial {
+            cx_pct,
+            cy_pct,
+            stops,
+            alpha,
+            lut,
+        }
+    }
+
     pub fn primary_color(&self) -> u32 {
         match self {
             Self::Solid(c, _) => *c,
-            Self::LinearV(s, _) | Self::LinearH(s, _) | Self::LinearDiag(s, _) => {
-                s.first().map_or(0, |x| x.1)
-            }
-            Self::Radial { stops, .. } => stops.first().map_or(0, |x| x.1),
+            Self::LinearV { stops, .. }
+            | Self::LinearH { stops, .. }
+            | Self::LinearDiag { stops, .. }
+            | Self::Radial { stops, .. } => stops.first().map_or(0, |x| x.1),
+        }
+    }
+
+    pub fn tinted(&self, target: u32, weight: f32) -> Self {
+        let map_stops = |stops: &[(f32, u32)]| -> Vec<(f32, u32)> {
+            stops.iter().map(|&(p, c)| (p, mix(c, target, weight))).collect()
+        };
+        match self {
+            Self::Solid(c, a) => Self::Solid(mix(*c, target, weight), *a),
+            Self::LinearV { stops, alpha, .. } => Self::linear_v(map_stops(stops), *alpha),
+            Self::LinearH { stops, alpha, .. } => Self::linear_h(map_stops(stops), *alpha),
+            Self::LinearDiag { stops, alpha, .. } => Self::linear_diag(map_stops(stops), *alpha),
+            Self::Radial {
+                cx_pct,
+                cy_pct,
+                stops,
+                alpha,
+                ..
+            } => Self::radial(*cx_pct, *cy_pct, map_stops(stops), *alpha),
         }
     }
 
@@ -129,22 +189,23 @@ impl CssBackground {
             Self::Solid(color, alpha) => {
                 canvas.rounded_rect_corners(rect, radii, *color, *alpha);
             }
-            Self::LinearV(stops, alpha) => {
-                canvas.multi_stop_gradient_v(rect, stops, radii, *alpha);
+            Self::LinearV { lut, alpha, .. } => {
+                canvas.multi_stop_gradient_v_lut(rect, lut, radii, *alpha);
             }
-            Self::LinearH(stops, alpha) => {
-                canvas.multi_stop_gradient_h(rect, stops, radii, *alpha);
+            Self::LinearH { lut, alpha, .. } => {
+                canvas.multi_stop_gradient_h_lut(rect, lut, radii, *alpha);
             }
-            Self::LinearDiag(stops, alpha) => {
-                canvas.multi_stop_gradient_diag(rect, stops, radii, *alpha);
+            Self::LinearDiag { lut, alpha, .. } => {
+                canvas.multi_stop_gradient_diag_lut(rect, lut, radii, *alpha);
             }
             Self::Radial {
                 cx_pct,
                 cy_pct,
-                stops,
+                lut,
                 alpha,
+                ..
             } => {
-                canvas.multi_stop_radial_gradient(rect, *cx_pct, *cy_pct, stops, radii, *alpha);
+                canvas.multi_stop_radial_gradient_lut(rect, *cx_pct, *cy_pct, lut, radii, *alpha);
             }
         }
     }
@@ -161,9 +222,89 @@ pub struct CssInsetShadow {
     pub alpha: f32,
 }
 
+const SURFACE_CACHE_MAX_ENTRIES: usize = 128;
+const SURFACE_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const SURFACE_CACHE_MAX_ENTRY_BYTES: usize = 1024 * 1024;
+
+static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SurfaceCacheKey {
+    cache_id: u64,
+    w: u32,
+    h: u32,
+    radii: [i32; 4],
+}
+
+struct SurfaceCacheEntry {
+    sprite: Arc<Sprite>,
+    bytes: usize,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct SurfaceCache {
+    entries: HashMap<SurfaceCacheKey, SurfaceCacheEntry>,
+    total_bytes: usize,
+    tick: u64,
+}
+
+impl SurfaceCache {
+    fn get(&mut self, key: SurfaceCacheKey) -> Option<Arc<Sprite>> {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            self.tick = self.tick.wrapping_add(1);
+            entry.last_used = self.tick;
+            return Some(Arc::clone(&entry.sprite));
+        }
+        None
+    }
+
+    fn insert(&mut self, key: SurfaceCacheKey, sprite: Arc<Sprite>) {
+        let bytes = sprite.pixels.len().saturating_mul(std::mem::size_of::<u32>());
+        if bytes == 0 || bytes > SURFACE_CACHE_MAX_ENTRY_BYTES {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.bytes);
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= SURFACE_CACHE_MAX_ENTRIES
+                || self.total_bytes + bytes > SURFACE_CACHE_MAX_BYTES)
+        {
+            let Some(evict_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&evict_key) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+            }
+        }
+        self.tick = self.tick.wrapping_add(1);
+        self.total_bytes += bytes;
+        self.entries.insert(
+            key,
+            SurfaceCacheEntry {
+                sprite,
+                bytes,
+                last_used: self.tick,
+            },
+        );
+    }
+}
+
+fn surface_cache() -> &'static Mutex<SurfaceCache> {
+    static CACHE: OnceLock<Mutex<SurfaceCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(SurfaceCache::default()))
+}
+
 /// Complete declarative CSS + SVG surface for any UI widget state.
 #[derive(Clone, Debug, Default)]
 pub struct CssSurface {
+    pub cache_id: u64,
     pub bg: Option<CssBackground>,
     pub box_shadows: Vec<CssInsetShadow>,
     pub border: Option<(u32, f32, i32)>,
@@ -176,6 +317,14 @@ pub struct CssSurface {
 }
 
 impl CssSurface {
+    pub fn assign_cache_id(&mut self) {
+        if self.is_empty() {
+            self.cache_id = 0;
+        } else {
+            self.cache_id = NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.bg.is_none()
             && self.box_shadows.is_empty()
@@ -187,13 +336,106 @@ impl CssSurface {
             && self.sprite.is_none()
     }
 
+    fn should_cache(&self, rect: Rect, radii: [i32; 4]) -> bool {
+        if self.cache_id == 0 || self.is_empty() {
+            return false;
+        }
+        let bytes = (rect.w as usize)
+            .saturating_mul(rect.h as usize)
+            .saturating_mul(std::mem::size_of::<u32>());
+        if bytes == 0 || bytes > SURFACE_CACHE_MAX_ENTRY_BYTES {
+            return false;
+        }
+        // An opaque unrounded flat solid fill is a single canvas memset and is
+        // already faster than cache lookup + sprite blit.
+        let is_plain_flat_solid = radii == [0, 0, 0, 0]
+            && self.box_shadows.is_empty()
+            && self.border.is_none()
+            && self.border_top.is_none()
+            && self.border_right.is_none()
+            && self.border_bottom.is_none()
+            && self.border_left.is_none()
+            && self.sprite.is_none()
+            && matches!(self.bg, Some(CssBackground::Solid(_, a)) if a >= 0.999);
+        !is_plain_flat_solid
+    }
+
     pub fn paint(&self, canvas: &mut Canvas, rect: Rect, default_radii: [i32; 4]) {
-        if rect.is_empty() {
+        if rect.is_empty() || canvas.clip_rect(rect).is_empty() {
             return;
         }
+        // Complete vector/raster button sprites are self-contained; never paint
+        // fallback CSS backgrounds or borders beneath/over their anti-aliased edge.
+        if let Some(ref sp) = self.sprite {
+            let w = rect.w.max(1) as u32;
+            let h = rect.h.max(1) as u32;
+            if sp.width == w && sp.height == h {
+                canvas.blit_sprite(rect.x, rect.y, sp);
+                return;
+            }
+            if self.cache_id != 0
+                && (w as usize)
+                    .saturating_mul(h as usize)
+                    .saturating_mul(4)
+                    <= SURFACE_CACHE_MAX_ENTRY_BYTES
+            {
+                let key = SurfaceCacheKey {
+                    cache_id: self.cache_id,
+                    w,
+                    h,
+                    radii: [0; 4],
+                };
+                if let Ok(mut guard) = surface_cache().lock() {
+                    if let Some(cached) = guard.get(key) {
+                        drop(guard);
+                        canvas.blit_sprite(rect.x, rect.y, &cached);
+                        return;
+                    }
+                }
+                let scaled = Arc::new(sp.scale_bilinear(w, h));
+                if let Ok(mut guard) = surface_cache().lock() {
+                    guard.insert(key, Arc::clone(&scaled));
+                }
+                canvas.blit_sprite(rect.x, rect.y, &scaled);
+                return;
+            }
+            let scaled = sp.scale_bilinear(w, h);
+            canvas.blit_sprite(rect.x, rect.y, &scaled);
+            return;
+        }
+
         let radii = self.radii.unwrap_or(default_radii);
-        if let Some(ref bg) = self.bg {
-            bg.paint(canvas, rect, radii);
+        if self.should_cache(rect, radii) {
+            let key = SurfaceCacheKey {
+                cache_id: self.cache_id,
+                w: rect.w as u32,
+                h: rect.h as u32,
+                radii,
+            };
+            if let Ok(mut guard) = surface_cache().lock() {
+                if let Some(cached) = guard.get(key) {
+                    drop(guard);
+                    canvas.blit_sprite(rect.x, rect.y, &cached);
+                    return;
+                }
+            }
+            let mut off = Canvas::new(rect.w as usize, rect.h as usize, 0);
+            off.set_argb(true);
+            self.paint_uncached(&mut off, Rect::new(0, 0, rect.w, rect.h), radii);
+            let sprite = Arc::new(off.into_sprite());
+            if let Ok(mut guard) = surface_cache().lock() {
+                guard.insert(key, Arc::clone(&sprite));
+            }
+            canvas.blit_sprite(rect.x, rect.y, &sprite);
+            return;
+        }
+
+        self.paint_uncached(canvas, rect, radii);
+    }
+
+    pub fn paint_uncached(&self, canvas: &mut Canvas, rect: Rect, default_radii: [i32; 4]) {
+        if rect.is_empty() {
+            return;
         }
         if let Some(ref sp) = self.sprite {
             if sp.width == rect.w as u32 && sp.height == rect.h as u32 {
@@ -202,6 +444,11 @@ impl CssSurface {
                 let scaled = sp.scale_bilinear(rect.w.max(1) as u32, rect.h.max(1) as u32);
                 canvas.blit_sprite(rect.x, rect.y, &scaled);
             }
+            return;
+        }
+        let radii = self.radii.unwrap_or(default_radii);
+        if let Some(ref bg) = self.bg {
+            bg.paint(canvas, rect, radii);
         }
         let border_inset = self.border.map_or(0, |(_, _, w)| w.max(0));
         let shadow_rect = rect.inset(border_inset);
@@ -287,13 +534,77 @@ fn paint_clipped_strip(
         return;
     }
     canvas.mark_dirty(clip);
-    for y in clip.y..clip.bottom() {
-        for x in clip.x..clip.right() {
+
+    let is_full_circle =
+        outer.w == outer.h && radii.iter().all(|&r| r * 2 >= outer.w) && outer.w >= 4;
+    if is_full_circle {
+        for y in clip.y..clip.bottom() {
+            for x in clip.x..clip.right() {
+                let cov = Canvas::corner_point_coverage(outer, radii, x, y);
+                if cov > 0.0 {
+                    canvas.blend_pixel(x, y, color, alpha * cov);
+                }
+            }
+        }
+        return;
+    }
+
+    let max_r = (outer.w / 2).min(outer.h / 2).max(0);
+    let tl = radii[0].clamp(0, max_r);
+    let tr = radii[1].clamp(0, max_r);
+    let br = radii[2].clamp(0, max_r);
+    let bl = radii[3].clamp(0, max_r);
+
+    let top_end = (outer.y + tl.max(tr)).clamp(clip.y, clip.bottom());
+    let bot_start = (outer.bottom() - bl.max(br)).clamp(top_end, clip.bottom());
+
+    if bot_start > top_end {
+        canvas.fill_alpha(
+            Rect::new(clip.x, top_end, clip.w, bot_start - top_end),
+            color,
+            alpha,
+        );
+    }
+
+    let mut paint_corner_row = |y: i32| {
+        let l_inset = if y < outer.y + tl {
+            tl
+        } else if y >= outer.bottom() - bl && bl > 0 {
+            bl
+        } else {
+            0
+        };
+        let r_inset = if y < outer.y + tr {
+            tr
+        } else if y >= outer.bottom() - br && br > 0 {
+            br
+        } else {
+            0
+        };
+        let mid_l = (outer.x + l_inset).max(clip.x);
+        let mid_r = (outer.right() - r_inset).min(clip.right());
+        if mid_r > mid_l {
+            canvas.fill_alpha(Rect::new(mid_l, y, mid_r - mid_l, 1), color, alpha);
+        }
+        for x in clip.x..mid_l.min(clip.right()) {
             let cov = Canvas::corner_point_coverage(outer, radii, x, y);
             if cov > 0.0 {
                 canvas.blend_pixel(x, y, color, alpha * cov);
             }
         }
+        for x in mid_r.max(clip.x)..clip.right() {
+            let cov = Canvas::corner_point_coverage(outer, radii, x, y);
+            if cov > 0.0 {
+                canvas.blend_pixel(x, y, color, alpha * cov);
+            }
+        }
+    };
+
+    for y in clip.y..top_end {
+        paint_corner_row(y);
+    }
+    for y in bot_start..clip.bottom() {
+        paint_corner_row(y);
     }
 }
 
@@ -491,11 +802,31 @@ pub struct ControlsSkin {
     pub button_hover: CssSurface,
     pub button_active: CssSurface,
     pub button_primary: CssSurface,
+    pub button_primary_hover: CssSurface,
+    pub button_primary_active: CssSurface,
     pub button_radius: i32,
     pub button_text: u32,
     pub button_primary_text: u32,
+    pub icon_button_hover: CssSurface,
+    pub icon_button_active: CssSurface,
     pub card: CssSurface,
     pub card_radius: i32,
+    pub popup_surface: CssSurface,
+    pub popup_radius: i32,
+    pub switch_track_off: CssSurface,
+    pub switch_track_on: CssSurface,
+    pub switch_knob: CssSurface,
+    pub switch_radius: i32,
+    pub slider_track: CssSurface,
+    pub slider_fill: CssSurface,
+    pub slider_thumb: CssSurface,
+    pub slider_thumb_hover: CssSurface,
+    pub slider_thumb_radius: i32,
+    pub list_item_selected: CssSurface,
+    pub list_item_hover: CssSurface,
+    pub list_item_radius: i32,
+    pub list_item_selected_text: u32,
+    pub toolbar_bg: CssSurface,
     pub tab_normal: CssSurface,
     pub tab_hover: CssSurface,
     pub tab_active: CssSurface,
@@ -519,6 +850,145 @@ pub struct ControlsSkin {
     pub progress_chunk_gap: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SplashDim {
+    Px(i32),
+    Pct(f32),
+}
+
+impl SplashDim {
+    pub fn resolve(self, total: i32) -> i32 {
+        match self {
+            Self::Px(v) => v,
+            Self::Pct(f) => ((total as f32) * f).round() as i32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplashAnchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    Center,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl SplashAnchor {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "top_left" | "topleft" => Self::TopLeft,
+            "top_center" | "topcenter" | "top" => Self::TopCenter,
+            "top_right" | "topright" => Self::TopRight,
+            "bottom_left" | "bottomleft" => Self::BottomLeft,
+            "bottom_center" | "bottomcenter" | "bottom" => Self::BottomCenter,
+            "bottom_right" | "bottomright" => Self::BottomRight,
+            _ => Self::Center,
+        }
+    }
+
+    pub fn resolve_rect(
+        self,
+        bounds: Rect,
+        x: SplashDim,
+        y: SplashDim,
+        w: SplashDim,
+        h: SplashDim,
+    ) -> Rect {
+        let dx = x.resolve(bounds.w);
+        let dy = y.resolve(bounds.h);
+        let rw = w.resolve(bounds.w).max(1);
+        let rh = h.resolve(bounds.h).max(1);
+        let rx = match self {
+            Self::TopLeft | Self::BottomLeft => bounds.x + dx,
+            Self::TopCenter | Self::Center | Self::BottomCenter => {
+                bounds.x + bounds.w / 2 + dx - rw / 2
+            }
+            Self::TopRight | Self::BottomRight => bounds.right() + dx - rw,
+        };
+        let ry = match self {
+            Self::TopLeft | Self::TopCenter | Self::TopRight => bounds.y + dy,
+            Self::Center => bounds.y + bounds.h / 2 + dy - rh / 2,
+            Self::BottomLeft | Self::BottomCenter | Self::BottomRight => bounds.bottom() + dy - rh,
+        };
+        Rect::new(rx, ry, rw, rh)
+    }
+
+    pub fn resolve_text_point(self, bounds: Rect, x: SplashDim, y: SplashDim) -> (i32, i32) {
+        let dx = x.resolve(bounds.w);
+        let dy = y.resolve(bounds.h);
+        let px = match self {
+            Self::TopLeft | Self::BottomLeft => bounds.x + dx,
+            Self::TopCenter | Self::Center | Self::BottomCenter => bounds.x + bounds.w / 2 + dx,
+            Self::TopRight | Self::BottomRight => bounds.right() + dx,
+        };
+        let py = match self {
+            Self::TopLeft | Self::TopCenter | Self::TopRight => bounds.y + dy,
+            Self::Center => bounds.y + bounds.h / 2 + dy,
+            Self::BottomLeft | Self::BottomCenter | Self::BottomRight => bounds.bottom() + dy,
+        };
+        (px, py)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PowerSplashLayer {
+    pub anchor: SplashAnchor,
+    pub x: SplashDim,
+    pub y: SplashDim,
+    pub w: SplashDim,
+    pub h: SplashDim,
+    pub radii: [i32; 4],
+    pub surface: CssSurface,
+}
+
+#[derive(Clone, Debug)]
+pub struct PowerSplashAnim {
+    pub frames: Vec<Sprite>,
+    pub width: i32,
+    pub height: i32,
+    pub fps: f32,
+    pub anchor: SplashAnchor,
+    pub x: SplashDim,
+    pub y: SplashDim,
+}
+
+#[derive(Clone, Debug)]
+pub struct PowerSplashSkin {
+    pub bg_color: u32,
+    pub layers: Vec<PowerSplashLayer>,
+    pub animation: Option<PowerSplashAnim>,
+    pub show_space_logo: bool,
+    pub logo_anchor: SplashAnchor,
+    pub logo_x: SplashDim,
+    pub logo_y: SplashDim,
+    pub logo_size: i32,
+    pub title_anchor: SplashAnchor,
+    pub title_x: SplashDim,
+    pub title_y: SplashDim,
+    pub title_size: f32,
+    pub title_color: u32,
+    pub title_shadow: Option<u32>,
+    pub subtitle_anchor: SplashAnchor,
+    pub subtitle_x: SplashDim,
+    pub subtitle_y: SplashDim,
+    pub subtitle_size: f32,
+    pub subtitle_color: u32,
+    pub poweroff_title: String,
+    pub reboot_title: String,
+    pub done_title: String,
+    pub poweroff_subtitle: String,
+    pub reboot_subtitle: String,
+    pub done_subtitle: String,
+    pub log_bg: u32,
+    pub log_border: u32,
+    pub log_text: u32,
+    pub log_accent: u32,
+    pub hint_color: u32,
+}
+
 /// Complete parsed declarative skin for an external theme package.
 #[derive(Clone, Debug)]
 pub struct CustomThemeSkin {
@@ -530,6 +1000,7 @@ pub struct CustomThemeSkin {
     pub start_button: StartButtonSkin,
     pub start_menu: Option<StartMenuSkin>,
     pub controls: ControlsSkin,
+    pub power_splash: Option<PowerSplashSkin>,
 }
 
 /// Copyable static reference wrapper around [`CustomThemeSkin`] so [`Theme`] stays `Copy + Eq`.
@@ -616,6 +1087,7 @@ pub fn fallback_missing_theme(config: &mut DesktopConfig) -> Option<String> {
     config.panel_position = default.panel_position;
     config.panel_size = default.panel_size;
     config.panel_start_fullscreen = default.panel_start_fullscreen;
+    config.wm_button_layout = default.wm_button_layout;
     Some(missing)
 }
 
@@ -867,12 +1339,112 @@ fn select_accent_variant<'a>(
     None
 }
 
-fn file_mtime_key(path: &Path) -> u64 {
-    fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs())
+#[inline]
+fn fnv_u64(mut h: u64, val: u64) -> u64 {
+    for b in val.to_le_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+#[inline]
+fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    fnv_u64(h, 0xff)
+}
+
+fn hash_file_meta(mut h: u64, path: &Path) -> u64 {
+    if let Ok(m) = fs::metadata(path) {
+        h = fnv_u64(h, m.len());
+        if let Ok(t) = m.modified() {
+            if let Ok(d) = t.duration_since(SystemTime::UNIX_EPOCH) {
+                h = fnv_u64(h, d.as_secs());
+                h = fnv_u64(h, u64::from(d.subsec_nanos()));
+            }
+        }
+    }
+    h
+}
+
+/// Content/metadata fingerprint over every asset in a theme pack directory so
+/// upgrading `theme.toml` or any SVG sprite always invalidates `SKIN_CACHE`.
+pub fn theme_dir_fingerprint(dir: &Path) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let Ok(rd) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    names.sort();
+    for name in names {
+        h = fnv_bytes(h, name.as_bytes());
+        h = hash_file_meta(h, &dir.join(&name));
+    }
+    h
+}
+
+/// Fast low-overhead directory/stamp fingerprint across all theme roots so
+/// Shell, App windows, and Settings detect installs/upgrades/removals in <= 2s
+/// without reading or parsing `theme.toml`.
+pub fn installed_themes_fingerprint() -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let stamp_path = Path::new(THEME_RELOAD_STAMP);
+    h = hash_file_meta(h, stamp_path);
+    if let Ok(raw) = fs::read(stamp_path) {
+        let len = raw.len().min(128);
+        h = fnv_bytes(h, &raw[..len]);
+    }
+    for root in theme_root_dirs() {
+        h = fnv_bytes(h, root.to_string_lossy().as_bytes());
+        let Ok(rd) = fs::read_dir(&root) else {
+            h = fnv_u64(h, 0);
+            continue;
+        };
+        let mut dirs: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| {
+                if e.path().is_dir() {
+                    e.file_name().to_str().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        dirs.sort();
+        for name in dirs {
+            if !valid_theme_id(&name) {
+                continue;
+            }
+            let sub = root.join(&name);
+            let toml_p = sub.join("theme.toml");
+            if toml_p.is_file() {
+                h = fnv_bytes(h, name.as_bytes());
+                h = hash_file_meta(h, &toml_p);
+                // Also fold SVG filenames/meta lightly in case a theme upgrade replaced SVGs only.
+                if let Ok(assets) = fs::read_dir(&sub) {
+                    let mut svgs: Vec<String> = assets
+                        .flatten()
+                        .filter_map(|a| {
+                            let s = a.file_name().to_string_lossy().to_string();
+                            if s.ends_with(".svg") { Some(s) } else { None }
+                        })
+                        .collect();
+                    svgs.sort();
+                    for svg in svgs {
+                        h = fnv_bytes(h, svg.as_bytes());
+                        h = hash_file_meta(h, &sub.join(&svg));
+                    }
+                }
+            }
+        }
+    }
+    h
 }
 
 static SKIN_CACHE: OnceLock<Mutex<HashMap<(String, ThemeMode, u32, u64), &'static CustomThemeSkin>>> =
@@ -886,7 +1458,7 @@ fn load_external_theme(id: &str, req_mode: ThemeMode, req_accent: u32) -> Option
         .into_iter()
         .find(|path| path.is_file())?;
     let theme_dir = toml_path.parent()?.to_path_buf();
-    let mtime = file_mtime_key(&toml_path);
+    let dir_fp = theme_dir_fingerprint(&theme_dir);
     let text = fs::read_to_string(&toml_path).ok()?;
     let root_val: toml::Value = toml::from_str(&text).ok()?;
     let mut table = root_val.as_table()?.clone();
@@ -919,20 +1491,40 @@ fn load_external_theme(id: &str, req_mode: ThemeMode, req_accent: u32) -> Option
         .cloned()
         .unwrap_or_default();
 
+    let base_style_resolved = base_style.unwrap_or(ThemeStyle::Spui);
+    let mode_resolved = if req_mode == ThemeMode::Dark {
+        ThemeMode::Dark
+    } else {
+        default_mode.unwrap_or(req_mode)
+    };
+    let accent_resolved = if req_accent == uxconf::ACCENT_PRESETS[0].0 {
+        default_accent.unwrap_or(req_accent)
+    } else {
+        req_accent
+    };
+    let mut base_palette = match (base_style_resolved, mode_resolved) {
+        (ThemeStyle::VortexGlass, m) => Theme::vortexglass_with_accent(accent_resolved, m),
+        (ThemeStyle::Win98, m) => Theme::win98_with_accent(accent_resolved, m),
+        (ThemeStyle::Spui, ThemeMode::Dark) => Theme::dark_with_accent(accent_resolved),
+        (ThemeStyle::Spui, ThemeMode::Light) => Theme::light_with_accent(accent_resolved),
+    };
+    apply_external_colors(&mut base_palette, &colors);
+
     let has_skin_sections = table.contains_key("window")
         || table.contains_key("titlebar")
         || table.contains_key("taskbar")
         || table.contains_key("controls")
+        || table.contains_key("power_splash")
         || table.get("schema").and_then(toml::Value::as_integer).unwrap_or(1) >= 2;
 
     let skin = if has_skin_sections {
-        let key = (id.to_string(), req_mode, req_accent & 0x00ff_ffff, mtime);
+        let key = (id.to_string(), req_mode, req_accent & 0x00ff_ffff, dir_fp);
         let cache = SKIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         let mut guard = cache.lock().ok()?;
         if let Some(&cached) = guard.get(&key) {
             Some(SkinRef(cached))
         } else {
-            let parsed = parse_custom_skin(id, key.clone(), &table, &theme_dir);
+            let parsed = parse_custom_skin(id, key.clone(), &table, &theme_dir, &base_palette);
             let leaked: &'static CustomThemeSkin = Box::leak(Box::new(parsed));
             guard.insert(key, leaked);
             Some(SkinRef(leaked))
@@ -1141,9 +1733,9 @@ pub fn parse_css_background(raw: &str) -> Option<CssBackground> {
             return None;
         }
         return Some(match dir {
-            1 => CssBackground::LinearH(stops, 1.0),
-            2 => CssBackground::LinearDiag(stops, 1.0),
-            _ => CssBackground::LinearV(stops, 1.0),
+            1 => CssBackground::linear_h(stops, 1.0),
+            2 => CssBackground::linear_diag(stops, 1.0),
+            _ => CssBackground::linear_v(stops, 1.0),
         });
     }
     if let Some(inner) = lower
@@ -1178,12 +1770,7 @@ pub fn parse_css_background(raw: &str) -> Option<CssBackground> {
         if stops.is_empty() {
             return None;
         }
-        return Some(CssBackground::Radial {
-            cx_pct,
-            cy_pct,
-            stops,
-            alpha: 1.0,
-        });
+        return Some(CssBackground::radial(cx_pct, cy_pct, stops, 1.0));
     }
     parse_css_color_str(s).map(|(c, a)| CssBackground::Solid(c, a))
 }
@@ -1362,7 +1949,8 @@ fn parse_surface(
                 icons::decode_theme_asset(&theme_dir.join(rel), target_size)
             }
         });
-    CssSurface {
+    let mut out = CssSurface {
+        cache_id: 0,
         bg,
         box_shadows,
         border,
@@ -1372,7 +1960,280 @@ fn parse_surface(
         border_left,
         radii,
         sprite,
+    };
+    out.assign_cache_id();
+    out
+}
+
+fn parse_splash_dim(val: &toml::Value) -> Option<SplashDim> {
+    if let Some(n) = val.as_integer() {
+        return Some(SplashDim::Px(n as i32));
     }
+    if let Some(f) = val.as_float() {
+        return Some(SplashDim::Px(f.round() as i32));
+    }
+    let s = val.as_str()?.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        let p = pct.trim().parse::<f32>().ok()?;
+        return Some(SplashDim::Pct(p / 100.0));
+    }
+    let px_str = s.strip_suffix("px").unwrap_or(s).trim();
+    px_str.parse::<i32>().ok().map(SplashDim::Px)
+}
+
+fn parse_splash_dim_key(
+    tbl: Option<&toml::value::Table>,
+    key: &str,
+    default: SplashDim,
+) -> SplashDim {
+    tbl.and_then(|t| t.get(key))
+        .and_then(parse_splash_dim)
+        .unwrap_or(default)
+}
+
+fn parse_splash_anchor_key(
+    tbl: Option<&toml::value::Table>,
+    key: &str,
+    default: SplashAnchor,
+) -> SplashAnchor {
+    tbl.and_then(|t| t.get(key))
+        .and_then(toml::Value::as_str)
+        .map(SplashAnchor::parse)
+        .unwrap_or(default)
+}
+
+fn tint_surface(src: &CssSurface, target: u32, weight: f32) -> CssSurface {
+    let mut out = src.clone();
+    out.bg = out.bg.map(|b| b.tinted(target, weight));
+    out.assign_cache_id();
+    out
+}
+
+fn slice_sprite_horizontal(sheet: &Sprite, frame_w: u32, frame_h: u32, count: usize) -> Vec<Sprite> {
+    let fw = frame_w.max(1) as usize;
+    let fh = frame_h.max(1) as usize;
+    let sw = sheet.width as usize;
+    let sh = sheet.height as usize;
+    let rows = fh.min(sh);
+    let mut frames = Vec::with_capacity(count);
+    for i in 0..count {
+        let x0 = i * fw;
+        if x0 + fw > sw {
+            break;
+        }
+        let mut pixels = Vec::with_capacity(fw * rows);
+        for row in 0..rows {
+            let start = row * sw + x0;
+            pixels.extend_from_slice(&sheet.pixels[start..start + fw]);
+        }
+        frames.push(Sprite {
+            width: fw as u32,
+            height: rows as u32,
+            pixels,
+        });
+    }
+    frames
+}
+
+fn parse_power_splash(
+    root: &toml::value::Table,
+    theme_dir: &Path,
+    pal: &Theme,
+) -> Option<PowerSplashSkin> {
+    let sp_tbl = root.get("power_splash")?.as_table()?;
+    let bg_color = sp_tbl
+        .get("bg_color")
+        .and_then(parse_color)
+        .unwrap_or(pal.bg_top);
+
+    let mut layers = Vec::new();
+    if let Some(arr) = sp_tbl.get("layers").and_then(toml::Value::as_array) {
+        for item in arr {
+            let Some(ltbl) = item.as_table() else {
+                continue;
+            };
+            let surface = parse_surface(Some(ltbl), "", theme_dir, None);
+            if surface.is_empty() {
+                continue;
+            }
+            let radii = ltbl
+                .get("radius")
+                .and_then(parse_radii_val)
+                .unwrap_or([0; 4]);
+            layers.push(PowerSplashLayer {
+                anchor: parse_splash_anchor_key(Some(ltbl), "anchor", SplashAnchor::TopLeft),
+                x: parse_splash_dim_key(Some(ltbl), "x", SplashDim::Px(0)),
+                y: parse_splash_dim_key(Some(ltbl), "y", SplashDim::Px(0)),
+                w: parse_splash_dim_key(Some(ltbl), "w", SplashDim::Pct(1.0)),
+                h: parse_splash_dim_key(Some(ltbl), "h", SplashDim::Pct(1.0)),
+                radii,
+                surface,
+            });
+        }
+    }
+
+    let animation = sp_tbl
+        .get("animation")
+        .and_then(toml::Value::as_table)
+        .and_then(|atbl| {
+            let width = atbl
+                .get("width")
+                .and_then(toml::Value::as_integer)
+                .unwrap_or(48)
+                .clamp(8, 640) as i32;
+            let height = atbl
+                .get("height")
+                .and_then(toml::Value::as_integer)
+                .unwrap_or(48)
+                .clamp(8, 320) as i32;
+            let fps = atbl
+                .get("fps")
+                .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+                .unwrap_or(12.0)
+                .clamp(1.0, 60.0) as f32;
+            let mut frames = Vec::new();
+            if let Some(sheet_rel) = atbl
+                .get("sprite_sheet")
+                .or_else(|| atbl.get("sheet"))
+                .and_then(toml::Value::as_str)
+            {
+                let count = atbl
+                    .get("frame_count")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(1)
+                    .clamp(1, 64) as usize;
+                if !sheet_rel.is_empty()
+                    && !sheet_rel.contains("..")
+                    && !sheet_rel.starts_with('/')
+                {
+                    if let Some(sheet) = icons::decode_theme_asset(
+                        &theme_dir.join(sheet_rel),
+                        Some(((width * count as i32) as u32, height as u32)),
+                    ) {
+                        frames = slice_sprite_horizontal(&sheet, width as u32, height as u32, count);
+                    }
+                }
+            } else if let Some(list) = atbl.get("frames").and_then(toml::Value::as_array) {
+                for item in list {
+                    let Some(rel) = item.as_str() else {
+                        continue;
+                    };
+                    if !rel.is_empty() && !rel.contains("..") && !rel.starts_with('/') {
+                        if let Some(sp) = icons::decode_theme_asset(
+                            &theme_dir.join(rel),
+                            Some((width as u32, height as u32)),
+                        ) {
+                            frames.push(sp);
+                        }
+                    }
+                }
+            }
+            if frames.is_empty() {
+                None
+            } else {
+                Some(PowerSplashAnim {
+                    frames,
+                    width,
+                    height,
+                    fps,
+                    anchor: parse_splash_anchor_key(Some(atbl), "anchor", SplashAnchor::Center),
+                    x: parse_splash_dim_key(Some(atbl), "x", SplashDim::Px(0)),
+                    y: parse_splash_dim_key(Some(atbl), "y", SplashDim::Px(60)),
+                })
+            }
+        });
+
+    let opt = Some(sp_tbl);
+    Some(PowerSplashSkin {
+        bg_color,
+        layers,
+        animation,
+        show_space_logo: sp_tbl
+            .get("show_space_logo")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true),
+        logo_anchor: parse_splash_anchor_key(opt, "logo_anchor", SplashAnchor::Center),
+        logo_x: parse_splash_dim_key(opt, "logo_x", SplashDim::Px(0)),
+        logo_y: parse_splash_dim_key(opt, "logo_y", SplashDim::Px(-64)),
+        logo_size: sp_tbl
+            .get("logo_size")
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(68)
+            .clamp(24, 160) as i32,
+        title_anchor: parse_splash_anchor_key(opt, "title_anchor", SplashAnchor::Center),
+        title_x: parse_splash_dim_key(opt, "title_x", SplashDim::Px(0)),
+        title_y: parse_splash_dim_key(opt, "title_y", SplashDim::Px(12)),
+        title_size: sp_tbl
+            .get("title_size")
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+            .unwrap_or(22.0) as f32,
+        title_color: sp_tbl
+            .get("title_color")
+            .and_then(parse_color)
+            .unwrap_or(pal.titlebar_text),
+        title_shadow: sp_tbl.get("title_shadow").and_then(parse_color),
+        subtitle_anchor: parse_splash_anchor_key(opt, "subtitle_anchor", SplashAnchor::Center),
+        subtitle_x: parse_splash_dim_key(opt, "subtitle_x", SplashDim::Px(0)),
+        subtitle_y: parse_splash_dim_key(opt, "subtitle_y", SplashDim::Px(96)),
+        subtitle_size: sp_tbl
+            .get("subtitle_size")
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+            .unwrap_or(13.0) as f32,
+        subtitle_color: sp_tbl
+            .get("subtitle_color")
+            .and_then(parse_color)
+            .unwrap_or(pal.text_dim),
+        poweroff_title: sp_tbl
+            .get("poweroff_title")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("正在关闭计算机")
+            .to_string(),
+        reboot_title: sp_tbl
+            .get("reboot_title")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("正在重新启动")
+            .to_string(),
+        done_title: sp_tbl
+            .get("done_title")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("即将完成，请稍候")
+            .to_string(),
+        poweroff_subtitle: sp_tbl
+            .get("poweroff_subtitle")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("正在保存设置并停止系统服务...")
+            .to_string(),
+        reboot_subtitle: sp_tbl
+            .get("reboot_subtitle")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("正在同步文件系统并准备重启...")
+            .to_string(),
+        done_subtitle: sp_tbl
+            .get("done_subtitle")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("正在移交控制权至系统内核...")
+            .to_string(),
+        log_bg: sp_tbl
+            .get("log_bg")
+            .and_then(parse_color)
+            .unwrap_or(0x0b101b),
+        log_border: sp_tbl
+            .get("log_border")
+            .and_then(parse_color)
+            .unwrap_or(pal.accent),
+        log_text: sp_tbl
+            .get("log_text")
+            .and_then(parse_color)
+            .unwrap_or(0xe2e8f0),
+        log_accent: sp_tbl
+            .get("log_accent")
+            .and_then(parse_color)
+            .unwrap_or(pal.accent),
+        hint_color: sp_tbl
+            .get("hint_color")
+            .and_then(parse_color)
+            .unwrap_or(pal.text_muted),
+    })
 }
 
 fn parse_custom_skin(
@@ -1380,6 +2241,7 @@ fn parse_custom_skin(
     cache_key: (String, ThemeMode, u32, u64),
     root: &toml::value::Table,
     theme_dir: &Path,
+    pal: &Theme,
 ) -> CustomThemeSkin {
     let win_tbl = root.get("window").and_then(toml::Value::as_table);
     let top_radius = win_tbl
@@ -1967,28 +2829,181 @@ fn parse_custom_skin(
         );
     }
 
+    let mut btn_primary_hover = parse_surface(ctrl_tbl, "button_primary_hover", theme_dir, None);
+    if btn_primary_hover.is_empty() {
+        btn_primary_hover = tint_surface(&btn_primary, 0xffffff, 0.14);
+        btn_primary_hover.border = btn_primary_hover.border.or(btn_hover.border);
+    }
+    let mut btn_primary_active = parse_surface(ctrl_tbl, "button_primary_active", theme_dir, None);
+    if btn_primary_active.is_empty() {
+        btn_primary_active = tint_surface(&btn_primary, 0x000000, 0.18);
+        btn_primary_active.border = btn_primary_active.border.or(btn_active.border);
+    }
+    let mut icon_btn_hover = parse_surface(ctrl_tbl, "icon_button_hover", theme_dir, None);
+    if icon_btn_hover.is_empty() {
+        icon_btn_hover = btn_hover.clone();
+    }
+    let mut icon_btn_active = parse_surface(ctrl_tbl, "icon_button_active", theme_dir, None);
+    if icon_btn_active.is_empty() {
+        icon_btn_active = btn_active.clone();
+    }
+
+    let button_radius = ctrl_tbl
+        .and_then(|t| t.get("button_radius"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(3) as i32;
+    let card_radius = ctrl_tbl
+        .and_then(|t| t.get("card_radius"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(4) as i32;
+    let input_bg = ctrl_tbl
+        .and_then(|t| t.get("input_bg"))
+        .and_then(parse_color)
+        .unwrap_or(pal.input_bg);
+    let input_border = ctrl_tbl
+        .and_then(|t| t.get("input_border"))
+        .and_then(parse_color)
+        .unwrap_or(pal.window_border);
+    let input_focus_border = ctrl_tbl
+        .and_then(|t| t.get("input_focus_border"))
+        .and_then(parse_color)
+        .unwrap_or(pal.accent);
+
+    let mut popup_surface = parse_surface(ctrl_tbl, "popup", theme_dir, None);
+    if popup_surface.is_empty() {
+        popup_surface.bg = Some(CssBackground::Solid(pal.panel, 1.0));
+        popup_surface.border = Some((pal.panel_border, 1.0, 1));
+        popup_surface.box_shadows = card_surf.box_shadows.clone();
+    }
+    let popup_radius = ctrl_tbl
+        .and_then(|t| t.get("popup_radius"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(i64::from(card_radius)) as i32;
+
+    let mut switch_track_off = parse_surface(ctrl_tbl, "switch_track_off", theme_dir, None);
+    if switch_track_off.is_empty() {
+        switch_track_off.bg = Some(CssBackground::Solid(mix(input_bg, pal.window_alt, 0.45), 1.0));
+        switch_track_off.border = Some((input_border, 1.0, 1));
+        switch_track_off.box_shadows = parse_css_box_shadow("inset 0 1px rgba(0, 0, 0, 0.14)");
+    }
+    let mut switch_track_on = parse_surface(ctrl_tbl, "switch_track_on", theme_dir, None);
+    if switch_track_on.is_empty() {
+        switch_track_on.bg = Some(CssBackground::linear_v(
+            vec![
+                (0.0, mix(pal.accent, 0xffffff, 0.22)),
+                (1.0, mix(pal.accent, 0x000000, 0.10)),
+            ],
+            1.0,
+        ));
+        switch_track_on.border = Some((mix(pal.accent, 0x000000, 0.22), 1.0, 1));
+        switch_track_on.box_shadows = parse_css_box_shadow("inset 0 1px rgba(255, 255, 255, 0.28)");
+    }
+    let mut switch_knob = parse_surface(ctrl_tbl, "switch_knob", theme_dir, None);
+    if switch_knob.is_empty() {
+        switch_knob = btn_normal.clone();
+        switch_knob.border = switch_knob.border.or(Some((input_border, 1.0, 1)));
+    }
+    let switch_radius = ctrl_tbl
+        .and_then(|t| t.get("switch_radius"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(-1) as i32;
+
+    let mut slider_track = parse_surface(ctrl_tbl, "slider_track", theme_dir, None);
+    if slider_track.is_empty() {
+        slider_track = prog_track.clone();
+    }
+    let mut slider_fill = parse_surface(ctrl_tbl, "slider_fill", theme_dir, None);
+    if slider_fill.is_empty() {
+        slider_fill = prog_fill.clone();
+    }
+    let mut slider_thumb = parse_surface(ctrl_tbl, "slider_thumb", theme_dir, None);
+    if slider_thumb.is_empty() {
+        slider_thumb = btn_normal.clone();
+    }
+    let mut slider_thumb_hover = parse_surface(ctrl_tbl, "slider_thumb_hover", theme_dir, None);
+    if slider_thumb_hover.is_empty() {
+        slider_thumb_hover = btn_hover.clone();
+    }
+    let slider_thumb_radius = ctrl_tbl
+        .and_then(|t| t.get("slider_thumb_radius"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(i64::from(button_radius)) as i32;
+
+    let mut list_item_selected = parse_surface(ctrl_tbl, "list_item_selected", theme_dir, None);
+    if list_item_selected.is_empty() {
+        list_item_selected.bg = Some(CssBackground::Solid(pal.selection_bg, 1.0));
+    }
+    let mut list_item_hover = parse_surface(ctrl_tbl, "list_item_hover", theme_dir, None);
+    if list_item_hover.is_empty() {
+        list_item_hover.bg = Some(CssBackground::Solid(pal.panel_hover, 1.0));
+    }
+    let list_item_radius = ctrl_tbl
+        .and_then(|t| t.get("list_item_radius"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(i64::from(button_radius.min(6))) as i32;
+    let list_item_selected_text = ctrl_tbl
+        .and_then(|t| t.get("list_item_selected_text"))
+        .and_then(parse_color)
+        .unwrap_or(pal.selection_text);
+
+    let mut toolbar_bg = parse_surface(ctrl_tbl, "toolbar", theme_dir, None);
+    if toolbar_bg.is_empty() {
+        toolbar_bg.bg = Some(CssBackground::linear_v(
+            vec![(0.0, pal.panel_high), (1.0, pal.panel)],
+            1.0,
+        ));
+        toolbar_bg.border_bottom = Some((pal.window_border, 1));
+    }
+
+    let is_dark_rgb = |c: u32| -> bool {
+        let r = ((c >> 16) & 0xff) as f32;
+        let g = ((c >> 8) & 0xff) as f32;
+        let b = (c & 0xff) as f32;
+        (0.299 * r + 0.587 * g + 0.114 * b) < 138.0
+    };
+    let default_tab_active_text = tab_active
+        .bg
+        .as_ref()
+        .map_or(pal.text, |b| {
+            if is_dark_rgb(b.primary_color()) { 0xffffff } else { 0x111111 }
+        });
+
     let controls = ControlsSkin {
         button_normal: btn_normal,
         button_hover: btn_hover,
         button_active: btn_active,
         button_primary: btn_primary,
-        button_radius: ctrl_tbl
-            .and_then(|t| t.get("button_radius"))
-            .and_then(toml::Value::as_integer)
-            .unwrap_or(3) as i32,
+        button_primary_hover: btn_primary_hover,
+        button_primary_active: btn_primary_active,
+        button_radius,
         button_text: ctrl_tbl
             .and_then(|t| t.get("button_text"))
             .and_then(parse_color)
-            .unwrap_or(0x000000),
+            .unwrap_or(pal.text),
         button_primary_text: ctrl_tbl
             .and_then(|t| t.get("button_primary_text"))
             .and_then(parse_color)
-            .unwrap_or(0x000000),
+            .unwrap_or(pal.selection_text),
+        icon_button_hover: icon_btn_hover,
+        icon_button_active: icon_btn_active,
         card: card_surf,
-        card_radius: ctrl_tbl
-            .and_then(|t| t.get("card_radius"))
-            .and_then(toml::Value::as_integer)
-            .unwrap_or(4) as i32,
+        card_radius,
+        popup_surface,
+        popup_radius,
+        switch_track_off,
+        switch_track_on,
+        switch_knob,
+        switch_radius,
+        slider_track,
+        slider_fill,
+        slider_thumb,
+        slider_thumb_hover,
+        slider_thumb_radius,
+        list_item_selected,
+        list_item_hover,
+        list_item_radius,
+        list_item_selected_text,
+        toolbar_bg,
         tab_normal,
         tab_hover,
         tab_active,
@@ -1999,23 +3014,14 @@ fn parse_custom_skin(
         tab_text: ctrl_tbl
             .and_then(|t| t.get("tab_text"))
             .and_then(parse_color)
-            .unwrap_or(0x222222),
+            .unwrap_or(pal.text_dim),
         tab_active_text: ctrl_tbl
             .and_then(|t| t.get("tab_active_text"))
             .and_then(parse_color)
-            .unwrap_or(0x000000),
-        input_bg: ctrl_tbl
-            .and_then(|t| t.get("input_bg"))
-            .and_then(parse_color)
-            .unwrap_or(0xffffff),
-        input_border: ctrl_tbl
-            .and_then(|t| t.get("input_border"))
-            .and_then(parse_color)
-            .unwrap_or(0x7f9db9),
-        input_focus_border: ctrl_tbl
-            .and_then(|t| t.get("input_focus_border"))
-            .and_then(parse_color)
-            .unwrap_or(0x0054e3),
+            .unwrap_or(default_tab_active_text),
+        input_bg,
+        input_border,
+        input_focus_border,
         input_radius: ctrl_tbl
             .and_then(|t| t.get("input_radius"))
             .and_then(toml::Value::as_integer)
@@ -2048,7 +3054,9 @@ fn parse_custom_skin(
             .unwrap_or(2) as i32,
     };
 
-    CustomThemeSkin {
+    let power_splash = parse_power_splash(root, theme_dir, pal);
+
+    let mut skin = CustomThemeSkin {
         cache_key,
         window,
         titlebar,
@@ -2057,6 +3065,88 @@ fn parse_custom_skin(
         start_button,
         start_menu,
         controls,
+        power_splash,
+    };
+    finalize_skin_cache_ids(&mut skin);
+    skin
+}
+
+fn finalize_skin_cache_ids(skin: &mut CustomThemeSkin) {
+    skin.window.active_frame.assign_cache_id();
+    skin.window.inactive_frame.assign_cache_id();
+    skin.titlebar.active.assign_cache_id();
+    skin.titlebar.inactive.assign_cache_id();
+    for s in [
+        &mut skin.caption_buttons.close_normal,
+        &mut skin.caption_buttons.close_hover,
+        &mut skin.caption_buttons.close_active,
+        &mut skin.caption_buttons.min_normal,
+        &mut skin.caption_buttons.min_hover,
+        &mut skin.caption_buttons.min_active,
+        &mut skin.caption_buttons.max_normal,
+        &mut skin.caption_buttons.max_hover,
+        &mut skin.caption_buttons.max_active,
+        &mut skin.caption_buttons.restore_normal,
+        &mut skin.caption_buttons.restore_hover,
+        &mut skin.caption_buttons.restore_active,
+    ] {
+        s.assign_cache_id();
+    }
+    skin.taskbar.bg.assign_cache_id();
+    skin.taskbar.button_normal.assign_cache_id();
+    skin.taskbar.button_hover.assign_cache_id();
+    skin.taskbar.button_active.assign_cache_id();
+    skin.taskbar.button_pressed.assign_cache_id();
+    if let Some(ref mut tray) = skin.taskbar.tray_bg {
+        tray.assign_cache_id();
+    }
+    skin.start_button.normal.assign_cache_id();
+    skin.start_button.hover.assign_cache_id();
+    skin.start_button.active.assign_cache_id();
+    if let Some(ref mut sm) = skin.start_menu {
+        sm.header_bg.assign_cache_id();
+        sm.footer_bg.assign_cache_id();
+        sm.logout_badge.assign_cache_id();
+        sm.reboot_badge.assign_cache_id();
+        sm.shutdown_badge.assign_cache_id();
+    }
+    for s in [
+        &mut skin.controls.button_normal,
+        &mut skin.controls.button_hover,
+        &mut skin.controls.button_active,
+        &mut skin.controls.button_primary,
+        &mut skin.controls.button_primary_hover,
+        &mut skin.controls.button_primary_active,
+        &mut skin.controls.icon_button_hover,
+        &mut skin.controls.icon_button_active,
+        &mut skin.controls.card,
+        &mut skin.controls.popup_surface,
+        &mut skin.controls.switch_track_off,
+        &mut skin.controls.switch_track_on,
+        &mut skin.controls.switch_knob,
+        &mut skin.controls.slider_track,
+        &mut skin.controls.slider_fill,
+        &mut skin.controls.slider_thumb,
+        &mut skin.controls.slider_thumb_hover,
+        &mut skin.controls.list_item_selected,
+        &mut skin.controls.list_item_hover,
+        &mut skin.controls.toolbar_bg,
+        &mut skin.controls.tab_normal,
+        &mut skin.controls.tab_hover,
+        &mut skin.controls.tab_active,
+        &mut skin.controls.scrollbar_track,
+        &mut skin.controls.scrollbar_thumb,
+        &mut skin.controls.scrollbar_thumb_hover,
+        &mut skin.controls.scrollbar_thumb_active,
+        &mut skin.controls.progress_track,
+        &mut skin.controls.progress_fill,
+    ] {
+        s.assign_cache_id();
+    }
+    if let Some(ref mut ps) = skin.power_splash {
+        for layer in &mut ps.layers {
+            layer.surface.assign_cache_id();
+        }
     }
 }
 
@@ -2490,6 +3580,23 @@ impl Theme {
         self.custom_skin.is_none() && matches!(self.style, ThemeStyle::VortexGlass)
     }
 
+    pub const fn glass_chrome_enabled(&self) -> bool {
+        self.is_vortexglass()
+    }
+
+    #[allow(dead_code)]
+    pub fn style_label(&self) -> String {
+        if let Some(skin) = self.skin() {
+            skin.cache_key.0.clone()
+        } else if self.is_win98() {
+            String::from("Win98")
+        } else if self.is_vortexglass() {
+            String::from("VortexGlass 4.0")
+        } else {
+            String::from("SPUI 4.0")
+        }
+    }
+
     /// Accent-tinted Aero glass colorization base & opacity for active/inactive chrome.
     pub fn glass_tint(&self, active: bool) -> (u32, u8) {
         if self.is_dark() {
@@ -2589,10 +3696,7 @@ impl Theme {
 
     pub const fn radius_popup(&self) -> i32 {
         if let Some(skin) = self.skin() {
-            if let Some(ref sm) = skin.start_menu {
-                return sm.top_radius;
-            }
-            return 4;
+            return skin.controls.popup_radius;
         }
         if self.is_win98() {
             0
@@ -2894,6 +3998,20 @@ mod tests {
         assert!(luna_skin.caption_buttons.restore_normal.sprite.is_some());
         assert!(luna_skin.start_button.icon.is_none());
         assert!(luna_skin.start_menu.is_some());
+        let luna_ps = luna_skin
+            .power_splash
+            .as_ref()
+            .expect("XP Luna power_splash");
+        assert!(!luna_ps.layers.is_empty());
+        assert_eq!(
+            luna_ps
+                .animation
+                .as_ref()
+                .expect("XP Luna splash animation")
+                .frames
+                .len(),
+            12
+        );
 
         // 2. Olive Green (Homestead) via #10b981 accent swatch
         cfg.accent = 0x10b981;
@@ -2910,6 +4028,12 @@ mod tests {
         let noir = Theme::from_config(&cfg);
         assert_eq!(noir.window, 0x20242d);
         assert_eq!(noir.text, 0xeef1f7);
+        let noir_ps = noir
+            .skin()
+            .and_then(|s| s.power_splash.as_ref())
+            .expect("XP Royale Noir power_splash");
+        assert_ne!(noir_ps.bg_color, luna_ps.bg_color);
+        assert_eq!(noir_ps.animation.as_ref().unwrap().frames.len(), 12);
     }
 
     #[test]
@@ -2946,6 +4070,21 @@ mod tests {
         assert!(classic_skin.caption_buttons.min_normal.sprite.is_some());
         assert!(classic_skin.caption_buttons.max_normal.sprite.is_some());
         assert!(classic_skin.caption_buttons.restore_normal.sprite.is_some());
+        let aqua_ps = classic_skin
+            .power_splash
+            .as_ref()
+            .expect("Aqua power_splash");
+        assert!(!aqua_ps.layers.is_empty());
+        assert_eq!(
+            aqua_ps
+                .animation
+                .as_ref()
+                .expect("Aqua splash animation")
+                .frames
+                .len(),
+            12
+        );
+        assert_eq!(classic_skin.controls.tab_active_text, 0xffffff);
 
         // 2. Graphite accent (#64748b) switches traffic lights to Graphite CSS orbs
         cfg.accent = 0x64748b;
@@ -2962,6 +4101,12 @@ mod tests {
         let dark = Theme::from_config(&cfg);
         assert_eq!(dark.window, 0x252629);
         assert_eq!(dark.text, 0xeef1f6);
+        let dark_ps = dark
+            .skin()
+            .and_then(|s| s.power_splash.as_ref())
+            .expect("Aqua Dark power_splash");
+        assert_ne!(dark_ps.bg_color, aqua_ps.bg_color);
+        assert_eq!(dark_ps.animation.as_ref().unwrap().frames.len(), 12);
     }
 
     #[test]
@@ -2999,22 +4144,148 @@ mod tests {
         assert!(def_skin.caption_buttons.min_normal.sprite.is_some());
         assert!(def_skin.caption_buttons.max_normal.sprite.is_some());
         assert!(def_skin.caption_buttons.restore_normal.sprite.is_some());
+        let amb_ps = def_skin
+            .power_splash
+            .as_ref()
+            .expect("Ambiance power_splash");
+        assert!(!amb_ps.layers.is_empty());
+        assert_eq!(
+            amb_ps
+                .animation
+                .as_ref()
+                .expect("Ambiance splash animation")
+                .frames
+                .len(),
+            10
+        );
 
         // 2. Radiance (#f59e0b) light chrome
         cfg.accent = 0xf59e0b;
         let radiance = Theme::from_config(&cfg);
         assert_eq!(radiance.titlebar_text, 0x3c3c3c);
+        let rad_ps = radiance
+            .skin()
+            .and_then(|s| s.power_splash.as_ref())
+            .expect("Radiance power_splash");
+        assert_ne!(rad_ps.bg_color, amb_ps.bg_color);
 
         // 3. MATE green (#10b981)
         cfg.accent = 0x10b981;
         let mate = Theme::from_config(&cfg);
         assert_eq!(mate.accent, 0x6f913d);
+        let mate_ps = mate
+            .skin()
+            .and_then(|s| s.power_splash.as_ref())
+            .expect("MATE power_splash");
+        assert_ne!(mate_ps.bg_color, amb_ps.bg_color);
 
         // 4. Ambiance Darkness (Dark mode)
         cfg.mode = ThemeMode::Dark;
         let darkness = Theme::from_config(&cfg);
         assert_eq!(darkness.window, 0x2c2b29);
         assert_eq!(darkness.text, 0xe7e4dc);
+        let dark_ps = darkness
+            .skin()
+            .and_then(|s| s.power_splash.as_ref())
+            .expect("Darkness power_splash");
+        assert_ne!(dark_ps.bg_color, amb_ps.bg_color);
+        assert_eq!(dark_ps.animation.as_ref().unwrap().frames.len(), 10);
+    }
+
+    #[test]
+    fn sprite_only_surface_skips_css_bg_and_border() {
+        let mut pixels = vec![0u32; 8 * 8];
+        for y in 2..6 {
+            for x in 2..6 {
+                pixels[y * 8 + x] = 0xffff_3311;
+            }
+        }
+        let sprite = crate::draw::Sprite {
+            width: 8,
+            height: 8,
+            pixels,
+        };
+        let surf = CssSurface {
+            bg: Some(CssBackground::Solid(0x00ff00, 1.0)),
+            border: Some((0xff0000, 1.0, 1)),
+            sprite: Some(sprite),
+            ..CssSurface::default()
+        };
+        let mut canvas = Canvas::new(12, 12, 0x223344);
+        surf.paint(&mut canvas, Rect::new(2, 2, 8, 8), [0; 4]);
+        // Transparent outer ring of sprite must preserve untouched canvas background (zero border/bg halo).
+        assert_eq!(canvas.pixels()[2 * 12 + 2] & 0x00ff_ffff, 0x223344);
+        assert_eq!(canvas.pixels()[2 * 12 + 9] & 0x00ff_ffff, 0x223344);
+        assert_eq!(canvas.pixels()[4 * 12 + 4] & 0x00ff_ffff, 0xff3311);
+    }
+
+    #[test]
+    fn surface_cache_matches_uncached_paint() {
+        let mut surf = CssSurface {
+            bg: Some(CssBackground::linear_v(
+                vec![(0.0, 0x4488cc), (0.5, 0x225599), (1.0, 0x113366)],
+                1.0,
+            )),
+            border: Some((0x99ccff, 1.0, 1)),
+            box_shadows: parse_css_box_shadow("inset 0 1px #ffffff"),
+            radii: Some([4, 4, 4, 4]),
+            ..CssSurface::default()
+        };
+        surf.assign_cache_id();
+        let rect = Rect::new(4, 3, 24, 18);
+
+        let mut expected = Canvas::new(32, 24, 0x00000000);
+        surf.paint_uncached(&mut expected, rect, [4; 4]);
+
+        let mut miss = Canvas::new(32, 24, 0x00000000);
+        surf.paint(&mut miss, rect, [4; 4]);
+        for (idx, (&cached_px, &direct_px)) in
+            miss.pixels().iter().zip(expected.pixels().iter()).enumerate()
+        {
+            for shift in [16, 8, 0] {
+                let c = ((cached_px >> shift) & 0xff) as i32;
+                let d = ((direct_px >> shift) & 0xff) as i32;
+                assert!(
+                    (c - d).abs() <= 2,
+                    "pixel {idx} channel shift {shift}: cached={cached_px:#08x} direct={direct_px:#08x}"
+                );
+            }
+        }
+
+        let mut hit = Canvas::new(32, 24, 0x00000000);
+        surf.paint(&mut hit, rect, [4; 4]);
+        assert_eq!(hit.pixels(), miss.pixels());
+    }
+
+    #[test]
+    fn gradient_lut_matches_linear_interpolation() {
+        let stops = [(0.0f32, 0x102030), (0.5, 0x8090a0), (1.0, 0xf0e0d0)];
+        let lut = crate::draw::build_gradient_lut(&stops);
+        assert_eq!(lut[0], 0x102030);
+        assert_eq!(lut[255], 0xf0e0d0);
+        assert_eq!(
+            lut[128],
+            Canvas::sample_gradient_stops(&stops, 128.0 / 255.0) & 0x00ff_ffff
+        );
+    }
+
+    #[test]
+    fn theme_dir_fingerprint_detects_asset_updates() {
+        let dir = std::env::temp_dir().join(format!("spui_fp_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("theme.toml"), "id = \"t\"\n").expect("write toml");
+        let fp1 = theme_dir_fingerprint(&dir);
+        assert_ne!(fp1, 0);
+
+        std::fs::write(dir.join("splash_anim.svg"), "<svg/>").expect("add asset");
+        let fp2 = theme_dir_fingerprint(&dir);
+        assert_ne!(fp2, fp1);
+
+        std::fs::remove_file(dir.join("splash_anim.svg")).expect("remove asset");
+        let fp3 = theme_dir_fingerprint(&dir);
+        assert_eq!(fp3, fp1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

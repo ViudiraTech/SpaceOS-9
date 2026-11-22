@@ -365,13 +365,14 @@ pub fn list_item_bg(
     selected: bool,
     hovered: bool,
 ) -> u32 {
-    if theme.skin().is_some() {
-        let r = theme.radius_control();
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let r = ctrl.list_item_radius;
         if selected {
-            canvas.rounded_rect(rect, r, theme.selection_bg, 1.0);
-            return theme.selection_text;
+            ctrl.list_item_selected.paint(canvas, rect, [r; 4]);
+            return ctrl.list_item_selected_text;
         } else if hovered {
-            canvas.rounded_rect(rect, r, theme.panel_hover, 1.0);
+            ctrl.list_item_hover.paint(canvas, rect, [r; 4]);
         }
         return theme.text;
     }
@@ -429,6 +430,12 @@ pub fn list_item_bg(
     } else {
         if selected {
             canvas.rounded_rect(rect, RADIUS_CONTROL, theme.accent_soft, 1.0);
+            if rect.h >= 20 {
+                canvas.fill(
+                    Rect::new(rect.x, rect.y + 5, 3, rect.h - 10),
+                    theme.accent,
+                );
+            }
         } else if hovered {
             canvas.rounded_rect(rect, RADIUS_CONTROL, theme.panel_hover, 1.0);
         }
@@ -808,6 +815,20 @@ pub fn titlebar(
                 }
                 CaptionHit::None => continue,
             };
+            let faded_inactive = !active && !is_hov && cb.inactive_opacity < 0.99;
+            if faded_inactive {
+                if let Some(ref sp) = btn_surf.sprite {
+                    let op = (cb.inactive_opacity.clamp(0.2, 1.0) * 255.0).round() as u8;
+                    if sp.width == btn.w as u32 && sp.height == btn.h as u32 {
+                        canvas.blit_sprite_opacity(btn.x, btn.y, sp, op);
+                    } else {
+                        let scaled =
+                            sp.scale_bilinear(btn.w.max(1) as u32, btn.h.max(1) as u32);
+                        canvas.blit_sprite_opacity(btn.x, btn.y, &scaled, op);
+                    }
+                    continue;
+                }
+            }
             btn_surf.paint(canvas, btn, [cb.radius; 4]);
             if btn_surf.sprite.is_none() {
                 let shift = i32::from(is_pressed);
@@ -819,7 +840,7 @@ pub fn titlebar(
                     cb.glyph_color,
                 );
             }
-            if !active && !is_hov && cb.inactive_opacity < 0.99 {
+            if faded_inactive && btn_surf.sprite.is_none() {
                 let fade = (1.0 - cb.inactive_opacity).clamp(0.0, 0.75);
                 let veil = skin
                     .titlebar
@@ -1167,6 +1188,15 @@ pub fn window_border(canvas: &mut Canvas, theme: &Theme, active: bool, maximized
 }
 
 pub fn popup_surface(canvas: &mut Canvas, theme: &Theme, rect: Rect, radius: i32) {
+    if let Some(skin) = theme.skin() {
+        let r = if radius > 0 {
+            skin.controls.popup_radius.min(radius).max(2)
+        } else {
+            0
+        };
+        skin.controls.popup_surface.paint(canvas, rect, [r; 4]);
+        return;
+    }
     if theme.is_win98() {
         canvas.fill(rect, theme.panel);
         window_outer_bevel(canvas, theme, rect);
@@ -1440,6 +1470,553 @@ pub fn draw_aero_floating_pill(
     canvas.rounded_border(rect, radius, brd, 0.92, 1);
 }
 
+/// Draw a horizontal window/app toolbar surface adapting to the active theme.
+pub fn toolbar_surface(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    glass_toolbar: bool,
+    active: bool,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    if theme.is_vortexglass() {
+        draw_aero_extended_toolbar(canvas, theme, rect, glass_toolbar, active);
+    } else if let Some(skin) = theme.skin() {
+        skin.controls.toolbar_bg.paint(canvas, rect, [0; 4]);
+    } else if theme.is_win98() {
+        canvas.fill(rect, theme.panel);
+        if rect.h >= 2 {
+            canvas.fill(
+                Rect::new(rect.x, rect.bottom() - 2, rect.w, 1),
+                theme.bevel_shadow,
+            );
+            canvas.fill(
+                Rect::new(rect.x, rect.bottom() - 1, rect.w, 1),
+                theme.bevel_hi,
+            );
+        }
+    } else {
+        canvas.fill(rect, theme.panel);
+        canvas.fill(
+            Rect::new(rect.x, rect.bottom() - 1, rect.w, 1),
+            theme.window_border,
+        );
+    }
+}
+
+/// Draw a bottom window status bar surface with top separator adapting to the active theme.
+pub fn status_bar_surface(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    if rect.is_empty() {
+        return;
+    }
+    if theme.is_vortexglass() {
+        draw_aero_surface(canvas, theme, rect, 0, false, false, 0.0, false);
+        canvas.fill(
+            Rect::new(rect.x, rect.y, rect.w, 1),
+            theme.window_border,
+        );
+    } else if let Some(skin) = theme.skin() {
+        skin.controls.toolbar_bg.paint(canvas, rect, [0; 4]);
+        canvas.fill(
+            Rect::new(rect.x, rect.y, rect.w, 1),
+            theme.window_border,
+        );
+    } else if theme.is_win98() {
+        canvas.fill(rect, theme.panel);
+        canvas.fill(Rect::new(rect.x, rect.y, rect.w, 1), theme.bevel_shadow);
+        if rect.h >= 2 {
+            canvas.fill(Rect::new(rect.x, rect.y + 1, rect.w, 1), theme.bevel_hi);
+        }
+    } else {
+        canvas.fill(rect, theme.panel);
+        canvas.fill(
+            Rect::new(rect.x, rect.y, rect.w, 1),
+            theme.window_border,
+        );
+    }
+}
+
+/// Draw a standard sidebar navigation pane with right divider.
+pub fn sidebar_surface(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    if rect.is_empty() {
+        return;
+    }
+    canvas.fill(rect, theme.window_alt);
+    let sep = if theme.is_win98() {
+        theme.bevel_shadow
+    } else {
+        theme.window_border
+    };
+    canvas.fill(Rect::new(rect.right() - 1, rect.y, 1, rect.h), sep);
+}
+
+/// Optionally fill a list/table container body for classic contrast themes.
+pub fn table_body_bg(canvas: &mut Canvas, theme: &Theme, rect: Rect) {
+    if !rect.is_empty() && theme.is_win98() {
+        canvas.fill(rect, theme.input_bg);
+    }
+}
+
+/// Draw a single-line or multi-line input / LCD / readout well frame.
+pub fn input_frame(canvas: &mut Canvas, theme: &Theme, rect: Rect, focused: bool) {
+    if rect.is_empty() {
+        return;
+    }
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let rad = ctrl.input_radius;
+        canvas.rounded_rect(rect, rad, ctrl.input_bg, 1.0);
+        let brd = if focused {
+            ctrl.input_focus_border
+        } else {
+            ctrl.input_border
+        };
+        canvas.rounded_border(rect, rad, brd, 1.0, 1);
+    } else if theme.is_win98() {
+        canvas.fill(rect, theme.input_bg);
+        sunken_bevel(canvas, theme, rect);
+    } else if theme.is_vortexglass() {
+        let dark = theme.is_dark();
+        let rad = theme.radius_control();
+        let focus_t = animate_bool(rect, focused, 0.15);
+        canvas.rounded_rect(rect, rad, theme.input_bg, 1.0);
+        if rect.w > 4 && rect.h > 4 {
+            canvas.fill_alpha(
+                Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, 1),
+                0x000000,
+                if dark { 0.32 } else { 0.14 },
+            );
+        }
+        let idle_brd = if dark { theme.panel_border } else { 0xabadb3 };
+        let focus_brd = theme.aero_hover_border();
+        let border = if focus_t > 0.001 {
+            mix(idle_brd, focus_brd, focus_t)
+        } else {
+            idle_brd
+        };
+        canvas.rounded_border(rect, rad, border, 1.0, 1);
+        if focus_t > 0.001 {
+            canvas.rounded_border(rect.inset(-2), rad + 2, focus_brd, 0.32 * focus_t, 2);
+        }
+    } else {
+        let focus_t = animate_bool(rect, focused, 0.15);
+        canvas.rounded_rect(rect, RADIUS_CONTROL, theme.input_bg, 1.0);
+        let border = if focus_t > 0.001 {
+            mix(theme.panel_border, theme.accent, focus_t)
+        } else {
+            theme.panel_border
+        };
+        canvas.rounded_border(rect, RADIUS_CONTROL, border, 1.0, 1);
+        if focus_t > 0.001 {
+            canvas.rounded_border(
+                rect.inset(-2),
+                RADIUS_CONTROL + 2,
+                theme.accent,
+                0.28 * focus_t,
+                2,
+            );
+        }
+    }
+}
+
+/// Paint a browser or panel tab item and return the contrast foreground text color.
+#[allow(dead_code)]
+pub fn tab_item(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    active: bool,
+    hovered: bool,
+    pressed: bool,
+    custom_radii: Option<[i32; 4]>,
+) -> u32 {
+    if rect.is_empty() {
+        return theme.text;
+    }
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let radii = custom_radii.unwrap_or(ctrl.tab_radii);
+        let surf = if active {
+            &ctrl.tab_active
+        } else if hovered {
+            &ctrl.tab_hover
+        } else {
+            &ctrl.tab_normal
+        };
+        surf.paint(canvas, rect, radii);
+        return if active {
+            ctrl.tab_active_text
+        } else {
+            ctrl.tab_text
+        };
+    }
+    if theme.is_win98() {
+        let bg = if active {
+            theme.window
+        } else if hovered {
+            theme.panel_hover
+        } else {
+            theme.panel
+        };
+        canvas.fill(rect, bg);
+        if pressed && !active {
+            sunken_bevel(canvas, theme, rect);
+        } else {
+            raised_bevel(canvas, theme, rect);
+        }
+        if active && rect.w > 2 && rect.h > 2 {
+            canvas.fill(
+                Rect::new(rect.x + 1, rect.bottom() - 2, rect.w - 2, 2),
+                theme.window,
+            );
+        }
+        return theme.text;
+    }
+    if theme.is_vortexglass() {
+        let rad = custom_radii.map_or(6, |r| r[0]);
+        if active || hovered {
+            draw_aero_surface(
+                canvas,
+                theme,
+                rect,
+                rad,
+                active,
+                true,
+                if hovered { 0.85 } else { 0.25 },
+                pressed,
+            );
+        } else {
+            let pill_bg = if theme.is_dark() { 0x1d2b3e } else { 0xeaf3fc };
+            canvas.rounded_rect_corners(rect, custom_radii.unwrap_or([rad; 4]), pill_bg, 0.56);
+            canvas.rounded_border_corners(
+                rect,
+                custom_radii.unwrap_or([rad; 4]),
+                theme.window_border,
+                0.50,
+                1,
+            );
+        }
+        if active && rect.w > 24 {
+            canvas.fill_alpha(
+                Rect::new(rect.x + 8, rect.y + 2, rect.w - 16, 2),
+                theme.accent,
+                0.85,
+            );
+        }
+        return if active || hovered {
+            theme.text
+        } else {
+            theme.text_muted
+        };
+    }
+    let radii = custom_radii.unwrap_or([RADIUS_CONTROL; 4]);
+    let bg = if active {
+        theme.window_high
+    } else if hovered {
+        theme.panel_hover
+    } else {
+        mix(theme.panel, theme.window, 0.35)
+    };
+    canvas.rounded_rect_corners(rect, radii, bg, 1.0);
+    if active {
+        canvas.rounded_border_corners(rect, radii, theme.window_border, 1.0, 1);
+        if rect.w > 20 {
+            canvas.fill(
+                Rect::new(rect.x + 10, rect.y + 2, rect.w - 20, 2),
+                theme.accent,
+            );
+        }
+        theme.text
+    } else {
+        theme.text_muted
+    }
+}
+
+/// Paint a selectable filter chip/pill and return the contrast foreground text color.
+pub fn filter_pill(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    selected: bool,
+    hovered: bool,
+) -> u32 {
+    if rect.is_empty() {
+        return theme.text;
+    }
+    let r = theme.radius_control();
+    if theme.is_win98() {
+        canvas.fill(
+            rect,
+            if selected {
+                theme.window_alt
+            } else if hovered {
+                theme.panel_hover
+            } else {
+                theme.panel
+            },
+        );
+        if selected {
+            sunken_bevel(canvas, theme, rect);
+        } else {
+            raised_bevel(canvas, theme, rect);
+        }
+        return theme.text;
+    }
+    if theme.is_vortexglass() {
+        draw_aero_surface(
+            canvas,
+            theme,
+            rect,
+            r,
+            selected,
+            !selected,
+            if hovered { 1.0 } else { 0.0 },
+            false,
+        );
+        return if selected { 0xffffff } else { theme.text };
+    }
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let surf = if selected {
+            &ctrl.button_primary
+        } else if hovered {
+            &ctrl.button_hover
+        } else {
+            &ctrl.button_normal
+        };
+        surf.paint(canvas, rect, [ctrl.button_radius; 4]);
+        return if selected {
+            ctrl.button_primary_text
+        } else {
+            ctrl.button_text
+        };
+    }
+    let bg = if selected {
+        theme.accent
+    } else if hovered {
+        theme.panel_hover
+    } else {
+        theme.window_alt
+    };
+    canvas.rounded_rect(rect, r, bg, 1.0);
+    if !selected {
+        canvas.rounded_border(rect, r, theme.window_border, 1.0, 1);
+    }
+    if selected {
+        theme.selection_text
+    } else {
+        theme.text_dim
+    }
+}
+
+/// Paint a selectable option/preset card with hover and selected highlight states.
+pub fn selectable_card(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    selected: bool,
+    hovered: bool,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    if theme.is_win98() {
+        canvas.fill(
+            rect,
+            if selected {
+                theme.window_alt
+            } else if hovered {
+                theme.panel_hover
+            } else {
+                theme.panel
+            },
+        );
+        if selected {
+            sunken_bevel(canvas, theme, rect);
+        } else {
+            raised_bevel(canvas, theme, rect);
+        }
+        return;
+    }
+    if let Some(skin) = theme.skin() {
+        let cr = skin.controls.card_radius;
+        skin.controls.card.paint(canvas, rect, [cr; 4]);
+        if hovered && !selected {
+            skin.controls.list_item_hover.paint(canvas, rect, [cr; 4]);
+        }
+        if selected {
+            canvas.rounded_border(rect, cr, skin.controls.input_focus_border, 1.0, 2);
+        }
+        return;
+    }
+    let cr = theme.radius_control();
+    let fill = if selected {
+        theme.accent_soft
+    } else if hovered {
+        theme.panel_hover
+    } else if theme.is_vortexglass() {
+        theme.window_high
+    } else {
+        theme.window_alt
+    };
+    canvas.rounded_rect(rect, cr, fill, 1.0);
+    let brd = if selected {
+        if theme.is_vortexglass() {
+            theme.aero_press_border()
+        } else {
+            theme.accent
+        }
+    } else if hovered && theme.is_vortexglass() {
+        theme.aero_hover_border()
+    } else {
+        theme.window_border
+    };
+    canvas.rounded_border(rect, cr, brd, 1.0, if selected { 2 } else { 1 });
+}
+
+/// Paint an icon/glyph/keypad action button background and return foreground text color.
+pub fn action_button_surface(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    primary: bool,
+    hovered: bool,
+    pressed: bool,
+    pill_primary: bool,
+) -> u32 {
+    if rect.is_empty() {
+        return theme.text;
+    }
+    if theme.is_win98() {
+        let bg = if primary {
+            theme.accent
+        } else if hovered {
+            theme.panel_hover
+        } else {
+            theme.panel
+        };
+        canvas.fill(rect, bg);
+        if pressed {
+            sunken_bevel(canvas, theme, rect);
+        } else {
+            raised_bevel(canvas, theme, rect);
+        }
+        return if primary { 0xffffff } else { theme.text };
+    }
+    if theme.is_vortexglass() {
+        let radius = if primary && pill_primary {
+            rect.h / 2
+        } else {
+            theme.radius_control().max(5)
+        };
+        draw_aero_surface(
+            canvas,
+            theme,
+            rect,
+            radius,
+            primary,
+            !primary,
+            if hovered { 1.0 } else { 0.0 },
+            pressed,
+        );
+        return if primary { 0xffffff } else { theme.text };
+    }
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let radius = if primary && pill_primary {
+            rect.h / 2
+        } else {
+            ctrl.button_radius
+        };
+        let surf = if primary {
+            if pressed {
+                &ctrl.button_primary_active
+            } else if hovered {
+                &ctrl.button_primary_hover
+            } else {
+                &ctrl.button_primary
+            }
+        } else if pressed {
+            &ctrl.button_active
+        } else if hovered {
+            &ctrl.button_hover
+        } else {
+            &ctrl.button_normal
+        };
+        surf.paint(canvas, rect, [radius; 4]);
+        return if primary {
+            ctrl.button_primary_text
+        } else {
+            ctrl.button_text
+        };
+    }
+    let radius = if primary && pill_primary {
+        rect.h / 2
+    } else {
+        theme.radius_control()
+    };
+    let base = if primary { theme.accent } else { theme.panel_high };
+    let bg = if pressed {
+        mix(base, 0x000000, 0.14)
+    } else if hovered {
+        if theme.is_dark() {
+            mix(base, 0xffffff, 0.14)
+        } else {
+            mix(base, 0x000000, 0.08)
+        }
+    } else {
+        base
+    };
+    canvas.rounded_rect(rect, radius, bg, 1.0);
+    if !primary {
+        canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
+    }
+    if primary { 0xffffff } else { theme.text }
+}
+
+/// Return tactile 1px press offset for classic/skeuomorphic themes.
+pub const fn button_press_offset(theme: &Theme, pressed: bool) -> i32 {
+    if pressed && (theme.is_win98() || theme.skin().is_some()) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Paint a decorative accent square/album art tile adapting to the active theme.
+pub fn accent_tile_surface(canvas: &mut Canvas, theme: &Theme, rect: Rect, active: bool) {
+    if rect.is_empty() {
+        return;
+    }
+    if theme.is_win98() {
+        canvas.fill(rect, theme.accent);
+        sunken_bevel(canvas, theme, rect);
+    } else if theme.is_vortexglass() {
+        draw_aero_surface(
+            canvas,
+            theme,
+            rect,
+            theme.radius_card(),
+            true,
+            false,
+            if active { 0.35 } else { 0.0 },
+            false,
+        );
+        crate::vortex::blit_aero_sheen(canvas, rect.inset(1), 0, 0, None, 0.42);
+    } else {
+        canvas.rounded_rect(rect, theme.radius_card(), theme.accent, 1.0);
+        canvas.circle(
+            rect.x as f32 + rect.w as f32 * 0.5,
+            rect.y as f32 + rect.h as f32 * 0.5,
+            (rect.w.min(rect.h) as f32 * 0.36).clamp(16.0, 44.0),
+            theme.window_high,
+            0.24,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn button_anim(
     canvas: &mut Canvas,
@@ -1455,12 +2032,18 @@ pub fn button_anim(
     if let Some(skin) = theme.skin() {
         let ctrl = &skin.controls;
         let rad = [ctrl.button_radius; 4];
-        let surf = if pressed {
+        let surf = if primary {
+            if pressed {
+                &ctrl.button_primary_active
+            } else if hover_t > 0.25 {
+                &ctrl.button_primary_hover
+            } else {
+                &ctrl.button_primary
+            }
+        } else if pressed {
             &ctrl.button_active
         } else if hover_t > 0.25 {
             &ctrl.button_hover
-        } else if primary {
-            &ctrl.button_primary
         } else {
             &ctrl.button_normal
         };
@@ -1783,6 +2366,36 @@ pub fn toggle_switch_anim(
     hover: bool,
 ) {
     let p = progress.clamp(0.0, 1.0);
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let tr = if ctrl.switch_radius >= 0 {
+            ctrl.switch_radius
+        } else {
+            (rect.h / 2).max(1)
+        };
+        let track_surf = if p >= 0.5 {
+            &ctrl.switch_track_on
+        } else {
+            &ctrl.switch_track_off
+        };
+        track_surf.paint(canvas, rect, [tr; 4]);
+        let pad = 2;
+        let knob_d = (rect.h - pad * 2).max(6);
+        let stretch = ((0.5 - (p - 0.5).abs()) * 2.0).clamp(0.0, 1.0);
+        let knob_w = knob_d + (stretch * 3.0).round() as i32;
+        let knob_rad = if ctrl.switch_radius >= 0 {
+            ctrl.switch_radius.min(knob_d / 2)
+        } else {
+            knob_d / 2
+        };
+        let start_x = rect.x + pad;
+        let end_x = rect.right() - knob_w - pad;
+        let knob_x = (start_x as f32 + (end_x - start_x) as f32 * p).round() as i32;
+        let knob_r = Rect::new(knob_x, rect.y + pad, knob_w, knob_d);
+        canvas.rounded_rect(knob_r.offset(0, 1), knob_rad, 0x000000, 0.22);
+        ctrl.switch_knob.paint(canvas, knob_r, [knob_rad; 4]);
+        return;
+    }
     if theme.is_win98() {
         let pressed = is_rect_pressed(rect);
         let track_bg = if p > 0.5 {
@@ -2090,6 +2703,36 @@ pub fn slider(
     dragging: bool,
 ) {
     let p = progress.clamp(0.0, 1.0);
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let hover_t = animate_bool(rect, hover || dragging, 0.12);
+        let track_h = 5;
+        let track_y = rect.y + (rect.h - track_h) / 2;
+        let track_rect = Rect::new(rect.x, track_y, rect.w, track_h);
+        ctrl.slider_track.paint(canvas, track_rect, [2; 4]);
+        let active_w = (((rect.w - 2).max(0) as f32) * p).round() as i32;
+        if active_w > 0 {
+            let clip_r = Rect::new(rect.x + 1, track_y + 1, active_w, (track_h - 2).max(1));
+            canvas.with_clip(clip_r, |c| {
+                ctrl.slider_fill.paint(c, track_rect.inset(1), [2; 4]);
+            });
+        }
+        let thumb_w = 12;
+        let thumb_h = rect.h.clamp(16, 20);
+        let travel = (rect.w - thumb_w).max(0);
+        let thumb_x = rect.x + ((travel as f32) * p).round() as i32;
+        let thumb_y = rect.y + (rect.h - thumb_h) / 2;
+        let thumb_r = Rect::new(thumb_x, thumb_y, thumb_w, thumb_h);
+        let rad = ctrl.slider_thumb_radius.min(thumb_w / 2);
+        canvas.rounded_rect(thumb_r.offset(0, 1), rad, 0x000000, 0.20);
+        let thumb_surf = if dragging || hover_t > 0.25 {
+            &ctrl.slider_thumb_hover
+        } else {
+            &ctrl.slider_thumb
+        };
+        thumb_surf.paint(canvas, thumb_r, [rad; 4]);
+        return;
+    }
     if theme.is_win98() {
         let track_h = 4;
         let track_y = rect.y + (rect.h - track_h) / 2;
@@ -2465,6 +3108,36 @@ pub fn color_swatch(
         }
         return;
     }
+    if let Some(skin) = theme.skin() {
+        let sel_t = animate_bool(rect, selected, 0.18);
+        let hov_t = animate_bool(rect.offset(1, 1), hover, 0.12);
+        let cx = rect.x as f32 + rect.w as f32 * 0.5;
+        let cy = rect.y as f32 + rect.h as f32 * 0.5;
+        let radius = (rect.w.min(rect.h) as f32 * 0.5 - 3.0).max(4.0);
+        canvas.circle(cx, cy, radius, color, 1.0);
+        canvas.ring(cx, cy, radius, 1.0, skin.controls.input_border, 0.72);
+        if sel_t > 0.001 {
+            canvas.ring(
+                cx,
+                cy,
+                radius + 2.2 * sel_t,
+                1.8 * sel_t,
+                skin.controls.input_focus_border,
+                0.95 * sel_t,
+            );
+            canvas.circle(cx, cy, 3.2 * sel_t, 0xffffff, 0.98 * sel_t);
+        } else if hov_t > 0.001 {
+            canvas.ring(
+                cx,
+                cy,
+                radius + 1.8 * hov_t,
+                1.4 * hov_t,
+                theme.text_muted,
+                0.75 * hov_t,
+            );
+        }
+        return;
+    }
     let sel_t = animate_bool(rect, selected, 0.18);
     let hov_t = animate_bool(rect.offset(1, 1), hover, 0.12);
     let cx = rect.x as f32 + rect.w as f32 * 0.5;
@@ -2506,6 +3179,35 @@ pub fn icon_button(
     hover: bool,
 ) {
     let pressed = enabled && is_rect_pressed(rect);
+    if let Some(skin) = theme.skin() {
+        let ctrl = &skin.controls;
+        let hover_t = animate_bool(rect, hover && enabled, MOTION_HOVER);
+        let rad = [ctrl.button_radius; 4];
+        if pressed {
+            ctrl.icon_button_active.paint(canvas, rect, rad);
+        } else if hover_t > 0.25 {
+            ctrl.icon_button_hover.paint(canvas, rect, rad);
+        }
+        let tint = if enabled {
+            if hover_t > 0.001 || pressed {
+                ctrl.button_text
+            } else {
+                theme.text_dim
+            }
+        } else {
+            theme.text_muted
+        };
+        let shift = i32::from(pressed);
+        icons::draw(
+            canvas,
+            icon,
+            rect.x + (rect.w - 16) / 2 + shift,
+            rect.y + (rect.h - 16) / 2 + shift,
+            16,
+            Some(tint),
+        );
+        return;
+    }
     if theme.is_win98() {
         if pressed {
             canvas.fill(rect, mix(theme.panel, theme.bevel_shadow, 0.16));
@@ -2631,61 +3333,7 @@ pub fn text_input_ime(
     focused: bool,
     leading_icon: Option<Icon>,
 ) -> Rect {
-    if let Some(skin) = theme.skin() {
-        let ctrl = &skin.controls;
-        let rad = ctrl.input_radius;
-        canvas.rounded_rect(rect, rad, ctrl.input_bg, 1.0);
-        let brd = if focused {
-            ctrl.input_focus_border
-        } else {
-            ctrl.input_border
-        };
-        canvas.rounded_border(rect, rad, brd, 1.0, 1);
-    } else if theme.is_win98() {
-        canvas.fill(rect, theme.input_bg);
-        sunken_bevel(canvas, theme, rect);
-    } else if theme.is_vortexglass() {
-        let dark = theme.is_dark();
-        let rad = theme.radius_control();
-        let focus_t = animate_bool(rect, focused, 0.15);
-        canvas.rounded_rect(rect, rad, theme.input_bg, 1.0);
-        if rect.w > 4 && rect.h > 4 {
-            canvas.fill_alpha(
-                Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, 1),
-                0x000000,
-                if dark { 0.32 } else { 0.14 },
-            );
-        }
-        let idle_brd = if dark { theme.panel_border } else { 0xabadb3 };
-        let focus_brd = theme.aero_hover_border();
-        let border = if focus_t > 0.001 {
-            mix(idle_brd, focus_brd, focus_t)
-        } else {
-            idle_brd
-        };
-        canvas.rounded_border(rect, rad, border, 1.0, 1);
-        if focus_t > 0.001 {
-            canvas.rounded_border(rect.inset(-2), rad + 2, focus_brd, 0.32 * focus_t, 2);
-        }
-    } else {
-        let focus_t = animate_bool(rect, focused, 0.15);
-        canvas.rounded_rect(rect, RADIUS_CONTROL, theme.input_bg, 1.0);
-        let border = if focus_t > 0.001 {
-            mix(theme.panel_border, theme.accent, focus_t)
-        } else {
-            theme.panel_border
-        };
-        canvas.rounded_border(rect, RADIUS_CONTROL, border, 1.0, 1);
-        if focus_t > 0.001 {
-            canvas.rounded_border(
-                rect.inset(-2),
-                RADIUS_CONTROL + 2,
-                theme.accent,
-                0.28 * focus_t,
-                2,
-            );
-        }
-    }
+    input_frame(canvas, theme, rect, focused);
 
     let mut text_x = rect.x + 10;
     if let Some(ic) = leading_icon {

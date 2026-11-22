@@ -528,7 +528,7 @@ impl ThemePreset {
                 ("panel", "/position", Value::String("bottom".to_string())),
                 ("panel", "/size", Value::Int(44)),
                 ("panel", "/start-fullscreen", Value::Bool(false)),
-                ("wm", "/titlebar/button-layout", Value::String("right".to_string())),
+                ("wm", "/button-layout", Value::String("right".to_string())),
             ],
             Self::Spui4 => vec![
                 ("appearance", "/theme/id", Value::String("spui-4".to_string())),
@@ -558,7 +558,7 @@ impl ThemePreset {
                 ("panel", "/position", Value::String("bottom".to_string())),
                 ("panel", "/size", Value::Int(46)),
                 ("panel", "/start-fullscreen", Value::Bool(true)),
-                ("wm", "/titlebar/button-layout", Value::String("right".to_string())),
+                ("wm", "/button-layout", Value::String("right".to_string())),
             ],
             Self::Win98 => vec![
                 ("appearance", "/theme/id", Value::String("win98".to_string())),
@@ -582,7 +582,7 @@ impl ThemePreset {
                 ),
                 ("panel", "/position", Value::String("bottom".to_string())),
                 ("panel", "/start-fullscreen", Value::Bool(false)),
-                ("wm", "/titlebar/button-layout", Value::String("right".to_string())),
+                ("wm", "/button-layout", Value::String("right".to_string())),
             ],
         }
     }
@@ -1013,6 +1013,7 @@ pub struct DesktopConfig {
     pub theme_style: ThemeStyle,
     pub mode: ThemeMode,
     pub accent: u32,
+    pub theme_reload_gen: String,
     pub font_scale: i32,
     // desktop
     pub wallpaper: String,
@@ -1097,6 +1098,7 @@ impl Default for DesktopConfig {
             theme_style: ThemeStyle::VortexGlass,
             mode: ThemeMode::Light,
             accent: ACCENT_PRESETS[0].0,
+            theme_reload_gen: String::new(),
             font_scale: 100,
             wallpaper: WALLPAPERS[0].file.to_string(),
             backdrop_style: BackdropStyle::Cover,
@@ -1213,6 +1215,11 @@ impl DesktopConfig {
             ("appearance", "/theme/accent") => {
                 if let Some(rgb) = value.as_str().and_then(parse_hex_rgb) {
                     self.accent = rgb;
+                }
+            }
+            ("appearance", "/theme/reload-gen") => {
+                if let Some(s) = value.as_str() {
+                    self.theme_reload_gen = s.to_string();
                 }
             }
             ("appearance", "/font/scale") => {
@@ -1689,5 +1696,18 @@ mod tests {
         assert_eq!(cfg.mode, ThemeMode::Light);
         assert_eq!(cfg.panel_size, 44);
         assert!(!cfg.panel_start_fullscreen);
+        assert_eq!(cfg.wm_button_layout, ButtonLayout::Right);
+
+        assert!(cfg.apply_property("wm", "/button-layout", &Value::String("left".to_string())));
+        assert_eq!(cfg.wm_button_layout, ButtonLayout::Left);
+        assert!(cfg.apply_theme_preset(ThemePreset::Spui4));
+        assert_eq!(cfg.wm_button_layout, ButtonLayout::Right);
+
+        assert!(cfg.apply_property(
+            "appearance",
+            "/theme/reload-gen",
+            &Value::String("1795300000-42".to_string())
+        ));
+        assert_eq!(cfg.theme_reload_gen, "1795300000-42");
     }
 }

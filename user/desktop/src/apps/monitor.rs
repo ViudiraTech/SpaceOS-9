@@ -622,30 +622,7 @@ fn draw_performance_tab(
     // CPU Sparkline
     let spark_h = (cpu_card.h - 160).max(80);
     let spark_r = Rect::new(cpu_card.x + 16, cpu_card.y + 44, cpu_card.w - 32, spark_h);
-    if theme.is_win98() {
-        canvas.fill(spark_r, theme.input_bg);
-        ui::sunken_bevel(canvas, theme, spark_r);
-    } else if theme.is_vortexglass() {
-        let (st, sb) = if theme.is_dark() {
-            (0x131d2b, 0x1d2c3f)
-        } else {
-            (0xf2f7fd, 0xffffff)
-        };
-        ui::draw_win7_glossy_box(
-            canvas,
-            spark_r,
-            4,
-            st,
-            st,
-            sb,
-            sb,
-            theme.window_border,
-            if theme.is_dark() { 0.18 } else { 0.85 },
-        );
-    } else {
-        canvas.rounded_rect(spark_r, 4, theme.window_alt, 1.0);
-        canvas.rounded_border(spark_r, 4, theme.window_border, 1.0, 1);
-    }
+    ui::input_frame(canvas, theme, spark_r, false);
 
     // Grid lines (25%, 50%, 75%)
     for pct in [0.25, 0.50, 0.75] {
@@ -736,30 +713,7 @@ fn draw_performance_tab(
 
     // Memory Sparkline
     let m_spark_r = Rect::new(mem_card.x + 16, mem_card.y + 44, mem_card.w - 32, spark_h);
-    if theme.is_win98() {
-        canvas.fill(m_spark_r, theme.input_bg);
-        ui::sunken_bevel(canvas, theme, m_spark_r);
-    } else if theme.is_vortexglass() {
-        let (st, sb) = if theme.is_dark() {
-            (0x131d2b, 0x1d2c3f)
-        } else {
-            (0xf2f7fd, 0xffffff)
-        };
-        ui::draw_win7_glossy_box(
-            canvas,
-            m_spark_r,
-            4,
-            st,
-            st,
-            sb,
-            sb,
-            theme.window_border,
-            if theme.is_dark() { 0.18 } else { 0.85 },
-        );
-    } else {
-        canvas.rounded_rect(m_spark_r, 4, theme.window_alt, 1.0);
-        canvas.rounded_border(m_spark_r, 4, theme.window_border, 1.0, 1);
-    }
+    ui::input_frame(canvas, theme, m_spark_r, false);
     for pct in [0.25, 0.50, 0.75] {
         let gy = m_spark_r.bottom() - (m_spark_r.h as f32 * pct).round() as i32;
         canvas.fill(
@@ -811,7 +765,6 @@ fn draw_processes_tab(
     content: Rect,
 ) {
     let top = content.y + 58;
-    let is_win98 = theme.is_win98();
 
     // Search bar & count
     let filtered: Vec<&ProcessInfo> = data
@@ -928,25 +881,8 @@ fn draw_processes_tab(
             }
             let is_sel = selected_pid == Some(proc.pid);
             let row_r = Rect::new(rows_clip.x + 2, ry, rows_clip.w - 4, PROC_ROW_H);
-            let win98_sel = is_win98 && is_sel;
-            let vortex_sel = theme.is_vortexglass() && is_sel;
-
-            let name_fg = if is_win98 || theme.is_vortexglass() {
-                if is_sel {
-                    ui::list_item_bg(c, theme, row_r, true, false)
-                } else {
-                    if idx % 2 == 1 {
-                        c.fill(row_r, theme.window_alt);
-                    }
-                    theme.text
-                }
-            } else if is_sel {
-                c.rounded_rect(row_r, 4, theme.accent_soft, 1.0);
-                c.fill(
-                    Rect::new(row_r.x, row_r.y + 4, 3, row_r.h - 8),
-                    theme.accent,
-                );
-                theme.accent
+            let name_fg = if is_sel {
+                ui::list_item_bg(c, theme, row_r, true, false)
             } else {
                 if idx % 2 == 1 {
                     c.fill(row_r, theme.window_alt);
@@ -963,7 +899,7 @@ fn draw_processes_tab(
                 col_name as f32,
                 baseline,
                 12.0,
-                if vortex_sel { name_fg } else if win98_sel { theme.selection_text } else if is_sel { theme.accent } else { theme.text },
+                name_fg,
                 if is_sel { Face::Bold } else { Face::Ui },
             );
 
@@ -973,11 +909,7 @@ fn draw_processes_tab(
                 col_pid as f32,
                 baseline,
                 12.0,
-                if win98_sel {
-                    theme.selection_text
-                } else {
-                    theme.text_dim
-                },
+                if is_sel { name_fg } else { theme.text_dim },
                 Face::Ui,
             );
 
@@ -988,8 +920,8 @@ fn draw_processes_tab(
                 col_cpu as f32,
                 baseline,
                 12.0,
-                if win98_sel {
-                    theme.selection_text
+                if is_sel {
+                    name_fg
                 } else if proc.cpu_percent > 10.0 {
                     theme.accent
                 } else {
@@ -1009,11 +941,7 @@ fn draw_processes_tab(
                 col_rss as f32,
                 baseline,
                 12.0,
-                if win98_sel {
-                    theme.selection_text
-                } else {
-                    theme.text_dim
-                },
+                if is_sel { name_fg } else { theme.text_dim },
                 Face::Ui,
             );
 
@@ -1024,11 +952,7 @@ fn draw_processes_tab(
                 col_st as f32,
                 baseline,
                 12.0,
-                if win98_sel {
-                    theme.selection_text
-                } else {
-                    theme.text_muted
-                },
+                if is_sel { name_fg } else { theme.text_muted },
                 Face::Ui,
             );
         }

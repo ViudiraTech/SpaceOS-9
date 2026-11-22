@@ -104,6 +104,35 @@ button {
 }
 )CSS";
 
+std::string format_css_rgb(uint32_t argb) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "#%02x%02x%02x",
+                  static_cast<unsigned>((argb >> 16) & 0xff),
+                  static_cast<unsigned>((argb >> 8) & 0xff),
+                  static_cast<unsigned>(argb & 0xff));
+    return std::string(buf);
+}
+
+std::string build_palette_ua_css(const SpaceThemePalette& p) {
+    int btn_r = std::clamp(static_cast<int>(p.button_radius), 0, 12);
+    int inp_r = std::clamp(static_cast<int>(p.input_radius), 0, 12);
+    if (p.theme_style == SPACE_THEME_WIN98) {
+        btn_r = 0;
+        inp_r = 0;
+    }
+    std::string css;
+    css.reserve(512);
+    css += "html, body { color: " + format_css_rgb(p.text) + "; background-color: " + format_css_rgb(p.bg) + "; }\n";
+    css += "a { color: " + format_css_rgb(p.link) + "; }\n";
+    css += "button { border-radius: " + std::to_string(btn_r) + "px; border: 1px solid " +
+           format_css_rgb(p.button_border) + "; background-color: " + format_css_rgb(p.button_bg) +
+           "; color: " + format_css_rgb(p.button_text) + "; }\n";
+    css += "input, textarea, select { color: " + format_css_rgb(p.input_text) +
+           "; border-color: " + format_css_rgb(p.input_border) +
+           "; border-radius: " + std::to_string(inp_r) + "px; }\n";
+    return css;
+}
+
 bool contains_ci(const std::string& hay, const std::string& needle) {
     if (needle.empty()) return false;
     std::string h = to_lower_ascii(hay);
@@ -424,10 +453,22 @@ void space_page_destroy(SpacePage* page) {
 
 void space_page_set_theme(SpacePage* page, int dark_mode, int theme_style) {
     if (!page) return;
+    page->has_palette = false;
     page->dark_mode = (dark_mode != 0);
     page->theme_style = theme_style;
     page->is_win98 = (theme_style == SPACE_THEME_WIN98);
     page->is_vortex = (theme_style == SPACE_THEME_VORTEXGLASS);
+    page->mark_dirty(true, true);
+}
+
+void space_page_set_palette(SpacePage* page, const SpaceThemePalette* palette) {
+    if (!page || !palette) return;
+    page->palette = *palette;
+    page->has_palette = true;
+    page->dark_mode = (palette->dark_mode != 0);
+    page->theme_style = palette->theme_style;
+    page->is_win98 = (palette->theme_style == SPACE_THEME_WIN98);
+    page->is_vortex = (palette->theme_style == SPACE_THEME_VORTEXGLASS);
     page->mark_dirty(true, true);
 }
 
@@ -448,7 +489,8 @@ void space_page_load_html(SpacePage* page, const char* html, int html_len, const
 
     std::string master = std::string(litehtml::master_css) + "\n" + space::kExtraUaCss;
     std::string user_css;
-    if (page->is_win98) user_css = space::kWin98UaOverride;
+    if (page->has_palette) user_css = space::build_palette_ua_css(page->palette);
+    else if (page->is_win98) user_css = space::kWin98UaOverride;
     else if (page->is_vortex) user_css = page->dark_mode ? space::kVortexDarkUaOverride : space::kVortexLightUaOverride;
     else if (page->dark_mode) user_css = space::kDarkUaOverride;
 

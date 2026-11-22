@@ -40,6 +40,7 @@ pub fn channel_defaults(channel: &str) -> Vec<(&'static str, Value)> {
             ("/theme/style", Value::String("vortexglass".to_string())),
             ("/theme/mode", Value::String("light".to_string())),
             ("/theme/accent", Value::String("#5898d8".to_string())),
+            ("/theme/reload-gen", Value::String(String::new())),
             ("/font/scale", Value::Int(100)),
         ],
         "desktop" => vec![

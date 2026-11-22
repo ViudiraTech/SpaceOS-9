@@ -14,6 +14,29 @@ enum SpaceThemeStyle {
     SPACE_THEME_VORTEXGLASS = 2,
 };
 
+typedef struct SpaceThemePalette {
+    uint32_t bg;
+    uint32_t text;
+    uint32_t text_muted;
+    uint32_t link;
+    uint32_t accent;
+    uint32_t button_bg;
+    uint32_t button_bg_active;
+    uint32_t button_border;
+    uint32_t button_text;
+    uint32_t input_bg;
+    uint32_t input_border;
+    uint32_t input_focus_border;
+    uint32_t input_text;
+    uint32_t track_bg;
+    uint32_t selection_bg;
+    uint32_t selection_text;
+    int32_t button_radius;
+    int32_t input_radius;
+    int32_t dark_mode;
+    int32_t theme_style;
+} SpaceThemePalette;
+
 enum SpaceBorderStyle {
     SPACE_BORDER_NONE = 0,
     SPACE_BORDER_SOLID = 1,
@@ -118,6 +141,7 @@ SpacePage* space_page_create(const SpaceHostCallbacks* cb, int viewport_w, int v
                              int dark_mode, int theme_style);
 void space_page_destroy(SpacePage* page);
 void space_page_set_theme(SpacePage* page, int dark_mode, int theme_style);
+void space_page_set_palette(SpacePage* page, const SpaceThemePalette* palette);
 void space_page_load_html(SpacePage* page, const char* html, int html_len, const char* url);
 void space_page_resize(SpacePage* page, int viewport_w, int viewport_h);
 int space_page_relayout(SpacePage* page, int force);

@@ -12,7 +12,7 @@ use crate::ddm::wire::PowerAction;
 use crate::draw::{mix, Canvas, Rect};
 use crate::icons::{self, Icon};
 use crate::text::{Face, TextRenderer};
-use crate::theme::Theme;
+use crate::theme::{PowerSplashSkin, SplashAnchor, SplashDim, Theme};
 use crate::ui;
 use crate::x11::{CursorKind, X};
 use std::fs::File;
@@ -285,12 +285,259 @@ fn draw_frame(
     action: PowerAction,
     elapsed_s: f32,
     tailer: &LogTailer,
+    show_logs: bool,
 ) {
+    if let Some(splash) = theme.skin().and_then(|s| s.power_splash.as_ref()) {
+        draw_frame_declarative(canvas, text, splash, action, elapsed_s, tailer, show_logs);
+        return;
+    }
     if theme.is_win98() {
         draw_frame_win98(canvas, text, theme, action, elapsed_s, tailer);
         return;
     }
     draw_frame_spui(canvas, text, theme, action, elapsed_s, tailer);
+}
+
+fn draw_anchored_text(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    anchor: SplashAnchor,
+    bounds: Rect,
+    x: SplashDim,
+    y: SplashDim,
+    size: f32,
+    color: u32,
+    shadow: Option<u32>,
+    face: Face,
+    content: &str,
+) {
+    if content.is_empty() {
+        return;
+    }
+    let (px, py) = anchor.resolve_text_point(bounds, x, y);
+    let mut draw_at = |canvas: &mut Canvas, ox: f32, oy: f32, col: u32| match anchor {
+        SplashAnchor::TopCenter | SplashAnchor::Center | SplashAnchor::BottomCenter => {
+            text.draw_centered(canvas, content, ox, oy, size, col, face);
+        }
+        SplashAnchor::TopRight | SplashAnchor::BottomRight => {
+            text.draw_right(canvas, content, ox, oy, size, col, face);
+        }
+        SplashAnchor::TopLeft | SplashAnchor::BottomLeft => {
+            text.draw(canvas, content, ox, oy, size, col, face);
+        }
+    };
+    if let Some(sh) = shadow {
+        draw_at(canvas, px as f32 + 1.0, py as f32 + 1.5, sh);
+    }
+    draw_at(canvas, px as f32, py as f32, color);
+}
+
+fn draw_log_lines(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    body: Rect,
+    elapsed_s: f32,
+    tailer: &LogTailer,
+    empty_color: u32,
+    neutral_color: Option<u32>,
+) {
+    let line_h = 19;
+    let max_lines = (body.h / line_h).max(1) as usize;
+    let start_idx = tailer.lines.len().saturating_sub(max_lines);
+    let max_w = (body.w - 8) as f32;
+
+    canvas.with_clip(body, |canvas| {
+        if tailer.lines.is_empty() {
+            text.draw(
+                canvas,
+                "[  +0.000s] [INIT  ] Awaiting telemetry stream from systemg PID 1...",
+                body.x as f32,
+                (body.y + 15) as f32,
+                13.0,
+                empty_color,
+                Face::CyberMono,
+            );
+            return;
+        }
+        let mut y = body.y + 15;
+        let visible = &tailer.lines[start_idx..];
+        let blink_cursor = ((elapsed_s * 2.5) as u32).is_multiple_of(2);
+        for (idx, line) in visible.iter().enumerate() {
+            let is_last = idx + 1 == visible.len();
+            let raw = if is_last && blink_cursor {
+                format!("{} _", line.text)
+            } else {
+                line.text.clone()
+            };
+            let clipped = text.truncate(&raw, max_w, 12.5, Face::CyberMono);
+            let col = if line.accent == 0x94a3b8 {
+                neutral_color.unwrap_or(line.accent)
+            } else {
+                line.accent
+            };
+            text.draw(
+                canvas,
+                &clipped,
+                body.x as f32,
+                y as f32,
+                12.5,
+                col,
+                Face::CyberMono,
+            );
+            y += line_h;
+        }
+    });
+}
+
+fn draw_frame_declarative(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    splash: &PowerSplashSkin,
+    action: PowerAction,
+    elapsed_s: f32,
+    tailer: &LogTailer,
+    show_logs: bool,
+) {
+    let bounds = canvas.bounds();
+    canvas.fill(bounds, splash.bg_color);
+
+    for layer in &splash.layers {
+        let r = layer
+            .anchor
+            .resolve_rect(bounds, layer.x, layer.y, layer.w, layer.h);
+        layer.surface.paint(canvas, r, layer.radii);
+    }
+
+    if splash.show_space_logo {
+        let sz = splash.logo_size.max(16);
+        let lr = splash.logo_anchor.resolve_rect(
+            bounds,
+            splash.logo_x,
+            splash.logo_y,
+            SplashDim::Px(sz),
+            SplashDim::Px(sz),
+        );
+        icons::draw(canvas, Icon::SpaceLogo, lr.x, lr.y, sz as u32, None);
+    }
+
+    let is_reboot = matches!(action, PowerAction::Reboot);
+    let title = if tailer.done && !splash.done_title.is_empty() {
+        splash.done_title.as_str()
+    } else if is_reboot && !splash.reboot_title.is_empty() {
+        splash.reboot_title.as_str()
+    } else {
+        splash.poweroff_title.as_str()
+    };
+    draw_anchored_text(
+        canvas,
+        text,
+        splash.title_anchor,
+        bounds,
+        splash.title_x,
+        splash.title_y,
+        splash.title_size,
+        splash.title_color,
+        splash.title_shadow,
+        Face::Bold,
+        title,
+    );
+
+    if let Some(anim) = &splash.animation {
+        if !anim.frames.is_empty() {
+            let ar = anim.anchor.resolve_rect(
+                bounds,
+                anim.x,
+                anim.y,
+                SplashDim::Px(anim.width),
+                SplashDim::Px(anim.height),
+            );
+            let idx = ((elapsed_s * anim.fps.max(1.0)).floor() as usize) % anim.frames.len();
+            canvas.blit_sprite(ar.x, ar.y, &anim.frames[idx]);
+        }
+    }
+
+    let subtitle = if tailer.done && !splash.done_subtitle.is_empty() {
+        splash.done_subtitle.as_str()
+    } else if is_reboot && !splash.reboot_subtitle.is_empty() {
+        splash.reboot_subtitle.as_str()
+    } else {
+        splash.poweroff_subtitle.as_str()
+    };
+    draw_anchored_text(
+        canvas,
+        text,
+        splash.subtitle_anchor,
+        bounds,
+        splash.subtitle_x,
+        splash.subtitle_y,
+        splash.subtitle_size,
+        splash.subtitle_color,
+        None,
+        Face::Ui,
+        subtitle,
+    );
+
+    if show_logs {
+        let box_w = (bounds.w - 96).clamp(420, 920);
+        let box_h = ((bounds.h / 2) - 44).clamp(150, 300);
+        let box_x = (bounds.w - box_w) / 2;
+        let box_y = bounds.h - box_h - 44;
+        let log_rect = Rect::new(box_x, box_y, box_w, box_h);
+        canvas.rounded_rect(log_rect, 8, splash.log_bg, 0.92);
+        canvas.rounded_border(log_rect, 8, splash.log_border, 0.65, 1);
+        canvas.fill_alpha(
+            Rect::new(box_x + 1, box_y + 28, box_w - 2, 1),
+            splash.log_border,
+            0.35,
+        );
+        text.draw(
+            canvas,
+            "SYSTEMG PID-1 // SHUTDOWN LOG",
+            (box_x + 12) as f32,
+            (box_y + 19) as f32,
+            12.0,
+            splash.log_accent,
+            Face::CyberMono,
+        );
+        text.draw_right(
+            canvas,
+            SHUTDOWN_LOG_PATH,
+            (box_x + box_w - 12) as f32,
+            (box_y + 19) as f32,
+            11.0,
+            splash.log_text,
+            Face::CyberMono,
+        );
+        let body = Rect::new(box_x + 12, box_y + 36, box_w - 24, box_h - 44);
+        draw_log_lines(
+            canvas,
+            text,
+            body,
+            elapsed_s,
+            tailer,
+            splash.log_text,
+            Some(splash.log_text),
+        );
+    }
+
+    let hint = if show_logs {
+        "按 F2 / Esc 隐藏关机日志"
+    } else {
+        "按 F2 / Esc 查看关机日志"
+    };
+    draw_anchored_text(
+        canvas,
+        text,
+        SplashAnchor::BottomCenter,
+        bounds,
+        SplashDim::Px(0),
+        SplashDim::Px(-14),
+        12.0,
+        splash.hint_color,
+        None,
+        Face::Ui,
+        hint,
+    );
 }
 
 fn draw_frame_win98(
@@ -605,47 +852,7 @@ fn draw_frame_spui(
     );
 
     let body = Rect::new(box_x + 12, panel_top + 38, box_w - 24, box_h - 46);
-    let line_h = 19;
-    let max_lines = (body.h / line_h).max(1) as usize;
-    let start_idx = tailer.lines.len().saturating_sub(max_lines);
-    let max_w = (body.w - 8) as f32;
-
-    canvas.with_clip(body, |canvas| {
-        if tailer.lines.is_empty() {
-            text.draw(
-                canvas,
-                "[  +0.000s] [INIT  ] Awaiting telemetry stream from systemg PID 1...",
-                body.x as f32,
-                (body.y + 15) as f32,
-                13.0,
-                0x94a3b8,
-                Face::CyberMono,
-            );
-            return;
-        }
-        let mut y = body.y + 15;
-        let visible = &tailer.lines[start_idx..];
-        let blink_cursor = ((elapsed_s * 2.5) as u32).is_multiple_of(2);
-        for (idx, line) in visible.iter().enumerate() {
-            let is_last = idx + 1 == visible.len();
-            let raw = if is_last && blink_cursor {
-                format!("{} _", line.text)
-            } else {
-                line.text.clone()
-            };
-            let clipped = text.truncate(&raw, max_w, 12.5, Face::CyberMono);
-            text.draw(
-                canvas,
-                &clipped,
-                body.x as f32,
-                y as f32,
-                12.5,
-                line.accent,
-                Face::CyberMono,
-            );
-            y += line_h;
-        }
-    });
+    draw_log_lines(canvas, text, body, elapsed_s, tailer, 0x94a3b8, None);
 }
 
 /// Entrypoint for `spui power-splash [poweroff|reboot]`.
@@ -669,7 +876,9 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = uxconf::storage::load_desktop_config_readonly();
     let theme = Theme::from_config(&cfg);
-    let bg_color = if theme.is_win98() {
+    let bg_color = if let Some(splash) = theme.skin().and_then(|s| s.power_splash.as_ref()) {
+        splash.bg_color
+    } else if theme.is_win98() {
         theme.bg_top
     } else {
         0x040812
@@ -679,7 +888,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut text = TextRenderer::load()?;
     text.set_ui_scale(theme.ui_scale());
     let win = x.generate_id()?;
-    let mask = EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY;
+    let mask = EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY | EventMask::KEY_PRESS;
     x.create_window(win, x.root, 0, 0, x.width, x.height, true, mask, bg_color)?;
     x.set_title(win, "SpaceOS Shutdown")?;
     x.set_class(win, "spui-power-splash", "SPUI")?;
@@ -687,9 +896,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut canvas = x.create_canvas(usize::from(x.width), usize::from(x.height), bg_color);
     let mut tailer = LogTailer::new();
+    let mut show_logs = false;
     let start = Instant::now();
 
-    draw_frame(&mut canvas, &mut text, &theme, action, 0.0, &tailer);
+    draw_frame(&mut canvas, &mut text, &theme, action, 0.0, &tailer, show_logs);
     let _ = x.put_canvas(win, &canvas, canvas.bounds());
     x.map(win)?;
     x.raise(win)?;
@@ -698,9 +908,19 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     while RUNNING.load(Ordering::Relaxed) {
         while let Some(ev) = x.poll()? {
-            if let x11rb::protocol::Event::DestroyNotify(_) = ev {
-                RUNNING.store(false, Ordering::Relaxed);
-                break;
+            match ev {
+                x11rb::protocol::Event::DestroyNotify(_) => {
+                    RUNNING.store(false, Ordering::Relaxed);
+                    break;
+                }
+                x11rb::protocol::Event::KeyPress(key_ev) => {
+                    let sym = x.key_symbol(key_ev.detail, key_ev.state.into());
+                    // Escape (0xff1b) or F2 (0xffbf) toggles the live shutdown log panel.
+                    if sym == 0xff1b || sym == 0xffbf {
+                        show_logs = !show_logs;
+                    }
+                }
+                _ => {}
             }
         }
         if !RUNNING.load(Ordering::Relaxed) {
@@ -708,7 +928,15 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         tailer.poll();
         let elapsed_s = start.elapsed().as_secs_f32();
-        draw_frame(&mut canvas, &mut text, &theme, action, elapsed_s, &tailer);
+        draw_frame(
+            &mut canvas,
+            &mut text,
+            &theme,
+            action,
+            elapsed_s,
+            &tailer,
+            show_logs,
+        );
         let _ = x.put_canvas(win, &canvas, canvas.bounds());
         let _ = x.flush();
         std::thread::sleep(Duration::from_millis(25));

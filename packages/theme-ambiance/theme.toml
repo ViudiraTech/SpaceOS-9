@@ -200,6 +200,42 @@ button_active_border = "1px solid #ada9a2"
 button_primary_bg = "linear-gradient(180deg, #f37b4b 0%, #e45a28 52%, #dd4814 100%)"
 button_primary_border = "1px solid #b8390c"
 button_primary_box_shadow = "inset 0 1px #fab59a, inset 0 -1px #a6320a"
+button_primary_hover_bg = "linear-gradient(180deg, #f78c62 0%, #eb6836 52%, #e65420 100%)"
+button_primary_hover_border = "1px solid #c23d10"
+button_primary_hover_box_shadow = "inset 0 1px #ffc9b3"
+button_primary_active_bg = "linear-gradient(180deg, #b83a0e 0%, #cf4717 55%, #dd4814 100%)"
+button_primary_active_border = "1px solid #8c2706"
+popup_radius = 6
+popup_bg = "#f7f6f4"
+popup_border = "1px solid #c5c1ba"
+popup_box_shadow = "inset 0 1px #ffffff"
+switch_radius = 10
+switch_track_off_bg = "linear-gradient(180deg, #d6d3cd 0%, #e7e5e0 100%)"
+switch_track_off_border = "1px solid #aba79f"
+switch_track_off_box_shadow = "inset 0 1px rgba(0, 0, 0, 0.14)"
+switch_track_on_bg = "linear-gradient(180deg, #f07746 0%, #e15726 52%, #dd4814 100%)"
+switch_track_on_border = "1px solid #b5360b"
+switch_track_on_box_shadow = "inset 0 1px #fab59a"
+switch_knob_bg = "linear-gradient(180deg, #ffffff 0%, #f2f0ec 58%, #e4e1db 100%)"
+switch_knob_border = "1px solid #a8a49c"
+switch_knob_box_shadow = "inset 0 1px #ffffff"
+slider_track_bg = "linear-gradient(180deg, #d8d5cf 0%, #ebe9e5 100%)"
+slider_track_border = "1px solid #bfbcb5"
+slider_fill_bg = "linear-gradient(180deg, #f5865a 0%, #e76130 50%, #dd4814 100%)"
+slider_thumb_radius = 6
+slider_thumb_bg = "linear-gradient(180deg, #ffffff 0%, #f0eeea 52%, #e2dfd9 100%)"
+slider_thumb_border = "1px solid #aba79f"
+slider_thumb_box_shadow = "inset 0 1px #ffffff"
+slider_thumb_hover_bg = "linear-gradient(180deg, #ffffff 0%, #faf5f2 52%, #f3ddd4 100%)"
+slider_thumb_hover_border = "1px solid #dd4814"
+toolbar_bg = "linear-gradient(180deg, #f3f1ee 0%, #e5e2dc 100%)"
+toolbar_border_bottom = "1px solid #c5c1ba"
+list_item_radius = 4
+list_item_selected_bg = "linear-gradient(180deg, #f07746 0%, #e15726 55%, #dd4814 100%)"
+list_item_selected_border = "1px solid #b5360b"
+list_item_selected_text = "#ffffff"
+list_item_hover_bg = "#f7ebe6"
+list_item_hover_border = "1px solid #ebbfb0"
 card_radius = 4
 card_bg = "linear-gradient(180deg, #faf9f8 0%, #f1efec 100%)"
 card_border = "1px solid #d4d1cb"
@@ -235,6 +271,62 @@ progress_track_border = "1px solid #bfbcb5"
 progress_fill_bg = "linear-gradient(180deg, #f5865a 0%, #e76130 50%, #dd4814 100%)"
 progress_chunk_w = 0
 progress_chunk_gap = 0
+
+[power_splash]
+bg_color = "#300a24"
+show_space_logo = true
+logo_anchor = "center"
+logo_x = 0
+logo_y = -72
+logo_size = 72
+title_anchor = "center"
+title_x = 0
+title_y = 10
+title_size = 23.0
+title_color = "#f7f5f2"
+title_shadow = "#1a0312"
+subtitle_anchor = "center"
+subtitle_x = 0
+subtitle_y = 86
+subtitle_size = 13.0
+subtitle_color = "#d6c3d0"
+poweroff_title = "正在关闭计算机"
+reboot_title = "正在重新启动 SpaceOS"
+done_title = "即将安全关闭电源"
+poweroff_subtitle = "正在保存会话并停止系统后台服务..."
+reboot_subtitle = "正在同步文件系统并准备重新启动..."
+done_subtitle = "正在移交控制权至系统内核..."
+log_bg = "#1e0717"
+log_border = "#dd4814"
+log_text = "#efe9ec"
+log_accent = "#f07746"
+hint_color = "#b89aae"
+
+[[power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = "100%"
+bg = "radial-gradient(circle at 50% 42%, #5e2750 0%, #3d1332 58%, #2c001e 100%)"
+
+[[power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = 3
+bg = "linear-gradient(to right, #772953 0%, #dd4814 50%, #772953 100%)"
+
+[power_splash.animation]
+sprite_sheet = "splash_anim.svg"
+frame_count = 10
+width = 96
+height = 16
+fps = 6.0
+anchor = "center"
+x = 0
+y = 48
 
 # ==============================================================================
 # Variant 1: Radiance Light Chrome
@@ -290,6 +382,33 @@ normal_bg = "linear-gradient(to bottom, #ffffff 0%, #eeece8 55%, #e1ded7 100%)"
 normal_box_shadow = "inset 0 1px #ffffff, inset -1px -1px #b8b4ac"
 normal_border = "1px solid #bcb8b0"
 
+[accents.radiance.power_splash]
+bg_color = "#f2f1f0"
+title_color = "#3c3c3c"
+title_shadow = "#ffffff"
+subtitle_color = "#6e6b64"
+log_bg = "#2b2926"
+log_border = "#dd4814"
+log_text = "#eae7e1"
+log_accent = "#f07746"
+hint_color = "#7b7872"
+
+[[accents.radiance.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = "100%"
+bg = "radial-gradient(circle at 50% 42%, #ffffff 0%, #f2f1f0 60%, #e4e1db 100%)"
+
+[[accents.radiance.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = 3
+bg = "linear-gradient(to right, #dfdbd3 0%, #dd4814 50%, #dfdbd3 100%)"
+
 # ==============================================================================
 # Variant 2: MATE Green Accent
 # Activated when user selects Emerald (#10b981).
@@ -328,6 +447,38 @@ input_focus_border = "#6f913d"
 scrollbar_thumb_hover_bg = "linear-gradient(to right, #97b566 0%, #81a051 55%, #6f913d 100%)"
 scrollbar_thumb_hover_border = "1px solid #55702c"
 progress_fill_bg = "linear-gradient(180deg, #9bb969 0%, #83a252 50%, #6f913d 100%)"
+switch_track_on_bg = "linear-gradient(180deg, #98b566 0%, #7d9c4b 52%, #6f913d 100%)"
+switch_track_on_border = "1px solid #55702c"
+slider_fill_bg = "linear-gradient(180deg, #9bb969 0%, #83a252 50%, #6f913d 100%)"
+list_item_selected_bg = "linear-gradient(180deg, #93b261 0%, #789847 52%, #6f913d 100%)"
+list_item_selected_border = "1px solid #526d2a"
+
+[accents.mate.power_splash]
+bg_color = "#232b1e"
+title_color = "#f2f5ee"
+title_shadow = "#11160d"
+subtitle_color = "#c5d1b8"
+log_bg = "#171d14"
+log_border = "#87a556"
+log_text = "#e7eee0"
+log_accent = "#a8c776"
+hint_color = "#96a687"
+
+[[accents.mate.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = "100%"
+bg = "radial-gradient(circle at 50% 42%, #36452c 0%, #232b1e 60%, #161b12 100%)"
+
+[[accents.mate.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = 3
+bg = "linear-gradient(to right, #3c4d30 0%, #87a556 50%, #3c4d30 100%)"
 
 # ==============================================================================
 # Variant 3: Ambiance Darkness
@@ -434,3 +585,62 @@ scrollbar_grip_dark = "#272623"
 progress_track_bg = "#201f1d"
 progress_track_border = "1px solid #484641"
 progress_fill_bg = "linear-gradient(180deg, #f5865a 0%, #e76130 50%, #dd4814 100%)"
+button_primary_hover_bg = "linear-gradient(180deg, #f78c62 0%, #eb6836 52%, #e65420 100%)"
+button_primary_hover_border = "1px solid #d44412"
+button_primary_active_bg = "linear-gradient(180deg, #b83a0e 0%, #cf4717 55%, #dd4814 100%)"
+button_primary_active_border = "1px solid #8c2706"
+popup_radius = 6
+popup_bg = "#32312e"
+popup_border = "1px solid #52504a"
+popup_box_shadow = "inset 0 1px #45433e"
+switch_radius = 10
+switch_track_off_bg = "linear-gradient(180deg, #201f1d 0%, #2c2b29 100%)"
+switch_track_off_border = "1px solid #4f4d47"
+switch_track_off_box_shadow = "inset 0 1px rgba(0, 0, 0, 0.35)"
+switch_track_on_bg = "linear-gradient(180deg, #f07746 0%, #e15726 52%, #dd4814 100%)"
+switch_track_on_border = "1px solid #b5360b"
+switch_knob_bg = "linear-gradient(180deg, #595750 0%, #44423c 55%, #373631 100%)"
+switch_knob_border = "1px solid #6b685f"
+slider_track_bg = "linear-gradient(180deg, #201f1d 0%, #2b2a27 100%)"
+slider_track_border = "1px solid #4a4843"
+slider_fill_bg = "linear-gradient(180deg, #f5865a 0%, #e76130 50%, #dd4814 100%)"
+slider_thumb_radius = 6
+slider_thumb_bg = "linear-gradient(180deg, #56544d 0%, #42403a 55%, #36342f 100%)"
+slider_thumb_border = "1px solid #6b685f"
+slider_thumb_hover_bg = "linear-gradient(180deg, #695449 0%, #524038 55%, #42332c 100%)"
+slider_thumb_hover_border = "1px solid #dd4814"
+toolbar_bg = "linear-gradient(180deg, #42413c 0%, #34332f 100%)"
+toolbar_border_bottom = "1px solid #4a4843"
+list_item_radius = 4
+list_item_selected_bg = "linear-gradient(180deg, #f07746 0%, #e15726 55%, #dd4814 100%)"
+list_item_selected_border = "1px solid #b5360b"
+list_item_selected_text = "#ffffff"
+list_item_hover_bg = "#413f3a"
+list_item_hover_border = "1px solid #59564f"
+
+[dark.power_splash]
+bg_color = "#242321"
+title_color = "#eae6dd"
+title_shadow = "#141312"
+subtitle_color = "#b8b4ab"
+log_bg = "#1b1a18"
+log_border = "#dd4814"
+log_text = "#e7e4dc"
+log_accent = "#f07746"
+hint_color = "#949087"
+
+[[dark.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = "100%"
+bg = "radial-gradient(circle at 50% 42%, #363430 0%, #242321 60%, #191816 100%)"
+
+[[dark.power_splash.layers]]
+anchor = "top_left"
+x = 0
+y = 0
+w = "100%"
+h = 3
+bg = "linear-gradient(to right, #3e3c37 0%, #dd4814 50%, #3e3c37 100%)"

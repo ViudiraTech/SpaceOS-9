@@ -71,7 +71,7 @@ pub struct FetchPool {
     queues: Arc<(Mutex<FetchQueues>, Condvar)>,
     tab_gens: Arc<Mutex<HashMap<u64, u64>>>,
     storage: Arc<Mutex<BrowserStorage>>,
-    dark_mode: Arc<Mutex<(bool, i32)>>,
+    theme_colors: Arc<Mutex<pages::PageThemeColors>>,
 }
 
 impl Drop for FetchPool {
@@ -97,7 +97,7 @@ impl FetchPool {
         let completed = Arc::new(Mutex::new(Vec::new()));
         let queues = Arc::new((Mutex::new(FetchQueues::default()), Condvar::new()));
         let tab_gens = Arc::new(Mutex::new(HashMap::<u64, u64>::new()));
-        let dark_mode = Arc::new(Mutex::new((false, 0i32)));
+        let theme_colors = Arc::new(Mutex::new(pages::PageThemeColors::from_legacy(false, 0)));
 
         // Dedicated navigation workers (never starved by slow images/XHR) + general workers.
         for worker_idx in 0..6 {
@@ -106,7 +106,7 @@ impl FetchPool {
             let gens = Arc::clone(&tab_gens);
             let comp = Arc::clone(&completed);
             let st = Arc::clone(&storage);
-            let dm = Arc::clone(&dark_mode);
+            let tc = Arc::clone(&theme_colors);
             thread::spawn(move || loop {
                 let job = {
                     let (lock, cv) = &*q;
@@ -126,20 +126,19 @@ impl FetchPool {
                         guard = cv.wait(guard).unwrap();
                     }
                 };
-                let (dark, theme_style) = *dm.lock().unwrap();
+                let colors = *tc.lock().unwrap();
                 let kind = if job.is_navigation {
                     FetchKind::Navigation
                 } else {
                     FetchKind::Subresource
                 };
-                let response = sync_fetch_with_kind_styled(
+                let response = sync_fetch_with_kind_themed(
                     &job.method,
                     &job.url,
                     &job.headers,
                     &job.body,
                     Some(&st),
-                    dark,
-                    theme_style,
+                    colors,
                     kind,
                 );
                 if !job.is_navigation && Self::is_req_stale(&gens, &job) {
@@ -166,7 +165,7 @@ impl FetchPool {
             queues,
             tab_gens,
             storage,
-            dark_mode,
+            theme_colors,
         }
     }
 
@@ -211,8 +210,12 @@ impl FetchPool {
     }
 
     pub fn set_theme_style(&self, dark_mode: bool, theme_style: i32) {
-        if let Ok(mut g) = self.dark_mode.lock() {
-            *g = (dark_mode, theme_style);
+        self.set_theme_colors(pages::PageThemeColors::from_legacy(dark_mode, theme_style));
+    }
+
+    pub fn set_theme_colors(&self, colors: pages::PageThemeColors) {
+        if let Ok(mut g) = self.theme_colors.lock() {
+            *g = colors;
         }
     }
 
@@ -442,14 +445,32 @@ pub fn sync_fetch_styled(
     dark_mode: bool,
     theme_style: i32,
 ) -> FetchResponse {
-    sync_fetch_with_kind_styled(
+    sync_fetch_with_kind_themed(
         method,
         url_str,
         req_headers,
         req_body,
         storage,
-        dark_mode,
-        theme_style,
+        pages::PageThemeColors::from_legacy(dark_mode, theme_style),
+        FetchKind::Navigation,
+    )
+}
+
+pub fn sync_fetch_themed(
+    method: &str,
+    url_str: &str,
+    req_headers: &BTreeMap<String, String>,
+    req_body: &[u8],
+    storage: Option<&Arc<Mutex<BrowserStorage>>>,
+    colors: pages::PageThemeColors,
+) -> FetchResponse {
+    sync_fetch_with_kind_themed(
+        method,
+        url_str,
+        req_headers,
+        req_body,
+        storage,
+        colors,
         FetchKind::Navigation,
     )
 }
@@ -464,14 +485,13 @@ pub fn sync_fetch_with_kind(
     is_win98: bool,
     kind: FetchKind,
 ) -> FetchResponse {
-    sync_fetch_with_kind_styled(
+    sync_fetch_with_kind_themed(
         method,
         url_str,
         req_headers,
         req_body,
         storage,
-        dark_mode,
-        if is_win98 { 1 } else { 0 },
+        pages::PageThemeColors::from_legacy(dark_mode, if is_win98 { 1 } else { 0 }),
         kind,
     )
 }
@@ -486,9 +506,29 @@ pub fn sync_fetch_with_kind_styled(
     theme_style: i32,
     kind: FetchKind,
 ) -> FetchResponse {
+    sync_fetch_with_kind_themed(
+        method,
+        url_str,
+        req_headers,
+        req_body,
+        storage,
+        pages::PageThemeColors::from_legacy(dark_mode, theme_style),
+        kind,
+    )
+}
+
+pub fn sync_fetch_with_kind_themed(
+    method: &str,
+    url_str: &str,
+    req_headers: &BTreeMap<String, String>,
+    req_body: &[u8],
+    storage: Option<&Arc<Mutex<BrowserStorage>>>,
+    colors: pages::PageThemeColors,
+    kind: FetchKind,
+) -> FetchResponse {
     if url_str.starts_with("about:") || url_str.starts_with("space://") || url_str.is_empty() {
         let guard = storage.and_then(|s| s.lock().ok());
-        let page = pages::serve_builtin_styled(url_str, guard.as_deref(), dark_mode, theme_style);
+        let page = pages::serve_builtin_themed(url_str, guard.as_deref(), colors);
         let mut hdrs = BTreeMap::new();
         hdrs.insert(String::from("content-type"), page.content_type.to_string());
         return FetchResponse {
@@ -553,6 +593,18 @@ pub fn prefetch_subresources_styled(
     dark_mode: bool,
     theme_style: i32,
 ) {
+    prefetch_subresources_themed(
+        urls,
+        storage,
+        pages::PageThemeColors::from_legacy(dark_mode, theme_style),
+    );
+}
+
+pub fn prefetch_subresources_themed(
+    urls: &[String],
+    storage: Option<&Arc<Mutex<BrowserStorage>>>,
+    colors: pages::PageThemeColors,
+) {
     let mut todo = Vec::new();
     let mut seen = HashSet::new();
     for raw in urls {
@@ -569,14 +621,13 @@ pub fn prefetch_subresources_styled(
         return;
     }
     if todo.len() == 1 {
-        let _ = sync_fetch_with_kind_styled(
+        let _ = sync_fetch_with_kind_themed(
             "GET",
             &todo[0],
             &BTreeMap::new(),
             &[],
             storage,
-            dark_mode,
-            theme_style,
+            colors,
             FetchKind::Subresource,
         );
         return;
@@ -594,14 +645,13 @@ pub fn prefetch_subresources_styled(
                 if i >= todo_ref.len() {
                     break;
                 }
-                let _ = sync_fetch_with_kind_styled(
+                let _ = sync_fetch_with_kind_themed(
                     "GET",
                     &todo_ref[i],
                     hdrs_ref,
                     &[],
                     storage,
-                    dark_mode,
-                    theme_style,
+                    colors,
                     FetchKind::Subresource,
                 );
             });

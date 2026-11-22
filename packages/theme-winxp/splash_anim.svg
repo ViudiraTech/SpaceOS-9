@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="14" viewBox="0 0 1920 14">
+<defs>
+<linearGradient id="trackBg" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0%" stop-color="#c4d3f5"/>
+<stop offset="30%" stop-color="#f2f6ff"/>
+<stop offset="100%" stop-color="#dde8fc"/>
+</linearGradient>
+<linearGradient id="blockG" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0%" stop-color="#a8d1ff"/>
+<stop offset="35%" stop-color="#3c86f2"/>
+<stop offset="85%" stop-color="#1952c4"/>
+<stop offset="100%" stop-color="#2c6be0"/>
+</linearGradient>
+<clipPath id="c0"><rect x="3" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c1"><rect x="163" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c2"><rect x="323" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c3"><rect x="483" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c4"><rect x="643" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c5"><rect x="803" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c6"><rect x="963" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c7"><rect x="1123" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c8"><rect x="1283" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c9"><rect x="1443" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c10"><rect x="1603" y="3" width="154" height="8" rx="4"/></clipPath>
+<clipPath id="c11"><rect x="1763" y="3" width="154" height="8" rx="4"/></clipPath>
+</defs>
+<rect x="1" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c0)"><rect x="-31" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="-20" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="-9" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="161" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c1)"><rect x="145" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="156" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="167" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="321" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c2)"><rect x="321" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="332" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="343" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="481" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c3)"><rect x="497" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="508" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="519" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="641" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c4)"><rect x="673" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="684" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="695" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="801" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c5)"><rect x="849" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="860" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="871" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="961" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c6)"><rect x="1025" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="1036" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="1047" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="1121" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c7)"><rect x="1201" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="1212" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="1223" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="1281" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c8)"><rect x="1377" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="1388" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="1399" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="1441" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c9)"><rect x="1553" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="1564" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="1575" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="1601" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c10)"><rect x="1729" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="1740" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="1751" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+<rect x="1761" y="1" width="158" height="12" rx="6" fill="url(#trackBg)" stroke="#1b3f91" stroke-width="1.2"/>
+<g clip-path="url(#c11)"><rect x="1905" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.68"/><rect x="1916" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="0.86"/><rect x="1927" y="3" width="9" height="8" rx="1.6" fill="url(#blockG)" opacity="1.00"/></g>
+</svg>

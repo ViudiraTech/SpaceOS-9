@@ -735,6 +735,19 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - `index.json.sig`：sha256 `8799b15524ffdff1b97570872d239571ecf27a5e864ba56ff3fb72a3898806e7`
   - 新增 `Aqua Classic`（顶部银灰面板、左侧晶球窗口按钮、居中标题栏、Graphite/Dark 变体）与 `Ambiance`（顶部暖炭黑面板、官方 19×19 SVG 按钮、象牙白窗体、Radiance/MATE/Darkness 变体）声明式主题包，并将设置外观页重构为可分页搜索/筛选的主题画廊。
 
+- 2026-11-21：声明式 `[power_splash]` 关机动画、控件视觉抛光与实时包管理重载：
+  - `base-core-1.0.0-8-x86_64.spk`：sha256 `a36c49b9852c7c67c412c9cd27eac65a116f02aac0ac24b1a35f77777caeb1ef`（`3139960` bytes）
+  - `spk-runtime-1.0.0-4-x86_64.spk`：sha256 `36b6fa71e00ee6a8c7af68b04bc2d49368eed78de7f71a6e05276184496cca91`（`2053403` bytes）
+  - `theme-winxp-1.0.0-5-x86_64.spk`：sha256 `032a9cf8b488f6832b1a7796e3b439504f1aedfe8c22df7c3c741f85f25d2afe`（`696237` bytes）
+  - `theme-aqua-1.0.0-2-x86_64.spk`：sha256 `5a3340e4ba043dfebf7affca6d59c71355410106a7aceae162b26f8c5371dceb`（`106524` bytes）
+  - `theme-ambiance-1.0.0-2-x86_64.spk`：sha256 `1b246d7f586bf870812c59a09c321bea57bec47000e2846c5b0ad8ff0f82a5a1`（`53016` bytes）
+  - `index.json`：sha256 `f9fb5279643305221bfcf92f759110be42c3151cea3890c5c1fed19ae0a85454`（`2799` bytes）
+  - `index.json.sig`：sha256 `f25ef900312bcb00bf618dfd55e56bd5667f7533079877daac2128eedc3c1e7b`（`271` bytes）
+  - `repo.json`：sha256 `461e5949d559a22636c16aa0b819cf512c4fa49beab260e0014dd5ea2ed1a943`（`1029` bytes）
+  - `repo.json.sig`：sha256 `0780631bdcac799f594e428262c00ff2ff046f8a0c9a3640014b94be4f3a4a39`（`271` bytes）
+  - `spui-theme-kick` 改为原子单调写 `/run/spui-theme.stamp` 并同步广播 `uxconf-query -c appearance -p /theme/reload-gen`；`App`/`Shell` 新增 2s `installed_themes_fingerprint()` 低频轮询并在卸载当前主题时将默认回退写回 `uxconfd`；各主题包补充水平 SVG 精灵帧 `splash_anim.svg` 与 `[power_splash]`/`[controls]` 声明式皮肤并修正 `/button-layout`。
+  - 旧 `base-core-1.0.0-7`、`spk-runtime-1.0.0-3`、`theme-winxp-1.0.0-4`、`theme-aqua-1.0.0-1`、`theme-ambiance-1.0.0-1` 已从生产仓库删除。
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。

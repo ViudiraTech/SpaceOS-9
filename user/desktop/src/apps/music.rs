@@ -17,7 +17,7 @@
 //! blocks the window event loop.
 
 use crate::app::{App, UiEvent};
-use crate::draw::{mix, Canvas, Rect};
+use crate::draw::{Canvas, Rect};
 use crate::icons::Icon;
 use crate::sound::{apply_mixer_volume, play as play_sound, SystemSound};
 use crate::text::{Face, TextRenderer};
@@ -991,40 +991,11 @@ fn draw_player(
 ) {
     canvas.clear(theme.window);
     let content = content_rect(theme, width, height);
-    let is_win98 = theme.is_win98();
 
     // Top Now-Playing Card
     ui::card(canvas, theme, layout.album);
     let art = layout.art;
-    if is_win98 {
-        canvas.fill(art, theme.accent);
-        ui::sunken_bevel(canvas, theme, art);
-    } else if theme.is_vortexglass() {
-        ui::draw_aero_surface(
-            canvas,
-            theme,
-            art,
-            theme.radius_card(),
-            true,
-            false,
-            if state.play_state == PlayState::Playing {
-                0.35
-            } else {
-                0.0
-            },
-            false,
-        );
-        crate::vortex::blit_aero_sheen(canvas, art.inset(1), 0, 0, None, 0.42);
-    } else {
-        canvas.rounded_rect(art, theme.radius_card(), theme.accent, 1.0);
-        canvas.circle(
-            art.x as f32 + art.w as f32 * 0.5,
-            art.y as f32 + art.h as f32 * 0.5,
-            40.0,
-            theme.window_high,
-            0.24,
-        );
-    }
+    ui::accent_tile_surface(canvas, theme, art, state.play_state == PlayState::Playing);
     text.draw_centered(
         canvas,
         "♪",
@@ -1208,18 +1179,7 @@ fn draw_player(
             }
             let selected = idx == state.current;
             let is_hover = hover == Some(HitTarget::TrackRow(idx));
-            let win98_sel = is_win98 && selected;
-            let row_fg = if is_win98 || theme.is_vortexglass() {
-                ui::list_item_bg(cv, theme, row, selected, is_hover)
-            } else {
-                if selected {
-                    cv.rounded_rect(row, 5, theme.accent_soft, 1.0);
-                    cv.rounded_border(row, 5, theme.accent, 0.55, 1);
-                } else if is_hover {
-                    cv.rounded_rect(row, 5, theme.panel_hover, 0.85);
-                }
-                theme.text
-            };
+            let row_fg = ui::list_item_bg(cv, theme, row, selected, is_hover);
 
             let badge = if selected && state.play_state == PlayState::Playing {
                 "▶"
@@ -1236,7 +1196,7 @@ fn draw_player(
                     row.x as f32 + 10.0,
                     row.y as f32 + 23.0,
                     11.5,
-                    if win98_sel { row_fg } else { theme.text_muted },
+                    if selected { row_fg } else { theme.text_muted },
                     Face::Mono,
                 );
             } else {
@@ -1246,7 +1206,11 @@ fn draw_player(
                     row.x as f32 + 10.0,
                     row.y as f32 + 23.0,
                     12.0,
-                    if win98_sel { row_fg } else { theme.accent },
+                    if selected && row_fg != theme.text {
+                        row_fg
+                    } else {
+                        theme.accent
+                    },
                     Face::Bold,
                 );
             }
@@ -1261,7 +1225,7 @@ fn draw_player(
                 row.right() as f32 - 12.0,
                 row.y as f32 + 23.0,
                 11.5,
-                if win98_sel { row_fg } else { theme.text_muted },
+                if selected { row_fg } else { theme.text_muted },
                 Face::Mono,
             );
 
@@ -1274,13 +1238,7 @@ fn draw_player(
                 text_left as f32,
                 row.y as f32 + 17.0,
                 12.5,
-                if win98_sel {
-                    row_fg
-                } else if selected {
-                    theme.text
-                } else {
-                    theme.text_dim
-                },
+                if selected { row_fg } else { theme.text_dim },
                 Face::Bold,
             );
             let row_sub = text.truncate(&item.subtitle, text_max, 10.5, Face::Ui);
@@ -1290,7 +1248,7 @@ fn draw_player(
                 text_left as f32,
                 row.y as f32 + 31.0,
                 10.5,
-                if win98_sel { row_fg } else { theme.text_muted },
+                if selected { row_fg } else { theme.text_muted },
                 Face::Ui,
             );
         }
@@ -1371,7 +1329,7 @@ fn draw_spectrum(
             };
             cv.rounded_rect(
                 bar,
-                if theme.is_win98() { 0 } else { 2 },
+                theme.radius_control().min(2),
                 theme.accent,
                 alpha,
             );
@@ -1423,70 +1381,15 @@ fn draw_progress_row(
     );
 
     let bar = layout.progress_bar;
-    let is_win98 = theme.is_win98();
-    let is_vortex = theme.is_vortexglass();
-    let track_h = if is_win98 { 8 } else if is_vortex { 7 } else { 5 };
-    let track = Rect::new(bar.x, bar.y + (bar.h - track_h) / 2, bar.w, track_h);
-    if is_win98 {
-        canvas.fill(track, theme.input_bg);
-        ui::sunken_bevel(canvas, theme, track);
-    } else if is_vortex {
-        ui::progress_bar(canvas, theme, track, frac, Some(theme.accent));
-    } else {
-        canvas.rounded_rect(track, 2, theme.window_alt, 1.0);
-        canvas.rounded_border(track, 2, theme.window_border, 1.0, 1);
-    }
-
-    let fill_w = ((track.w as f32) * frac).round() as i32;
-    if fill_w > 0 && !is_vortex {
-        if is_win98 {
-            let inner_w = (fill_w - 2).min(track.w - 2).max(0);
-            if inner_w > 0 {
-                canvas.fill(
-                    Rect::new(track.x + 1, track.y + 1, inner_w, (track_h - 2).max(1)),
-                    theme.accent,
-                );
-            }
-        } else {
-            let filled = Rect::new(track.x, track.y, fill_w.min(track.w), track_h);
-            canvas.rounded_rect(filled, 2, theme.accent, 1.0);
-        }
-    }
-    if hot || state.play_state != PlayState::Stopped {
-        if is_win98 {
-            let kx = (track.x + fill_w).clamp(track.x, track.right()) - 5;
-            let thumb = Rect::new(kx, track.y - 3, 10, track_h + 6);
-            canvas.fill(thumb, theme.panel);
-            ui::raised_bevel(canvas, theme, thumb);
-        } else if is_vortex {
-            let knob_d = if hot { 14 } else { 11 };
-            let kx = (track.x + fill_w).clamp(track.x, track.right()) - knob_d / 2;
-            let ky = track.y + track_h / 2 - knob_d / 2;
-            let knob_r = Rect::new(kx, ky, knob_d, knob_d);
-            ui::draw_aero_surface(
-                canvas,
-                theme,
-                knob_r,
-                knob_d / 2,
-                true,
-                false,
-                if hot { 1.0 } else { 0.25 },
-                false,
-            );
-        } else {
-            let knob_d = if hot { 12 } else { 9 };
-            let kx = (track.x + fill_w).clamp(track.x, track.right()) - knob_d / 2;
-            let ky = track.y + track_h / 2 - knob_d / 2;
-            canvas.rounded_rect(Rect::new(kx, ky, knob_d, knob_d), knob_d / 2, 0xffffff, 1.0);
-            canvas.rounded_border(
-                Rect::new(kx, ky, knob_d, knob_d),
-                knob_d / 2,
-                theme.accent,
-                if hot { 0.9 } else { 0.5 },
-                1,
-            );
-        }
-    }
+    let slider_r = Rect::new(bar.x, bar.y + (bar.h - 20) / 2, bar.w, 20);
+    ui::slider(
+        canvas,
+        theme,
+        slider_r,
+        frac,
+        hot,
+        hot && ui::is_rect_pressed(slider_r),
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -1506,53 +1409,15 @@ fn draw_transport_button(
     primary: bool,
     hover: bool,
 ) {
-    let is_win98 = theme.is_win98();
-    let fg = if is_win98 {
-        let bg = if hover {
-            theme.panel_hover
-        } else if primary {
-            theme.panel_high
-        } else {
-            theme.panel
-        };
-        canvas.fill(rect, bg);
-        ui::raised_bevel(canvas, theme, rect);
-        if primary { theme.accent } else { theme.text }
-    } else if theme.is_vortexglass() {
-        let radius = if primary { rect.h / 2 } else { 6 };
-        ui::draw_aero_surface(
-            canvas,
-            theme,
-            rect,
-            radius,
-            primary,
-            !primary,
-            if hover { 1.0 } else { 0.0 },
-            false,
-        );
-        if primary { 0xffffff } else { theme.text }
-    } else {
-        let base = if primary {
-            theme.accent
-        } else {
-            theme.panel_high
-        };
-        let bg = if hover {
-            if theme.is_dark() {
-                mix(base, 0xffffff, 0.14)
-            } else {
-                mix(base, 0x000000, 0.08)
-            }
-        } else {
-            base
-        };
-        let radius = if primary { rect.h / 2 } else { 6 };
-        canvas.rounded_rect(rect, radius, bg, 1.0);
-        if !primary {
-            canvas.rounded_border(rect, radius, theme.window_border, 1.0, 1);
-        }
-        if primary { 0xffffff } else { theme.text }
-    };
+    let fg = ui::action_button_surface(
+        canvas,
+        theme,
+        rect,
+        primary,
+        hover,
+        ui::is_rect_pressed(rect),
+        true,
+    );
     let cx = rect.x + rect.w / 2;
     let cy = rect.y + rect.h / 2;
     match kind {
@@ -1590,41 +1455,15 @@ fn draw_transport_button(
 }
 
 fn draw_mute_button(canvas: &mut Canvas, theme: &Theme, rect: Rect, muted: bool, hover: bool) {
-    if theme.is_win98() {
-        let bg = if hover {
-            theme.panel_hover
-        } else if muted {
-            theme.panel_high
-        } else {
-            theme.panel
-        };
-        canvas.fill(rect, bg);
-        if muted {
-            ui::sunken_bevel(canvas, theme, rect);
-        } else {
-            ui::raised_bevel(canvas, theme, rect);
-        }
-    } else if theme.is_vortexglass() {
-        ui::draw_aero_surface(
-            canvas,
-            theme,
-            rect,
-            5,
-            muted,
-            !muted,
-            if hover { 1.0 } else { 0.0 },
-            false,
-        );
-    } else {
-        let bg = if hover {
-            theme.panel_hover
-        } else {
-            theme.panel_high
-        };
-        canvas.rounded_rect(rect, 5, bg, 1.0);
-        canvas.rounded_border(rect, 5, theme.window_border, 1.0, 1);
-    }
-    let fg = if muted { theme.danger } else { theme.text };
+    let fg = ui::action_button_surface(
+        canvas,
+        theme,
+        rect,
+        muted,
+        hover,
+        muted || ui::is_rect_pressed(rect),
+        false,
+    );
     let cx = rect.x + rect.w / 2;
     let cy = rect.y + rect.h / 2;
     canvas.fill(Rect::new(cx - 7, cy - 3, 4, 6), fg);
@@ -1639,8 +1478,8 @@ fn draw_mute_button(canvas: &mut Canvas, theme: &Theme, rect: Rect, muted: bool,
         fg,
     );
     if muted {
-        canvas.line(cx + 3, cy - 4, cx + 8, cy + 4, theme.danger, 1.0);
-        canvas.line(cx + 8, cy - 4, cx + 3, cy + 4, theme.danger, 1.0);
+        canvas.line(cx + 3, cy - 4, cx + 8, cy + 4, fg, 1.0);
+        canvas.line(cx + 8, cy - 4, cx + 3, cy + 4, fg, 1.0);
     } else {
         canvas.fill(Rect::new(cx + 3, cy - 3, 2, 6), fg);
         canvas.fill(Rect::new(cx + 6, cy - 5, 2, 10), fg);
