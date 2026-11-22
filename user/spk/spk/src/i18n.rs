@@ -616,6 +616,20 @@ pub fn setuid_preserved(lang: Lang, package: &str) -> String {
     }
 }
 
+/// The server sent a different number of bytes than the index promised. This
+/// is almost always a stale cached index rather than a corrupted package.
+pub fn package_size_mismatch(lang: Lang, mirror: &str, actual: u64, expected: u64) -> String {
+    if lang.is_zh() {
+        format!(
+            "{mirror}: 下载到 {actual} 字节，仓库索引记录 {expected} 字节；索引可能已过期，请先运行 spk sync 刷新"
+        )
+    } else {
+        format!(
+            "{mirror}: downloaded {actual} bytes but the repository index says {expected}; the index may be stale, run spk sync"
+        )
+    }
+}
+
 pub fn root_required(lang: Lang) -> &'static str {
     if lang.is_zh() {
         "spk 必须以 root 运行（setuid/系统文件写入需要 euid 0）"

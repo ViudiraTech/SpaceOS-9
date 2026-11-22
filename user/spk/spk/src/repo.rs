@@ -58,13 +58,14 @@ impl LoadedRepo {
     }
 
     pub fn ensure_package(&self, package: &spk_core::index::IndexPackage) -> Result<PathBuf> {
-        self.ensure_package_with_progress(package, &mut |_| {})
+        self.ensure_package_with_progress(package, &mut |_| {}, crate::i18n::Lang::En)
     }
 
     pub fn ensure_package_with_progress(
         &self,
         package: &spk_core::index::IndexPackage,
         progress: &mut dyn FnMut(u64),
+        lang: crate::i18n::Lang,
     ) -> Result<PathBuf> {
         match &self.package_cache {
             Some(cache) => crate::remote::ensure_package_with_progress(
@@ -73,6 +74,7 @@ impl LoadedRepo {
                 package,
                 self.offline,
                 progress,
+                lang,
             ),
             None => {
                 let path = self.dir.join(&package.filename);
