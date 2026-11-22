@@ -783,6 +783,17 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - 开始菜单新增“检查新软件”（内置 SVG 图标），右键任意开始菜单项可在桌面添加/移除快捷方式；桌面默认只显示 `files,term,browser,store` 四个图标，列表持久化在 `desktop:/icons/shortcuts`。
   - 旧版本 `base-1.0.0-6`、`base-core-1.0.0-8`、`hello-0.1.0-1`、`hello-0.2.0-1`、`spk-runtime-1.0.0-4`、`sudo-0.1.0-3`、`theme-*-1.0.0-{2,5}` 已从生产仓库删除。
 
+- 2026-11-22：字体软件包（Hack / Carlito / Croscore）、字体配置与书样预览：
+  - `font-hack-1.0.0-1-x86_64.spk`：sha256 `19226a899cc14f6e4858aabbdca7fae902ce997b7398c5c71a06be822e1bef10`（`394227` bytes，MIT + Bitstream Vera）
+  - `font-carlito-1.0.0-1-x86_64.spk`：sha256 `94fd0dd53955894aa8bc868117eee13fe4f7897df4651821bdc9cd88dcbbef0e`（`813707` bytes，OFL-1.1）
+  - `font-croscore-1.0.0-1-x86_64.spk`：sha256 `15f880b91098f1e793147142a278f879a3df79de983b1530ca09abed21e84a82`（`2344148` bytes，Apache-2.0）
+  - `space-editor-1.0.0-2-x86_64.spk`：sha256 `795192198faf44d20df523eb0d74fa2da47d73128c70b16a4947a8baac06fdd6`（正文改用 Serif 角色，跟随“文档字体”设置）
+  - `index.json`：sha256 `08466fecbc86cbdbe97eadb4c123457a5667b79ca9860b1a8af303ac19d66ca9`（`4936` bytes）
+  - `repo.json`：sha256 `d63cd86f37b3352abfb5eb35ade3af7fd3a58c4a0a6b44e88ae93966ab46aaec`（`1749` bytes）
+  - `store.json`：sha256 `a2b50d246c60329c98a650ff5d2609e1566577ef12f549b2f00e7a3fb29a1485`（`13683` bytes）
+  - 字体文件用 `tools/fetch_alpine_package.py` 从固定 Alpine 版本按索引校验后解包（与镜像取 Noto/DejaVu 同源），许可证全文与版权声明随包安装到 `/usr/share/licenses/<pkg>/`。
+  - 预览为书样卡片：`tools/build_font_previews.py` 用包内真实 TTF 渲染 960×540 JPEG，`previews/font-*.jpg` 经 `spk fetch-asset` 下发。
+
 ## 13. 安全模型
 
 - 威胁：恶意仓库、篡改镜像、坏包、路径逃逸、脚本提权、降级攻击、磁盘耗尽。
