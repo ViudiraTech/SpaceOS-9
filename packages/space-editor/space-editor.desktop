@@ -1,0 +1,16 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SpaceEditor
+Name[zh_CN]=SpaceEditor
+GenericName=字处理软件
+Comment=所见即所得 A4 分页文档编辑器（支持 .docx）
+Exec=/usr/bin/space-editor %f
+TryExec=/usr/bin/space-editor
+Icon=space-editor
+Terminal=false
+Categories=Office;WordProcessor;Utility;
+MimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document;text/markdown;text/html;text/plain;
+Keywords=editor;doc;docx;writer;document;文档;排版;文字处理;
+StartupNotify=false
+X-SpaceOS-DesktopShortcut=true

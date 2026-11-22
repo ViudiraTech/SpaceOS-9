@@ -65,7 +65,8 @@ if [ -f "$STORE_SOURCE" ]; then
     install -m 0644 "$STORE_SOURCE" "$REPO/store.in.json"
 fi
 
-PREVIEWS_DIR=${SPK_PREVIEWS_DIR:-$ROOT/packages/previews}
+PREVIEWS_DIR=${SPK_PREVIEWS_DIR:-$BUILD/previews}
+rm -rf "$REPO/previews"
 if [ -d "$PREVIEWS_DIR" ]; then
     install -d -m 0755 "$REPO/previews"
     for asset in "$PREVIEWS_DIR"/*.jpg "$PREVIEWS_DIR"/*.png; do

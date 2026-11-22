@@ -1392,7 +1392,8 @@ pub fn fetch_asset(
         if repo::is_remote_url(&src) {
             remote_mirrors.push(src);
         } else {
-            local_dirs.push(std::path::PathBuf::from(src));
+            let local_path = src.strip_prefix("file://").unwrap_or(&src);
+            local_dirs.push(std::path::PathBuf::from(local_path));
         }
     }
     let embedded = paths.root.join("var/lib/spk/repo/x86_64");

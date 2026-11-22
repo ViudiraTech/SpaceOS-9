@@ -9,7 +9,7 @@
 name = "theme-ambiance"
 epoch = 0
 version = "1.0.0"
-release = 4
+release = 5
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "Ambiance SPUI theme"
@@ -35,6 +35,7 @@ category = "themes"
 icon = "appearance"
 accent = ["#f97316", "#c2410c"]
 banner = "previews/theme-ambiance.jpg"
+screenshots = ["previews/theme-ambiance.jpg", "previews/theme-ambiance-2.jpg"]
 featured_rank = 90
 highlights = [
     "包含 Ambiance、Radiance、MATE 与 Darkness 四重变体",

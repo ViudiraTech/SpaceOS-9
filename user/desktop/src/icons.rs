@@ -23,6 +23,35 @@ use std::sync::{Arc, Mutex, OnceLock};
 const ICON_DIR: &str = "/usr/share/spui/icons/breeze";
 const LOGO_PATH: &str = "/usr/share/spui/logo.png";
 
+fn resolve_sysroot_path(path: &str) -> std::path::PathBuf {
+    if path.starts_with("/usr/") {
+        if let Ok(root) = std::env::var("SPUI_SYSROOT") {
+            let trimmed = root.trim();
+            if !trimmed.is_empty() {
+                return Path::new(trimmed.trim_end_matches('/')).join(path.trim_start_matches('/'));
+            }
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
+const DOCUMENT_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <defs>
+    <linearGradient id="docbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="52%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1e40af"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="40" height="40" rx="11" fill="url(#docbg)"/>
+  <path d="M15 11 H28 L34 17 V36 A2 2 0 0 1 32 38 H15 A2 2 0 0 1 13 36 V13 A2 2 0 0 1 15 11 Z" fill="#ffffff" opacity="0.96"/>
+  <path d="M28 11 V17 H34 Z" fill="#93c5fd"/>
+  <rect x="17" y="21" width="13" height="2.4" rx="1.2" fill="#2563eb"/>
+  <rect x="17" y="26" width="13" height="2.2" rx="1.1" fill="#60a5fa"/>
+  <rect x="17" y="31" width="9" height="2.2" rx="1.1" fill="#60a5fa"/>
+</svg>
+"##;
+
 const BROWSER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
@@ -110,6 +139,7 @@ pub enum Icon {
     Terminal,
     Files,
     Editor,
+    Document,
     Settings,
     Monitor,
     Calculator,
@@ -200,6 +230,7 @@ define_svg_icons! {
     Terminal => "terminal.svg",
     Files => "files.svg",
     Editor => "editor.svg",
+    Document => "document.svg",
     Settings => "settings.svg",
     Monitor => "monitor.svg",
     Calculator => "calculator.svg",
@@ -312,6 +343,7 @@ impl Icon {
             Some("sh" | "py") => Self::FileScript,
             Some("png" | "jpg" | "jpeg" | "svg" | "bmp") => Self::FileImage,
             Some("mp3" | "flac" | "wav" | "ogg") => Self::Music,
+            Some("docx") => Self::Document,
             Some(
                 "txt" | "md" | "toml" | "json" | "yaml" | "yml" | "conf" | "log" | "ini"
                 | "service",
@@ -373,7 +405,8 @@ impl IconStore {
     fn render_logo(&mut self, size: u32) -> Option<Sprite> {
         if !self.logo_tried {
             self.logo_tried = true;
-            if let Some(mut raw) = decode_png(Path::new(LOGO_PATH)) {
+            let logo = resolve_sysroot_path(LOGO_PATH);
+            if let Some(mut raw) = decode_png(&logo) {
                 // Mipmap down to 128x128 once so all icon sizes (18..72px) are supersampled.
                 while raw.width > 256 && raw.height > 256 {
                     raw = box_halve(&raw);
@@ -390,7 +423,7 @@ impl IconStore {
     fn render_svg(&mut self, icon: Icon, size: u32, tint: Option<u32>) -> Option<Sprite> {
         let file = icon.svg_name()?;
         if !self.svg_sources.contains_key(&icon) {
-            let path = format!("{ICON_DIR}/{file}");
+            let path = resolve_sysroot_path(&format!("{ICON_DIR}/{file}"));
             let xml = match fs::read_to_string(path) {
                 Ok(text) => text,
                 Err(_) if icon == Icon::Minesweeper => String::from(MINESWEEPER_SVG),
@@ -398,6 +431,7 @@ impl IconStore {
                 Err(_) if icon == Icon::Store => String::from(STORE_SVG),
                 Err(_) if icon == Icon::StoreCheck => String::from(STORE_CHECK_SVG),
                 Err(_) if icon == Icon::Shield => String::from(SHIELD_SVG),
+                Err(_) if icon == Icon::Document => String::from(DOCUMENT_SVG),
                 Err(_) => return None,
             };
             self.svg_sources.insert(icon, xml);
@@ -533,6 +567,11 @@ fn apply_rounded_mask(sprite: &mut Sprite, radius: f32) {
 
 pub fn decode_png(path: &Path) -> Option<Sprite> {
     let bytes = fs::read(path).ok()?;
+    decode_png_bytes(&bytes)
+}
+
+#[allow(dead_code)]
+pub fn decode_png_bytes(bytes: &[u8]) -> Option<Sprite> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
@@ -562,7 +601,12 @@ pub fn decode_png(path: &Path) -> Option<Sprite> {
 
 pub fn decode_jpeg(path: &Path) -> Option<Sprite> {
     let bytes = fs::read(path).ok()?;
-    let mut decoder = zune_jpeg::JpegDecoder::new(bytes.as_slice());
+    decode_jpeg_bytes(&bytes)
+}
+
+#[allow(dead_code)]
+pub fn decode_jpeg_bytes(bytes: &[u8]) -> Option<Sprite> {
+    let mut decoder = zune_jpeg::JpegDecoder::new(bytes);
     let decoded = decoder.decode().ok()?;
     let info = decoder.info()?;
     let (w, h) = (info.width as u32, info.height as u32);
@@ -574,6 +618,18 @@ pub fn decode_jpeg(path: &Path) -> Option<Sprite> {
             rgb.extend_from_slice(&[g, g, g]);
         }
         Some(Sprite::from_rgb(w, h, &rgb))
+    } else {
+        None
+    }
+}
+
+/// Decode in-memory PNG or JPEG bytes by checking their magic signature.
+#[allow(dead_code)]
+pub fn decode_image_bytes(bytes: &[u8]) -> Option<Sprite> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        decode_png_bytes(bytes)
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        decode_jpeg_bytes(bytes)
     } else {
         None
     }
@@ -683,6 +739,16 @@ mod tests {
         let sprite = store
             .render_svg(Icon::Shield, 48, None)
             .expect("embedded shield SVG must render");
+        assert_eq!((sprite.width, sprite.height), (48, 48));
+        assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
+    }
+
+    #[test]
+    fn document_builtin_svg_renders_cleanly() {
+        let mut store = IconStore::new();
+        let sprite = store
+            .render_svg(Icon::Document, 48, None)
+            .expect("embedded document SVG must render");
         assert_eq!((sprite.width, sprite.height), (48, 48));
         assert!(sprite.pixels.iter().any(|&p| (p >> 24) != 0));
     }

@@ -9,7 +9,7 @@
 name = "theme-winxp"
 epoch = 0
 version = "1.0.0"
-release = 7
+release = 8
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "XP Luna SPUI theme"
@@ -35,6 +35,7 @@ category = "themes"
 icon = "appearance"
 accent = ["#3b82f6", "#1d4ed8"]
 banner = "previews/theme-winxp.jpg"
+screenshots = ["previews/theme-winxp.jpg", "previews/theme-winxp-2.jpg"]
 featured_rank = 100
 highlights = [
     "支持深色 Royale Noir 与橄榄绿/金属银变体",

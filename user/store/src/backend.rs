@@ -282,13 +282,28 @@ fn emit(ev_tx: &mpsc::Sender<BackendEvent>, wake: &WakePipe, event: BackendEvent
     wake.wake();
 }
 
-fn resolve_spk_bin() -> &'static str {
+fn resolve_spk_bin() -> String {
+    if let Ok(over) = std::env::var("SPK_BIN") {
+        let trimmed = over.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
     if Path::new("/usr/bin/spk").is_file() {
-        "/usr/bin/spk"
+        "/usr/bin/spk".into()
     } else if Path::new("/bin/spk").is_file() {
-        "/bin/spk"
+        "/bin/spk".into()
     } else {
-        "spk"
+        "spk".into()
+    }
+}
+
+fn apply_spk_root(cmd: &mut Command) {
+    if let Ok(root) = std::env::var("SPK_ROOT") {
+        let trimmed = root.trim();
+        if !trimmed.is_empty() {
+            cmd.arg("--root").arg(trimmed);
+        }
     }
 }
 
@@ -304,9 +319,10 @@ fn resolve_sudo_bin() -> &'static str {
 
 fn run_spk_json_cmd(args: &[&str]) -> Result<String, String> {
     let spk = resolve_spk_bin();
-    let out = Command::new(spk)
-        .env("LC_ALL", "C.UTF-8")
-        .env("NO_COLOR", "1")
+    let mut cmd = Command::new(&spk);
+    cmd.env("LC_ALL", "C.UTF-8").env("NO_COLOR", "1");
+    apply_spk_root(&mut cmd);
+    let out = cmd
         .args(args)
         .output()
         .map_err(|e| format!("无法启动 spk（{spk}）：{e}"))?;
@@ -445,8 +461,9 @@ fn query_worker(
                     );
                 } else {
                     let spk = resolve_spk_bin();
-                    let mut cmd = Command::new(spk);
+                    let mut cmd = Command::new(&spk);
                     cmd.env("LC_ALL", "C.UTF-8").env("NO_COLOR", "1");
+                    apply_spk_root(&mut cmd);
                     if offline {
                         cmd.arg("--offline");
                     }

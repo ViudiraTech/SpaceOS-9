@@ -1071,14 +1071,15 @@ fn draw_detail(
     canvas.fill(main, theme.bg_bottom);
     let pres = state.presentation(&pkg);
     let area = content_scroll_area(main);
-    let header_h = 164;
+    let header_h = 136;
     let header = Rect::new(area.x, area.y, area.w, header_h);
     ui::card(canvas, theme, header);
 
-    let show_preview = (pres.banner.is_some() || pres.is_theme) && header.w >= 720;
-    let preview_w = if show_preview { 244 } else { 0 };
+    let show_preview =
+        pres.screenshots.is_empty() && (pres.banner.is_some() || pres.is_theme) && header.w >= 720;
+    let preview_w = if show_preview { 220 } else { 0 };
     if show_preview {
-        let pr = Rect::new(header.right() - preview_w - 16, header.y + 16, preview_w, 132);
+        let pr = Rect::new(header.right() - preview_w - 16, header.y + 12, preview_w, 112);
         let banner = state.banner_sprite(pres.banner.as_deref());
         ui_cards::draw_preview_artwork(
             canvas,
@@ -1094,19 +1095,19 @@ fn draw_detail(
     ui_cards::icon_badge(
         canvas,
         pres.icon,
-        Rect::new(header.x + 20, header.y + 20, 76, 76),
+        Rect::new(header.x + 18, header.y + 18, 64, 64),
         pres.accent,
     );
-    let info_x = header.x + 112;
-    let info_w = (header.w - 128 - if show_preview { preview_w + 24 } else { 0 }).max(120);
+    let info_x = header.x + 96;
+    let info_w = (header.w - 112 - if show_preview { preview_w + 24 } else { 0 }).max(120);
     ui_cards::draw_text_clipped(
         text,
         canvas,
         &pres.display_name,
         info_x,
-        header.y + 40,
+        header.y + 34,
         info_w,
-        20.0,
+        19.0,
         theme.text,
         Face::Bold,
     );
@@ -1115,7 +1116,7 @@ fn draw_detail(
         canvas,
         &pres.subtitle,
         info_x,
-        header.y + 64,
+        header.y + 56,
         info_w,
         12.5,
         theme.text_muted,
@@ -1131,7 +1132,7 @@ fn draw_detail(
             format_bytes(pkg.size)
         ),
         info_x,
-        header.y + 84,
+        header.y + 74,
         info_w,
         11.5,
         theme.text_muted,
@@ -1140,7 +1141,7 @@ fn draw_detail(
 
     let pointer = state.last_pointer;
     let mut button_x = info_x;
-    let btn_y = header.y + 108;
+    let btn_y = header.y + 92;
     let primary_rect = Rect::new(button_x, btn_y, 114, 32);
     let hovered = prev_hits.hover_rect(pointer.0, pointer.1, primary_rect);
     if let Some(job) = state.job_for(&name) {
@@ -1241,7 +1242,7 @@ fn draw_detail(
         hits.push(appearance, Action::OpenAppearance);
     }
 
-    let stats = Rect::new(area.x, header.bottom() + 12, area.w, 64);
+    let stats = Rect::new(area.x, header.bottom() + 10, area.w, 56);
     let source_label = pkg.repo.clone().unwrap_or_else(|| {
         if pkg.installed {
             "本地已安装".into()
@@ -1268,7 +1269,7 @@ fn draw_detail(
     ];
     ui_cards::quick_stats(canvas, text, theme, stats, &items);
 
-    let tabs = Rect::new(area.x, stats.bottom() + 12, area.w, 32);
+    let tabs = Rect::new(area.x, stats.bottom() + 10, area.w, 30);
     let mut tab_x = tabs.x;
     for (tab, label) in [
         (crate::model::DetailTab::Overview, "概览"),
@@ -1308,6 +1309,171 @@ fn draw_detail(
         let mut y = body.y - offset;
         canvas.with_clip(body, |canvas| match state_ref.detail_tab {
             crate::model::DetailTab::Overview => {
+                if !pres.screenshots.is_empty() {
+                    let shot_count = pres.screenshots.len();
+                    let active_idx = state_ref.detail_shot_idx % shot_count;
+                    ui_cards::draw_text(
+                        text,
+                        canvas,
+                        "实机截图",
+                        body.x,
+                        y + 14,
+                        13.5,
+                        theme.text,
+                        Face::Bold,
+                    );
+                    if shot_count > 1 {
+                        let count_str = format!("{} / {}", active_idx + 1, shot_count);
+                        ui_cards::draw_text(
+                            text,
+                            canvas,
+                            &count_str,
+                            body.x + 68,
+                            y + 14,
+                            11.5,
+                            theme.text_muted,
+                            Face::Ui,
+                        );
+                    }
+                    y += 22;
+
+                    let side_by_side = inner_w >= 560 && shot_count > 1;
+                    let (gallery_w, gallery_h) = if side_by_side {
+                        (376, 212)
+                    } else {
+                        let gw = inner_w.min(480);
+                        (gw, (gw * 9 / 16).clamp(160, 240))
+                    };
+                    let gallery_rect = Rect::new(body.x, y, gallery_w, gallery_h);
+                    let active_rel = pres.screenshots.get(active_idx).map(String::as_str);
+                    let sprite = state_ref.banner_sprite(active_rel);
+                    ui_cards::draw_preview_artwork(
+                        canvas,
+                        gallery_rect,
+                        10,
+                        pres.accent,
+                        pres.icon,
+                        sprite,
+                        pres.is_theme,
+                    );
+                    if shot_count > 1 {
+                        let prev_btn = Rect::new(
+                            gallery_rect.x + 10,
+                            gallery_rect.y + (gallery_h - 32) / 2,
+                            28,
+                            32,
+                        );
+                        let next_btn = Rect::new(
+                            gallery_rect.right() - 38,
+                            gallery_rect.y + (gallery_h - 32) / 2,
+                            28,
+                            32,
+                        );
+                        for (btn_rect, lbl, act) in [
+                            (prev_btn, "‹", Action::DetailShotPrev),
+                            (next_btn, "›", Action::DetailShotNext),
+                        ] {
+                            let hov = prev_hits.hover_rect(pointer.0, pointer.1, btn_rect);
+                            canvas.rounded_rect(
+                                btn_rect,
+                                14,
+                                0x0f172a,
+                                if hov { 0.72 } else { 0.45 },
+                            );
+                            let tw = text.measure(lbl, 16.0, Face::Bold);
+                            text.draw(
+                                canvas,
+                                lbl,
+                                (btn_rect.x + btn_rect.w / 2) as f32 - tw * 0.5,
+                                (btn_rect.y + 21) as f32,
+                                16.0,
+                                0xffffff,
+                                Face::Bold,
+                            );
+                            hits.push_clipped(btn_rect, body, act);
+                        }
+
+                        if side_by_side {
+                            let thumb_w = 144;
+                            let thumb_h = 81;
+                            let gap = 10;
+                            let start_tx = gallery_rect.right() + 14;
+                            let mut tx = start_tx;
+                            let mut ty = y;
+                            for (idx, shot_rel) in pres.screenshots.iter().enumerate() {
+                                if ty + thumb_h > y + gallery_h + 4 {
+                                    tx += thumb_w + gap;
+                                    ty = y;
+                                }
+                                if tx + thumb_w > body.x + inner_w {
+                                    break;
+                                }
+                                let tr = Rect::new(tx, ty, thumb_w, thumb_h);
+                                let t_sprite = state_ref.banner_sprite(Some(shot_rel.as_str()));
+                                ui_cards::draw_preview_artwork(
+                                    canvas,
+                                    tr,
+                                    8,
+                                    pres.accent,
+                                    pres.icon,
+                                    t_sprite,
+                                    pres.is_theme,
+                                );
+                                let selected = idx == active_idx;
+                                let hov = prev_hits.hover_rect(pointer.0, pointer.1, tr);
+                                if selected || hov {
+                                    canvas.rounded_border(
+                                        tr,
+                                        8,
+                                        if selected { theme.accent } else { theme.text },
+                                        0.95,
+                                        if selected { 2 } else { 1 },
+                                    );
+                                }
+                                hits.push_clipped(tr, body, Action::SelectDetailShot(idx));
+                                ty += thumb_h + gap;
+                            }
+                            y += gallery_h + 14;
+                        } else {
+                            y += gallery_h + 10;
+                            let thumb_w = 128;
+                            let thumb_h = 72;
+                            let mut tx = body.x;
+                            for (idx, shot_rel) in pres.screenshots.iter().enumerate() {
+                                if tx + thumb_w > body.x + inner_w {
+                                    break;
+                                }
+                                let tr = Rect::new(tx, y, thumb_w, thumb_h);
+                                let t_sprite = state_ref.banner_sprite(Some(shot_rel.as_str()));
+                                ui_cards::draw_preview_artwork(
+                                    canvas,
+                                    tr,
+                                    7,
+                                    pres.accent,
+                                    pres.icon,
+                                    t_sprite,
+                                    pres.is_theme,
+                                );
+                                let selected = idx == active_idx;
+                                let hov = prev_hits.hover_rect(pointer.0, pointer.1, tr);
+                                if selected || hov {
+                                    canvas.rounded_border(
+                                        tr,
+                                        7,
+                                        if selected { theme.accent } else { theme.text },
+                                        0.95,
+                                        if selected { 2 } else { 1 },
+                                    );
+                                }
+                                hits.push_clipped(tr, body, Action::SelectDetailShot(idx));
+                                tx += thumb_w + 10;
+                            }
+                            y += thumb_h + 14;
+                        }
+                    } else {
+                        y += gallery_h + 14;
+                    }
+                }
                 for line in ui_cards::wrap_text(
                     text,
                     &pres.description,

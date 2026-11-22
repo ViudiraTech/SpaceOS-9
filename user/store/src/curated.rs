@@ -14,6 +14,7 @@ pub struct PackagePresentation {
     pub icon: Icon,
     pub accent: [u32; 2],
     pub banner: Option<String>,
+    pub screenshots: Vec<String>,
     pub is_theme: bool,
     pub featured_rank: i32,
 }
@@ -79,6 +80,7 @@ pub fn icon_from_name(name: Option<&str>, fallback: Icon) -> Icon {
         "browser" => Icon::Browser,
         "files" => Icon::Files,
         "editor" => Icon::Editor,
+        "document" => Icon::Document,
         "music" => Icon::Music,
         "calculator" => Icon::Calculator,
         "help" => Icon::Help,
@@ -177,6 +179,13 @@ pub fn present_package(pkg: &StorePackage, meta: Option<&StoreMeta>) -> PackageP
                 vec!["由 Ed25519 签名仓库安全分发".to_string()]
             }
         });
+    let banner = meta.and_then(|m| m.banner.clone());
+    let mut screenshots = meta.map(|m| m.screenshots.clone()).unwrap_or_default();
+    if screenshots.is_empty() {
+        if let Some(b) = banner.clone() {
+            screenshots.push(b);
+        }
+    }
     PackagePresentation {
         display_name,
         subtitle,
@@ -185,7 +194,8 @@ pub fn present_package(pkg: &StorePackage, meta: Option<&StoreMeta>) -> PackageP
         category,
         icon: icon_from_name(meta.and_then(|m| m.icon.as_deref()), fallback_icon),
         accent: accent_colors(meta, category),
-        banner: meta.and_then(|m| m.banner.clone()),
+        banner,
+        screenshots,
         is_theme,
         featured_rank: meta.and_then(|m| m.featured_rank).unwrap_or(10),
     }
