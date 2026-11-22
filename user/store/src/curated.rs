@@ -159,15 +159,9 @@ pub fn present_package(pkg: &StorePackage, meta: Option<&StoreMeta>) -> PackageP
         .and_then(|m| m.description.clone())
         .unwrap_or_else(|| {
             if pkg.summary.is_empty() {
-                format!("SpaceOS 软件源中的软件包 `{}`。", pkg.name)
+                format!("SpaceOS 软件包 `{}`。", pkg.name)
             } else {
-                format!(
-                    "{}（{} · 架构 {}，ABI {}）。",
-                    pkg.summary,
-                    pkg.display_version(),
-                    pkg.arch,
-                    pkg.abi
-                )
+                pkg.summary.clone()
             }
         });
     let highlights = meta

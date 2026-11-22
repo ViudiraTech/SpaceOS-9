@@ -648,6 +648,102 @@ pub fn more_button(
     }
 }
 
+/// Compact icon-only pill button for header bar utility actions.
+pub fn toolbar_icon_button(
+    canvas: &mut Canvas,
+    theme: &Theme,
+    rect: Rect,
+    icon: Icon,
+    active: bool,
+    hovered: bool,
+    enabled: bool,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    let radius = (rect.h / 2).min(theme.radius_control().max(8));
+    let bg = if active {
+        mix(theme.window_high, theme.accent, 0.16)
+    } else if hovered && enabled {
+        mix(theme.window_high, theme.panel_hover, 0.65)
+    } else {
+        mix(theme.window_alt, theme.window_high, 0.45)
+    };
+    let border = if active || (hovered && enabled) {
+        mix(theme.accent, theme.panel_border, 0.42)
+    } else {
+        soft_border(theme)
+    };
+    canvas.rounded_rect(rect, radius, bg, 1.0);
+    canvas.rounded_border(rect, radius, border, 0.92, 1);
+
+    let tint = if !enabled {
+        theme.text_muted
+    } else if active {
+        theme.accent
+    } else if hovered {
+        theme.text
+    } else {
+        theme.text_dim
+    };
+    let glyph = 15;
+    icons::draw(
+        canvas,
+        icon,
+        rect.x + (rect.w - glyph) / 2,
+        rect.y + (rect.h - glyph) / 2,
+        glyph as u32,
+        Some(tint),
+    );
+}
+
+/// Compact clickable status chip with a small indicator dot (used in the topbar).
+pub fn status_dot_chip(
+    canvas: &mut Canvas,
+    text: &mut TextRenderer,
+    theme: &Theme,
+    rect: Rect,
+    label: &str,
+    dot_color: u32,
+    hovered: bool,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    let radius = rect.h / 2;
+    let fill = if hovered {
+        mix(theme.window_high, dot_color, 0.18)
+    } else {
+        mix(theme.window_high, dot_color, 0.10)
+    };
+    let border = if hovered {
+        mix(dot_color, theme.panel_border, 0.35)
+    } else {
+        mix(dot_color, theme.window_high, 0.50)
+    };
+    canvas.rounded_rect(rect, radius, fill, 1.0);
+    canvas.rounded_border(rect, radius, border, 0.88, 1);
+
+    let dot_sz = 6;
+    let dot_x = rect.x + 10;
+    let dot_y = rect.y + (rect.h - dot_sz) / 2;
+    canvas.rounded_rect(Rect::new(dot_x, dot_y, dot_sz, dot_sz), 3, dot_color, 1.0);
+
+    let text_x = dot_x + dot_sz + 6;
+    let max_tw = (rect.right() - text_x - 8).max(8);
+    let shown = text.truncate(label, max_tw as f32, 11.5, Face::Bold);
+    let y = rect.y + (rect.h + 8) / 2;
+    text.draw(
+        canvas,
+        &shown,
+        text_x as f32,
+        y as f32,
+        11.5,
+        badge_text_color(theme, dot_color),
+        Face::Bold,
+    );
+}
+
 pub fn badge(
     canvas: &mut Canvas,
     text: &mut TextRenderer,

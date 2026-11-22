@@ -1,8 +1,8 @@
 use crate::model::{
-    CacheInfoJson, CatalogJson, CheckOkJson, FullSnapshot, InfoPackageJson, LogEntry, LogLevel,
-    MaintResult, PackageFileEntry, PackageFilesJson, ProgressStreamEvent, SpkErrorJson,
-    StorePackage, TrustListJson, TxJob, TxJobKind, TxJobStatus, TxPlanJson, VerifyJson,
-    format_bytes,
+    CacheInfoJson, CatalogJson, CatalogSyncMode, CheckOkJson, FullSnapshot, InfoPackageJson,
+    LogEntry, LogLevel, MaintResult, PackageFileEntry, PackageFilesJson, ProgressStreamEvent,
+    SpkErrorJson, StorePackage, TrustListJson, TxJob, TxJobKind, TxJobStatus, TxPlanJson,
+    VerifyJson, format_bytes,
 };
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct AuthSecret {
     buf: String,
@@ -43,7 +44,7 @@ enum AuthReply {
 }
 
 pub enum BackendCmd {
-    RefreshCatalog { offline: bool },
+    RefreshCatalog { mode: CatalogSyncMode },
     LoadPackageDetails { name: String },
     PreviewTx { kind: TxJobKind, title: String },
     FetchBanner {
@@ -208,8 +209,8 @@ impl StoreBackend {
         out
     }
 
-    pub fn refresh_catalog(&self, offline: bool) {
-        let _ = self.query_tx.send(BackendCmd::RefreshCatalog { offline });
+    pub fn refresh_catalog(&self, mode: CatalogSyncMode) {
+        let _ = self.query_tx.send(BackendCmd::RefreshCatalog { mode });
     }
 
     pub fn load_package_details(&self, name: impl Into<String>) {
@@ -359,11 +360,15 @@ pub fn extract_spk_error(stdout: &str, stderr: &str, code: Option<i32>) -> Strin
     format!("spk 执行失败（退出码 {}）", code.unwrap_or(-1))
 }
 
-fn load_full_snapshot(offline: bool) -> Result<FullSnapshot, String> {
-    let catalog_raw = if offline {
-        run_spk_json_cmd(&["--offline", "--json", "--lang", "zh_CN", "catalog"])?
-    } else {
-        run_spk_json_cmd(&["--json", "--lang", "zh_CN", "catalog"])?
+fn load_full_snapshot(mode: CatalogSyncMode) -> Result<FullSnapshot, String> {
+    let catalog_raw = match mode {
+        CatalogSyncMode::LocalReload => {
+            run_spk_json_cmd(&["--offline", "--json", "--lang", "zh_CN", "catalog"])?
+        }
+        CatalogSyncMode::Startup => run_spk_json_cmd(&["--json", "--lang", "zh_CN", "catalog"])?,
+        CatalogSyncMode::ForceRefresh => {
+            run_spk_json_cmd(&["--refresh", "--json", "--lang", "zh_CN", "catalog"])?
+        }
     };
     let catalog: CatalogJson =
         serde_json::from_str(&catalog_raw).map_err(|e| format!("解析 catalog JSON 失败: {e}"))?;
@@ -379,11 +384,28 @@ fn load_full_snapshot(offline: bool) -> Result<FullSnapshot, String> {
         .map(|t| t.keys)
         .unwrap_or_default();
 
+    let any_enabled = catalog.repositories.iter().any(|r| r.enabled);
+    let any_unhealthy = catalog
+        .repositories
+        .iter()
+        .any(|r| r.enabled && (r.stale || !r.synced));
+    let offline = mode == CatalogSyncMode::LocalReload || (any_enabled && any_unhealthy);
+    let synced_at = if mode != CatalogSyncMode::LocalReload && !offline {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    } else {
+        None
+    };
+
     Ok(FullSnapshot {
         catalog,
         cache,
         trust_keys,
         offline,
+        mode,
+        synced_at,
     })
 }
 
@@ -394,8 +416,8 @@ fn query_worker(
 ) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            BackendCmd::RefreshCatalog { offline } => {
-                let res = load_full_snapshot(offline);
+            BackendCmd::RefreshCatalog { mode } => {
+                let res = load_full_snapshot(mode);
                 emit(&ev_tx, &wake, BackendEvent::CatalogLoaded(res));
             }
             BackendCmd::LoadPackageDetails { name } => {
@@ -601,7 +623,20 @@ fn tx_worker(
             }
 
             run_single_tx(&mut job, &auth_rx, &ev_tx, &wake);
-            let _ = query_tx.send(BackendCmd::RefreshCatalog { offline: true });
+            let post_mode = if matches!(job.status, TxJobStatus::Succeeded)
+                && matches!(
+                    job.kind,
+                    TxJobKind::Sync
+                        | TxJobKind::RepoAdd { .. }
+                        | TxJobKind::RepoRemove(_)
+                        | TxJobKind::RepoPriority { .. }
+                        | TxJobKind::TrustAdd(_)
+                ) {
+                CatalogSyncMode::ForceRefresh
+            } else {
+                CatalogSyncMode::LocalReload
+            };
+            let _ = query_tx.send(BackendCmd::RefreshCatalog { mode: post_mode });
         }
     }
 }

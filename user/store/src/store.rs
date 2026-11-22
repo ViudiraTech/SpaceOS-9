@@ -28,8 +28,8 @@ use crate::curated::{
     PackagePresentation,
 };
 use crate::model::{
-    format_bytes, format_timestamp, CatalogJson, FullSnapshot, InstalledFilter, LogEntry,
-    LogLevel, NavSection, PackageFileEntry, RepoStatusEntry, SortMode, StoreCategory,
+    format_bytes, format_timestamp, CatalogJson, CatalogSyncMode, FullSnapshot, InstalledFilter,
+    LogEntry, LogLevel, NavSection, PackageFileEntry, RepoStatusEntry, SortMode, StoreCategory,
     StorePackage, TxJob, TxJobKind, TxJobStatus, TxPlanJson,
 };
 use crate::ui_cards::{self, FEATURED_CARD_H, SIDEBAR_W, TOPBAR_H};
@@ -216,6 +216,8 @@ struct StoreState {
     updates: Vec<String>,
     offline: bool,
     loading: bool,
+    pending_manual_refresh: bool,
+    last_sync_at: Option<u64>,
     view: NavSection,
     category: StoreCategory,
     sort: SortMode,
@@ -287,6 +289,8 @@ impl StoreState {
             updates: Vec::new(),
             offline: false,
             loading: true,
+            pending_manual_refresh: false,
+            last_sync_at: None,
             view: NavSection::Discover,
             category: StoreCategory::All,
             sort: SortMode::Featured,
@@ -328,13 +332,47 @@ impl StoreState {
     }
 
     fn apply_snapshot(&mut self, snapshot: FullSnapshot, backend: Option<&StoreBackend>) {
+        let was_offline = self.offline;
         self.catalog = snapshot.catalog;
-        self.repos = self.catalog.repositories.clone();
         self.packages = self.catalog.packages.clone();
         self.updates = self.catalog.updates.clone();
         self.trust_keys = snapshot.trust_keys;
         self.cache = snapshot.cache;
-        self.offline = snapshot.offline;
+
+        if snapshot.mode == CatalogSyncMode::LocalReload {
+            // Post-transaction local reloads run with `--offline` purely to avoid extra network
+            // round-trips; never let that latch the UI into offline mode or mark synced repos stale.
+            let prev_repos = self.repos.clone();
+            let mut merged = self.catalog.repositories.clone();
+            if !self.offline {
+                for repo in &mut merged {
+                    if let Some(prev) = prev_repos.iter().find(|r| r.name == repo.name) {
+                        repo.synced = prev.synced;
+                        repo.stale = prev.stale;
+                        repo.error = prev.error.clone();
+                        repo.last_sync = repo.last_sync.max(prev.last_sync);
+                    }
+                }
+            }
+            self.repos = merged;
+        } else {
+            self.repos = self.catalog.repositories.clone();
+            self.offline = snapshot.offline;
+            if !self.offline {
+                self.last_sync_at = snapshot.synced_at.or(self.last_sync_at);
+            }
+            if was_offline && !self.offline {
+                self.banner_requested.clear();
+            }
+            if self.pending_manual_refresh {
+                self.pending_manual_refresh = false;
+                if self.offline {
+                    self.toast("无法连接软件源，当前使用离线缓存");
+                } else {
+                    self.toast("软件源已同步");
+                }
+            }
+        }
         self.loading = false;
         let len = self.hero_slides().len();
         if len > 0 && self.hero_index >= len {
@@ -564,7 +602,7 @@ pub fn run_store(options: StoreOptions) -> Result<(), String> {
         state.detail = Some(package);
     }
 
-    backend.refresh_catalog(false);
+    backend.refresh_catalog(CatalogSyncMode::Startup);
     let mut prev_hits = Hits::new();
 
     loop {
@@ -886,9 +924,12 @@ fn perform_action(app: &mut App, state: &mut StoreState, backend: &StoreBackend,
             enqueue_or_preview(app, state, backend, TxJobKind::UpgradeAll);
         }
         Action::RefreshCatalog => {
-            state.loading = true;
-            backend.refresh_catalog(state.offline);
-            app.needs_redraw = true;
+            if !state.loading {
+                state.loading = true;
+                state.pending_manual_refresh = true;
+                backend.refresh_catalog(CatalogSyncMode::ForceRefresh);
+                app.needs_redraw = true;
+            }
         }
         Action::HeroCta(index) => {
             if let Some(slide) = state.hero_slides().get(index).cloned() {
@@ -1137,6 +1178,8 @@ fn apply_backend_event(state: &mut StoreState, backend: &StoreBackend, event: Ba
         }
         BackendEvent::CatalogLoaded(Err(error)) => {
             state.loading = false;
+            state.pending_manual_refresh = false;
+            state.offline = true;
             state.toast(error);
         }
         BackendEvent::PackageDetailsLoaded { name, files, .. } => {
@@ -1415,5 +1458,93 @@ mod tests {
             .set_bounds(400.0, 1200.0, Rect::new(0, 0, 8, 400));
         let _ = handle_wheel(&mut state, 400, 300, 3, Rect::new(0, 0, 1000, 700));
         assert!(state.open_menu.is_none());
+    }
+
+    #[test]
+    fn local_reload_preserves_online_state_and_repo_status() {
+        let mut state = StoreState::new();
+        let online_repo = RepoStatusEntry {
+            name: "spaceos-main".into(),
+            enabled: true,
+            synced: true,
+            stale: false,
+            package_count: 14,
+            ..Default::default()
+        };
+        state.apply_snapshot(
+            FullSnapshot {
+                catalog: CatalogJson {
+                    repositories: vec![online_repo],
+                    ..Default::default()
+                },
+                offline: false,
+                mode: CatalogSyncMode::Startup,
+                synced_at: Some(1_795_342_273),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!state.offline);
+        assert_eq!(state.last_sync_at, Some(1_795_342_273));
+
+        // Post-tx local reload runs `--offline` so `spk` reports `stale = true`,
+        // which must NOT latch the store into offline cache mode.
+        let offline_reload_repo = RepoStatusEntry {
+            name: "spaceos-main".into(),
+            enabled: true,
+            synced: true,
+            stale: true,
+            package_count: 14,
+            ..Default::default()
+        };
+        state.apply_snapshot(
+            FullSnapshot {
+                catalog: CatalogJson {
+                    repositories: vec![offline_reload_repo],
+                    ..Default::default()
+                },
+                offline: true,
+                mode: CatalogSyncMode::LocalReload,
+                synced_at: None,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!state.offline);
+        assert!(!state.repos[0].stale);
+        assert!(state.repos[0].synced);
+    }
+
+    #[test]
+    fn force_refresh_recovers_from_offline_mode() {
+        let mut state = StoreState::new();
+        state.offline = true;
+        state.pending_manual_refresh = true;
+        let recovered_repo = RepoStatusEntry {
+            name: "spaceos-main".into(),
+            enabled: true,
+            synced: true,
+            stale: false,
+            package_count: 14,
+            ..Default::default()
+        };
+        state.apply_snapshot(
+            FullSnapshot {
+                catalog: CatalogJson {
+                    repositories: vec![recovered_repo],
+                    ..Default::default()
+                },
+                offline: false,
+                mode: CatalogSyncMode::ForceRefresh,
+                synced_at: Some(1_795_349_000),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!state.offline);
+        assert!(!state.loading);
+        assert!(!state.pending_manual_refresh);
+        assert_eq!(state.last_sync_at, Some(1_795_349_000));
+        assert_eq!(state.toast.as_ref().map(|t| t.0.as_str()), Some("软件源已同步"));
     }
 }

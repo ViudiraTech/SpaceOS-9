@@ -257,6 +257,14 @@ doas spk repo priority local 1
 doas spk sync
 ```
 
+
+镜像与 CDN：
+
+- 同一个仓库可以写多个 URL（`repos.json` 的 `urls` 数组），`spk` 按顺序尝试，第一个可用的胜出；`--remote-repo` / `--repo-url` 支持逗号分隔，构建时直接生成。
+- CDN 只应缓存 `.spk`：这些文件名带版本号且永不覆写。`index.json`、`repo.json`、`store.json`、`*.sig`、`pkg/…`、`previews/…` 都必须回源，否则又会出现“清单与索引对不上”。
+- Cloudflare（当前站点已在用）：免费版默认不缓存无已知后缀的文件，需要一条 Cache Rule：路径匹配 `^/spaceos/repo/.*\.spk$` → Eligible，Edge TTL 跟随源站；其余路径不缓存。
+- Bunny.net（无 KYC、邮箱即可注册、支持信用卡、14 天免卡试用）：亚洲 $0.03/GB，账号每月最低 $1。建 Pull Zone，源站填 `https://goutoustdio.top`，加 Edge Rule 让 `*.json`、`*.sig`、`/pkg/*`、`/previews/*` 绕过缓存，其余（`.spk`）长缓存；再绑一个 `cdn.goutoustdio.top` 并写进 `urls` 作为首选镜像。
+
 ## 5. 依赖与求解
 
 ### 5.1 版本比较

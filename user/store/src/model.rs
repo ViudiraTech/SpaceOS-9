@@ -336,12 +336,22 @@ pub enum ProgressStreamEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CatalogSyncMode {
+    #[default]
+    Startup,
+    ForceRefresh,
+    LocalReload,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FullSnapshot {
     pub catalog: CatalogJson,
     pub cache: CacheInfoJson,
     pub trust_keys: Vec<TrustKeyEntry>,
     pub offline: bool,
+    pub mode: CatalogSyncMode,
+    pub synced_at: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
