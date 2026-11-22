@@ -213,7 +213,8 @@ size = 11
 - 只签 `repo.json`；`index.json` 与 `pkg/` 下所有文件由 `repo.json` 的 sha256 覆盖。
   旧客户端仍只读 `index.json` + `index.json.sig`，`index.json` 保持 schema 1 语义，只是只含最新版本。
 - 安装/升级只需要 `index.json`；`downgrade` 或 `pkg=version` 才按需拉 `pkg/…`，由 `repo.json` 校验哈希。
-- 仓库可提供 `.zst` 压缩版；客户端按 ETag/304 缓存索引，默认 15 分钟内不重新联网（`--refresh` 强制，`SPK_SYNC_TTL_SECONDS` 可调）。
+- 仓库可提供 `.zst` 压缩版；普通命令默认 15 分钟内不重新联网（`SPK_SYNC_TTL_SECONDS` 可调），但**显式 `spk sync` 总是强制刷新**，`--refresh` 可对任意命令强制。
+- 缓存契约：只有 `.spk` 可以 `immutable`；`index.json`、`repo.json`、`store.json`、`*.sig`、`pkg/…`、`previews/…` 都是原地重写的文件，必须 `no-cache`。客户端对 `repo.json` / `pkg/` 请求带 `Cache-Control: no-cache`，并校验 `repo.json` 的 catalog 摘要必须匹配当前索引、历史文件必须匹配清单摘要，否则丢弃缓存重拉或换镜像。
 - 镜像：同一仓库可有多个 URL；客户端按优先级切换，签名保证一致性。
 - 保留策略：`.spk` 内容不可变，长缓存；历史文件随版本数增长，旧版本可按策略清理。
 - `spk-host index` 维护 `.spk-index-cache.json`（文件名 + size + mtime），只重新检查变化的包，新增一个包只多花一个包的时间。

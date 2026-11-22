@@ -909,7 +909,9 @@ pub fn sync(paths: &Paths, urls: &[String], report: ReportOptions, lang: Lang) -
         crate::remote::RemoteOptions {
             offline: report.offline,
             allow_unsigned: report.allow_unsigned,
-            refresh: report.refresh,
+            // An explicit `spk sync` is the user asking for fresh data; the
+            // freshness TTL only exists to keep ordinary commands quiet.
+            refresh: true,
         },
     )?;
     if repos.is_empty() {

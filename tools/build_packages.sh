@@ -109,6 +109,6 @@ pack_one base 1.0.0-7 "$ROOT/packages/base/manifest.toml" "$BUILD/packages/base"
 pack_one theme-winxp 1.0.0-8 "$ROOT/packages/theme-winxp/manifest.toml" "$BUILD/packages/theme-winxp"
 pack_one theme-aqua 1.0.0-5 "$ROOT/packages/theme-aqua/manifest.toml" "$BUILD/packages/theme-aqua"
 pack_one theme-ambiance 1.0.0-5 "$ROOT/packages/theme-ambiance/manifest.toml" "$BUILD/packages/theme-ambiance"
-pack_one spk-runtime 1.0.0-7 "$ROOT/packages/spk-runtime/manifest.toml" "$BUILD/packages/spk-runtime"
+pack_one spk-runtime 1.0.0-8 "$ROOT/packages/spk-runtime/manifest.toml" "$BUILD/packages/spk-runtime"
 
 printf 'reproducible packages in %s\n' "$REPO"
