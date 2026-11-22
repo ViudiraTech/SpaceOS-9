@@ -194,6 +194,9 @@ pub struct RepoManifest {
     pub catalog: FileDigest,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub history: BTreeMap<String, FileDigest>,
+    /// Optional `store.json`: per-package presentation plus editorial picks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<FileDigest>,
 }
 
 impl RepoManifest {
@@ -228,6 +231,11 @@ impl RepoManifest {
                 return Err(Error::Index(format!(
                     "{name}: malformed history sha256"
                 )));
+            }
+        }
+        if let Some(store) = &manifest.store {
+            if !is_sha256_hex(&store.sha256) {
+                return Err(Error::Index("malformed store sha256".into()));
             }
         }
         Ok(manifest)

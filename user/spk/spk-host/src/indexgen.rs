@@ -17,6 +17,7 @@ use spk_core::index::{
     history_path, history_to_bytes, validate_repo_name, FileDigest, Index, IndexPackage,
     RepoManifest, RevokedVersion, REPO_SCHEMA,
 };
+use spk_core::store::{StoreDoc, STORE_SCHEMA};
 use spk_core::keys::{read_signature, signature_path, write_signature, PublicKey, SignatureEntry};
 use spk_core::manifest::validate_arch;
 use spk_core::{Error, Result};
@@ -44,6 +45,8 @@ struct IndexCache {
 
 const CACHE_SCHEMA: u32 = 1;
 const CACHE_FILE: &str = ".spk-index-cache.json";
+/// Authored half of store.json: hero slides, sections and category labels.
+const STORE_SOURCE: &str = "store.in.json";
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +54,8 @@ struct CacheEntry {
     size: u64,
     mtime: u64,
     package: IndexPackage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store: Option<spk_core::manifest::PackageStoreMeta>,
 }
 
 impl IndexCache {
@@ -176,6 +181,7 @@ pub fn generate_with_keys_and_security(
     };
     let mut identities = BTreeSet::new();
     let mut all = Vec::new();
+    let mut store_metas: BTreeMap<String, (spk_core::version::Version, spk_core::manifest::PackageStoreMeta)> = BTreeMap::new();
     for (name, path) in paths {
         let metadata = fs::metadata(&path)?;
         let mtime = metadata
@@ -190,8 +196,8 @@ pub fn generate_with_keys_and_security(
                 && entry.package.filename == name
                 && entry.package.arch == arch
         });
-        let package = match cached {
-            Some(entry) => entry.package.clone(),
+        let (package, store_meta) = match cached {
+            Some(entry) => (entry.package.clone(), entry.store.clone()),
             None => {
                 let inspected = inspect_spk(&path)?;
                 if inspected.manifest.arch != arch {
@@ -206,20 +212,38 @@ pub fn generate_with_keys_and_security(
                         "{name}: expected package filename '{expected}'"
                     )));
                 }
-                IndexPackage::from_manifest(
+                let package = IndexPackage::from_manifest(
                     &inspected.manifest,
                     name.clone(),
                     inspected.package_size,
                     inspected.package_sha256,
-                )
+                );
+                let mut store = inspected.manifest.store.clone();
+                if !inspected.manifest.description.trim().is_empty() {
+                    let meta = store.get_or_insert_with(Default::default);
+                    if meta.description.is_none() {
+                        meta.description = Some(inspected.manifest.description.clone());
+                    }
+                }
+                (package, store)
             }
         };
+        if let Some(meta) = &store_meta {
+            // The newest release of a package owns its store metadata.
+            match store_metas.get(&package.name) {
+                Some((version, _)) if *version > package.version() => {}
+                _ => {
+                    store_metas.insert(package.name.clone(), (package.version(), meta.clone()));
+                }
+            }
+        }
         next_cache.entries.insert(
             name,
             CacheEntry {
                 size: metadata.len(),
                 mtime,
                 package: package.clone(),
+                store: store_meta,
             },
         );
         if !identities.insert(package.identity()) {
@@ -250,6 +274,30 @@ pub fn generate_with_keys_and_security(
     let bytes = index.to_bytes()?;
     let index_path = repo_dir.join("index.json");
     atomic_write(&index_path, &bytes, 0o644)?;
+
+    // store.json: editorial picks come from the authored store.in.json, the
+    // per-package blocks from each package's `[store]` table. The result is
+    // pinned by repo.json, so the repository keeps a single signature.
+    let authored_path = repo_dir.join(STORE_SOURCE);
+    let mut store = if authored_path.is_file() {
+        let raw = fs::read(&authored_path)?;
+        StoreDoc::from_slice(&raw)
+            .map_err(|error| Error::Index(format!("{STORE_SOURCE}: {error}")))?
+    } else {
+        StoreDoc::default()
+    };
+    store.schema = STORE_SCHEMA;
+    for (name, (_, meta)) in store_metas {
+        store.packages.insert(name, meta);
+    }
+    store.validate()?;
+    let store_bytes = store.to_bytes()?;
+    let store_path = repo_dir.join("store.json");
+    atomic_write(&store_path, &store_bytes, 0o644)?;
+    let store_digest = FileDigest {
+        sha256: sha256_bytes(&store_bytes),
+        size: store_bytes.len() as u64,
+    };
 
     let mut by_name: BTreeMap<String, Vec<IndexPackage>> = BTreeMap::new();
     for package in &all {
@@ -291,6 +339,7 @@ pub fn generate_with_keys_and_security(
             size: bytes.len() as u64,
         },
         history,
+        store: Some(store_digest),
     };
     let manifest_bytes = manifest.to_bytes()?;
     let manifest_path = repo_dir.join("repo.json");
@@ -439,6 +488,17 @@ fn verify_manifest(repo_dir: &Path, index: &Index, key_path: &Path) -> Result<()
         return Err(Error::Index(
             "repo.json catalog digest does not match index.json".into(),
         ));
+    }
+    if let Some(digest) = &manifest.store {
+        let bytes = fs::read(repo_dir.join("store.json")).map_err(|e| {
+            Error::Index(format!("store.json is referenced by repo.json but missing: {e}"))
+        })?;
+        if bytes.len() as u64 != digest.size || sha256_bytes(&bytes) != digest.sha256 {
+            return Err(Error::Index(
+                "store.json does not match the digest in repo.json".into(),
+            ));
+        }
+        StoreDoc::from_slice(&bytes)?;
     }
     for (name, digest) in &manifest.history {
         let path = repo_dir.join(history_path(name));

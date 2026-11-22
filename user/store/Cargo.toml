@@ -1,0 +1,29 @@
+#
+#       user/store/Cargo.toml
+#       SpaceOS-9 graphical package manager and App Store powered by spk and SPUI 4.0
+#
+#       2026/11/21 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+[package]
+name = "space_store"
+version = "1.0.0"
+edition = "2021"
+description = "SpaceOS-9 graphical package manager and App Store powered by spk and SPUI 4.0"
+license = "LicenseRef-Proprietary"
+
+[lib]
+name = "space_store"
+path = "src/lib.rs"
+
+[[bin]]
+name = "space-store"
+path = "src/main.rs"
+
+[dependencies]
+spui_ui = { path = "../spui_ui" }
+uxconf = { package = "spui", path = "../desktop" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+libc = "0.2"

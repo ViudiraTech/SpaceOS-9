@@ -134,7 +134,7 @@ pub struct AppEntry {
     pub category: AppCategory,
 }
 
-pub const APPS: [AppEntry; 11] = [
+pub const APPS: [AppEntry; 13] = [
     AppEntry {
         name: "文件管理器",
         subtitle: "浏览目录与系统文件",
@@ -223,6 +223,22 @@ pub const APPS: [AppEntry; 11] = [
         icon: Icon::Browser,
         mode: "browser",
         category: AppCategory::Productivity,
+    },
+    AppEntry {
+        name: "Space 商店",
+        subtitle: "浏览、安装与更新软件包",
+        keywords: "store shop app market install update 商店 软件 应用 安装 更新",
+        icon: Icon::Store,
+        mode: "store",
+        category: AppCategory::System,
+    },
+    AppEntry {
+        name: "检查新软件",
+        subtitle: "检查软件源中的新版本与更新",
+        keywords: "check update upgrade refresh new 检查 更新 升级 新软件",
+        icon: Icon::StoreCheck,
+        mode: "store-check",
+        category: AppCategory::System,
     },
 ];
 
@@ -782,6 +798,8 @@ fn infer_window_icon(title: &str) -> Icon {
         || lower.contains("mp3")
     {
         Icon::Music
+    } else if title.contains("商店") || lower.contains("store") {
+        Icon::Store
     } else if title.contains("浏览器") || lower.contains("browser") {
         Icon::Browser
     } else if title.contains("设置") || lower.contains("setting") {
@@ -1466,6 +1484,49 @@ impl Shell {
         } else {
             108
         }
+    }
+
+    /// APPS indices shown on the desktop, in the order the user arranged.
+    fn desktop_app_indices(&self) -> Vec<usize> {
+        self.config
+            .desktop_shortcuts
+            .split(',')
+            .filter(|mode| !mode.is_empty())
+            .filter_map(|mode| APPS.iter().position(|app| app.mode == mode))
+            .collect()
+    }
+
+    /// Add or remove `APPS[index]` from the desktop, persisting the choice.
+    fn toggle_desktop_shortcut(&mut self, index: usize) {
+        let mode = APPS[index].mode;
+        let mut modes: Vec<String> = self
+            .config
+            .desktop_shortcuts
+            .split(',')
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .collect();
+        let present = modes.iter().any(|m| m == mode);
+        if present {
+            modes.retain(|m| m != mode);
+        } else {
+            modes.push(mode.to_string());
+        }
+        let next = modes.join(",");
+        if let Some(client) = self.ux_client.as_mut() {
+            let _ = client.set(
+                "desktop",
+                "/icons/shortcuts",
+                uxconf::Value::String(next.clone()),
+            );
+        }
+        let _ = self.config.apply_property("desktop", "/icons/shortcuts", &uxconf::Value::String(next));
+        self.show_toast(
+            if present { "已从桌面移除" } else { "已添加到桌面" },
+            APPS[index].name,
+        );
+        let _ = self.draw_desktop();
+        let _ = self.present_desktop();
     }
 
     fn desktop_icon_rect(&self, index: usize) -> Rect {
@@ -2960,6 +3021,10 @@ impl Shell {
                         }
                     } else if e.detail == 1 {
                         self.menu_click(x, y)?;
+                    } else if e.detail == 3 {
+                        if let Hit::MenuRow(app_idx) = self.menu_hit(x, y) {
+                            self.toggle_desktop_shortcut(app_idx);
+                        }
                     }
                 } else if e.event == self.ctx_menu && self.ctx_open {
                     if !popup_contains_point(CTX_WIDTH, CTX_HEIGHT, x, y) {
@@ -4336,8 +4401,8 @@ impl Shell {
         if !self.config.desktop_icons_visible {
             return Hit::None;
         }
-        for idx in 0..APPS.len() {
-            if self.desktop_icon_rect(idx).contains(x, y) {
+        for (slot, idx) in self.desktop_app_indices().into_iter().enumerate() {
+            if self.desktop_icon_rect(slot).contains(x, y) {
                 return Hit::DesktopIcon(idx);
             }
         }
@@ -5134,15 +5199,30 @@ impl Shell {
             }
         }
         self.last_launch = Some((mode, now));
-        let mut cmd = if mode == "browser" {
+        let mut cmd = if mode == "browser" || mode == "store" || mode == "store-check" {
+            let binary = if mode == "browser" {
+                "space-browser"
+            } else {
+                "space-store"
+            };
             let sibling = std::env::current_exe()
                 .ok()
-                .and_then(|p| p.parent().map(|d| d.join("space-browser")))
+                .and_then(|p| p.parent().map(|d| d.join(binary)))
                 .filter(|p| p.is_file());
             if let Some(bin) = sibling {
                 Command::new(bin)
             } else {
-                Command::new("/usr/bin/space-browser")
+                let installed = std::path::PathBuf::from(format!("/usr/bin/{binary}"));
+                if !installed.is_file() {
+                    if mode == "store" {
+                        self.show_toast(
+                            "Space 商店尚未安装",
+                            "在终端执行 doas spk install space-store 即可安装。",
+                        );
+                    }
+                    return;
+                }
+                Command::new(installed)
             }
         } else {
             let Ok(path) = std::env::current_exe() else {
@@ -5154,6 +5234,9 @@ impl Shell {
         };
         if let Some(arg) = extra_arg {
             cmd.arg(arg);
+        }
+        if mode == "store-check" {
+            cmd.arg("--updates");
         }
         let _ = cmd.spawn();
     }
@@ -5200,8 +5283,9 @@ impl Shell {
         }
 
         let icon_sz = self.config.desktop_icon_size.clamp(32, 48) as u32;
-        for (idx, app) in APPS.iter().enumerate() {
-            let cell = self.desktop_icon_rect(idx);
+        for (slot, idx) in self.desktop_app_indices().into_iter().enumerate() {
+            let app = &APPS[idx];
+            let cell = self.desktop_icon_rect(slot);
             let hovered = self.hover == Hit::DesktopIcon(idx);
             let selected = self.selected_desktop_icon == Some(idx);
             if selected || hovered {
@@ -5267,6 +5351,7 @@ impl Shell {
     fn superbar_glow_tint(icon: Icon, fallback_accent: u32) -> u32 {
         match icon {
             Icon::Files | Icon::Browser => 0x56a8f5,
+            Icon::Store => 0x7c8cf8,
             Icon::Terminal => 0x62c4e8,
             Icon::Monitor | Icon::Minesweeper => 0x4fd18b,
             Icon::Editor => 0xf2a74b,
@@ -8444,6 +8529,7 @@ mod tests {
         assert_eq!(infer_window_icon("音乐播放器"), Icon::Music);
         assert_eq!(infer_window_icon("系统设置"), Icon::Settings);
         assert_eq!(infer_window_icon("Space 浏览器"), Icon::Browser);
+        assert_eq!(infer_window_icon("Space 商店"), Icon::Store);
         assert_eq!(infer_window_icon("帮助手册"), Icon::Help);
         assert_eq!(infer_window_icon("系统通知"), Icon::Notify);
         assert_eq!(infer_window_icon("会话账户"), Icon::Login);

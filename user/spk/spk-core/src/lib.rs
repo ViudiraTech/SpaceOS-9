@@ -20,6 +20,7 @@ pub mod fsutil;
 pub mod index;
 pub mod keys;
 pub mod manifest;
+pub mod store;
 pub mod version;
 
 pub use error::{Error, Result};

@@ -218,6 +218,26 @@ size = 11
 - 保留策略：`.spk` 内容不可变，长缓存；历史文件随版本数增长，旧版本可按策略清理。
 - `spk-host index` 维护 `.spk-index-cache.json`（文件名 + size + mtime），只重新检查变化的包，新增一个包只多花一个包的时间。
 
+### 4.3 store.json（图形商店元数据）
+
+图形商店不硬编码任何软件信息。仓库额外发布一个 `store.json`，由 `repo.json` 的 `store` 摘要覆盖、随同一把密钥校验：
+
+```json
+{"schema":1,
+ "packages":{"theme-aqua":{"display_name":"Aqua Classic 晶球主题","subtitle":"…",
+   "description":"…","category":"themes","highlights":["…"],"icon":"wallpaper",
+   "accent":["#38bdf8","#0284c7"],"banner":null,"featured_rank":95}},
+ "hero":[{"overline":"…","title":"…","subtitle":"…","cta":"获取主题","package":"theme-winxp",
+   "go_updates":false,"accent":["#1e3a8a","#2563eb"],"icon":"appearance"}],
+ "sections":[{"title":"精选主题","subtitle":"…","packages":["theme-winxp","theme-aqua"]}],
+ "categories":[{"slug":"themes","label":"桌面主题","subtitle":"…"}]}
+```
+
+- `packages` 由 `spk-host index` 从每个包 manifest 的 `[store]` 表生成（F-Droid 的做法：元数据随包走）；`hero`/`sections`/`categories` 来自仓库作者维护的 `store.in.json`（Play 商店的编辑集合）。
+- `spk sync` 拉取并校验 `store.json`，缓存进索引快照；`spk catalog --json` 把整份文档作为 `store` 字段透传，`spk info --json` 额外透传单个包的 `store` 块。离线可用。
+- `[store]` 字段全部可选：`display_name`、`subtitle`、`description`、`category`（themes/system/utilities/development/multimedia）、`highlights`、`icon`、`accent`（1–2 个 `#rrggbb`）、`banner`、`featured_rank`。旧包没有该表时，客户端按 `theme-` 前缀/`spui-theme` provides 与 summary 通用降级。
+- 兼容性：`manifest.rs` 不再 `deny_unknown_fields`，旧客户端可以安装带新字段的包；`index.json` 结构未变，旧客户端照常工作。
+
 ## 5. 依赖与求解
 
 ### 5.1 版本比较
@@ -747,6 +767,21 @@ app.use("/spaceos/repo", express.static("/data/spaceos/repo", {
   - `repo.json.sig`：sha256 `0780631bdcac799f594e428262c00ff2ff046f8a0c9a3640014b94be4f3a4a39`（`271` bytes）
   - `spui-theme-kick` 改为原子单调写 `/run/spui-theme.stamp` 并同步广播 `uxconf-query -c appearance -p /theme/reload-gen`；`App`/`Shell` 新增 2s `installed_themes_fingerprint()` 低频轮询并在卸载当前主题时将默认回退写回 `uxconfd`；各主题包补充水平 SVG 精灵帧 `splash_anim.svg` 与 `[power_splash]`/`[controls]` 声明式皮肤并修正 `/button-layout`。
   - 旧 `base-core-1.0.0-7`、`spk-runtime-1.0.0-3`、`theme-winxp-1.0.0-4`、`theme-aqua-1.0.0-1`、`theme-ambiance-1.0.0-1` 已从生产仓库删除。
+
+- 2026-11-22：图形商店 `space-store`（独立软件包，默认镜像不自带）、仓库透明元数据与桌面快捷方式：
+  - `space-store-1.0.0-1-x86_64.spk`：sha256 `44e2a93058860b922e5aff62b366938d05cffe207f8a50e769aa279bad1151dd`（`1593960` bytes）
+  - `base-core-1.0.0-9-x86_64.spk`：sha256 `52ef6128b8633288db30e23da5ab16f3c630aa558f2823df60ea12a5798c6a29`（`3228623` bytes）
+  - `spk-runtime-1.0.0-5-x86_64.spk`：sha256 `1323054cedfd91913bde51668e37e4c1642ea6c8fe34c143c19d340153aed069`（`2141687` bytes）
+  - `base-1.0.0-7` / `sudo-0.1.0-4` / `hello-0.1.0-2` / `hello-0.2.0-2`
+  - `theme-winxp-1.0.0-6` / `theme-aqua-1.0.0-3` / `theme-ambiance-1.0.0-3`：新增 `[store]` 展示元数据
+  - `index.json`：sha256 `b17209ea3f88ee6ad182c051b245fca756e821d5c51c3fdecedddde1b2e25e25`（`3167` bytes）
+  - `index.json.sig`：sha256 `72f0c905400b61b6256f82eeda8d9b1378ad02819eb37973c7139ad4e72e53b4`（`271` bytes）
+  - `repo.json`：sha256 `99cd21c31e9fbffd655760b5fa61b73dcf54fc351c7197ec30a72f25acb799ba`（`1230` bytes）
+  - `repo.json.sig`：sha256 `090f3c0bbaea4994da53219ffff4f3d78b0a7bc8f2c59f2bcd973ef87b90b96e`（`271` bytes）
+  - `store.json`：sha256 `07e54308779e92765f9b055c8478fa2728e9ec5bdee6c6fe5d0caea6ab6d7101`（`7664` bytes）
+  - 商店 100% 通过 `spk ... --json` 读取数据、通过排队事务执行变更，非 root 运行、按需 `sudo -S -v` 弹窗授权；界面完全走 `spui_ui::ui` 语义原语，不判断皮肤。
+  - 开始菜单新增“检查新软件”（内置 SVG 图标），右键任意开始菜单项可在桌面添加/移除快捷方式；桌面默认只显示 `files,term,browser,store` 四个图标，列表持久化在 `desktop:/icons/shortcuts`。
+  - 旧版本 `base-1.0.0-6`、`base-core-1.0.0-8`、`hello-0.1.0-1`、`hello-0.2.0-1`、`spk-runtime-1.0.0-4`、`sudo-0.1.0-3`、`theme-*-1.0.0-{2,5}` 已从生产仓库删除。
 
 ## 13. 安全模型
 

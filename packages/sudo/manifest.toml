@@ -9,7 +9,7 @@
 name = "sudo"
 epoch = 0
 version = "0.1.0"
-release = 3
+release = 4
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "SpaceOS-9 sudo and doas"
@@ -27,3 +27,15 @@ replaces = []
 conffiles = []
 scripts = false
 allow_setuid = true
+
+[store]
+display_name = "sudo / doas 权限管理工具"
+subtitle = "管理员授权 · 时间戳票据缓存 · 密码策略校验"
+category = "system"
+icon = "login"
+accent = ["#10b981", "#047857"]
+featured_rank = 75
+highlights = [
+    "支持 -S 标准输入授权与 -n 非交互票据检查",
+    "保留独立 suid 位并受 spk 白名单安全保护",
+]

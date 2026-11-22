@@ -26,6 +26,7 @@ use crate::state::Paths;
 
 const MAX_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 256 * 1024;
+const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024;
 const RETRIES: usize = 3;
 const RETENTION_DAYS: u64 = 30;
 const CACHE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -58,6 +59,8 @@ pub struct RemoteSync {
     pub security: SecurityState,
     pub mirrors: Vec<String>,
     pub stale: bool,
+    /// Store metadata published by the repository, verified against repo.json.
+    pub store: Option<spk_core::store::StoreDoc>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -82,6 +85,7 @@ struct CachedSnapshot {
     index: Index,
     meta: SnapshotMeta,
     key_id: String,
+    store: Option<spk_core::store::StoreDoc>,
 }
 
 pub fn repo_id(name_hint: &str, urls: &[String]) -> String {
@@ -179,12 +183,100 @@ fn load_current(
     let index = Index::from_slice(&index_bytes)?;
     let meta_bytes = fs::read(dir.join("meta.json"))?;
     let meta: SnapshotMeta = serde_json::from_slice(&meta_bytes)?;
+    let store = fs::read(dir.join("store.json"))
+        .ok()
+        .and_then(|bytes| spk_core::store::StoreDoc::from_slice(&bytes).ok());
     Ok(Some(CachedSnapshot {
         dir,
         index,
         meta,
         key_id,
+        store,
     }))
+}
+
+/// Fetch and verify the repository manifest and, when it publishes one, the
+/// store document. Both are cached inside the index snapshot so that
+/// `spk catalog` can expose them to the graphical store offline.
+fn sync_store(
+    paths: &Paths,
+    client: &HttpClient,
+    base: &str,
+    dir: &Path,
+    index_bytes: &[u8],
+    options: RemoteOptions,
+) -> Result<Option<spk_core::store::StoreDoc>> {
+    let response = match get(
+        client,
+        &http::join_url(base, "repo.json"),
+        &[("Cache-Control", "no-cache".to_string())],
+        MAX_STORE_BYTES,
+    ) {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    if response.status == 404 {
+        return Ok(None);
+    }
+    if !(200..=299).contains(&response.status) {
+        return Err(SpkError::Network(format!(
+            "HTTP {} fetching repo.json",
+            response.status
+        )));
+    }
+    let signature = match get(
+        client,
+        &http::join_url(base, "repo.json.sig"),
+        &[("Cache-Control", "no-cache".to_string())],
+        MAX_SIGNATURE_BYTES,
+    ) {
+        Ok(response) if (200..=299).contains(&response.status) => Some(
+            serde_json::from_slice::<SignatureFile>(&response.body).map_err(|error| {
+                SpkError::Signature(format!("{base}: malformed repo.json.sig: {error}"))
+            })?,
+        ),
+        _ => None,
+    };
+    repo::verify_index_bytes(paths, &response.body, signature.as_ref(), options.allow_unsigned)?;
+    let manifest = RepoManifest::from_slice(&response.body)
+        .map_err(|error| SpkError::Security(format!("{base}: invalid repo.json: {error}")))?;
+    if manifest.catalog.sha256 != sha256_bytes(index_bytes)
+        || manifest.catalog.size != index_bytes.len() as u64
+    {
+        return Err(SpkError::Security(format!(
+            "{base}: repo.json catalog digest does not match the index"
+        )));
+    }
+    spk_core::fsutil::atomic_write(&dir.join("repo.json"), &response.body, 0o644)?;
+    if let Some(signature) = &signature {
+        let mut json = serde_json::to_vec_pretty(signature)?;
+        json.push(b'\n');
+        spk_core::fsutil::atomic_write(&dir.join("repo.json.sig"), &json, 0o644)?;
+    }
+    let Some(digest) = &manifest.store else {
+        return Ok(None);
+    };
+    let response = get(
+        client,
+        &http::join_url(base, "store.json"),
+        &[("Cache-Control", "no-cache".to_string())],
+        MAX_STORE_BYTES,
+    )?;
+    if !(200..=299).contains(&response.status) {
+        return Err(SpkError::Security(format!(
+            "{base}: repo.json lists store.json but the mirror returned HTTP {}",
+            response.status
+        )));
+    }
+    if response.body.len() as u64 != digest.size || sha256_bytes(&response.body) != digest.sha256 {
+        return Err(SpkError::Security(format!(
+            "{base}: store.json does not match the signed digest"
+        )));
+    }
+    let doc = spk_core::store::StoreDoc::from_slice(&response.body)
+        .map_err(|error| SpkError::Security(format!("{base}: invalid store.json: {error}")))?;
+    spk_core::fsutil::atomic_write(&dir.join("store.json"), &response.body, 0o644)?;
+    Ok(Some(doc))
 }
 
 fn mirror_index_url(base: &str) -> String {
@@ -354,11 +446,30 @@ fn sync_mirror(
                 &meta,
                 &merged,
             )?;
+            let store = match sync_store(paths, &client, base, &dir, &response.body, options) {
+                Ok(store) => store,
+                Err(error @ (SpkError::Security(_) | SpkError::Signature(_))) => {
+                    return Err(error)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        i18n::repo_mirror_unavailable(
+                            Lang::En,
+                            &format!("{name} (store metadata)"),
+                            base,
+                            &error.to_string()
+                        )
+                    );
+                    None
+                }
+            };
             Ok(CachedSnapshot {
                 dir,
                 index,
                 meta,
                 key_id,
+                store,
             })
         }
         status => Err(SpkError::Network(format!(
@@ -385,8 +496,6 @@ pub fn sync_repo(
     }
     let id = repo_id(name_hint, &mirrors);
     let root = paths.repo_cache.join(&id);
-    fs::create_dir_all(root.join("snapshots"))?;
-    fs::create_dir_all(&paths.package_cache)?;
     let old = load_current(paths, &root, options)?;
     let security = SecurityState::load(&root.join("security.json"))?;
     if !options.offline && !options.refresh {
@@ -400,6 +509,7 @@ pub fn sync_repo(
                     security: security.merge(&old.index),
                     mirrors,
                     stale: false,
+                    store: old.store.clone(),
                 });
             }
         }
@@ -413,10 +523,13 @@ pub fn sync_repo(
                 security,
                 mirrors,
                 stale: true,
+                store: old.store,
             }),
             None => Err(SpkError::Network(i18n::offline_not_cached(lang, name_hint))),
         };
     }
+    fs::create_dir_all(root.join("snapshots"))?;
+    fs::create_dir_all(&paths.package_cache)?;
     let mut last_error = None;
     for base in &mirrors {
         match sync_mirror(
@@ -437,6 +550,7 @@ pub fn sync_repo(
                     security: merged,
                     mirrors,
                     stale: false,
+                    store: cached.store,
                 });
             }
             Err(error @ SpkError::Signature(_)) | Err(error @ SpkError::Security(_)) => {
@@ -469,6 +583,7 @@ pub fn sync_repo(
             security,
             mirrors,
             stale: true,
+            store: old.store,
         });
     }
     Err(last_error.unwrap_or_else(|| SpkError::Network(i18n::no_usable_mirror(lang, name_hint))))
@@ -659,18 +774,18 @@ pub fn ensure_package_with_progress(
     progress: &mut dyn FnMut(u64),
     lang: Lang,
 ) -> Result<PathBuf> {
-    fs::create_dir_all(cache)?;
     let destination = cache.join(format!("{}.spk", package.sha256));
     if verify_cached_package(&destination, package)? {
         return Ok(destination);
     }
-    let _ = fs::remove_file(&destination);
     if offline {
         return Err(SpkError::Network(format!(
             "{} is not cached and --offline was given",
             package.filename
         )));
     }
+    fs::create_dir_all(cache)?;
+    let _ = fs::remove_file(&destination);
     let part = cache.join(format!("{}.spk.part", package.sha256));
     let client = HttpClient::new()?;
     let mut last_error = None;

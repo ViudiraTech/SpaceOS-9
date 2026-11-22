@@ -9,7 +9,7 @@
 name = "base"
 epoch = 0
 version = "1.0.0"
-release = 6
+release = 7
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "SpaceOS-9 base meta package"
@@ -27,3 +27,12 @@ replaces = []
 conffiles = []
 scripts = false
 allow_setuid = false
+
+[store]
+display_name = "SpaceOS 基础系统元包"
+subtitle = "SpaceOS-9 最小可用系统依赖锚点"
+category = "system"
+icon = "settings"
+accent = ["#0ea5e9", "#0369a1"]
+featured_rank = 60
+highlights = ["依赖并保护 base-core 运行时完整性"]

@@ -1,0 +1,42 @@
+#
+#       packages/space-store/manifest.toml
+#       Space 商店: graphical package manager front end for spk
+#
+#       2026/11/22 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
+name = "space-store"
+epoch = 0
+version = "1.0.0"
+release = 1
+arch = "x86_64"
+abi = "spaceos-1"
+summary = "Space 商店：图形软件包管理器"
+description = "基于 spk 的图形软件中心。浏览、搜索、安装、更新与卸载软件包，管理软件源与信任密钥，所有变更都以 spk 事务执行，并可用应用内的管理员授权完成提权。"
+license = "LicenseRef-Proprietary"
+url = "https://github.com/ViudiraTech/SpaceOS-9"
+packager = "SpaceOS Build <build@spaceos>"
+build_date = 0
+
+depends = ["spk-runtime"]
+provides = ["space-store"]
+conflicts = []
+replaces = []
+
+conffiles = []
+scripts = false
+allow_setuid = false
+
+[store]
+display_name = "Space 商店"
+subtitle = "浏览、安装与更新 SpaceOS 软件包"
+category = "utilities"
+icon = "store"
+accent = ["#6366f1", "#4338ca"]
+featured_rank = 85
+highlights = [
+    "原生 SPUI 界面，跟随系统主题实时切换",
+    "所有变更经由 spk 事务、签名校验与回滚日志",
+    "支持更新中心、版本锁定与软件源维护",
+]

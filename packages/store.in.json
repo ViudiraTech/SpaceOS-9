@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "hero": [
+    {
+      "overline": "SpaceOS-9 软件中心",
+      "title": "安全、可复现的原子软件包管理",
+      "subtitle": "基于 Ed25519 签名验证与事务回滚日志，轻松管理桌面主题与系统组件。",
+      "cta": "同步软件源",
+      "go_updates": false,
+      "accent": ["#1e293b", "#2563eb"],
+      "icon": "store"
+    },
+    {
+      "overline": "精选推荐 · 声明式桌面主题",
+      "title": "XP Luna 经典主题",
+      "subtitle": "支持经典与深色多变体切换、抗锯齿标题栏与主题专属关机动画，安装后即刻热生效。",
+      "cta": "获取主题",
+      "package": "theme-winxp",
+      "accent": ["#1e3a8a", "#2563eb"],
+      "icon": "appearance"
+    },
+    {
+      "overline": "编辑精选 · 暖色创作环境",
+      "title": "Ambiance 暖炭主题",
+      "subtitle": "暖炭黑面板配合象牙白高对比窗口与四重变体配色，适合长时间开发与文字工作。",
+      "cta": "立即体验",
+      "package": "theme-ambiance",
+      "accent": ["#4c1d3d", "#c2410c"],
+      "icon": "wallpaper"
+    }
+  ],
+  "sections": [
+    {
+      "title": "精选主题",
+      "subtitle": "让桌面换一种气质",
+      "packages": ["theme-winxp", "theme-aqua", "theme-ambiance"]
+    },
+    {
+      "title": "系统核心",
+      "subtitle": "SpaceOS 的基石组件",
+      "packages": ["base-core", "spk-runtime", "sudo", "base"]
+    }
+  ],
+  "categories": [
+    { "slug": "themes", "label": "桌面主题", "subtitle": "窗口、图标与关机动画" },
+    { "slug": "system", "label": "系统核心", "subtitle": "运行时、权限与包管理" },
+    { "slug": "utilities", "label": "实用工具", "subtitle": "命令行与验证工具" }
+  ]
+}

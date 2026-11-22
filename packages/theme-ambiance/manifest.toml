@@ -9,7 +9,7 @@
 name = "theme-ambiance"
 epoch = 0
 version = "1.0.0"
-release = 2
+release = 3
 arch = "x86_64"
 abi = "spaceos-1"
 summary = "Ambiance SPUI theme"
@@ -27,3 +27,16 @@ replaces = []
 conffiles = []
 scripts = true
 allow_setuid = false
+
+[store]
+display_name = "Ambiance 暖炭主题"
+subtitle = "暖炭黑顶栏 · 琥珀橙闭窗键 · 象牙白窗体"
+category = "themes"
+icon = "appearance"
+accent = ["#f97316", "#c2410c"]
+featured_rank = 90
+highlights = [
+    "包含 Ambiance、Radiance、MATE 与 Darkness 四重变体",
+    "抗锯齿矢量 SVG 控制按钮，高分屏清晰锐利",
+    "暖梅紫梯度呼吸圆点声明式关机画面",
+]

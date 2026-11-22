@@ -45,6 +45,9 @@ struct Cli {
     /// Disable progress bars and spinners
     #[arg(long = "noprogressbar", global = true)]
     no_progress_bar: bool,
+    /// Emit NDJSON phase and progress events to stderr
+    #[arg(long = "progress-json", global = true)]
+    progress_json: bool,
     /// Accept an unsigned index (debug only)
     #[arg(long = "allow-unsigned", global = true)]
     allow_unsigned: bool,
@@ -128,10 +131,25 @@ enum Command {
     },
     /// Show installed packages, holds, repositories and cache status
     Status,
+    /// List installed and repository packages together
+    Catalog {
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+    },
+    /// Search packages across installed and repository catalogs
+    Search {
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        query: Vec<String>,
+    },
     /// List installed packages
     List,
-    /// Show package information
-    Info { package: String },
+    /// Show package information (installed or in configured repositories)
+    Info {
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        package: String,
+    },
     /// List files owned by a package
     Files { package: String },
     /// Show which package owns a path
@@ -220,8 +238,10 @@ SpaceOS-9 原生包管理器
   unhold        解除锁定
   remove        删除软件包（-Rs 删除孤儿依赖）
   status        显示已安装、锁定、仓库和缓存状态
+  catalog       列出已安装与软件源中的全部软件包
+  search        按名称/摘要/Provides 搜索软件包
   list          列出已安装软件包
-  info          显示软件包信息
+  info          显示软件包详细信息（支持远程未安装包）
   files         列出软件包拥有的文件
   owns          显示路径属于哪个软件包
   check         检查数据库和文件系统一致性
@@ -236,7 +256,8 @@ SpaceOS-9 原生包管理器
   --root <ROOT>                 安装根目录（默认 /）
   --noconfirm                   跳过确认
   --lang <LANG>                 输出语言：en 或 zh_CN
-  --json                        输出 JSON（事务计划/错误）
+  --json                        输出 JSON（查询/事务计划/错误）
+  --progress-json               向 stderr 输出结构化 NDJSON 阶段与进度事件
   --script-failure <POLICY>     脚本失败策略：rollback 或 keep
   --no-sandbox-scripts          不使用沙箱运行 .INSTALL（仅调试）
   --offline                     只使用缓存，不访问网络
@@ -316,8 +337,14 @@ fn zh_subcommand_help(topic: &str) -> Option<&'static str> {
         "hold" => "锁定软件包\n\n用法: spk [全局选项] hold <目标...>\n",
         "unhold" => "解除锁定\n\n用法: spk [全局选项] unhold <目标...>\n",
         "status" => "显示已安装、锁定、仓库和缓存状态\n\n用法: spk [全局选项] status\n",
+        "catalog" => {
+            "列出已安装与软件源中的全部软件包\n\n用法: spk [全局选项] catalog [--repo <URL|PATH>]\n"
+        }
+        "search" => {
+            "按名称、摘要或 Provides 搜索软件包\n\n用法: spk [全局选项] search [--repo <URL|PATH>] [关键词...]\n"
+        }
         "list" => "列出已安装软件包\n\n用法: spk [全局选项] list\n",
-        "info" => "显示软件包信息\n\n用法: spk [全局选项] info <软件包>\n",
+        "info" => "显示软件包详细信息（支持远程未安装包）\n\n用法: spk [全局选项] info [--repo <URL|PATH>] <软件包>\n",
         "files" => "列出软件包拥有的文件\n\n用法: spk [全局选项] files <软件包>\n",
         "owns" => "显示路径属于哪个软件包\n\n用法: spk [全局选项] owns <路径>\n",
         "check" => "检查数据库和文件系统一致性\n\n用法: spk [全局选项] check\n",
@@ -518,6 +545,13 @@ fn main() -> ExitCode {
     let json = cli.json;
     if cli.no_progress_bar || cli.json {
         std::env::set_var("SPK_NO_PROGRESS", "1");
+    } else {
+        std::env::remove_var("SPK_NO_PROGRESS");
+    }
+    if cli.progress_json {
+        std::env::set_var("SPK_PROGRESS_JSON", "1");
+    } else {
+        std::env::remove_var("SPK_PROGRESS_JSON");
     }
     let lang = Lang::detect_for(&cli.root, cli.lang.as_deref());
     match run(cli) {
@@ -689,8 +723,8 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             },
             lang,
         ),
-        Command::Hold { targets } => ops::hold(&paths, &targets, lang),
-        Command::Unhold { targets } => ops::unhold(&paths, &targets, lang),
+        Command::Hold { targets } => ops::hold_with_json(&paths, &targets, cli.json, lang),
+        Command::Unhold { targets } => ops::unhold_with_json(&paths, &targets, cli.json, lang),
         Command::Remove {
             recursive,
             recursive_short,
@@ -715,27 +749,70 @@ fn run(cli: Cli) -> Result<(), SpkError> {
             lang,
         ),
         Command::Status => ops::status(&paths, cli.json, lang),
-        Command::List => ops::list(&paths),
-        Command::Info { package } => ops::info(&paths, &package, lang),
-        Command::Files { package } => ops::files(&paths, &package, lang),
-        Command::Owns { path } => ops::owns(&paths, &path, lang),
-        Command::Check => ops::check_database(&paths, lang),
-        Command::Repair => ops::repair_database(&paths, lang),
+        Command::Catalog { repos } => ops::catalog(
+            &paths,
+            &repos,
+            ReportOptions {
+                json: cli.json,
+                print: false,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
+            },
+            lang,
+        ),
+        Command::Search { repos, query } => ops::search(
+            &paths,
+            &repos,
+            &query,
+            ReportOptions {
+                json: cli.json,
+                print: false,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
+            },
+            lang,
+        ),
+        Command::List => ops::list_with_json(&paths, cli.json),
+        Command::Info { repos, package } => ops::info_with_options(
+            &paths,
+            &repos,
+            &package,
+            ReportOptions {
+                json: cli.json,
+                print: false,
+                script_failure_keep,
+                no_sandbox_scripts: cli.no_sandbox_scripts,
+                offline: cli.offline,
+                allow_unsigned: cli.allow_unsigned,
+                refresh: cli.refresh,
+            },
+            lang,
+        ),
+        Command::Files { package } => ops::files_with_json(&paths, &package, cli.json, lang),
+        Command::Owns { path } => ops::owns_with_json(&paths, &path, cli.json, lang),
+        Command::Check => ops::check_database_with_json(&paths, cli.json, lang),
+        Command::Repair => ops::repair_database_with_json(&paths, cli.json, lang),
         Command::Repo { command } => match command {
             RepoCommand::Add {
                 name,
                 url,
                 priority,
-            } => spk_ops::repo::add(&paths, &name, &url, priority),
-            RepoCommand::Remove { name } => spk_ops::repo::remove(&paths, &name),
-            RepoCommand::List => spk_ops::repo::list(&paths),
+            } => spk_ops::repo::add_with_json(&paths, &name, &url, priority, cli.json),
+            RepoCommand::Remove { name } => spk_ops::repo::remove_with_json(&paths, &name, cli.json),
+            RepoCommand::List => spk_ops::repo::list_with_json(&paths, cli.json),
             RepoCommand::Priority { name, priority } => {
-                spk_ops::repo::set_priority(&paths, &name, priority)
+                spk_ops::repo::set_priority_with_json(&paths, &name, priority, cli.json)
             }
         },
         Command::Trust { command } => match command {
-            TrustCommand::Add { key } => ops::trust_add(&paths, &key, lang),
-            TrustCommand::List => ops::trust_list(&paths),
+            TrustCommand::Add { key } => ops::trust_add_with_json(&paths, &key, cli.json, lang),
+            TrustCommand::List => ops::trust_list_with_json(&paths, cli.json),
         },
     }
 }

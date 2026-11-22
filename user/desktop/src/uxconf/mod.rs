@@ -995,6 +995,27 @@ pub fn parse_start_tiles(raw: &str) -> Vec<StartTileSpec> {
     out
 }
 
+/// Keep only well-formed app modes in a `desktop/shortcuts` value.
+pub fn sanitize_shortcuts(value: &str) -> String {
+    let mut seen = Vec::new();
+    for part in value.split(',') {
+        let mode = part.trim();
+        if mode.is_empty() || mode.len() > 24 {
+            continue;
+        }
+        if !mode
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            continue;
+        }
+        if !seen.iter().any(|existing| existing == mode) {
+            seen.push(mode.to_string());
+        }
+    }
+    seen.join(",")
+}
+
 /// Serialize Start Screen tiles back into canonical `id:size` form.
 pub fn encode_start_tiles(tiles: &[StartTileSpec]) -> String {
     tiles
@@ -1020,6 +1041,8 @@ pub struct DesktopConfig {
     pub backdrop_style: BackdropStyle,
     pub solid_color: u32,
     pub desktop_icons_visible: bool,
+    /// Comma separated app modes shown on the desktop, in display order.
+    pub desktop_shortcuts: String,
     pub desktop_icon_size: i32,
     // panel
     pub panel_position: PanelPosition,
@@ -1104,6 +1127,7 @@ impl Default for DesktopConfig {
             backdrop_style: BackdropStyle::Cover,
             solid_color: 0x14385c,
             desktop_icons_visible: true,
+            desktop_shortcuts: "files,term,browser,store".to_string(),
             desktop_icon_size: 40,
             panel_position: PanelPosition::Bottom,
             panel_size: 44,
@@ -1252,6 +1276,11 @@ impl DesktopConfig {
             ("desktop", "/icons/size") => {
                 if let Some(v) = value.as_int() {
                     self.desktop_icon_size = (v as i32).clamp(28, 56);
+                }
+            }
+            ("desktop", "/icons/shortcuts") => {
+                if let Some(s) = value.as_str() {
+                    self.desktop_shortcuts = sanitize_shortcuts(s);
                 }
             }
             ("panel", "/position") => {
